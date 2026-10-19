@@ -36,6 +36,11 @@ from .openhands_client import (
     Outcome,
     task_conversation_id,
 )
+from .runtime_state import (
+    DEFAULT_DESIRED_STATE_PATH,
+    DesiredStateError,
+    RuntimeReadiness,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +81,7 @@ class Dispatcher:
         workspace_root: str,
         lease_seconds: float = 300.0,
         session_ttl: float = 120.0,
+        desired_state_path: str | None = str(DEFAULT_DESIRED_STATE_PATH),
     ):
         self.cp = cp
         self.client = client
@@ -86,11 +92,41 @@ class Dispatcher:
         # Fetched once and reused: the runtime requires agent_settings on every
         # create, and re-reading it per task would be wasteful.
         self._agent_settings: dict[str, Any] | None = None
+        # The readiness barrier closes the init race: it applies and verifies
+        # the durable desired state before any conversation is created, instead
+        # of trusting the async SessionStart hook that runs too late.
+        self.readiness = (
+            RuntimeReadiness(client, desired_state_path)
+            if desired_state_path
+            else None
+        )
+        self._ready = self.readiness is None
 
     def _settings(self) -> dict[str, Any]:
         if self._agent_settings is None:
             self._agent_settings = self.client.agent_settings()
         return self._agent_settings
+
+    def _ensure_ready(self) -> tuple[bool, str | None]:
+        """Make the runtime match the durable desired state before dispatch.
+
+        Returns ``(ready, reason)``. The settings snapshot is re-read whenever
+        the barrier actually writes, so a conversation created afterwards
+        carries the registration the barrier just verified — that is what makes
+        the race impossible rather than merely unlikely.
+        """
+        if self._ready:
+            return True, None
+        assert self.readiness is not None
+        report = self.readiness.ensure()
+        if report.applied:
+            # The write changed the store; drop the cached snapshot so the next
+            # create forwards the verified state, not a pre-write one.
+            self._agent_settings = None
+        if report.ready:
+            self._ready = True
+            return True, None
+        return False, report.reason
 
     # --------------------------------------------------------------- public
     def tick(self, *, max_dispatch: int = 5) -> TickReport:
@@ -294,6 +330,25 @@ class Dispatcher:
 
     def _dispatch_queued(self, report: TickReport, *, max_dispatch: int) -> None:
         """Claim queued work and hand it to a conversation, idempotently."""
+        queued = self.cp.list_tasks(state=TaskState.QUEUED)
+        if not queued:
+            return
+        # Readiness gate. Checked only when there is work to dispatch, so a
+        # steady-state tick with an empty queue costs nothing. When the runtime
+        # is not ready the tasks stay queued and untouched: no lease is taken
+        # and no attempt is burned, because this is an environment problem, not
+        # the task's.
+        try:
+            ready, reason = self._ensure_ready()
+        except DesiredStateError as exc:
+            log.error("desired state unusable, not dispatching: %s", exc)
+            report.unavailable.extend(t.id for t in queued)
+            return
+        if not ready:
+            log.warning("runtime not ready, deferring dispatch: %s", reason)
+            report.unavailable.extend(t.id for t in queued)
+            return
+
         dispatched = 0
         touched = self._touched(report)
         for task in self.cp.list_tasks(state=TaskState.QUEUED):

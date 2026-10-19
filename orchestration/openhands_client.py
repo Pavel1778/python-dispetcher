@@ -190,19 +190,44 @@ class OpenHandsClient:
             raise ApiUnavailable(f"create_conversation -> {status}")
         return self._view(payload), status == 201
 
+    def settings(self) -> dict[str, Any]:
+        """Return the server's full settings document (``GET /api/settings``)."""
+        status, payload = self._request("GET", "/api/settings")
+        if status != 200:
+            raise ApiUnavailable(f"settings -> {status}")
+        if not isinstance(payload, dict):
+            raise ApiUnavailable("server returned no settings")
+        return payload
+
     def agent_settings(self) -> dict[str, Any]:
         """Return the server's configured ``agent_settings``.
 
         Read from the runtime so the dispatcher never has to hold or forward an
         API key itself; whatever the server already trusts is reused as-is.
         """
-        status, payload = self._request("GET", "/api/settings")
-        if status != 200:
-            raise ApiUnavailable(f"agent_settings -> {status}")
-        settings = (payload or {}).get("agent_settings")
+        settings = self.settings().get("agent_settings")
         if not isinstance(settings, dict):
             raise ApiUnavailable("server returned no agent_settings")
         return settings
+
+    def patch_settings(self, diff: dict[str, Any]) -> dict[str, Any]:
+        """Merge a settings diff (``PATCH /api/settings``) and return the result.
+
+        The endpoint merges ``agent_settings_diff`` field by field, so a patch
+        that sets only ``agent_context`` leaves every other field alone. A
+        rejected body (a diff key the server does not accept) comes back as a
+        4xx, which this raises as a programming error rather than retrying.
+        """
+        status, payload = self._request("PATCH", "/api/settings", diff)
+        if status == 404:
+            raise ApiUnavailable("PATCH /api/settings -> 404 (unsupported)")
+        if status >= 400:
+            raise ValueError(
+                f"PATCH /api/settings rejected: {status} {json.dumps(payload)[:200]}"
+            )
+        if not isinstance(payload, dict):
+            raise ApiUnavailable("PATCH /api/settings returned no body")
+        return payload
 
     def send_task(
         self,

@@ -26,6 +26,11 @@ class FakeConversation:
     final_response: str | None = None
     events: int = 0
     runs: int = 0
+    #: What the create request carried. The live server reads
+    #: ``agent_context`` from here; recording it lets a test prove the
+    #: dispatcher forwarded the verified state rather than an empty default.
+    agent_context: dict[str, Any] = field(default_factory=dict)
+    mcp_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -45,6 +50,16 @@ class FakeRuntime:
     require_key: bool = True
     expected_key: str = "test-key"
     seen_keys: list[str] = field(default_factory=list)
+    #: The server's settings document. ``PATCH`` merges into this; ``GET``
+    #: returns it. Mirrors the live store so the readiness barrier is exercised
+    #: over real sockets rather than a mock.
+    settings: dict[str, Any] = field(
+        default_factory=lambda: {"agent_settings": {"agent": "CodeActAgent"}}
+    )
+    #: When > 0, the next PATCH returns 503 this many times.
+    patch_fail_times: int = 0
+    #: When True, PATCH /api/settings answers 404 (endpoint unsupported).
+    patch_unsupported: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def finish(self, conversation_id: str, response: str | None) -> None:
@@ -114,7 +129,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /api/settings -> agent_settings required by the live create endpoint
         if parts == ["api", "settings"]:
-            self._json(200, {"agent_settings": {"agent": "CodeActAgent"}})
+            with self.runtime.lock:
+                self._json(200, json.loads(json.dumps(self.runtime.settings)))
             return
 
         # /api/conversations/{id}/events/search
@@ -167,7 +183,6 @@ class _Handler(BaseHTTPRequestHandler):
             return
         parts = [p for p in path.split("/") if p]
         body = self._read_body()
-
         # POST /api/conversations
         if len(parts) == 2 and parts[1] == "conversations":
             rt = self.runtime
@@ -190,6 +205,18 @@ class _Handler(BaseHTTPRequestHandler):
                     working_dir=(body.get("workspace") or {}).get("working_dir", ""),
                     title=body.get("title"),
                 )
+                # Mirror the live server: the conversation inherits exactly the
+                # agent_context and mcp_config the request carried. Nothing is
+                # copied from the stored settings — that is the whole defect the
+                # readiness barrier exists to close.
+                agent_settings = body.get("agent_settings") or {}
+                if isinstance(agent_settings, dict):
+                    ctx = agent_settings.get("agent_context")
+                    if isinstance(ctx, dict):
+                        c.agent_context = json.loads(json.dumps(ctx))
+                    mcp = agent_settings.get("mcp_config")
+                    if isinstance(mcp, dict):
+                        c.mcp_config = json.loads(json.dumps(mcp))
                 rt.conversations[cid] = c
                 rt.created_count += 1
                 self._json(201, self._info(c))
@@ -229,6 +256,49 @@ class _Handler(BaseHTTPRequestHandler):
                         c.status = "running"
                         c.runs += 1
             self._json(200, {"success": True})
+            return
+
+        self._json(404, {"detail": "Not Found"})
+
+    def do_PATCH(self) -> None:
+        path = self.path.split("?")[0]
+        if not self._guard():
+            return
+        parts = [p for p in path.split("/") if p]
+        body = self._read_body()
+
+        if parts == ["api", "settings"]:
+            rt = self.runtime
+            with rt.lock:
+                if rt.patch_unsupported:
+                    self._json(404, {"detail": "Not Found"})
+                    return
+                if rt.patch_fail_times > 0:
+                    rt.patch_fail_times -= 1
+                    self._json(503, {"detail": "temporarily unavailable"})
+                    return
+                diff = body.get("agent_settings_diff")
+                if not isinstance(diff, dict):
+                    # Confirmed live behaviour: the body must carry one of the
+                    # *_diff keys; a bare field is rejected with 400.
+                    self._json(400, {"detail": "no settings diff provided"})
+                    return
+                agent = rt.settings.setdefault("agent_settings", {})
+                for key, value in diff.items():
+                    if key in ("agent_context", "mcp_config") and isinstance(
+                        value, dict
+                    ):
+                        # Field-by-field merge, exactly as the live endpoint does.
+                        merged = dict(agent.get(key) or {})
+                        for sub_key, sub_value in value.items():
+                            if sub_value is None:
+                                merged.pop(sub_key, None)
+                            else:
+                                merged[sub_key] = sub_value
+                        agent[key] = merged
+                    else:
+                        agent[key] = value
+                self._json(200, json.loads(json.dumps(rt.settings)))
             return
 
         self._json(404, {"detail": "Not Found"})
