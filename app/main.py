@@ -15,14 +15,21 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings, get_settings
-from .dispatcher.core import Dispatcher, JrBridgeUnavailableError
+from .dispatcher.core import Dispatcher
 from .logging_config import configure_logging, get_logger, safe_extra
 from .openhands_client import OpenHandsClient
+from .orchestrator import (
+    CapExceeded,
+    Orchestrator,
+    OrchestratorError,
+    RepositoryNotAllowed,
+    ScopeViolation,
+)
 from .store.base import StateStore, StoreUnavailableError
 from .store.memory import InMemoryStateStore
 from .store.postgres import PostgresStateStore
@@ -38,6 +45,7 @@ class _Runtime:
         self.store: StateStore | None = None
         self.client: OpenHandsClient | None = None
         self.dispatcher: Dispatcher | None = None
+        self.orchestrator: Orchestrator | None = None
         self.loop_task: asyncio.Task[Any] | None = None
         self.last_heartbeat_ok: bool | None = None
         self.heartbeat_error: str | None = None
@@ -132,27 +140,66 @@ async def lifespan(app: FastAPI):
     )
     runtime.dispatcher = dispatcher
 
+    runtime.orchestrator = runtime.orchestrator or Orchestrator(
+        settings=settings, store=store
+    )
+
+    # The MCP sub-app's lifespan is NOT run when mounted, so its session
+    # manager must be entered here. Everything after this point runs inside it.
+    mcp_bridge = _mount_mcp(app, settings, runtime.orchestrator)
+    mcp_lifespan = mcp_bridge.lifespan() if mcp_bridge else _null_lifespan()
+    async with mcp_lifespan:
+        try:
+            await dispatcher.recover()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("recovery failed", **safe_extra(error=type(exc).__name__))
+
+        if settings.dispatcher_enable_background_loop:
+            runtime.loop_task = asyncio.create_task(dispatcher_loop(settings))
+
+        try:
+            yield
+        finally:
+            if runtime.loop_task is not None:
+                runtime.loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await runtime.loop_task
+                runtime.loop_task = None
+            await client.aclose()
+            await store.close()
+
+
+@contextlib.asynccontextmanager
+async def _null_lifespan():
+    yield
+
+
+def _mount_mcp(app: FastAPI, settings: Settings, orchestrator: Orchestrator):
+    """Mount the Streamable HTTP MCP app, if the optional dependency is present.
+
+    Kept optional so the core service (and its tests) do not require the ``mcp``
+    package. If it is missing we log and continue: /ready still reports state,
+    and the absence of the Sr->Jr transport is explicit rather than silent.
+
+    Returns the :class:`McpBridge` so the caller can enter its lifespan.
+    """
+    if not settings.mcp_enabled:
+        logger.info("MCP bridge transport disabled")
+        return None
     try:
-        await dispatcher.recover()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("recovery failed", **safe_extra(error=type(exc).__name__))
-
-    if settings.dispatcher_enable_background_loop:
-        runtime.loop_task = asyncio.create_task(dispatcher_loop(settings))
-
-    try:
-        yield
-    finally:
-        if runtime.loop_task is not None:
-            runtime.loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await runtime.loop_task
-            runtime.loop_task = None
-        await client.aclose()
-        await store.close()
+        from .mcp_server import McpBridge
+    except ImportError:  # pragma: no cover - exercised only without mcp installed
+        logger.warning(
+            "MCP bridge transport unavailable: 'mcp' package not installed"
+        )
+        return None
+    bridge = McpBridge(orchestrator, scope_secret=settings.jr_scope_secret)
+    app.mount(settings.mcp_mount_path, bridge.asgi_app)
+    logger.info("mounted MCP bridge transport", **safe_extra(path=settings.mcp_mount_path))
+    return bridge
 
 
-app = FastAPI(title="OpenHands Dispatcher", version=__version__, lifespan=lifespan)
+router = APIRouter()
 
 
 # --- schemas ---
@@ -190,7 +237,7 @@ class JrTaskResponse(BaseModel):
 
 # --- endpoints ---
 
-@app.get("/health", response_model=HealthResponse)
+@router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Liveness only. A 200 here does NOT mean tasks are being processed."""
     return HealthResponse(
@@ -198,7 +245,7 @@ async def health() -> HealthResponse:
     )
 
 
-@app.get("/ready", response_model=ReadyResponse)
+@router.get("/ready", response_model=ReadyResponse)
 async def ready() -> ReadyResponse:
     settings = runtime.settings or get_settings()
     details: dict[str, str] = {}
@@ -250,25 +297,51 @@ def require_bridge_token(
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-@app.post("/jr/tasks", response_model=JrTaskResponse)
+@router.post("/jr/tasks", response_model=JrTaskResponse)
 async def create_jr_task(
     payload: JrTaskRequest, _: None = Depends(require_bridge_token)
 ) -> JrTaskResponse:
-    """Protected bridge a Sr task calls to spawn a Jr child conversation."""
-    if runtime.dispatcher is None:
-        raise HTTPException(status_code=503, detail="dispatcher not initialised")
+    """Protected HTTP bridge a Sr task can call to spawn a Jr child conversation.
+
+    This routes through the same ``Orchestrator`` as the MCP transport, so the
+    repository allowlist, child cap, and idempotency rules apply identically
+    regardless of which transport a caller uses.
+    """
+    if runtime.orchestrator is None:
+        raise HTTPException(status_code=503, detail="orchestrator not initialised")
     try:
-        task, created = await runtime.dispatcher.create_junior_task(
+        view = await runtime.orchestrator.create_jr_task(
             workflow_id=payload.workflow_id,
-            parent_task_id=payload.parent_task_id,
+            task_id=payload.parent_task_id,
             title=payload.title,
             prompt=payload.prompt,
             idempotency_key=payload.idempotency_key,
             selected_repository=payload.selected_repository,
             selected_branch=payload.selected_branch,
         )
-    except JrBridgeUnavailableError as exc:
+    except (ScopeViolation, RepositoryNotAllowed, CapExceeded, OrchestratorError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except StoreUnavailableError as exc:
         raise HTTPException(status_code=503, detail="state store unavailable") from exc
-    return JrTaskResponse(task_id=task.id, created=created, status=task.status)
+    return JrTaskResponse(task_id=view.task_id, created=view.created, status=view.status)
+
+
+def create_app(*, settings: Settings | None = None) -> FastAPI:
+    """Build a fresh FastAPI app.
+
+    A factory (rather than only a module-level singleton) matters for the MCP
+    transport: the mounted MCP sub-app owns a session manager that can only be
+    started once, and mounts accumulate on a reused app. Each app instance
+    therefore gets its own bridge.
+    """
+    application = FastAPI(
+        title="OpenHands Dispatcher", version=__version__, lifespan=lifespan
+    )
+    application.include_router(router)
+    if settings is not None:
+        runtime.settings = settings
+    return application
+
+
+# Default app for `uvicorn app.main:app`.
+app = create_app()

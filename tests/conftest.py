@@ -85,6 +85,10 @@ def settings() -> Settings:
         dispatcher_enable_background_loop=False,
         dispatcher_poll_interval_seconds=0,
         jr_bridge_token="test-bridge-token",
+        jr_scope_secret="test-scope-secret",
+        jr_allowed_repositories="acme/widgets",
+        # Tests that need the MCP transport build their own app and enable it.
+        mcp_enabled=False,
     )
 
 

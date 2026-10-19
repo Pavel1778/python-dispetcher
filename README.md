@@ -3,16 +3,18 @@
 Autonomous Sr/Jr task dispatcher for [OpenHands Cloud](https://app.all-hands.dev),
 designed to run on **Render Free** with durable state in **PostgreSQL/Supabase**.
 
-> Status: **scaffold / pre-production**. Unit and store-contract tests pass.
-> Supabase, Render, and Better Stack are **not yet wired**. See "Blockers".
+> Status: **pre-production**. Unit, store-contract, and MCP HTTP end-to-end tests
+> pass locally. Supabase, Render, and Better Stack are **not yet verified against
+> live services**. See "Not yet verified".
 
 ## Architecture
 
 ```
-FastAPI (app/main.py)
+FastAPI (app/main.py, built by create_app())
   ├── GET  /health          liveness only (process is up)
   ├── GET  /ready           dependency readiness (DB + API key + last cycle)
-  └── POST /jr/tasks        protected bridge: Sr spawns a Jr child task
+  ├── POST /jr/tasks        protected HTTP bridge: Sr spawns a Jr child task
+  └── MOUNT /mcp            MCP streamable-HTTP server exposing create_jr_task
 
 Background loop (app/main.py: dispatcher_loop)
   └── Dispatcher.run_cycle()  (app/dispatcher/core.py)
@@ -123,13 +125,55 @@ guarantee of 24/7 background processing. The dispatcher is therefore designed to
 rebuild all state from PostgreSQL on every start; it never relies on a single
 long-lived process.
 
-## Blockers (not yet done)
+## Sr → Jr bridge (MCP)
 
-1. **Jr bridge transport.** The bridge endpoint exists and is token-protected,
-   but a Sr conversation has no wired way to *call* it yet (no MCP server or
-   tool registration). Until that exists, Sr plans are not executed as Jr work.
-   Workflows needing Jr children should end up `BLOCKED`, not `COMPLETED`.
-2. **Supabase credentials.** No real Supabase project is connected; only local
-   PostgreSQL has been exercised.
-3. **Better Stack.** `HEARTBEAT_URL` is supported and fired only after a fully
-   successful dispatch cycle, but no monitor is configured.
+A Sr conversation spawns Jr children through a real MCP server mounted on this
+service at `MCP_MOUNT_PATH` (default `/mcp`), using the **streamable-HTTP**
+transport. The server exposes one tool, `create_jr_task`.
+
+```
+Sr conversation (OpenHands sandbox)
+  └── MCP client  ──HTTPS──▶  POST /mcp  (app/mcp_server.py)
+                                    └── Orchestrator.create_jr_task()
+                                          └── StateStore.create_task(role=JR)
+```
+
+**Wiring.** When the dispatcher starts a Sr conversation it attaches the MCP
+config (`app/bridge_config.py`) built from `MCP_PUBLIC_BASE_URL`, plus a
+`system_message_suffix` that carries a **scope token**. Jr conversations get
+neither, so a Jr cannot spawn grandchildren.
+
+**Scope tokens** (`app/scope.py`). A shared bearer token alone would let any Sr
+act on any workflow. Instead the dispatcher mints an HMAC-SHA256 token binding
+`workflow_id` + `task_id` (+ expiry) and embeds it in the Sr's system message.
+Every `create_jr_task` call verifies that token *and* re-checks the parent task
+in the database, so a token for one workflow cannot create children in another.
+
+**Rules enforced in one place** (`app/orchestrator.py`, shared by both
+transports):
+
+* `JR_ALLOWED_REPOSITORIES` — comma-separated `owner/repo` allowlist. **Empty
+  means deny all** (fails closed).
+* `JR_MAX_CHILDREN_PER_WORKFLOW` — hard cap per Sr task.
+* Idempotency — a repeated call with the same key returns the existing child.
+
+**Auth.** `MCP_BEARER_TOKEN` (if set) protects `/mcp`; `JR_BRIDGE_TOKEN`
+protects `POST /jr/tasks`. `JR_SCOPE_SECRET` must be set for the bridge to
+authorise tool calls.
+
+## Deployment notes
+
+* **Render Free** spins down when idle and is not 24/7. All state lives in
+  PostgreSQL and is rebuilt on every start.
+* **Supabase Transaction pooler** (port `6543`) — see below.
+* **Better Stack** — `HEARTBEAT_URL` is fired only after a fully successful
+  dispatch cycle. No monitor is configured yet.
+
+## Not yet verified
+
+1. **Supabase credentials.** No real Supabase project has been connected; only
+   local PostgreSQL has been exercised. The Transaction-pooler code path
+   (`prepare_threshold=None`) is unit-tested but not run against a live pooler.
+2. **Live OpenHands Cloud.** All OpenHands API interaction is exercised through
+   a fake client; no end-to-end run against the real API has been performed.
+3. **Better Stack.** No monitor configured.

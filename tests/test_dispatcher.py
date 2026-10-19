@@ -229,37 +229,32 @@ async def test_workflow_completed_only_when_all_children_completed(dispatcher, s
     assert wf_after.status == WorkflowStatus.COMPLETED.value
 
 
-async def test_jr_bridge_creates_child_task(dispatcher, store):
+async def test_orchestrator_creates_child_task(settings, store):
+    """The orchestrator is the single path that creates Jr children.
+
+    Both transports (MCP and HTTP /jr/tasks) go through it, so caps and the
+    repository allowlist cannot be bypassed by picking a transport.
+    """
+    from app.orchestrator import Orchestrator
+
+    settings.jr_allowed_repositories = "acme/widgets"
+    settings.jr_scope_secret = "scope-secret"
+    orchestrator = Orchestrator(settings=settings, store=store)
     wf, task = await _make_workflow(store)
 
-    jr, created = await dispatcher.create_junior_task(
+    view = await orchestrator.create_jr_task(
         workflow_id=wf.id,
-        parent_task_id=task.id,
+        task_id=task.id,
         title="jr child",
         prompt="work",
         idempotency_key="wf-1-jr-bridge",
     )
 
-    assert created is True
-    assert jr.role == "JR"
-    assert jr.parent_task_id == task.id
-
-
-async def test_jr_bridge_requires_configuration(settings, store, fake_client):
-    from app.dispatcher.core import JrBridgeUnavailableError, Dispatcher
-
-    settings.jr_bridge_token = None
-    d = Dispatcher(settings=settings, store=store, client=fake_client, worker_id="w")
-    wf, task = await _make_workflow(store)
-
-    with pytest.raises(JrBridgeUnavailableError):
-        await d.create_junior_task(
-            workflow_id=wf.id,
-            parent_task_id=task.id,
-            title="x",
-            prompt="y",
-            idempotency_key="k",
-        )
+    assert view.created is True
+    assert view.status == TaskStatus.QUEUED.value
+    tasks = await store.list_tasks_for_workflow(wf.id)
+    child = next(t for t in tasks if t.role == "JR")
+    assert child.parent_task_id == task.id
 
 
 async def test_cycle_marks_success_flag(dispatcher, store, fake_client):

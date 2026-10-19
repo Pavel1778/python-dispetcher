@@ -57,6 +57,33 @@ class Settings(BaseSettings):
     # --- Jr bridge (protected endpoint Sr uses to spawn child conversations) ---
     jr_bridge_token: str | None = None
     jr_bridge_enabled: bool = True
+    # HMAC key used to mint per-conversation scope tokens. Without it a shared
+    # bearer token would let any Sr act on any workflow, so the bridge refuses
+    # to mint scoped tokens when this is unset.
+    jr_scope_secret: str | None = None
+    jr_scope_ttl_seconds: int = 24 * 60 * 60
+    # Hard cap on children a single Sr task may spawn.
+    jr_max_children_per_workflow: int = 20
+    # Repositories Sr is allowed to dispatch work into, comma-separated.
+    # Empty = deny all, so a misconfiguration fails closed rather than allowing
+    # arbitrary repos. Kept as a string (not list[str]) because pydantic-settings
+    # JSON-decodes complex types, which would make a plain "owner/repo" value -
+    # or an empty value - crash startup.
+    jr_allowed_repositories: str = ""
+    # MCP transport (the real Sr -> Jr mechanism). Mounted on the same app at
+    # MCP_MOUNT_PATH; disable to run HTTP-bridge-only.
+    mcp_enabled: bool = True
+    mcp_mount_path: str = "/mcp"
+    mcp_server_name: str = "openhands-dispatcher"
+    # Public HTTPS base URL the cloud sandbox uses to reach this service. Empty
+    # means the Sr conversation cannot be given the tools automatically.
+    mcp_public_base_url: str | None = None
+    mcp_bearer_token: str | None = None
+    mcp_request_timeout_seconds: int = 120
+    # Optional git-hosted plugin carrying .mcp.json (see app/bridge_config.py).
+    mcp_plugin_source: str | None = None
+    mcp_plugin_ref: str | None = None
+    mcp_plugin_repo_path: str | None = None
 
     # --- Monitoring ---
     heartbeat_url: str | None = None
@@ -76,12 +103,19 @@ class Settings(BaseSettings):
         """PostgreSQL DSN, preferring DATABASE_URL over SUPABASE_DB_URL."""
         return self.database_url or self.supabase_db_url
 
+    @property
+    def allowed_repositories(self) -> list[str]:
+        """Parsed repository allowlist. Empty means deny all."""
+        return [r.strip() for r in self.jr_allowed_repositories.split(",") if r.strip()]
+
     def redaction_secrets(self) -> list[str]:
         """Secret values that must never appear in logs or API responses."""
         candidates = [
             self.openhands_cloud_api_key,
             self.openhands_api_key,
             self.jr_bridge_token,
+            self.jr_scope_secret,
+            self.mcp_bearer_token,
             self.database_url,
             self.supabase_db_url,
         ]

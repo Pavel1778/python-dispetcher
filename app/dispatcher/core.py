@@ -18,8 +18,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..bridge_config import build_plugin_spec, build_scope_instructions
 from ..config import Settings
 from ..logging_config import get_logger, safe_extra
+from ..scope import mint_scope_token
 from ..openhands_client import (
     Conversation,
     OpenHandsAuthError,
@@ -45,16 +47,6 @@ from ..store.base import StateStore, StoreUnavailableError
 from ..store.models import Task
 
 logger = get_logger(__name__)
-
-
-class JrBridgeUnavailableError(RuntimeError):
-    """Raised when a Sr workflow requests Jr creation but no bridge is wired.
-
-    The bridge is the explicit mechanism by which a Sr task spawns Jr child
-    conversations. Without it (no ``JR_BRIDGE_TOKEN`` / endpoint), Sr plans are
-    not executed - the workflow is marked BLOCKED instead of silently claiming
-    success.
-    """
 
 
 def _utcnow() -> datetime:
@@ -200,6 +192,7 @@ class Dispatcher:
                 selected_repository=task.selected_repository,
                 selected_branch=task.selected_branch,
                 tags={"dispatcher_task_id": task.id, "dispatcher_role": task.role},
+                extra_body=self._bridge_start_overrides(task),
             )
         except (OpenHandsRateLimitError, OpenHandsTransientError) as exc:
             await self._defer(task, exc)
@@ -237,6 +230,51 @@ class Dispatcher:
                 status=TaskStatus.RUNNING.value,
                 app_conversation_id=start.app_conversation_id,
             )
+
+    def _bridge_start_overrides(self, task: Task) -> dict[str, Any]:
+        """Extra fields that give an SR conversation access to the bridge tools.
+
+        Only SR tasks get the bridge: a Jr task must not spawn grandchildren.
+        The scope token is minted here and embedded in the system prompt; the
+        MCP server config is attached only when an operator has configured a
+        public base URL (otherwise the tools would point at an unreachable
+        endpoint, which is worse than not offering them).
+        """
+        if task.role != TaskRole.SR.value:
+            return {}
+        if not self._settings.jr_scope_secret:
+            logger.warning(
+                "SR task started without bridge scope token (JR_SCOPE_SECRET unset)",
+                **safe_extra(task_id=task.id),
+            )
+            return {}
+
+        overrides: dict[str, Any] = {}
+        token = mint_scope_token(
+            self._settings.jr_scope_secret,
+            workflow_id=task.workflow_id,
+            task_id=task.id,
+            ttl_seconds=self._settings.jr_scope_ttl_seconds,
+        )
+        # NOTE: the token is a scoped capability, not a long-lived secret. It is
+        # logged nowhere and only travels into the conversation it authorises.
+        overrides["system_message_suffix"] = build_scope_instructions(
+            workflow_id=task.workflow_id,
+            task_id=task.id,
+            scope_token=token,
+        )
+
+        plugin_spec = build_plugin_spec(self._settings)
+        if plugin_spec is not None:
+            overrides["plugins"] = [plugin_spec]
+        elif not self._settings.mcp_public_base_url:
+            # Without a public URL the tools cannot be attached automatically;
+            # the operator must register the MCP server in account settings.
+            logger.info(
+                "MCP tools not attached: MCP_PUBLIC_BASE_URL unset",
+                **safe_extra(task_id=task.id),
+            )
+        return overrides
 
     async def advance(self) -> int:
         """Poll tasks that have a start task or conversation and move them on."""
@@ -395,76 +433,6 @@ class Dispatcher:
             **safe_extra(workflow_id=workflow_id, jr_task_count=len(jr_tasks)),
         )
         return True
-
-    # ------------------------------------------------------------------
-    # Jr bridge (explicit mechanism for Sr -> Jr)
-    # ------------------------------------------------------------------
-
-    async def create_junior_task(
-        self,
-        *,
-        workflow_id: str,
-        parent_task_id: str,
-        title: str,
-        prompt: str,
-        idempotency_key: str,
-        selected_repository: str | None = None,
-        selected_branch: str | None = None,
-    ) -> tuple[Task, bool]:
-        """Create a Jr child task under a Sr task.
-
-        This is the dispatcher-side bridge. It is invoked either by the
-        protected HTTP endpoint (``POST /jr/tasks``) that a Sr task calls, or
-        directly in-process. Requires the bridge token to be configured.
-        """
-        if not self._settings.jr_bridge_token:
-            raise JrBridgeUnavailableError(
-                "Jr bridge is not configured (JR_BRIDGE_TOKEN missing)"
-            )
-        parent = await self._store.get_task(parent_task_id)
-        if parent is None:
-            raise JrBridgeUnavailableError(f"parent task {parent_task_id} not found")
-        if parent.role != TaskRole.SR.value:
-            raise JrBridgeUnavailableError("only SR tasks may create JR children")
-        if parent.workflow_id != workflow_id:
-            raise JrBridgeUnavailableError("parent task does not belong to workflow")
-
-        task, created = await self._store.create_task(
-            workflow_id=workflow_id,
-            role=TaskRole.JR.value,
-            title=title,
-            prompt=prompt,
-            idempotency_key=idempotency_key,
-            parent_task_id=parent_task_id,
-            selected_repository=selected_repository or parent.selected_repository,
-            selected_branch=selected_branch or parent.selected_branch,
-            max_attempts=self._settings.dispatcher_max_attempts,
-        )
-        if created:
-            await self._store.record_event(
-                event_type="jr_task_created",
-                workflow_id=workflow_id,
-                task_id=task.id,
-                message="Jr child task created",
-                payload={"parent_task_id": parent_task_id},
-            )
-            logger.info(
-                "jr task created",
-                **safe_extra(workflow_id=workflow_id, task_id=task.id),
-            )
-        return task, created
-
-    async def mark_jr_completed(self, task_id: str, *, result_summary: str | None = None) -> None:
-        await self._store.update_task(
-            task_id,
-            status=TaskStatus.COMPLETED.value,
-            result_summary=result_summary,
-            finished_at=self._now(),
-            release_lease=True,
-        )
-        await self._store.record_event(
-            event_type="jr_task_completed", task_id=task_id, message=result_summary
-        )
 
     # ------------------------------------------------------------------
     # helpers

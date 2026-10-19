@@ -5,3 +5,7 @@ psycopg[binary]>=3.1,<4.0
 psycopg-pool>=3.2,<4.0
 pydantic>=2.6,<3.0
 pydantic-settings>=2.2,<3.0
+# MCP transport (the Sr -> Jr bridge). Imported lazily by app.main, so the
+# service still boots without it. Requires the 2.x API (MCPServer; FastMCP was
+# renamed in 2.0).
+mcp>=2.3,<3.0

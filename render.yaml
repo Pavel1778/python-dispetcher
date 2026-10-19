@@ -25,6 +25,16 @@ services:
         value: "true"
       - key: JR_BRIDGE_TOKEN
         sync: false
+      - key: JR_SCOPE_SECRET
+        sync: false
+      - key: JR_ALLOWED_REPOSITORIES
+        sync: false
+      - key: MCP_ENABLED
+        value: "true"
+      - key: MCP_PUBLIC_BASE_URL
+        sync: false
+      - key: MCP_BEARER_TOKEN
+        sync: false
       - key: HEARTBEAT_URL
         sync: false
       - key: DISPATCHER_ENABLE_BACKGROUND_LOOP
