@@ -64,6 +64,8 @@ _ALLOWED: dict[TaskState, frozenset[TaskState]] = {
             TaskState.FAILED,
             TaskState.CANCELLED,
             TaskState.RECOVERING,
+            TaskState.BLOCKED,
+            TaskState.VERIFYING,
         }
     ),
     TaskState.RUNNING: frozenset(
@@ -77,12 +79,29 @@ _ALLOWED: dict[TaskState, frozenset[TaskState]] = {
         }
     ),
     TaskState.VERIFYING: frozenset(
-        {TaskState.COMPLETED, TaskState.FAILED, TaskState.RUNNING}
+        {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.RUNNING,
+            TaskState.BLOCKED,
+            TaskState.DEAD_LETTER,
+        }
     ),
     # Recovery is a distinct state so a crashed task is never mistaken for a
-    # running one while it is being reconciled.
+    # running one while it is being reconciled. From here reality decides, so
+    # every safe outcome is reachable, including completion: a worker can die
+    # while its conversation finished successfully.
     TaskState.RECOVERING: frozenset(
-        {TaskState.RUNNING, TaskState.QUEUED, TaskState.FAILED, TaskState.CANCELLED}
+        {
+            TaskState.RUNNING,
+            TaskState.QUEUED,
+            TaskState.FAILED,
+            TaskState.CANCELLED,
+            TaskState.BLOCKED,
+            TaskState.VERIFYING,
+            TaskState.COMPLETED,
+            TaskState.DEAD_LETTER,
+        }
     ),
     TaskState.BLOCKED: frozenset({TaskState.QUEUED, TaskState.CANCELLED}),
     TaskState.FAILED: frozenset(
@@ -174,6 +193,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     approved      INTEGER,
     evidence      TEXT NOT NULL DEFAULT '[]',
     result        TEXT,
+    conversation_id TEXT,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -210,6 +230,7 @@ class Task:
     evidence: list[dict]
     result: str | None
     updated_at: float
+    conversation_id: str | None = None
 
     @property
     def lease_live(self) -> bool:
@@ -246,6 +267,22 @@ class ControlPlane:
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first schema, in place.
+
+        ``CREATE TABLE IF NOT EXISTS`` does not alter an existing table, so a
+        database written by an earlier version keeps its old columns. Adding
+        the column here keeps old state files usable instead of forcing a
+        migration script.
+        """
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "conversation_id" not in cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT")
 
     def _read(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -653,6 +690,37 @@ class ControlPlane:
             )
         return self.get_task(task_id)
 
+    def bind_conversation(self, task_id: str, conversation_id: str) -> Task:
+        """Record which conversation is executing a task.
+
+        Written before the task is started, so a crash between "create
+        conversation" and "start run" leaves the link recoverable.
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET conversation_id=?, updated_at=? WHERE id=?",
+                (conversation_id, _now(), task_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFound(f"task {task_id}")
+            self._event(
+                conn,
+                "conversation_bound",
+                task_id=task_id,
+                detail={"conversation_id": conversation_id},
+            )
+        return self.get_task(task_id)
+
+    def set_result(self, task_id: str, result: str) -> Task:
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET result=?, updated_at=? WHERE id=?",
+                (result, _now(), task_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFound(f"task {task_id}")
+        return self.get_task(task_id)
+
     def add_evidence(self, task_id: str, evidence: dict) -> Task:
         now = _now()
         with self._tx() as conn:
@@ -789,4 +857,5 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         evidence=json.loads(row["evidence"]),
         result=row["result"],
         updated_at=row["updated_at"],
+        conversation_id=row["conversation_id"],
     )
