@@ -215,3 +215,67 @@ def test_verify_schema_names_missing_tables(store):
         assert "sessions" in store.verify_schema()
     finally:
         _reset_schema()
+
+
+def test_verify_schema_detects_a_foreign_table_shape(store):
+    """A table that exists with the wrong columns must be reported too.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing when the table is already there,
+    so a database created by the other implementation keeps its own columns and
+    fails later with "column ... does not exist". The guard must name the table
+    even though it is present.
+    """
+    assert store.verify_schema() == []
+
+    import psycopg
+
+    # The other implementation's shape: right name, wrong columns.
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE workflows CASCADE")
+            cur.execute(
+                "CREATE TABLE workflows ("
+                " id uuid PRIMARY KEY DEFAULT gen_random_uuid(),"
+                " name text NOT NULL, status text NOT NULL,"
+                " idempotency_key text NOT NULL UNIQUE)"
+            )
+    try:
+        missing = store.verify_schema()
+        assert any(m.startswith("workflows(") for m in missing), missing
+        # The old query-based check only looked at table names, so it passed here.
+        assert "workflows" not in missing, "the table is present, not missing"
+    finally:
+        _reset_schema()
+
+
+def test_foreign_schema_fails_at_startup_not_on_the_first_request():
+    """A foreign schema must be refused by the startup check, not served.
+
+    This is the shape of the production incident: the health check passed while
+    every real request failed.
+    """
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TABLE IF EXISTS sessions, login_attempts, sr_tool_calls, "
+                "task_events, conversations, tasks, repositories, workflows CASCADE"
+            )
+            cur.execute(
+                "CREATE TABLE workflows ("
+                " id uuid PRIMARY KEY DEFAULT gen_random_uuid(),"
+                " name text NOT NULL, status text NOT NULL,"
+                " idempotency_key text NOT NULL UNIQUE)"
+            )
+    try:
+        # auto_migrate off: migrations cannot repair a pre-existing table anyway.
+        s = PostgresStore(DSN, auto_migrate=False)
+        try:
+            missing = s.verify_schema()
+            assert missing, "a foreign schema must be reported"
+            assert any(m.startswith("workflows(") for m in missing)
+        finally:
+            s.close()
+    finally:
+        _reset_schema()

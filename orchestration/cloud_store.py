@@ -277,6 +277,25 @@ class PostgresStore:
         with self._lock:
             self._conn.close()
 
+    #: Columns the code reads or writes, per table. Used to detect a database
+    #: that has the right table names but the wrong shape - typically one created
+    #: by the other implementation of this dispatcher. Only the columns a foreign
+    #: schema is likely to be missing are listed; the goal is a clear message,
+    #: not a copy of the DDL.
+    REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+        "workflows": ("id", "goal", "state", "created_at", "updated_at"),
+        "repositories": ("id", "full_name", "default_branch", "allowed_branches",
+                         "enabled"),
+        "tasks": ("id", "workflow_id", "goal", "state", "priority", "owner",
+                  "lease_expires", "attempt", "max_attempts", "dependencies"),
+        "conversations": ("id", "task_id", "external_conversation_id", "status"),
+        "task_events": ("seq", "at", "kind", "task_id", "workflow_id"),
+        "sr_tool_calls": ("event_id", "workflow_id", "name", "args", "claimed_at",
+                          "attempts", "delivered_at"),
+        "sessions": ("token_hash", "username", "csrf_token", "expires_at"),
+        "login_attempts": ("key", "failures", "locked_until"),
+    }
+
     def verify_schema(self) -> list[str]:
         """Return the tables the store needs that the database is missing.
 
@@ -284,6 +303,13 @@ class PostgresStore:
         produced the reported ``InFailedSqlTransaction`` cascade. Checking at
         startup turns that into one clear message instead of a 500 on the first
         request (a forgotten migration is the usual cause).
+
+        A table that exists with the *wrong columns* is reported the same way:
+        ``CREATE TABLE IF NOT EXISTS`` silently does nothing when the table is
+        already there, so a database created by the other implementation keeps
+        its own shape and fails later with "column ... does not exist". Such a
+        table is returned as ``table(column)`` so the name that matters is
+        visible. This method only reads; it never alters the schema.
         """
         required = (
             "workflows", "tasks", "conversations", "repositories",
@@ -291,11 +317,22 @@ class PostgresStore:
         )
         with self._tx() as cur:
             cur.execute(
-                "SELECT table_name FROM information_schema.tables "
+                "SELECT table_name, column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema()"
             )
-            present = {r["table_name"] for r in cur.fetchall()}
-        return [t for t in required if t not in present]
+            columns: dict[str, set[str]] = {}
+            for row in cur.fetchall():
+                columns.setdefault(row["table_name"], set()).add(row["column_name"])
+
+        missing: list[str] = []
+        for table in required:
+            if table not in columns:
+                missing.append(table)
+                continue
+            for column in self.REQUIRED_COLUMNS.get(table, ()):
+                if column not in columns[table]:
+                    missing.append(f"{table}({column})")
+        return missing
 
     # ---------------------------------------------------------------- infra
     @contextmanager
