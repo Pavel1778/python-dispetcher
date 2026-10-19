@@ -46,6 +46,10 @@ class FakeCloud:
         # Controls: how many polls a start task needs before READY.
         self.start_polls_required = 0
         self.start_fail = False
+        #: When > 0, the next N conversation starts fail with this status code
+        #: (e.g. 429). Lets a test drive the workflow-level rate-limit path.
+        self.start_status = 0
+        self.start_status_times = 0
         self.calls: list[tuple[str, str]] = []
 
     def make_conversation(self, *, title, repo=None, branch=None,
@@ -187,6 +191,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.cloud.calls.append(("POST", path))
 
         if path == "/api/v1/app-conversations":
+            if self.cloud.start_status_times > 0:
+                code = self.cloud.start_status
+                self.cloud.start_status_times -= 1
+                return self._json(code, {"detail": "capacity full"})
             body = self._read_body()
             msg = body.get("initial_message") or {}
             text = ""

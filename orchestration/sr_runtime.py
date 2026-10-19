@@ -35,7 +35,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .cloud_client import CloudClient, CloudError, CloudNotFound, CloudUnavailable
+from .cloud_client import (
+    CloudAuthError,
+    CloudClient,
+    CloudError,
+    CloudNotFound,
+    CloudUnavailable,
+)
 from .cloud_store import NotFound, PostgresStore
 from .sr_tools import SrTools, ToolResult
 
@@ -73,6 +79,8 @@ class SrTickReport:
     started: list[dict] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
     unavailable: list[str] = field(default_factory=list)
+    retried: list[dict] = field(default_factory=list)
+    retry_blocked: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +88,8 @@ class SrTickReport:
             "started": self.started,
             "errors": self.errors,
             "unavailable": self.unavailable,
+            "retried": self.retried,
+            "retry_blocked": self.retry_blocked,
         }
 
 
@@ -97,6 +107,8 @@ class SrRuntime:
         start_poll_interval: float = 2.0,
         agent_profile_id: str | None = None,
         plugins: list[dict[str, Any]] | None = None,
+        sr_start_max_attempts: int = 5,
+        sr_start_backoff_base: float = 5.0,
     ):
         self.store = store
         self.client = client
@@ -104,6 +116,12 @@ class SrRuntime:
         self.worker_id = worker_id
         self.start_poll_attempts = start_poll_attempts
         self.start_poll_interval = start_poll_interval
+        # Starting Sr is a Cloud call that can fail transiently (429, 5xx,
+        # network). Retry with exponential backoff, then block for a human: a
+        # permanent fault (a bad key, a deleted repository) must not be retried
+        # forever, and the workflow must never sit in 'queued' silently.
+        self.sr_start_max_attempts = sr_start_max_attempts
+        self.sr_start_backoff_base = sr_start_backoff_base
         # Account-level configuration to inherit. When unset, the conversation
         # is started without these fields, so it uses the account's own active
         # profile and configured MCP/skills. We never overwrite account settings.
@@ -188,10 +206,57 @@ class SrRuntime:
             return current.app_conversation_id
         raise CloudUnavailable("Sr start task not READY")
 
+    def _retry_sr_starts(self, report: SrTickReport) -> None:
+        """Start Sr for workflows that have none yet.
+
+        The web server starts Sr inline when a workflow is created. That call can
+        fail transiently (429 while the account is rate limited, a 5xx, a dropped
+        connection). Without this pass the workflow stays in ``queued`` with no Sr
+        and nothing ever revisits it, because every other step here needs an
+        ``sr_conversation_id`` to work with.
+
+        Backoff is exponential and persisted, so a restart does not hammer the
+        Cloud. After ``sr_start_max_attempts`` the workflow is blocked with the
+        last error as evidence, so the failure is visible instead of silent.
+        """
+        for row in self.store.pending_sr_starts(limit=10):
+            workflow_id = row["id"]
+            used = int(row.get("sr_attempt") or 0) + 1
+            try:
+                self.ensure_sr(workflow_id)
+            except CloudAuthError as e:
+                # A bad key is permanent: retrying only wastes the quota.
+                self.store.record_sr_failure(
+                    workflow_id, error=f"cloud auth failure: {e}", attempt=used,
+                    backoff_seconds=0, give_up=True,
+                )
+                report.retry_blocked.append(workflow_id)
+            except CloudError as e:
+                give_up = used >= self.sr_start_max_attempts
+                backoff = min(
+                    self.sr_start_backoff_base * (2 ** (used - 1)), 900.0
+                )
+                self.store.record_sr_failure(
+                    workflow_id, error=f"{type(e).__name__}: {e}", attempt=used,
+                    backoff_seconds=backoff, give_up=give_up,
+                )
+                if give_up:
+                    report.retry_blocked.append(workflow_id)
+                else:
+                    report.retried.append(
+                        {"workflow": workflow_id, "attempt": used,
+                         "retry_in": backoff}
+                    )
+            else:
+                self.store.mark_sr_started(workflow_id)
+                report.started.append({"workflow": workflow_id,
+                                       "attempt": used, "recovered": True})
+
     # ------------------------------------------------------------------- tick
     def tick(self) -> SrTickReport:
         """Handle every unclaimed Sr tool call for every workflow with an Sr."""
         report = SrTickReport()
+        self._retry_sr_starts(report)
         self._redeliver(report)
         for workflow in self.store.list_workflows():
             workflow_id = workflow["id"]

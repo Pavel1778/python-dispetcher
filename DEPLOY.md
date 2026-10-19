@@ -167,6 +167,7 @@ psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 psql "$SUPABASE_DB_URL" -f migrations/0002_sr_runtime.sql
 psql "$SUPABASE_DB_URL" -f migrations/0003_tool_call_recovery.sql
 psql "$SUPABASE_DB_URL" -f migrations/0004_auth.sql
+psql "$SUPABASE_DB_URL" -f migrations/0005_sr_start_retry.sql
 ```
 
 Do not run migrations against production without authorization. Applying them on

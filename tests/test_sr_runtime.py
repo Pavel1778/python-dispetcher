@@ -45,9 +45,9 @@ def _reset_schema() -> None:
                 "DROP TABLE IF EXISTS sr_tool_calls, task_events, conversations, "
                 "tasks, repositories, workflows CASCADE"
             )
-            cur.execute(open(os.path.join(_MIG, "0001_init.sql")).read())
-            cur.execute(open(os.path.join(_MIG, "0002_sr_runtime.sql")).read())
-            cur.execute(open(os.path.join(_MIG, "0003_tool_call_recovery.sql")).read())
+            for name in sorted(os.listdir(_MIG)):
+                if name.endswith(".sql"):
+                    cur.execute(open(os.path.join(_MIG, name)).read())
 
 
 @pytest.fixture(autouse=True)

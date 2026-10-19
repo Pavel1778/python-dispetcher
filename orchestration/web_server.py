@@ -201,8 +201,14 @@ class App:
         try:
             conversation_id = self.runtime.ensure_sr(workflow_id)
         except CloudError as e:
-            # Keep the workflow so the user can see it failed to start Sr.
-            self.store.bind_sr(workflow_id, status=f"error: {e}")
+            # Keep the workflow so the user can see it failed to start Sr. The Sr
+            # loop owns the retry policy: it retries a transient failure (429,
+            # 5xx) with backoff and blocks on a permanent one, so nothing here
+            # decides. Retry promptly, since this request already waited.
+            self.store.record_sr_failure(
+                workflow_id, error=f"{type(e).__name__}: {e}", attempt=1,
+                backoff_seconds=0.0, give_up=False,
+            )
             raise
         return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id}
 

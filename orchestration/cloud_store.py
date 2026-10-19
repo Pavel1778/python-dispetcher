@@ -283,7 +283,9 @@ class PostgresStore:
     #: schema is likely to be missing are listed; the goal is a clear message,
     #: not a copy of the DDL.
     REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
-        "workflows": ("id", "goal", "state", "created_at", "updated_at"),
+        "workflows": ("id", "goal", "state", "created_at", "updated_at",
+                      "sr_conversation_id", "sr_attempt", "sr_last_error",
+                      "sr_next_attempt_at"),
         "repositories": ("id", "full_name", "default_branch", "allowed_branches",
                          "enabled"),
         "tasks": ("id", "workflow_id", "goal", "state", "priority", "owner",
@@ -804,12 +806,102 @@ class PostgresStore:
     def sr_for(self, workflow_id: str) -> dict[str, Any] | None:
         with self._tx() as cur:
             cur.execute(
-                "SELECT sr_conversation_id, sr_start_task_id, sr_status, goal, state "
+                "SELECT sr_conversation_id, sr_start_task_id, sr_status, goal, state, "
+                "sr_attempt, sr_last_error, sr_next_attempt_at "
                 "FROM workflows WHERE id=%s",
                 (workflow_id,),
             )
             row = cur.fetchone()
         return row
+
+    def pending_sr_starts(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Workflows that have no Sr yet and are due for another start attempt.
+
+        A workflow whose Sr start failed transiently (429, 5xx, network) is left
+        in ``queued`` with no conversation. Nothing else revisits it, so the loop
+        scans for these. ``sr_next_attempt_at IS NULL`` means "never attempted";
+        a future timestamp is a backoff that has not elapsed.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                """
+                SELECT id, goal, sr_attempt, sr_last_error
+                  FROM workflows
+                 WHERE sr_conversation_id IS NULL
+                   AND state NOT IN ('completed', 'cancelled', 'failed')
+                   AND (sr_next_attempt_at IS NULL OR sr_next_attempt_at <= now())
+                 ORDER BY created_at
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            row["id"] = str(row["id"])
+        return rows
+
+    def record_sr_failure(
+        self,
+        workflow_id: str,
+        *,
+        error: str,
+        attempt: int,
+        backoff_seconds: float,
+        give_up: bool,
+    ) -> None:
+        """Record a failed Sr start and schedule the next attempt.
+
+        ``attempt`` is the number just used. When ``give_up`` is set the workflow
+        is moved to ``blocked`` with the error as evidence: a human must look,
+        because retrying forever would hide a permanent fault (a bad key, a
+        repository that no longer exists).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        next_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+        with self._tx() as cur:
+            cur.execute(
+                """
+                UPDATE workflows
+                   SET sr_attempt = %s,
+                       sr_last_error = %s,
+                       sr_next_attempt_at = %s,
+                       sr_status = %s,
+                       updated_at = now()
+                 WHERE id = %s
+                """,
+                (attempt, error[:2000], None if give_up else next_at,
+                 "failed" if give_up else "retrying", workflow_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFound(f"workflow {workflow_id}")
+            self._event(cur, "sr_start_failed", workflow_id=workflow_id,
+                        detail={"attempt": attempt, "error": error[:500],
+                                "give_up": give_up})
+            if give_up:
+                cur.execute(
+                    "UPDATE workflows SET state='blocked', updated_at=now() "
+                    "WHERE id=%s AND state NOT IN ('completed','cancelled')",
+                    (workflow_id,),
+                )
+                self._event(cur, "workflow_state", workflow_id=workflow_id,
+                            detail={"state": "blocked",
+                                    "reason": "Sr could not be started"})
+
+    def mark_sr_started(self, workflow_id: str) -> None:
+        """Clear the retry state once an Sr conversation exists."""
+        with self._tx() as cur:
+            cur.execute(
+                """
+                UPDATE workflows
+                   SET sr_attempt = 0, sr_last_error = NULL,
+                       sr_next_attempt_at = NULL, updated_at = now()
+                 WHERE id = %s
+                """,
+                (workflow_id,),
+            )
+            if cur.rowcount == 0:
+                raise NotFound(f"workflow {workflow_id}")
 
     def list_workflows(self) -> list[dict[str, Any]]:
         with self._tx() as cur:
