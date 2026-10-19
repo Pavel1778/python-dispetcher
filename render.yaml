@@ -1,0 +1,41 @@
+# Render blueprint for the Sr/Jr dispatcher web control plane.
+#
+# The service is a single stdlib HTTP server run as a module; there is no
+# WSGI/ASGI object and no external process manager. It is stateful: it holds a
+# background loop that drives Sr tool calls, Jr dispatch and workflow
+# verification, so run exactly one instance.
+#
+# Apply migrations before the first start:
+#   psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
+#   psql "$SUPABASE_DB_URL" -f migrations/0002_sr_runtime.sql
+#   psql "$SUPABASE_DB_URL" -f migrations/0003_tool_call_recovery.sql
+# They are idempotent, but the application never runs them itself.
+services:
+  - type: web
+    name: python-dispetcher
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      # Required. PostgreSQL/Supabase DSN. Set in the dashboard, never here.
+      - key: SUPABASE_DB_URL
+        sync: false
+      # Required. OpenHands Cloud API key (Bearer). Set in the dashboard.
+      - key: OPENHANDS_API_KEY
+        sync: false
+      # Required. Bearer token that guards the write API and the public bind.
+      # The server refuses to bind 0.0.0.0 without it.
+      - key: WEB_AUTH_TOKEN
+        sync: false
+      # Optional. Override only for a self-hosted Cloud/Enterprise instance.
+      - key: OPENHANDS_CLOUD_URL
+        sync: false
+      # Optional. Select an account agent profile by id. Unset = inherit the
+      # account's own active profile and its configured MCP servers/skills.
+      - key: OPENHANDS_AGENT_PROFILE_ID
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.6"

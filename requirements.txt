@@ -1,0 +1,9 @@
+# Runtime dependency of the web server and dispatcher.
+#
+# The whole orchestration layer is otherwise standard-library only on purpose
+# (see AGENTS.md); psycopg3 is the single third-party package, used by
+# orchestration/cloud_store.py for PostgreSQL/Supabase.
+#
+# The [binary] extra ships prebuilt wheels, so no libpq/compiler is needed on
+# the build image. psycopg 3.3.x requires Python >= 3.10.
+psycopg[binary]>=3.2,<4

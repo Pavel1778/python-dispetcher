@@ -27,6 +27,22 @@ class FakeCloud:
         self.events: dict[str, list[dict]] = {}
         self.messages: dict[str, list[str]] = {}
         self.client_tools: dict[str, list[dict]] = {}
+        # The start-request fields the server actually received, per conversation.
+        self.start_bodies: dict[str, dict] = {}
+        # Account-level configuration the fake reports. Not secret values.
+        self.settings: dict = {
+            "llm_api_key_set": True,
+            "active_agent_profile_id": None,
+            "agent_settings": {"mcp_config": {"playwright": {"enabled": True},
+                                              "fetch": {"enabled": True}}},
+            "registered_marketplaces": [{"name": "m1"}],
+            "inherited_marketplaces": [],
+            "disabled_skills": [],
+            "provider_tokens_set": {"github": None},
+        }
+        self.agent_profiles: dict = {"profiles": [], "active_agent_profile_id": None}
+        # Skills the fake reports for any conversation (name -> present).
+        self.skills: list[str] = ["work_hosts"]
         # Controls: how many polls a start task needs before READY.
         self.start_polls_required = 0
         self.start_fail = False
@@ -127,6 +143,19 @@ class _Handler(BaseHTTPRequestHandler):
                 items = [c for c in items if (c.get("tags") or {}).get(key) == value]
             return self._json(200, {"items": items, "next_page_id": None})
 
+        if path == "/api/v1/settings":
+            return self._json(200, self.cloud.settings)
+
+        if path == "/api/agent-profiles":
+            return self._json(200, self.cloud.agent_profiles)
+
+        if (path.startswith("/api/v1/app-conversations/")
+                and path.endswith("/skills")):
+            cid = path.split("/")[4]
+            if cid not in self.cloud.conversations:
+                return self._json(404, {"detail": "not found"})
+            return self._json(200, {"skills": [{"name": n} for n in self.cloud.skills]})
+
         if path == "/api/v1/app-conversations/start-tasks":
             ids = [i for i in self._query("ids").split(",") if i]
             out = []
@@ -170,6 +199,7 @@ class _Handler(BaseHTTPRequestHandler):
                 tags=body.get("tags"),
             )
             self.cloud.client_tools[cid] = body.get("client_tools") or []
+            self.cloud.start_bodies[cid] = body
             self.cloud.events[cid].append(
                 {"kind": "MessageEvent",
                  "llm_message": {"role": "user",

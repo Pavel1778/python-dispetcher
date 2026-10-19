@@ -75,10 +75,48 @@ class WorkflowVerifier:
 
     # ---------------------------------------------------------------- decide
     def _verify(self, workflow_id: str, report: VerifierReport) -> None:
+        # Read the Sr view first. Sr is the only actor that can add work, so its
+        # terminal-bad states must be handled even before any child task exists.
+        # Without this, an Sr that dies on startup (a rejected start task, an
+        # errored sandbox, a stopped agent) leaves the workflow queued forever,
+        # which is exactly the "silently hanging" failure we must not allow.
+        sr = self.store.sr_for(workflow_id)
+        conversation_id = (sr or {}).get("sr_conversation_id")
+        view = None
+        if conversation_id:
+            try:
+                view = self.client.get_conversation(conversation_id)
+            except CloudNotFound:
+                view = None
+            except CloudUnavailable:
+                report.unavailable.append(workflow_id)
+                return
+            if view is not None:
+                status = view.execution_status
+                if status in (ExecutionStatus.ERROR.value, ExecutionStatus.STUCK.value):
+                    self.store.set_workflow_state(workflow_id, "failed")
+                    report.failed.append(workflow_id)
+                    return
+                if status == ExecutionStatus.WAITING_FOR_CONFIRMATION.value:
+                    # Sr needs a human decision; cannot finish on its own.
+                    self.store.set_workflow_state(workflow_id, "blocked")
+                    report.blocked.append(workflow_id)
+                    return
+
         progress = self.store.workflow_progress(workflow_id)
         if progress["total"] == 0:
-            # Sr has not delegated anything yet. Nothing to complete.
-            report.waiting.append(workflow_id)
+            # Sr has not delegated anything yet. If Sr has stopped, or its
+            # conversation is gone, no work will ever arrive: block for a human
+            # rather than wait forever. Only a still-running Sr is "waiting".
+            stopped = view is not None and (
+                view.execution_status == ExecutionStatus.FINISHED.value
+            )
+            gone = view is None and bool(conversation_id)
+            if stopped or gone:
+                self.store.set_workflow_state(workflow_id, "blocked")
+                report.blocked.append(workflow_id)
+            else:
+                report.waiting.append(workflow_id)
             return
         if self.store.has_pending_tool_calls(workflow_id):
             # A tool call is claimed-but-unfinished or its result was never
@@ -105,23 +143,13 @@ class WorkflowVerifier:
 
         # All child tasks are terminal with at least one real completion. Now
         # require that Sr has actually stopped, so we do not complete a workflow
-        # while the Sr agent is still planning or adding tasks.
-        sr = self.store.sr_for(workflow_id)
-        conversation_id = (sr or {}).get("sr_conversation_id")
-        if conversation_id:
-            try:
-                view = self.client.get_conversation(conversation_id)
-            except CloudNotFound:
-                # The Sr conversation vanished; the durable task state still says
-                # the work is done, so we may complete on that evidence.
-                view = None
-            except CloudUnavailable:
-                report.unavailable.append(workflow_id)
-                return
-            if view is not None and view.execution_status != ExecutionStatus.FINISHED.value:
-                self.store.set_workflow_state(workflow_id, "verifying")
-                report.waiting.append(workflow_id)
-                return
+        # while the Sr agent is still planning or adding tasks. ``view is None``
+        # means the conversation vanished; the durable task state still says the
+        # work is done, so we may complete on that evidence.
+        if view is not None and view.execution_status != ExecutionStatus.FINISHED.value:
+            self.store.set_workflow_state(workflow_id, "verifying")
+            report.waiting.append(workflow_id)
+            return
 
         self.store.set_workflow_state(workflow_id, "completed")
         report.completed.append(workflow_id)

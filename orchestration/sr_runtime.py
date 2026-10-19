@@ -95,6 +95,8 @@ class SrRuntime:
         worker_id: str = "sr-runtime",
         start_poll_attempts: int = 30,
         start_poll_interval: float = 2.0,
+        agent_profile_id: str | None = None,
+        plugins: list[dict[str, Any]] | None = None,
     ):
         self.store = store
         self.client = client
@@ -102,6 +104,11 @@ class SrRuntime:
         self.worker_id = worker_id
         self.start_poll_attempts = start_poll_attempts
         self.start_poll_interval = start_poll_interval
+        # Account-level configuration to inherit. When unset, the conversation
+        # is started without these fields, so it uses the account's own active
+        # profile and configured MCP/skills. We never overwrite account settings.
+        self.agent_profile_id = agent_profile_id
+        self.plugins = plugins
         # Map the prefixed client-tool names back to the real Sr operations.
         self._ops = {
             "sr_create_task": self.tools.create_task,
@@ -140,6 +147,8 @@ class SrRuntime:
             title=f"Sr.{goal[:40]}",
             tags={"orchestratorsr": workflow_id.replace("-", "")},
             client_tools=SrTools.tool_schemas(),
+            agent_profile_id=self.agent_profile_id,
+            plugins=self.plugins,
         )
         # Record the start task before polling so a crash here is recoverable.
         self.store.bind_sr(workflow_id, start_task_id=start.id, status="starting")

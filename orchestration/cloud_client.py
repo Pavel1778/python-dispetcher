@@ -184,6 +184,9 @@ class CloudClient:
         tags: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         client_tools: list[dict[str, Any]] | None = None,
+        agent_profile_id: str | None = None,
+        agent_type: str | None = None,
+        plugins: list[dict[str, Any]] | None = None,
     ) -> StartTask:
         """``POST /api/v1/app-conversations`` -> a start task to poll.
 
@@ -197,6 +200,12 @@ class CloudClient:
         an ``ActionEvent`` in the conversation's event stream (confirmed against
         the live API). The caller is responsible for executing the call and
         returning the result; see :mod:`orchestration.sr_runtime`.
+
+        ``agent_profile_id``, ``agent_type`` and ``plugins`` are documented
+        fields that select account-level configuration. They are only sent when
+        the caller sets them: an omitted field means "inherit whatever the
+        account already uses", which is the desired default for reusing the
+        existing Cloud workspace rather than reconfiguring it.
         """
         body: dict[str, Any] = {
             "initial_message": {
@@ -220,6 +229,12 @@ class CloudClient:
             body["secrets"] = secrets
         if client_tools is not None:
             body["client_tools"] = client_tools
+        if agent_profile_id is not None:
+            body["agent_profile_id"] = agent_profile_id
+        if agent_type is not None:
+            body["agent_type"] = agent_type
+        if plugins is not None:
+            body["plugins"] = plugins
         status, payload = self._request("POST", "/api/v1/app-conversations", body)
         if status not in (200, 201):
             raise CloudError(f"start_conversation -> {status}")
@@ -366,6 +381,86 @@ class CloudClient:
         except CloudError:
             return False
         return status == 200
+
+    # -------------------------------------------------- account capabilities
+    # These are read-only. They report what the account *has configured* and
+    # what a conversation *has available*; neither is proof that a tool ran.
+    # Only an observed tool call in the event stream proves exercise.
+    def get_settings(self) -> dict[str, Any]:
+        """``GET /api/v1/settings`` -> the account's own agent settings.
+
+        Read-only. Used to discover the account's active agent profile and
+        configured MCP servers without changing any of them.
+        """
+        status, payload = self._request("GET", "/api/v1/settings")
+        if status != 200 or not isinstance(payload, dict):
+            raise CloudError(f"get_settings -> {status}")
+        return payload
+
+    def list_agent_profiles(self) -> dict[str, Any]:
+        """``GET /api/agent-profiles`` -> ``{profiles, active_agent_profile_id}``."""
+        status, payload = self._request("GET", "/api/agent-profiles")
+        if status != 200 or not isinstance(payload, dict):
+            raise CloudError(f"list_agent_profiles -> {status}")
+        return payload
+
+    def conversation_skills(self, conversation_id: str) -> list[str]:
+        """``GET /api/v1/app-conversations/{id}/skills`` -> skill names.
+
+        This is what a *specific* conversation actually has loaded, which is a
+        stronger statement than what the account is configured with.
+        """
+        status, payload = self._request(
+            "GET", f"/api/v1/app-conversations/{conversation_id}/skills"
+        )
+        if status != 200:
+            raise CloudError(f"conversation_skills -> {status}")
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            items = payload.get("skills") or []
+        else:
+            items = []
+        names: list[str] = []
+        for item in items:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict) and item.get("name"):
+                names.append(str(item["name"]))
+        return names
+
+    def account_capabilities(self) -> dict[str, Any]:
+        """A read-only snapshot of the account-level capabilities.
+
+        Returns only non-secret facts: whether an LLM key is set, the configured
+        MCP server names, the active agent profile id, and marketplace counts.
+        Secret *values* are never returned by the API and are never requested.
+        """
+        settings = self.get_settings()
+        agent_settings = settings.get("agent_settings") or {}
+        mcp = agent_settings.get("mcp_config") or {}
+        profiles: dict[str, Any] = {}
+        try:
+            profiles = self.list_agent_profiles()
+        except CloudError:
+            profiles = {}
+        return {
+            "llm_api_key_set": bool(settings.get("llm_api_key_set")),
+            "active_agent_profile_id": profiles.get("active_agent_profile_id")
+            or settings.get("active_agent_profile_id"),
+            "mcp_servers": sorted(mcp.keys()) if isinstance(mcp, dict) else [],
+            "registered_marketplaces": len(settings.get("registered_marketplaces") or []),
+            "inherited_marketplaces": len(settings.get("inherited_marketplaces") or []),
+            "disabled_skills": settings.get("disabled_skills") or [],
+            "provider_tokens_set": {
+                k: bool(v)
+                for k, v in (settings.get("provider_tokens_set") or {}).items()
+            },
+            "agent_profiles": [
+                {"name": p.get("name"), "mcp_server_refs": p.get("mcp_server_refs") or []}
+                for p in (profiles.get("profiles") or [])
+            ],
+        }
 
 
 def _start_task(payload: dict[str, Any]) -> StartTask:

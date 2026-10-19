@@ -107,3 +107,31 @@ successful-completion e2e needs a valid key and is not yet exercised.
   skip cleanly.
 - The account has a **daily conversation limit**; probing schemas can exhaust it.
   Prefer the fake Cloud server in `tests/fake_cloud.py` for iteration.
+
+## Account capability inheritance (Cloud path)
+
+- The web path starts Cloud conversations with only the fields it needs and
+  **omits** `agent_profile_id`, `agent_type`, `plugins`, `agent_settings` and
+  `conversation_settings`, so each conversation inherits the account's own
+  active agent profile and its configured MCP servers/skills. Never write these
+  fields to reconfigure the account; they are opt-in via
+  `OPENHANDS_AGENT_PROFILE_ID` / `SrRuntime(plugins=...)`.
+- `GET /api/capabilities` (read-only) reports what the account has
+  **configured** (settings: MCP names, marketplaces, LLM key presence, provider
+  tokens). `GET /api/v1/app-conversations/{id}/skills` reports what a specific
+  conversation has **available**. Neither proves a tool ran; only an observed
+  `ActionEvent` proves it was **exercised**. Do not conflate the three.
+- Client tools need no browser: `SrRuntime.tick()` polls `events/search`,
+  claims by the stable event `id`, executes, and delivers with `send-message`.
+  `tests/test_cloud_integration.py` proves this against the fake server.
+- The workflow verifier now reads the Sr view *first*: an Sr in `error`/`stuck`
+  fails the workflow, `waiting_for_confirmation` blocks it, and an Sr that
+  stopped (or vanished) with no child work blocks it — none of these may hang
+  forever or be reported as success.
+
+## Deployment
+
+- `requirements.txt` (only `psycopg[binary]`), `render.yaml`, `DEPLOY.md`.
+  Start: `python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN`.
+  Run exactly one instance. Migrations are manual and idempotent; the app never
+  applies them.

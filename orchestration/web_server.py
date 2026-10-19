@@ -259,13 +259,17 @@ class App:
     """Wires the store, Cloud client, Sr runtime and Jr dispatcher together."""
 
     def __init__(self, dsn: str, *, worker_id: str = "web", poll_interval: float = 5.0,
-                 token: str | None = None):
+                 token: str | None = None, agent_profile_id: str | None = None,
+                 plugins: list[dict[str, Any]] | None = None):
         self.store = PostgresStore(dsn)
         self.client = CloudClient()
         # Bearer token for the write API. Without one, only read-only requests
         # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
         # stranger to start Cloud conversations. ``None`` means "not set".
         self.token = token if token is not None else os.environ.get("WEB_AUTH_TOKEN")
+        # Optional account-level selection, read from the environment. Unset
+        # means "inherit the account's own active profile and MCP/skills".
+        profile = agent_profile_id or os.environ.get("OPENHANDS_AGENT_PROFILE_ID")
         self.dispatcher = CloudDispatcher(
             self.store, self.client, worker_id=worker_id,
             start_poll_interval=2.0, start_poll_attempts=40,
@@ -273,6 +277,7 @@ class App:
         self.runtime = SrRuntime(
             self.store, self.client, SrTools(self.store, self.dispatcher),
             worker_id=worker_id, start_poll_interval=2.0, start_poll_attempts=40,
+            agent_profile_id=profile, plugins=plugins,
         )
         self.verifier = WorkflowVerifier(self.store, self.client)
         self.poll_interval = poll_interval
@@ -433,6 +438,19 @@ class Handler(BaseHTTPRequestHandler):
                     "writes_require_auth": bool(getattr(self.app, "token", None)),
                     "last_tick": self.app.last_tick,
                 })
+            if path == "/api/capabilities":
+                # Read-only. Reports the account-level configuration the
+                # dispatcher will inherit; it never changes anything and never
+                # returns secret values.
+                try:
+                    caps = self.app.client.account_capabilities()
+                except CloudError as e:
+                    return self._json(502, {"error": f"cloud: {e}"})
+                caps["dispatcher"] = {
+                    "agent_profile_id": self.app.runtime.agent_profile_id,
+                    "plugins": self.app.runtime.plugins or [],
+                }
+                return self._json(200, caps)
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
