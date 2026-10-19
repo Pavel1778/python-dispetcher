@@ -133,8 +133,31 @@ successful-completion e2e needs a valid key and is not yet exercised.
 
 - `requirements.txt` (only `psycopg[binary]`), `render.yaml`, `DEPLOY.md`.
   Start: `python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN`.
-  Run exactly one instance. Migrations are manual and idempotent; the app never
-  applies them.
+  Run exactly one instance. Migrations are idempotent and applied by the
+  process on first connect (recorded in `schema_migrations`), because the
+  Render free plan has no shell to run `psql` in; `AUTO_MIGRATE=false` turns
+  that off for environments that manage the schema out of band.
+
+## Sr start retry (why a workflow is never left queued)
+
+- Starting Sr is a Cloud call that can fail transiently (429 while the account
+  is rate limited, a 5xx, a dropped connection). When it does, the workflow row
+  exists with no `sr_conversation_id`.
+- Nothing else revisits such a workflow: the Sr loop needs an
+  `sr_conversation_id` to service a workflow, so before this it sat in `queued`
+  forever. `SrRuntime._retry_sr_starts` now scans `pending_sr_starts()` each
+  tick and starts Sr, with a persisted exponential backoff
+  (`sr_attempt`/`sr_next_attempt_at`, migration `0005`).
+- Give-up policy: after `sr_start_max_attempts` the workflow is `blocked` with
+  the last error as evidence; a `CloudAuthError` (401/403) blocks at once,
+  because retrying a bad key only burns quota. Never retry forever, never stay
+  silent.
+- `_find_orphan_sr` (tag lookup) is what makes a concurrent or crashed start
+  safe: it reuses an existing Sr instead of creating a second one. Keep that
+  path intact.
+- Tests apply **every** file in `migrations/` (`sorted(os.listdir(_MIG))`), not
+  a hardcoded list, so a new migration cannot silently go unapplied. The schema
+  guard (`REQUIRED_COLUMNS`) must name any column the store depends on.
 
 ## Web auth (added on top of the machine token)
 
