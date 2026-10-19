@@ -112,6 +112,16 @@ Do not run migrations against production without authorization. There is no
 automatic migration on boot by design, so a schema change is always a
 deliberate, reviewable step.
 
+The server checks the schema on startup and refuses to start if a required
+table is missing, printing the names:
+
+```
+database is missing tables (apply migrations/): sessions, login_attempts
+```
+
+This turns a forgotten migration into one clear message at boot instead of a
+failed request later.
+
 ## Render
 
 `render.yaml` describes the web service. It does not contain secret values; the

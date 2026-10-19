@@ -654,6 +654,13 @@ def main() -> int:
     except StoreError as e:
         print(f"store error: {e}")
         return 2
+    # A forgotten migration shows up as UndefinedTable on the first request; name
+    # it at startup instead.
+    missing_tables = app.store.verify_schema()
+    if missing_tables:
+        print("database is missing tables (apply migrations/): "
+              + ", ".join(missing_tables))
+        return 2
     server = WebServer(app, args.host, args.port)
     server.start()
     print(f"listening on http://{args.host}:{server.port}")

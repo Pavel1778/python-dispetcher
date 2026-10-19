@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -201,22 +202,57 @@ class PostgresStore:
             self.dsn, row_factory=dict_row, autocommit=False,
             connect_timeout=connect_timeout,
         )
+        # psycopg connections are not thread-safe, but the web server answers
+        # each request on its own thread while sharing this one connection.
+        # Without serializing access, two threads interleave on one transaction
+        # and the loser sees "current transaction is aborted".
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
+
+    def verify_schema(self) -> list[str]:
+        """Return the tables the store needs that the database is missing.
+
+        A missing table is a real root cause of ``UndefinedTable``, which in turn
+        produced the reported ``InFailedSqlTransaction`` cascade. Checking at
+        startup turns that into one clear message instead of a 500 on the first
+        request (a forgotten migration is the usual cause).
+        """
+        required = (
+            "workflows", "tasks", "conversations", "repositories",
+            "task_events", "sr_tool_calls", "sessions", "login_attempts",
+        )
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema()"
+            )
+            present = {r["table_name"] for r in cur.fetchall()}
+        return [t for t in required if t not in present]
 
     # ---------------------------------------------------------------- infra
     @contextmanager
     def _tx(self) -> Iterator[Any]:
-        """Yield a cursor inside a transaction, committing or rolling back."""
-        conn = self._conn
-        try:
-            with conn.cursor() as cur:
-                yield cur
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
+        """Yield a cursor inside a transaction, committing or rolling back.
+
+        The lock makes the shared connection safe under the threaded server.
+        The rollback on entry recovers from a transaction that was already
+        aborted (e.g. by a previous failure) instead of propagating
+        ``InFailedSqlTransaction`` into an unrelated caller.
+        """
+        with self._lock:
+            conn = self._conn
+            if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+                conn.rollback()
+            try:
+                with conn.cursor() as cur:
+                    yield cur
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
 
     def _event(
         self,
@@ -271,13 +307,12 @@ class PostgresStore:
         return rid
 
     def allowed_repository(self, full_name: str) -> dict[str, Any] | None:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT * FROM repositories WHERE full_name=%s AND enabled",
                 (full_name,),
             )
             row = cur.fetchone()
-        self._conn.commit()
         return row
 
     # ------------------------------------------------------------------ tasks
@@ -348,17 +383,15 @@ class PostgresStore:
         return task
 
     def _by_idempotency(self, key: str) -> Task | None:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("SELECT * FROM tasks WHERE idempotency_key=%s", (key,))
             row = cur.fetchone()
-        self._conn.commit()
         return _row_to_task(row) if row else None
 
     def get_task(self, task_id: str) -> Task:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("SELECT * FROM tasks WHERE id=%s", (task_id,))
             row = cur.fetchone()
-        self._conn.commit()
         if row is None:
             raise NotFound(f"task {task_id}")
         return _row_to_task(row)
@@ -387,10 +420,9 @@ class PostgresStore:
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY priority DESC, created_at"
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(sql, tuple(params))
             rows = cur.fetchall()
-        self._conn.commit()
         return [_row_to_task(r) for r in rows]
 
     def claim_task(self, owner: str, *, lease_seconds: float = 300.0,
@@ -522,10 +554,9 @@ class PostgresStore:
                                 "start_task_id": start_task_id})
 
     def conversation_for(self, task_id: str) -> dict[str, Any] | None:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("SELECT * FROM conversations WHERE task_id=%s", (task_id,))
             row = cur.fetchone()
-        self._conn.commit()
         return row
 
     def set_result(self, task_id: str, result: str) -> Task:
@@ -570,7 +601,7 @@ class PostgresStore:
 
     # -------------------------------------------------------------- recovery
     def expired_leases(self) -> list[Task]:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """
                 SELECT * FROM tasks
@@ -579,7 +610,6 @@ class PostgresStore:
                 """
             )
             rows = cur.fetchall()
-        self._conn.commit()
         return [_row_to_task(r) for r in rows]
 
     def reclaim_expired(self, *, max_attempts: int | None = None) -> list[dict]:
@@ -636,10 +666,9 @@ class PostgresStore:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY seq DESC LIMIT %s"
         params.append(limit)
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(sql, tuple(params))
             rows = cur.fetchall()
-        self._conn.commit()
         return rows
 
     # ------------------------------------------------------------- Sr runtime
@@ -671,24 +700,22 @@ class PostgresStore:
                                 "start_task_id": start_task_id, "status": status})
 
     def sr_for(self, workflow_id: str) -> dict[str, Any] | None:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT sr_conversation_id, sr_start_task_id, sr_status, goal, state "
                 "FROM workflows WHERE id=%s",
                 (workflow_id,),
             )
             row = cur.fetchone()
-        self._conn.commit()
         return row
 
     def list_workflows(self) -> list[dict[str, Any]]:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT id, goal, state, sr_conversation_id, sr_status, created_at "
                 "FROM workflows ORDER BY created_at"
             )
             rows = cur.fetchall()
-        self._conn.commit()
         # ``id`` comes back as a uuid.UUID; callers compare it with string ids
         # (e.g. the workflow-scope check), so normalize it to str here.
         for row in rows:
@@ -700,10 +727,9 @@ class PostgresStore:
         if enabled_only:
             sql += " WHERE enabled"
         sql += " ORDER BY full_name"
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(sql)
             rows = cur.fetchall()
-        self._conn.commit()
         return rows
 
     def claim_tool_call(
@@ -753,10 +779,9 @@ class PostgresStore:
         return True
 
     def tool_call(self, event_id: str) -> dict[str, Any] | None:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("SELECT * FROM sr_tool_calls WHERE event_id=%s", (event_id,))
             row = cur.fetchone()
-        self._conn.commit()
         return row
 
     def finish_tool_call(
@@ -797,7 +822,7 @@ class PostgresStore:
         strand the result: Sr waits forever for a reply it will never get. These
         rows are re-delivered on the next tick.
         """
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """
                 SELECT c.event_id, c.workflow_id, c.name, c.result, c.is_error,
@@ -813,27 +838,24 @@ class PostgresStore:
                 (limit,),
             )
             rows = cur.fetchall()
-        self._conn.commit()
         return rows
 
     def tool_calls(self, *, workflow_id: str, limit: int = 100) -> list[dict]:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT * FROM sr_tool_calls WHERE workflow_id=%s "
                 "ORDER BY created_at DESC LIMIT %s",
                 (workflow_id, limit),
             )
             rows = cur.fetchall()
-        self._conn.commit()
         return rows
 
     def count_child_tasks(self, workflow_id: str) -> int:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT count(*) AS n FROM tasks WHERE workflow_id=%s", (workflow_id,)
             )
             row = cur.fetchone()
-        self._conn.commit()
         return int(row["n"]) if row else 0
 
     def has_pending_tool_calls(self, workflow_id: str) -> bool:
@@ -842,27 +864,25 @@ class PostgresStore:
         The workflow verifier uses this to avoid completing a workflow while a Sr
         call is still in flight or its result has not reached Sr yet.
         """
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT 1 FROM sr_tool_calls WHERE workflow_id=%s "
                 "AND (finished_at IS NULL OR delivered_at IS NULL) LIMIT 1",
                 (workflow_id,),
             )
             row = cur.fetchone()
-        self._conn.commit()
         return row is not None
 
     # -------------------------------------------------------- workflow state
     def workflow_progress(self, workflow_id: str) -> dict[str, int]:
         """Counts by category, from durable task state only."""
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT state, count(*) AS n FROM tasks WHERE workflow_id=%s "
                 "GROUP BY state",
                 (workflow_id,),
             )
             rows = cur.fetchall()
-        self._conn.commit()
         counts = {r["state"]: int(r["n"]) for r in rows}
         completed = counts.get(TaskState.COMPLETED.value, 0)
         cancelled = counts.get(TaskState.CANCELLED.value, 0)
@@ -909,7 +929,7 @@ class PostgresStore:
 
     def get_session(self, token_hash: str) -> dict[str, Any] | None:
         """Return the live session row, or ``None``. Expired rows are ignored."""
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT username, csrf_token, expires_at FROM sessions "
                 "WHERE token_hash=%s AND expires_at > now()",
@@ -921,7 +941,6 @@ class PostgresStore:
                     "UPDATE sessions SET last_seen=now() WHERE token_hash=%s",
                     (token_hash,),
                 )
-        self._conn.commit()
         return row
 
     def delete_session(self, token_hash: str) -> None:
@@ -934,12 +953,11 @@ class PostgresStore:
             return cur.rowcount
 
     def login_locked(self, key: str) -> bool:
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT locked_until FROM login_attempts WHERE key=%s", (key,)
             )
             row = cur.fetchone()
-        self._conn.commit()
         if not row or row["locked_until"] is None:
             return False
         cur_time = time.time()
@@ -977,12 +995,11 @@ class PostgresStore:
     # ---------------------------------------------------------- dashboard
     def dashboard_counts(self) -> dict[str, int]:
         """Real counts from durable state. No synthetic metrics."""
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("SELECT count(*) AS n FROM workflows")
             workflows = int(cur.fetchone()["n"])
             cur.execute("SELECT state, count(*) AS n FROM tasks GROUP BY state")
             by_state = {r["state"]: int(r["n"]) for r in cur.fetchall()}
-        self._conn.commit()
         queued = by_state.get(TaskState.QUEUED.value, 0)
         assigned = by_state.get(TaskState.ASSIGNED.value, 0)
         running = by_state.get(TaskState.RUNNING.value, 0)
@@ -1002,7 +1019,7 @@ class PostgresStore:
 
     def list_tasks_all(self, *, limit: int = 200) -> list[dict[str, Any]]:
         """All tasks, newest first, each with its workflow goal for display."""
-        with self._conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """
                 SELECT t.id, t.goal, t.state, t.attempt, t.max_attempts,
@@ -1020,7 +1037,6 @@ class PostgresStore:
                 (limit,),
             )
             rows = cur.fetchall()
-        self._conn.commit()
         for r in rows:
             for key in ("id", "workflow_id"):
                 if r.get(key) is not None:
