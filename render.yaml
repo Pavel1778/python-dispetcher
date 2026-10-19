@@ -1,0 +1,31 @@
+# Render Blueprint for the OpenHands dispatcher.
+# Free plan notes:
+#   * Free web services spin down after inactivity and restart on request.
+#   * The dispatcher therefore rebuilds state from PostgreSQL on every start.
+#   * A free instance is NOT a guarantee of 24/7 background processing.
+services:
+  - type: web
+    name: openhands-dispatcher
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: OPENHANDS_CLOUD_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: JR_BRIDGE_TOKEN
+        sync: false
+      - key: HEARTBEAT_URL
+        sync: false
+      - key: DISPATCHER_ENABLE_BACKGROUND_LOOP
+        value: "true"
+      - key: DISPATCHER_POLL_INTERVAL_SECONDS
+        value: "15"
+      - key: LOG_LEVEL
+        value: "INFO"
