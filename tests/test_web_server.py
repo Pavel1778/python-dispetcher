@@ -38,16 +38,20 @@ def _reset_schema() -> None:
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DROP TABLE IF EXISTS sr_tool_calls, task_events, conversations, "
-                "tasks, repositories, workflows CASCADE"
+                "DROP TABLE IF EXISTS sessions, login_attempts, sr_tool_calls, "
+                "task_events, conversations, tasks, repositories, workflows CASCADE"
             )
-            cur.execute(open(os.path.join(_MIG, "0001_init.sql")).read())
-            cur.execute(open(os.path.join(_MIG, "0002_sr_runtime.sql")).read())
-            cur.execute(open(os.path.join(_MIG, "0003_tool_call_recovery.sql")).read())
+            for name in ("0001_init.sql", "0002_sr_runtime.sql",
+                         "0003_tool_call_recovery.sql", "0004_auth.sql"):
+                cur.execute(open(os.path.join(_MIG, name)).read())
 
 
 class Client:
-    """Tiny JSON HTTP client for the tests."""
+    """Tiny JSON HTTP client for the tests.
+
+    Sends the bearer token on every request, because reads are now protected
+    too: the machine token authenticates both reads and writes.
+    """
 
     def __init__(self, base: str, token: str | None = None):
         self.base = base
@@ -57,14 +61,12 @@ class Client:
         return self._req("GET", path)
 
     def get_text(self, path: str):
-        req = urllib.request.Request(self.base + path)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status, r.read().decode()
+        return self._req("GET", path, raw=True)
 
     def post(self, path: str, body=None):
         return self._req("POST", path, body)
 
-    def _req(self, method: str, path: str, body=None):
+    def _req(self, method: str, path: str, body=None, raw: bool = False):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method)
         if self.token:
@@ -73,11 +75,15 @@ class Client:
             req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                raw = r.read()
-                return r.status, (json.loads(raw) if raw else None)
+                rawbody = r.read().decode()
+                if raw:
+                    return r.status, rawbody
+                return r.status, (json.loads(rawbody) if rawbody else None)
         except urllib.error.HTTPError as e:
-            raw = e.read()
-            return e.code, (json.loads(raw) if raw else None)
+            rawbody = e.read().decode()
+            if raw:
+                return e.code, rawbody
+            return e.code, (json.loads(rawbody) if rawbody else None)
 
 
 @pytest.fixture(autouse=True)
@@ -117,8 +123,21 @@ def http(server):
 def test_page_is_served(http):
     st, text = http.get_text("/")
     assert st == 200
-    assert "Sr/Jr dispatcher" in text
-    assert "/api/workflows" in text
+    assert "Диспетчер OpenHands" in text
+    assert "/static/app.js" in text
+
+
+def test_login_page_is_public(server):
+    anon = Client(f"http://127.0.0.1:{server.port}")
+    st, text = anon.get_text("/login")
+    assert st == 200
+    assert "Войти" in text
+
+
+def test_healthz_is_public_and_minimal(server):
+    anon = Client(f"http://127.0.0.1:{server.port}")
+    st, body = anon.get("/healthz")
+    assert st == 200 and body == {"status": "ok"}
 
 
 def test_config_reports_cloud_key(http):
@@ -129,6 +148,21 @@ def test_config_reports_cloud_key(http):
 def test_health(http):
     st, body = http.get("/api/health")
     assert st == 200 and body["store"] is True
+
+
+def test_dashboard_counts(http):
+    st, body = http.get("/api/dashboard")
+    assert st == 200 and "counts" in body
+    assert set(body["counts"]) >= {"tasks", "queued", "running", "completed", "failed"}
+
+
+def test_system_info_hides_secrets(http, monkeypatch):
+    monkeypatch.setenv("AUTH_SESSION_SECRET", "super-secret-value")
+    st, body = http.get("/api/system")
+    assert st == 200
+    assert "super-secret-value" not in json.dumps(body)
+    assert body["store"]["ok"] is True
+    assert "login_missing" in body["config"]
 
 
 # -------------------------------------------------------------- repositories
@@ -227,14 +261,14 @@ def test_send_message_rejects_empty(http):
 
 
 # ------------------------------------------------------------------- auth
-def test_writes_require_token(server):
-    anon = Client(f"http://127.0.0.1:{server.port}")  # no Authorization header
+def test_writes_require_auth(server):
+    anon = Client(f"http://127.0.0.1:{server.port}")  # no token, no session
     st, payload = anon.post("/api/repositories", {"full_name": "a/b"})
     assert st == 401
     assert "unauthorized" in payload["error"]
-    # A read still works without a token.
+    # Reads are protected too: no token and no session is unauthorized.
     st, payload = anon.get("/api/workflows")
-    assert st == 200
+    assert st == 401
 
 
 def test_wrong_token_is_rejected(server):

@@ -1,32 +1,49 @@
 """Web control panel for the Sr/Jr dispatcher (stdlib-only HTTP server).
 
-The user types a large task on the page. The server creates a workflow, starts a
-real Sr conversation on OpenHands Cloud (with the Sr client tools attached), and
-a background loop drives both sides:
+A single owner logs in with a username and password; every page and API is
+protected by a server-side session (see :mod:`orchestration.web_auth`). The user
+submits a task, the server creates a workflow and starts a real Sr conversation
+on OpenHands Cloud, and a background loop drives both sides:
 
-* :class:`~orchestration.sr_runtime.SrRuntime` handles the Sr's tool calls,
-  which create and manage Jr tasks.
+* :class:`~orchestration.sr_runtime.SrRuntime` services the Sr's client-tool
+  calls, which create and manage Jr tasks.
 * :class:`~orchestration.cloud_dispatcher.CloudDispatcher` runs the Jr tasks as
   their own Cloud conversations.
+* :class:`~orchestration.workflow_verifier.WorkflowVerifier` writes the only
+  terminal workflow states.
 
 Everything is durable in PostgreSQL, so a restart resumes the same workflows.
-The API key is read from the environment and never sent to the browser.
+The Cloud API key and the DSN are read from the environment and never sent to
+the browser.
 
 Run::
 
     SUPABASE_DB_URL="postgresql://..." OPENHANDS_API_KEY="..." \
+    AUTH_USERNAME="owner" AUTH_PASSWORD_HASH="pbkdf2_sha256$..." \
+    AUTH_SESSION_SECRET="..." \
         python -m orchestration.web_server --port 8000
 
-Endpoints:
-    GET  /                      the page
-    GET  /api/config            whether a Cloud key is configured
-    GET  /api/repositories      the repository allowlist
-    POST /api/repositories      add/update a repository
-    POST /api/workflows         {goal, repository?, branch?} -> start Sr
-    GET  /api/workflows         list workflows
-    GET  /api/workflows/<id>    one workflow with its tasks and tool calls
-    POST /api/workflows/<id>/message   send a message to the Sr conversation
-    GET  /api/health            store + Cloud reachability
+Public endpoints (no session):
+    GET  /login                  the login page
+    POST /login                  authenticate (rate limited)
+    GET  /healthz                minimal liveness probe for Render
+    GET  /static/app.css         stylesheet
+
+Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
+    GET  /                       the dashboard
+    POST /logout                 revoke the session
+    GET  /api/session            current user + CSRF token
+    GET  /api/dashboard          real counts + store/Cloud health
+    GET  /api/config             whether a Cloud key is configured
+    GET  /api/repositories       the repository allowlist
+    POST /api/repositories       add/update a repository        (CSRF)
+    POST /api/workflows          {goal, repository?, branch?}   (CSRF)
+    GET  /api/workflows          list workflows
+    GET  /api/workflows/<id>     one workflow with tasks, events, tool calls
+    POST /api/workflows/<id>/message   message to Sr             (CSRF)
+    GET  /api/tasks              task queue with state for filters
+    GET  /api/system             safe diagnostics
+    GET  /api/capabilities       account-level Cloud capabilities (read-only)
 """
 
 from __future__ import annotations
@@ -38,6 +55,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -52,204 +70,60 @@ from .cloud_store import (
 )
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
+from .web_auth import (
+    CSRF_HEADER,
+    SESSION_COOKIE,
+    AuthError,
+    AuthService,
+    cleared_cookie_header,
+    parse_cookie,
+    session_cookie_header,
+)
+from .web_ui import APP_CSS, APP_HTML, APP_JS
 from .workflow_verifier import WorkflowVerifier
 
 log = logging.getLogger("web_server")
 
-PAGE = """<!doctype html>
-<html lang="en">
+
+def _version() -> str:
+    """The package version, or ``unknown`` if it cannot be read."""
+    try:
+        from importlib.metadata import version
+        return version("python-dispetcher")
+    except Exception:  # noqa: BLE001 - diagnostics must not fail
+        return "dev"
+
+#: Minimal liveness page. Reveals nothing about configuration.
+HEALTHZ = {"status": "ok"}
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sr/Jr dispatcher</title>
-<style>
-  :root { --bg:#0f1115; --card:#181b22; --fg:#e6e8eb; --mut:#9aa4b2;
-          --acc:#4f8cff; --ok:#3fb950; --bad:#f85149; --warn:#d29922; }
-  * { box-sizing:border-box; }
-  body { margin:0; font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;
-         background:var(--bg); color:var(--fg); }
-  header { padding:20px 24px; border-bottom:1px solid #262b33;
-           display:flex; align-items:baseline; gap:12px; }
-  h1 { font-size:18px; margin:0; }
-  .mut { color:var(--mut); font-size:13px; }
-  main { max-width:1000px; margin:0 auto; padding:24px; }
-  .card { background:var(--card); border:1px solid #262b33; border-radius:10px;
-          padding:16px; margin-bottom:16px; }
-  label { display:block; font-size:13px; color:var(--mut); margin:8px 0 4px; }
-  textarea,input,select { width:100%; background:#0d0f13; color:var(--fg);
-          border:1px solid #303743; border-radius:8px; padding:10px;
-          font:inherit; }
-  textarea { min-height:90px; resize:vertical; }
-  button { background:var(--acc); color:#fff; border:0; border-radius:8px;
-           padding:10px 16px; font:inherit; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; }
-  .row > * { flex:1 1 200px; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #262b33; }
-  th { color:var(--mut); font-weight:500; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:999px;
-          font-size:12px; background:#222833; }
-  .pill.completed { background:rgba(63,185,80,.15); color:var(--ok); }
-  .pill.failed,.pill.dead_letter { background:rgba(248,81,73,.15); color:var(--bad); }
-  .pill.running,.pill.verifying,.pill.assigned { background:rgba(79,140,255,.15); color:var(--acc); }
-  .pill.blocked { background:rgba(210,153,34,.15); color:var(--warn); }
-  pre { background:#0d0f13; border:1px solid #262b33; border-radius:8px;
-        padding:10px; overflow:auto; max-height:320px; font-size:12px; }
-  .err { color:var(--bad); }
-  .ok { color:var(--ok); }
-</style>
+<title>Вход — Диспетчер OpenHands</title>
+<link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
-<header>
-  <h1>Sr/Jr dispatcher</h1>
-  <span class="mut" id="cfg"></span>
-</header>
-<main>
-  <div class="card">
-    <h3 style="margin:0 0 4px">New task</h3>
-    <p class="mut" style="margin:0">The Sr agent plans and delegates to Jr agents on OpenHands Cloud.</p>
-    <form id="form">
-      <label for="goal">Task</label>
-      <textarea id="goal" required placeholder="Describe the whole job..."></textarea>
-      <div class="row">
-        <div>
-          <label for="repo">Repository (optional)</label>
-          <select id="repo"><option value="">- none (analysis only) -</option></select>
-        </div>
-        <div>
-          <label for="branch">Branch (optional)</label>
-          <input id="branch" placeholder="main">
-        </div>
-      </div>
-      <div style="margin-top:12px">
-        <button type="submit" id="go">Start Sr</button>
-        <span class="mut" id="msg" style="margin-left:10px"></span>
-      </div>
-    </form>
+<body class="auth-body">
+<main class="auth-card">
+  <div class="auth-brand">
+    <span class="dot" aria-hidden="true"></span>
+    <h1>Диспетчер OpenHands</h1>
   </div>
-
-  <div class="card">
-    <h3 style="margin:0 0 8px">Workflows</h3>
-    <table>
-      <thead><tr><th>Goal</th><th>State</th><th>Sr</th><th>Tasks</th><th></th></tr></thead>
-      <tbody id="wfs"><tr><td colspan="5" class="mut">loading...</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="card" id="detail" style="display:none">
-    <h3 id="dtitle" style="margin:0 0 8px"></h3>
-    <div id="dbody"></div>
-  </div>
+  <p class="muted">Войдите, чтобы отправлять задачи в OpenHands Cloud.</p>
+  <form method="post" action="/login" id="loginform" autocomplete="on">
+    <label for="username">Логин</label>
+    <input id="username" name="username" type="text" required
+           autocomplete="username" autocapitalize="none" spellcheck="false"
+           aria-describedby="loginerr">
+    <label for="password">Пароль</label>
+    <input id="password" name="password" type="password" required
+           autocomplete="current-password" aria-describedby="loginerr">
+    <p class="err" id="loginerr" role="alert">__ERROR__</p>
+    <button type="submit" id="loginbtn">Войти</button>
+  </form>
+  <p class="muted small">Доступ только для владельца. Публичной регистрации нет.</p>
 </main>
-<script>
-const $ = (s) => document.querySelector(s);
-let current = null;
-
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  const t = await r.text();
-  let d; try { d = t ? JSON.parse(t) : {}; } catch { d = {raw:t}; }
-  if (!r.ok) throw new Error(d.error || r.status);
-  return d;
-}
-
-async function loadConfig() {
-  const c = await api('/api/config');
-  $('#cfg').textContent = c.cloud_key ? 'Cloud key configured' : 'NO CLOUD KEY - cannot start conversations';
-  const r = await api('/api/repositories');
-  const sel = $('#repo');
-  for (const repo of r.repositories) {
-    const o = document.createElement('option');
-    o.value = repo.full_name;
-    o.textContent = repo.full_name;
-    sel.appendChild(o);
-  }
-}
-
-async function loadWorkflows() {
-  const { workflows } = await api('/api/workflows');
-  const tb = $('#wfs');
-  tb.innerHTML = '';
-  if (!workflows.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="mut">no workflows yet</td></tr>';
-    return;
-  }
-  for (const w of workflows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(w.goal).slice(0,70)}</td>
-      <td><span class="pill ${w.state}">${w.state}</span></td>
-      <td class="mut">${w.sr_status || '-'}</td>
-      <td>${w.task_count}</td>
-      <td><button data-id="${w.id}" class="view">open</button></td>`;
-    tb.appendChild(tr);
-  }
-  tb.querySelectorAll('.view').forEach(b => b.onclick = () => openDetail(b.dataset.id));
-}
-
-function esc(s){ return String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
-async function openDetail(id) {
-  current = id;
-  const d = await api('/api/workflows/' + id);
-  $('#detail').style.display = 'block';
-  $('#dtitle').textContent = d.workflow.goal;
-  let html = `<p class="mut">Sr conversation: ${d.workflow.sr_conversation_id || 'starting...'}
-    &middot; state ${d.workflow.state}</p>
-    <div class="row"><input id="msgto" placeholder="Message to Sr...">
-      <button id="sendmsg" style="flex:0 0 auto">Send</button></div>
-    <h4>Tasks</h4><table><thead><tr><th>Goal</th><th>State</th><th>Attempt</th>
-      <th>Repository</th><th>Result</th></tr></thead><tbody>`;
-  for (const t of d.tasks) {
-    html += `<tr><td>${esc(t.goal)}</td>
-      <td><span class="pill ${t.state}">${t.state}</span></td>
-      <td>${t.attempt}</td><td class="mut">${esc(t.repository||'-')}</td>
-      <td class="mut">${esc((t.result||'').slice(0,120))}</td></tr>`;
-  }
-  html += '</tbody></table><h4>Sr tool calls</h4>';
-  if (!d.tool_calls.length) html += '<p class="mut">none yet</p>';
-  for (const c of d.tool_calls) {
-    html += `<pre>${esc(c.name)} ${esc(JSON.stringify(c.args))}
-  -> ${c.is_error ? 'ERROR' : 'ok'} ${esc(JSON.stringify(c.result))}</pre>`;
-  }
-  $('#dbody').innerHTML = html;
-  $('#sendmsg').onclick = async () => {
-    const text = $('#msgto').value.trim();
-    if (!text) return;
-    await api('/api/workflows/' + id + '/message', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({text})
-    });
-    $('#msgto').value = '';
-    openDetail(id);
-  };
-}
-
-$('#form').onsubmit = async (e) => {
-  e.preventDefault();
-  $('#go').disabled = true; $('#msg').textContent = 'starting Sr...';
-  try {
-    const body = { goal: $('#goal').value.trim() };
-    if ($('#repo').value) body.repository = $('#repo').value;
-    if ($('#branch').value.trim()) body.branch = $('#branch').value.trim();
-    const d = await api('/api/workflows', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
-    $('#msg').textContent = 'Sr started: ' + d.workflow_id;
-    $('#goal').value = '';
-    loadWorkflows();
-  } catch (err) {
-    $('#msg').innerHTML = '<span class="err">' + esc(err.message) + '</span>';
-  } finally {
-    $('#go').disabled = false;
-  }
-};
-
-loadConfig().catch(e => $('#cfg').innerHTML = '<span class="err">'+esc(e.message)+'</span>');
-loadWorkflows();
-setInterval(loadWorkflows, 5000);
-</script>
 </body>
 </html>
 """
@@ -260,13 +134,18 @@ class App:
 
     def __init__(self, dsn: str, *, worker_id: str = "web", poll_interval: float = 5.0,
                  token: str | None = None, agent_profile_id: str | None = None,
-                 plugins: list[dict[str, Any]] | None = None):
+                 plugins: list[dict[str, Any]] | None = None,
+                 auth: AuthService | None = None):
         self.store = PostgresStore(dsn)
         self.client = CloudClient()
-        # Bearer token for the write API. Without one, only read-only requests
+        # Bearer token for the machine API. Without one, only read-only requests
         # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
         # stranger to start Cloud conversations. ``None`` means "not set".
         self.token = token if token is not None else os.environ.get("WEB_AUTH_TOKEN")
+        # Browser login. Independent of the bearer token: a session authenticates
+        # the human, the token authenticates a machine client. Neither weakens
+        # the other; both are required to be present for their own path.
+        self.auth = auth or AuthService(self.store)
         # Optional account-level selection, read from the environment. Unset
         # means "inherit the account's own active profile and MCP/skills".
         profile = agent_profile_id or os.environ.get("OPENHANDS_AGENT_PROFILE_ID")
@@ -334,6 +213,13 @@ class App:
             raise NotFound(workflow_id)
         workflows = {w["id"]: w for w in self.store.list_workflows()}
         tasks = self.store.list_tasks(workflow_id=workflow_id)
+        # A reason to show when the workflow is not running: the first piece of
+        # evidence on any failed/blocked/dead-lettered task, else nothing.
+        reason = None
+        for t in tasks:
+            if t.state.value in ("failed", "blocked", "dead_letter") and t.evidence:
+                reason = t.evidence[0].get("reason") if isinstance(t.evidence[0], dict) else str(t.evidence[0])
+                break
         return {
             "workflow": {
                 "id": workflow_id,
@@ -341,21 +227,67 @@ class App:
                 "state": workflows.get(workflow_id, {}).get("state"),
                 "sr_conversation_id": wf.get("sr_conversation_id"),
                 "sr_status": wf.get("sr_status"),
+                "reason": reason,
             },
             "tasks": [
                 {
                     "id": t.id, "goal": t.goal, "state": t.state.value,
-                    "attempt": t.attempt, "repository": t.selected_repository,
+                    "attempt": t.attempt, "max_attempts": t.max_attempts,
+                    "repository": t.selected_repository,
                     "branch": t.selected_branch, "result": t.result,
+                    "evidence": t.evidence,
                 }
                 for t in tasks
             ],
             "tool_calls": self.store.tool_calls(workflow_id=workflow_id),
+            "events": [
+                {"at": str(e.get("at") or ""), "kind": e.get("kind"),
+                 "detail": e.get("detail")}
+                for e in self.store.events(workflow_id=workflow_id, limit=50)
+            ],
+        }
+
+    def system_info(self) -> dict[str, Any]:
+        """Safe diagnostics: presence of settings, never their values."""
+        store_ok, store_err = True, None
+        try:
+            self.store.dashboard_counts()
+        except Exception as e:  # noqa: BLE001 - diagnostics must not raise
+            store_ok, store_err = False, f"{type(e).__name__}"
+        cloud_ok, cloud_err = False, None
+        try:
+            cloud_ok = self.client.health()
+            if not cloud_ok:
+                cloud_err = "unreachable"
+        except CloudError as e:
+            cloud_err = type(e).__name__
+        except Exception as e:  # noqa: BLE001
+            cloud_err = type(e).__name__
+        last = self.last_tick or {}
+        return {
+            "store": {"ok": store_ok, "error": store_err},
+            "cloud": {"ok": cloud_ok, "error": cloud_err, "url": self.client.base_url},
+            "config": {
+                "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
+                "writes_require_auth": bool(self.token),
+                "login_configured": self.auth.configured,
+                "login_missing": self.auth.missing_settings(),
+            },
+            "build": {
+                "version": os.environ.get("APP_VERSION") or _version(),
+                "commit": (os.environ.get("RENDER_GIT_COMMIT")
+                           or os.environ.get("GIT_COMMIT") or "unknown"),
+            },
+            "runtime": {
+                "poll_interval": self.poll_interval,
+                "last_tick_at": last.get("at"),
+                "last_error": last.get("error") or last.get("cloud_error"),
+            },
         }
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SrJrDispatcher/1.0"
+    server_version = "SrJrDispatcher/2.0"
 
     def log_message(self, *a: Any) -> None:  # keep the console quiet
         pass
@@ -365,21 +297,47 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------- helpers
-    def _json(self, code: int, payload: Any) -> None:
+    def _json(self, code: int, payload: Any, *, cookie: str | None = None) -> None:
         body = json.dumps(payload, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 
-    def _html(self, code: int, text: str) -> None:
+    def _html(self, code: int, text: str, *, cookie: str | None = None) -> None:
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
+
+    def _static(self, code: int, text: str, content_type: str) -> None:
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, to: str, *, cookie: str | None = None) -> None:
+        self.send_response(303)
+        self.send_header("Location", to)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _body(self) -> dict[str, Any]:
         n = int(self.headers.get("Content-Length", 0))
@@ -390,24 +348,98 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             raise ValueError("body is not valid JSON")
 
-    def _authorized(self) -> bool:
-        """Writes require the configured bearer token; reads never do.
+    def _form(self) -> dict[str, str]:
+        n = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n).decode() if n else ""
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
-        When no token is configured the server is read-only, which is the safe
-        default for a process that can spend Cloud quota.
+    def _client_ip(self) -> str:
+        # Render terminates TLS and sets X-Forwarded-For; take the first hop.
+        fwd = self.headers.get("X-Forwarded-For")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _cookie_secure(self) -> bool:
+        """Mark cookies Secure when the request arrived over HTTPS."""
+        if os.environ.get("WEB_COOKIE_SECURE", "").lower() in ("1", "true", "yes"):
+            return True
+        if os.environ.get("WEB_COOKIE_SECURE", "").lower() in ("0", "false", "no"):
+            return False
+        return (self.headers.get("X-Forwarded-Proto") == "https")
+
+    # --------------------------------------------------------------- session
+    def _session(self):
+        token = parse_cookie(self.headers.get("Cookie"), SESSION_COOKIE)
+        return self.app.auth.resolve(token)
+
+    def _bearer_ok(self) -> bool:
+        """Machine authentication for the API, unchanged from before.
+
+        Kept separate from the browser session so that adding login never
+        weakens (or is weakened by) the existing bearer-token protection.
         """
         token = getattr(self.app, "token", None)
         if not token:
             return False
-        header = self.headers.get("Authorization", "")
-        return header == f"Bearer {token}"
+        return self.headers.get("Authorization", "") == f"Bearer {token}"
+
+    def _require_read(self) -> bool:
+        """Reads need either a browser session or a valid bearer token."""
+        if self._session() is not None or self._bearer_ok():
+            return True
+        self._json(401, {"error": "unauthorized"})
+        return False
+
+    def _require_write(self) -> bool:
+        """Writes need a session with a valid CSRF token, or a bearer token."""
+        if self._bearer_ok():
+            return True
+        session = self._session()
+        if session is None:
+            self._json(401, {"error": "unauthorized"})
+            return False
+        if not self.app.auth.csrf_ok(session, self.headers.get(CSRF_HEADER)):
+            self._json(403, {"error": "csrf token missing or invalid"})
+            return False
+        return True
 
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         try:
+            # --- public ---
+            if path == "/login":
+                if self._session() is not None:
+                    return self._redirect("/")
+                return self._html(200, LOGIN_PAGE.replace("__ERROR__", ""))
+            if path == "/healthz":
+                return self._json(200, HEALTHZ)
+            if path == "/static/app.css":
+                return self._static(200, APP_CSS, "text/css; charset=utf-8")
+            if path == "/static/app.js":
+                return self._static(200, APP_JS, "application/javascript; charset=utf-8")
+            if path == "/favicon.ico":
+                return self._json(404, {"error": "not found"})
+
+            # --- everything below requires authentication ---
             if path == "/":
-                return self._html(200, PAGE)
+                if self._session() is None and not self._bearer_ok():
+                    return self._redirect("/login")
+                return self._html(200, APP_HTML)
+            if not self._require_read():
+                return
+
+            if path == "/api/session":
+                s = self._session()
+                return self._json(200, {
+                    "username": s.username if s else "api",
+                    "csrf_token": s.csrf_token if s else "",
+                })
+            if path == "/api/dashboard":
+                return self._json(200, {"counts": self.app.store.dashboard_counts()})
+            if path == "/api/system":
+                return self._json(200, self.app.system_info())
             if path == "/api/config":
                 return self._json(200, {
                     "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
@@ -417,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {
                     "repositories": self.app.store.list_repositories()
                 })
+            if path == "/api/tasks":
+                return self._json(200, {"tasks": self.app.store.list_tasks_all()})
             if path == "/api/workflows":
                 out = []
                 for w in self.app.store.list_workflows():
@@ -436,6 +470,7 @@ class Handler(BaseHTTPRequestHandler):
                     "store": True,
                     "cloud": self.app.client.health(),
                     "writes_require_auth": bool(getattr(self.app, "token", None)),
+                    "login_configured": self.app.auth.configured,
                     "last_tick": self.app.last_tick,
                 })
             if path == "/api/capabilities":
@@ -461,9 +496,22 @@ class Handler(BaseHTTPRequestHandler):
     # ----------------------------------------------------------------- POST
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if not self._authorized():
-            return self._json(401, {"error": "unauthorized"})
         try:
+            # --- public: login (rate limited) ---
+            if path == "/login":
+                return self._login()
+            # --- logout: needs a session, but not CSRF (it only ends access) ---
+            if path == "/logout":
+                session = self._session()
+                token = parse_cookie(self.headers.get("Cookie"), SESSION_COOKIE)
+                if session is None and not self._bearer_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                self.app.auth.logout(token)
+                return self._json(200, {"ok": True},
+                                  cookie=cleared_cookie_header(secure=self._cookie_secure()))
+            # --- writes ---
+            if not self._require_write():
+                return
             body = self._body()
             if path == "/api/repositories":
                 name = (body.get("full_name") or "").strip()
@@ -505,6 +553,38 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             log.exception("POST %s failed", path)
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
+
+    # ---------------------------------------------------------------- login
+    def _login(self) -> None:
+        form = self._form()
+        username = (form.get("username") or "").strip()
+        password = form.get("password") or ""
+        if not self.app.auth.configured:
+            return self._html(
+                503,
+                LOGIN_PAGE.replace(
+                    "__ERROR__",
+                    "Вход не настроен на сервере. Задайте AUTH_USERNAME, "
+                    "AUTH_PASSWORD_HASH и AUTH_SESSION_SECRET.",
+                ),
+            )
+        try:
+            session = self.app.auth.login(username, password, client_ip=self._client_ip())
+        except AuthError:
+            session = None
+        if session is None:
+            # The same message for every failure: no user enumeration.
+            return self._html(
+                401,
+                LOGIN_PAGE.replace(
+                    "__ERROR__", "Неверный логин или пароль. Попробуйте ещё раз."
+                ),
+            )
+        cookie = session_cookie_header(
+            session.token, ttl=self.app.auth.session_ttl, secure=self._cookie_secure()
+        )
+        return self._redirect("/", cookie=cookie)
+
 
 
 class WebServer:
@@ -548,7 +628,7 @@ def main() -> int:
     ap.add_argument(
         "--token",
         default=os.environ.get("WEB_AUTH_TOKEN"),
-        help="bearer token required for writes (default: $WEB_AUTH_TOKEN)",
+        help="bearer token required for machine API writes (default: $WEB_AUTH_TOKEN)",
     )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -559,6 +639,15 @@ def main() -> int:
         return 2
     if args.host not in ("127.0.0.1", "localhost") and not args.token:
         print("refusing to bind a public interface without --token/WEB_AUTH_TOKEN")
+        return 2
+    # Login must be configured before exposing the server: without it, a public
+    # deployment would have no way to authenticate a human.
+    missing = AuthService(
+        store=None,  # type: ignore[arg-type] - only reading env here
+    ).missing_settings()
+    if args.host not in ("127.0.0.1", "localhost") and missing:
+        print("refusing to bind a public interface without login configured: "
+              + ", ".join(missing))
         return 2
     try:
         app = App(dsn, poll_interval=args.poll_interval, token=args.token)

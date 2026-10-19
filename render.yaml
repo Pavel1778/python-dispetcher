@@ -9,7 +9,12 @@
 #   psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 #   psql "$SUPABASE_DB_URL" -f migrations/0002_sr_runtime.sql
 #   psql "$SUPABASE_DB_URL" -f migrations/0003_tool_call_recovery.sql
+#   psql "$SUPABASE_DB_URL" -f migrations/0004_auth.sql
 # They are idempotent, but the application never runs them itself.
+#
+# Before the first deploy, generate the two secrets once (see DEPLOY.md):
+#   AUTH_PASSWORD_HASH   from `python -m orchestration.web_auth`
+#   AUTH_SESSION_SECRET  from `python -c "import secrets;print(secrets.token_urlsafe(48))"`
 services:
   - type: web
     name: python-dispetcher
@@ -17,7 +22,7 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN
-    healthCheckPath: /api/health
+    healthCheckPath: /healthz
     autoDeploy: false
     envVars:
       # Required. PostgreSQL/Supabase DSN. Set in the dashboard, never here.
@@ -26,8 +31,18 @@ services:
       # Required. OpenHands Cloud API key (Bearer). Set in the dashboard.
       - key: OPENHANDS_API_KEY
         sync: false
-      # Required. Bearer token that guards the write API and the public bind.
-      # The server refuses to bind 0.0.0.0 without it.
+      # Required. Owner login. The server refuses to bind 0.0.0.0 without these
+      # three, so a public deploy always has a way to authenticate a human.
+      - key: AUTH_USERNAME
+        sync: false
+      # Required. PBKDF2 hash of the owner password. Never the password itself.
+      - key: AUTH_PASSWORD_HASH
+        sync: false
+      # Required. Separate secret that signs sessions. Not the API key.
+      - key: AUTH_SESSION_SECRET
+        sync: false
+      # Required. Bearer token that guards the machine API and the public bind.
+      # Distinct from the login; a machine client sends it instead of a session.
       - key: WEB_AUTH_TOKEN
         sync: false
       # Optional. Override only for a self-hosted Cloud/Enterprise instance.

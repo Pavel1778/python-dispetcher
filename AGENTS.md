@@ -135,3 +135,21 @@ successful-completion e2e needs a valid key and is not yet exercised.
   Start: `python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN`.
   Run exactly one instance. Migrations are manual and idempotent; the app never
   applies them.
+
+## Web auth (added on top of the machine token)
+
+- Two independent paths: a browser **session** (`orchestration/web_auth.py`,
+  PBKDF2 password + server-side session rows + double-submit CSRF) and the
+  existing **Bearer** `WEB_AUTH_TOKEN` for machine clients. Never let one
+  replace the other; a change to either must keep both test suites green.
+- Sessions are stored server-side (`sessions` table, migration `0004_auth.sql`)
+  so logout is immediate; only `HMAC(AUTH_SESSION_SECRET, token)` is stored.
+  `AUTH_SESSION_SECRET` must be a separate secret from the Cloud API key.
+- Public routes are only `/login`, `/healthz`, `/static/*`. Everything else,
+  reads included, needs a session or a bearer token. `/healthz` must stay a
+  one-line JSON with no configuration.
+- The server refuses to bind `0.0.0.0` unless `WEB_AUTH_TOKEN` and all three
+  `AUTH_*` variables are set (`web_server.main`).
+- The UI (`orchestration/web_ui.py`) is static strings: dark theme, Russian,
+  responsive. It must not embed any secret, and every button must call a real
+  endpoint.

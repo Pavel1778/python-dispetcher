@@ -895,6 +895,142 @@ class PostgresStore:
             self._event(cur, "workflow_state", workflow_id=workflow_id,
                         detail={"state": state})
 
+    # --------------------------------------------------------------- auth
+    def create_session(self, *, token_hash: str, username: str,
+                       csrf_token: str, ttl_seconds: int) -> None:
+        with self._tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO sessions(token_hash, username, csrf_token, expires_at)
+                VALUES (%s, %s, %s, now() + make_interval(secs => %s))
+                """,
+                (token_hash, username, csrf_token, ttl_seconds),
+            )
+
+    def get_session(self, token_hash: str) -> dict[str, Any] | None:
+        """Return the live session row, or ``None``. Expired rows are ignored."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT username, csrf_token, expires_at FROM sessions "
+                "WHERE token_hash=%s AND expires_at > now()",
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                cur.execute(
+                    "UPDATE sessions SET last_seen=now() WHERE token_hash=%s",
+                    (token_hash,),
+                )
+        self._conn.commit()
+        return row
+
+    def delete_session(self, token_hash: str) -> None:
+        with self._tx() as cur:
+            cur.execute("DELETE FROM sessions WHERE token_hash=%s", (token_hash,))
+
+    def purge_expired_sessions(self) -> int:
+        with self._tx() as cur:
+            cur.execute("DELETE FROM sessions WHERE expires_at <= now()")
+            return cur.rowcount
+
+    def login_locked(self, key: str) -> bool:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT locked_until FROM login_attempts WHERE key=%s", (key,)
+            )
+            row = cur.fetchone()
+        self._conn.commit()
+        if not row or row["locked_until"] is None:
+            return False
+        cur_time = time.time()
+        locked = row["locked_until"].timestamp() > cur_time
+        return locked
+
+    def record_login_failure(self, key: str, *, max_failures: int,
+                             lockout_seconds: int) -> None:
+        with self._tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO login_attempts(key, failures, window_start, locked_until)
+                VALUES (%s, 1, now(), NULL)
+                ON CONFLICT (key) DO UPDATE
+                   SET failures = CASE
+                           WHEN login_attempts.window_start < now() - interval '15 minutes'
+                           THEN 1 ELSE login_attempts.failures + 1 END,
+                       window_start = CASE
+                           WHEN login_attempts.window_start < now() - interval '15 minutes'
+                           THEN now() ELSE login_attempts.window_start END,
+                       locked_until = CASE
+                           WHEN (CASE
+                                   WHEN login_attempts.window_start < now() - interval '15 minutes'
+                                   THEN 1 ELSE login_attempts.failures + 1 END) >= %s
+                           THEN now() + make_interval(secs => %s)
+                           ELSE NULL END
+                """,
+                (key, max_failures, lockout_seconds),
+            )
+
+    def clear_login_failures(self, key: str) -> None:
+        with self._tx() as cur:
+            cur.execute("DELETE FROM login_attempts WHERE key=%s", (key,))
+
+    # ---------------------------------------------------------- dashboard
+    def dashboard_counts(self) -> dict[str, int]:
+        """Real counts from durable state. No synthetic metrics."""
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM workflows")
+            workflows = int(cur.fetchone()["n"])
+            cur.execute("SELECT state, count(*) AS n FROM tasks GROUP BY state")
+            by_state = {r["state"]: int(r["n"]) for r in cur.fetchall()}
+        self._conn.commit()
+        queued = by_state.get(TaskState.QUEUED.value, 0)
+        assigned = by_state.get(TaskState.ASSIGNED.value, 0)
+        running = by_state.get(TaskState.RUNNING.value, 0)
+        verifying = by_state.get(TaskState.VERIFYING.value, 0)
+        recovering = by_state.get(TaskState.RECOVERING.value, 0)
+        return {
+            "workflows": workflows,
+            "tasks": sum(by_state.values()),
+            "queued": queued + assigned,
+            "running": running + verifying + recovering,
+            "completed": by_state.get(TaskState.COMPLETED.value, 0),
+            "failed": (by_state.get(TaskState.FAILED.value, 0)
+                       + by_state.get(TaskState.DEAD_LETTER.value, 0)),
+            "blocked": by_state.get(TaskState.BLOCKED.value, 0),
+            "cancelled": by_state.get(TaskState.CANCELLED.value, 0),
+        }
+
+    def list_tasks_all(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """All tasks, newest first, each with its workflow goal for display."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.id, t.goal, t.state, t.attempt, t.max_attempts,
+                       t.selected_repository, t.selected_branch, t.result,
+                       t.evidence, t.owner, t.updated_at,
+                       t.workflow_id, w.goal AS workflow_goal,
+                       c.external_conversation_id AS conversation_id,
+                       c.url AS conversation_url
+                  FROM tasks t
+                  LEFT JOIN workflows w ON w.id = t.workflow_id
+                  LEFT JOIN conversations c ON c.task_id = t.id
+                 ORDER BY t.updated_at DESC
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        self._conn.commit()
+        for r in rows:
+            for key in ("id", "workflow_id"):
+                if r.get(key) is not None:
+                    r[key] = str(r[key])
+            r["updated_at"] = r["updated_at"].timestamp() if r.get("updated_at") else None
+        return rows
+
+    def workflow_events(self, workflow_id: str, *, limit: int = 100) -> list[dict]:
+        return self.events(workflow_id=workflow_id, limit=limit)
+
 
 def _row_to_task(row: dict[str, Any]) -> Task:
     deps = row.get("dependencies")
