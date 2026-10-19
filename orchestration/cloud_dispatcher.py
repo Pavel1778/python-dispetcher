@@ -192,6 +192,25 @@ class CloudDispatcher:
             except CloudError as e:
                 self._fail(task, report, reason=f"cloud error: {e}")
 
+    def _task_tag(self, task: Task) -> tuple[str, str]:
+        """The Cloud tag that lets us find a conversation we started but lost.
+
+        A crash between ``start_conversation`` and ``bind_conversation`` leaves a
+        real conversation with no local row. Without a tag, the retry would start
+        a second one. The tag is stable per task, so the orphan can be found and
+        reused.
+        """
+        return "orchestratortaskid", task.id.replace("-", "")
+
+    def _find_orphan(self, task: Task) -> str | None:
+        """Return a Cloud conversation already tagged for this task, if any."""
+        key, value = self._task_tag(task)
+        items, _ = self.client.search_conversations(limit=50, tag=(key, value))
+        for conv in items:
+            if conv.tags.get(key) == value:
+                return conv.id
+        return None
+
     def _start_task(self, task: Task, report: TickReport) -> None:
         if not self._allowed(task):
             raise RepoNotAllowed(
@@ -206,12 +225,38 @@ class CloudDispatcher:
                                    "reused": True})
             return
 
+        # A previous attempt recorded a start task but not the conversation id
+        # (crash mid-start). Resume that start task instead of starting a second.
+        if existing and existing.get("external_start_task_id"):
+            start = self.client.get_start_task(existing["external_start_task_id"])
+            if start is not None and not start.failed:
+                conversation_id = self._await_start(start)
+                self.store.bind_conversation(
+                    task.id, conversation_id,
+                    start_task_id=start.id, status="running",
+                )
+                self.store.transition(task.id, TaskState.RUNNING, owner=self.worker_id)
+                report.started.append({"task": task.id, "conversation": conversation_id,
+                                       "resumed": True})
+                return
+            # Start task is gone or errored: fall through to the orphan search.
+
+        # A previous attempt may have created a conversation we never recorded.
+        orphan = self._find_orphan(task)
+        if orphan is not None:
+            self.store.bind_conversation(task.id, orphan, status="running")
+            self.store.transition(task.id, TaskState.RUNNING, owner=self.worker_id)
+            report.started.append({"task": task.id, "conversation": orphan,
+                                   "recovered": True})
+            return
+
+        key, value = self._task_tag(task)
         start = self.client.start_conversation(
             initial_message=task.goal,
             selected_repository=task.selected_repository,
             selected_branch=task.selected_branch,
             title=(task.goal[:60] or None),
-            tags={"orchestratortaskid": task.id.replace("-", "")},
+            tags={key: value},
         )
         # Record the start task before polling so a crash here is recoverable.
         self.store.bind_conversation(

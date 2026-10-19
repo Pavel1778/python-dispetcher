@@ -47,6 +47,7 @@ def _reset_schema() -> None:
             )
             cur.execute(open(os.path.join(_MIG, "0001_init.sql")).read())
             cur.execute(open(os.path.join(_MIG, "0002_sr_runtime.sql")).read())
+            cur.execute(open(os.path.join(_MIG, "0003_tool_call_recovery.sql")).read())
 
 
 @pytest.fixture(autouse=True)

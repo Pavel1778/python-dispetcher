@@ -32,9 +32,9 @@ MIGRATIONS = os.path.join(
 
 PROMPT = (
     "You are the Sr agent. Delegate the single unit of work below by calling the "
-    "create_task tool exactly once, then stop.\n"
+    "sr_create_task tool exactly once, then stop.\n"
     "Unit: 'Reply with exactly: JR-UNIT-OK'.\n"
-    "Call create_task with goal='Reply with exactly: JR-UNIT-OK' and no repository."
+    "Call sr_create_task with goal='Reply with exactly: JR-UNIT-OK' and no repository."
 )
 
 
@@ -49,6 +49,7 @@ def main() -> int:
         with conn.cursor() as cur:
             cur.execute(open(os.path.join(MIGRATIONS, "0001_init.sql")).read())
             cur.execute(open(os.path.join(MIGRATIONS, "0002_sr_runtime.sql")).read())
+            cur.execute(open(os.path.join(MIGRATIONS, "0003_tool_call_recovery.sql")).read())
 
     store = PostgresStore(dsn)
     client = CloudClient()

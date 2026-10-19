@@ -43,13 +43,15 @@ def _reset_schema() -> None:
             )
             cur.execute(open(os.path.join(_MIG, "0001_init.sql")).read())
             cur.execute(open(os.path.join(_MIG, "0002_sr_runtime.sql")).read())
+            cur.execute(open(os.path.join(_MIG, "0003_tool_call_recovery.sql")).read())
 
 
 class Client:
     """Tiny JSON HTTP client for the tests."""
 
-    def __init__(self, base: str):
+    def __init__(self, base: str, token: str | None = None):
         self.base = base
+        self.token = token
 
     def get(self, path: str):
         return self._req("GET", path)
@@ -65,6 +67,8 @@ class Client:
     def _req(self, method: str, path: str, body=None):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method)
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
@@ -92,7 +96,7 @@ def fake():
 def server(fake, monkeypatch):
     # Point the App's CloudClient at the fake by URL, and give it a key.
     monkeypatch.setenv("OPENHANDS_API_KEY", "test-key")
-    app = App(DSN, poll_interval=0.2)
+    app = App(DSN, poll_interval=0.2, token="test-token")
     app.client = CloudClient(fake.base_url, api_key="test-key", timeout=5.0)
     app.dispatcher.client = app.client
     app.runtime.client = app.client
@@ -106,7 +110,7 @@ def server(fake, monkeypatch):
 
 @pytest.fixture
 def http(server):
-    return Client(f"http://127.0.0.1:{server.port}")
+    return Client(f"http://127.0.0.1:{server.port}", token="test-token")
 
 
 # ------------------------------------------------------------------- static
@@ -220,3 +224,20 @@ def test_send_message_rejects_empty(http):
     wf = body["workflow_id"]
     st, body = http.post(f"/api/workflows/{wf}/message", {"text": ""})
     assert st == 400
+
+
+# ------------------------------------------------------------------- auth
+def test_writes_require_token(server):
+    anon = Client(f"http://127.0.0.1:{server.port}")  # no Authorization header
+    st, payload = anon.post("/api/repositories", {"full_name": "a/b"})
+    assert st == 401
+    assert "unauthorized" in payload["error"]
+    # A read still works without a token.
+    st, payload = anon.get("/api/workflows")
+    assert st == 200
+
+
+def test_wrong_token_is_rejected(server):
+    bad = Client(f"http://127.0.0.1:{server.port}", token="nope")
+    st, _ = bad.post("/api/repositories", {"full_name": "a/b"})
+    assert st == 401

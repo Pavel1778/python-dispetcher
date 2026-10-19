@@ -41,9 +41,26 @@ class ToolResult:
 class SrTools:
     """Real Sr operations. All state changes are durable in the store."""
 
+    #: Upper bound on child tasks per workflow. A model that loops on
+    #: ``sr_create_task`` cannot exhaust the account's conversation quota.
+    MAX_CHILD_TASKS = 25
+
     def __init__(self, store: PostgresStore, dispatcher: CloudDispatcher):
         self.store = store
         self.dispatcher = dispatcher
+
+    # ------------------------------------------------------------ helpers
+    def _in_workflow(self, task_id: str, workflow_id: str | None) -> bool:
+        """True when *task_id* belongs to *workflow_id*.
+
+        The model supplies ``task_id`` as free text. Without this check a Sr
+        conversation could read, revise, cancel or accept a task from another
+        workflow, because the store methods are keyed by task id alone.
+        """
+        if workflow_id is None:
+            return False
+        task = self.store.try_get_task(task_id)
+        return task is not None and task.workflow_id == workflow_id
 
     # ------------------------------------------------------------ create_task
     def create_task(
@@ -66,6 +83,13 @@ class SrTools:
         The repository (when given) must be in the allowlist; otherwise the
         task is rejected here, before any conversation is created.
         """
+        if not goal or not goal.strip():
+            return ToolResult(False, {}, "goal is required")
+        if self.store.count_child_tasks(workflow_id) >= self.MAX_CHILD_TASKS:
+            return ToolResult(
+                False, {},
+                f"workflow child-task limit reached ({self.MAX_CHILD_TASKS})",
+            )
         if repository is not None:
             repo = self.store.allowed_repository(repository)
             if repo is None:
@@ -117,7 +141,9 @@ class SrTools:
         )
 
     # -------------------------------------------------------- get_task_status
-    def get_task_status(self, task_id: str) -> ToolResult:
+    def get_task_status(self, task_id: str, *, workflow_id: str | None = None) -> ToolResult:
+        if not self._in_workflow(task_id, workflow_id):
+            return ToolResult(False, {}, f"unknown task: {task_id}")
         try:
             task = self.store.get_task(task_id)
         except NotFound:
@@ -138,7 +164,9 @@ class SrTools:
         )
 
     # -------------------------------------------------------- get_task_report
-    def get_task_report(self, task_id: str) -> ToolResult:
+    def get_task_report(self, task_id: str, *, workflow_id: str | None = None) -> ToolResult:
+        if not self._in_workflow(task_id, workflow_id):
+            return ToolResult(False, {}, f"unknown task: {task_id}")
         try:
             task = self.store.get_task(task_id)
         except NotFound:
@@ -155,12 +183,16 @@ class SrTools:
         )
 
     # ----------------------------------------------------- request_task_revision
-    def request_task_revision(self, task_id: str, feedback: str) -> ToolResult:
+    def request_task_revision(
+        self, task_id: str, feedback: str, *, workflow_id: str | None = None
+    ) -> ToolResult:
         """Send revision feedback and re-queue the task for another attempt.
 
         The task is moved to QUEUED (which clears the lease) and the feedback is
         stored as evidence, so the next dispatch runs with it in context.
         """
+        if not self._in_workflow(task_id, workflow_id):
+            return ToolResult(False, {}, f"unknown task: {task_id}")
         try:
             task = self.store.get_task(task_id)
         except NotFound:
@@ -184,8 +216,10 @@ class SrTools:
 
     # ----------------------------------------------------- accept_task_result
     def accept_task_result(self, task_id: str, *, accepted: bool,
-                           note: str = "") -> ToolResult:
+                           note: str = "", workflow_id: str | None = None) -> ToolResult:
         """Record Sr's acceptance decision on a verified task."""
+        if not self._in_workflow(task_id, workflow_id):
+            return ToolResult(False, {}, f"unknown task: {task_id}")
         try:
             task = self.store.get_task(task_id)
         except NotFound:
@@ -209,7 +243,9 @@ class SrTools:
         return ToolResult(True, {"task_id": task_id, "state": TaskState.QUEUED.value})
 
     # ------------------------------------------------------------ cancel_task
-    def cancel_task(self, task_id: str) -> ToolResult:
+    def cancel_task(self, task_id: str, *, workflow_id: str | None = None) -> ToolResult:
+        if not self._in_workflow(task_id, workflow_id):
+            return ToolResult(False, {}, f"unknown task: {task_id}")
         try:
             task = self.store.get_task(task_id)
         except NotFound:

@@ -112,7 +112,6 @@ class SrRuntime:
             "sr_accept_task_result": self.tools.accept_task_result,
             "sr_cancel_task": self.tools.cancel_task,
         }
-        self._workflow_scoped = {"sr_create_task", "sr_list_child_tasks"}
         self._tool_names = set(self._ops)
 
     # ------------------------------------------------------------------ start
@@ -125,6 +124,13 @@ class SrRuntime:
         existing = self.store.sr_for(workflow_id)
         if existing and existing.get("sr_conversation_id"):
             return existing["sr_conversation_id"]
+        # A crash after start_conversation but before bind_sr leaves a real Sr
+        # conversation with no local record. Find it by its tag instead of
+        # starting a second Sr for the same workflow.
+        orphan = self._find_orphan_sr(workflow_id)
+        if orphan is not None:
+            self.store.bind_sr(workflow_id, conversation_id=orphan, status="running")
+            return orphan
         goal = (existing or {}).get("goal") or "workflow"
         repos = self.store.list_repositories()
         start = self.client.start_conversation(
@@ -142,6 +148,20 @@ class SrRuntime:
             workflow_id, conversation_id=conversation_id, status="running"
         )
         return conversation_id
+
+    def _find_orphan_sr(self, workflow_id: str) -> str | None:
+        """A previously started Sr conversation tagged for this workflow."""
+        value = workflow_id.replace("-", "")
+        try:
+            items, _ = self.client.search_conversations(
+                limit=50, tag=("orchestratorsr", value)
+            )
+        except CloudError:
+            return None
+        for conv in items:
+            if conv.tags.get("orchestratorsr") == value:
+                return conv.id
+        return None
 
     def _await_start(self, start) -> str:
         current = start
@@ -163,6 +183,7 @@ class SrRuntime:
     def tick(self) -> SrTickReport:
         """Handle every unclaimed Sr tool call for every workflow with an Sr."""
         report = SrTickReport()
+        self._redeliver(report)
         for workflow in self.store.list_workflows():
             workflow_id = workflow["id"]
             sr = self.store.sr_for(workflow_id)
@@ -181,6 +202,26 @@ class SrRuntime:
             for event in events:
                 self._maybe_handle(workflow_id, sr["sr_conversation_id"], event, report)
         return report
+
+    def _redeliver(self, report: SrTickReport) -> None:
+        """Re-send results whose delivery was lost to a crash.
+
+        A tool call can be executed and recorded but never delivered (the process
+        died between ``finish_tool_call`` and ``send_message``). Without this, Sr
+        waits forever. Delivery is therefore at-least-once: a rare duplicate
+        message is preferable to a stalled workflow.
+        """
+        for row in self.store.pending_deliveries():
+            text = (
+                f"[{row['name']} result]\n"
+                f"{json.dumps(row['result'], default=str)}"
+            )
+            try:
+                self.client.send_message(row["sr_conversation_id"], text)
+            except CloudError as e:
+                report.errors.append({"name": row["name"], "error": str(e)})
+                continue
+            self.store.mark_delivered(row["event_id"])
 
     def _maybe_handle(
         self,
@@ -202,7 +243,7 @@ class SrRuntime:
             event_id, workflow_id=workflow_id, name=name, args=args
         ):
             return  # already executed by an earlier poll
-        result = self._execute(name, args, workflow_id)
+        result = self._execute(name, args, workflow_id, event_id)
         report.handled.append({"event_id": event_id, "name": name, "ok": result.ok})
         self.store.finish_tool_call(
             event_id,
@@ -210,15 +251,21 @@ class SrRuntime:
             is_error=not result.ok,
             task_id=result.data.get("task_id"),
         )
-        self._deliver(conversation_id, name, result, report)
+        self._deliver(event_id, conversation_id, name, result, report)
 
-    def _execute(self, name: str, args: dict[str, Any], workflow_id: str) -> ToolResult:
+    def _execute(
+        self, name: str, args: dict[str, Any], workflow_id: str, event_id: str
+    ) -> ToolResult:
         """Dispatch to the real Sr operation, forcing the workflow from context.
 
         Only the seven known tools are reachable, and only with their declared
         arguments, so a malformed call cannot reach arbitrary code. The model
         cannot be trusted to know the workflow id (observed live: it invented
         one), so ``workflow_id`` is always replaced with the real value.
+
+        ``create_task`` receives an idempotency key derived from the Cloud event
+        id. If the process crashed after the claim and this call is re-executed,
+        the store returns the task it already created instead of a second one.
         """
         args = dict(args)
         args.pop("kind", None)
@@ -227,9 +274,10 @@ class SrRuntime:
         if op is None:
             return ToolResult(False, {}, f"unknown tool: {name}")
         try:
-            if name in self._workflow_scoped:
-                return op(workflow_id=workflow_id, **args)
-            return op(**args)
+            if name == "sr_create_task":
+                args.setdefault("idempotency_key", f"sr:{event_id}")
+            # ``workflow_id`` always comes from trusted context, never the model.
+            return op(workflow_id=workflow_id, **args)
         except TypeError as e:  # bad arguments from the model
             return ToolResult(False, {}, f"invalid arguments for {name}: {e}")
         except NotFound as e:
@@ -240,6 +288,7 @@ class SrRuntime:
 
     def _deliver(
         self,
+        event_id: str,
         conversation_id: str,
         name: str,
         result: ToolResult,
@@ -249,8 +298,11 @@ class SrRuntime:
         try:
             self.client.send_message(conversation_id, text)
         except CloudError as e:
-            # The call is already recorded as handled; surface, do not crash.
+            # Execution is recorded; delivery is retried by ``_redeliver`` on the
+            # next tick, so a transient failure does not stall Sr.
             report.errors.append({"name": name, "error": str(e)})
+            return
+        self.store.mark_delivered(event_id)
 
 
 def _action_args(action: Any) -> dict[str, Any]:

@@ -689,6 +689,10 @@ class PostgresStore:
             )
             rows = cur.fetchall()
         self._conn.commit()
+        # ``id`` comes back as a uuid.UUID; callers compare it with string ids
+        # (e.g. the workflow-scope check), so normalize it to str here.
+        for row in rows:
+            row["id"] = str(row["id"])
         return rows
 
     def list_repositories(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
@@ -709,28 +713,51 @@ class PostgresStore:
         workflow_id: str | None,
         name: str,
         args: dict[str, Any],
+        lease_seconds: float = 120.0,
+        max_attempts: int = 5,
     ) -> bool:
         """Atomically claim a client-tool call for execution.
 
-        Returns True when this caller inserted the row (so it must run the tool),
-        False when another poll already claimed the same Cloud event id. The
-        primary key on ``event_id`` is what makes execution exactly-once across
-        polls and restarts.
+        Returns True when this caller may run the tool, False when another poll
+        already handled the same Cloud event id.
+
+        This is a *lease*, not a one-shot flag. The ``event_id`` primary key makes
+        the common case execute once; if the process crashes after the claim and
+        before :meth:`finish_tool_call`, the row is left unfinished and its
+        ``claimed_at`` goes stale, so a later poll re-claims it (bounded by
+        ``max_attempts``). That turns permanent event loss into at-least-once
+        execution, which is why the operations it calls must be idempotent.
         """
-        try:
-            with self._tx() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO sr_tool_calls(event_id, workflow_id, name, args)
-                    VALUES (%s,%s,%s,%s)
-                    """,
-                    (event_id, workflow_id, name, json.dumps(args)),
-                )
-                self._event(cur, "sr_tool_call_claimed", workflow_id=workflow_id,
-                            detail={"event_id": event_id, "name": name})
-        except psycopg.errors.UniqueViolation:
-            return False
+        with self._tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO sr_tool_calls(event_id, workflow_id, name, args,
+                                          claimed_at, attempts)
+                VALUES (%s,%s,%s,%s, now(), 1)
+                ON CONFLICT (event_id) DO UPDATE
+                   SET claimed_at = now(),
+                       attempts   = sr_tool_calls.attempts + 1
+                 WHERE sr_tool_calls.finished_at IS NULL
+                   AND sr_tool_calls.claimed_at < now() - make_interval(secs => %s)
+                   AND sr_tool_calls.attempts < %s
+                RETURNING event_id
+                """,
+                (event_id, workflow_id, name, json.dumps(args),
+                 lease_seconds, max_attempts),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            self._event(cur, "sr_tool_call_claimed", workflow_id=workflow_id,
+                        detail={"event_id": event_id, "name": name})
         return True
+
+    def tool_call(self, event_id: str) -> dict[str, Any] | None:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT * FROM sr_tool_calls WHERE event_id=%s", (event_id,))
+            row = cur.fetchone()
+        self._conn.commit()
+        return row
 
     def finish_tool_call(
         self,
@@ -753,6 +780,42 @@ class PostgresStore:
             self._event(cur, "sr_tool_call_finished", task_id=task_id,
                         detail={"event_id": event_id, "is_error": is_error})
 
+    def mark_delivered(self, event_id: str) -> None:
+        """Record that the result reached the Sr conversation."""
+        with self._tx() as cur:
+            cur.execute(
+                "UPDATE sr_tool_calls SET delivered_at=now() WHERE event_id=%s",
+                (event_id,),
+            )
+            self._event(cur, "sr_tool_call_delivered",
+                        detail={"event_id": event_id})
+
+    def pending_deliveries(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Finished calls whose result was never delivered to Sr.
+
+        A crash between ``finish_tool_call`` and ``send_message`` would otherwise
+        strand the result: Sr waits forever for a reply it will never get. These
+        rows are re-delivered on the next tick.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.event_id, c.workflow_id, c.name, c.result, c.is_error,
+                       w.sr_conversation_id
+                  FROM sr_tool_calls c
+                  JOIN workflows w ON w.id = c.workflow_id
+                 WHERE c.finished_at IS NOT NULL
+                   AND c.delivered_at IS NULL
+                   AND w.sr_conversation_id IS NOT NULL
+                 ORDER BY c.finished_at
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        self._conn.commit()
+        return rows
+
     def tool_calls(self, *, workflow_id: str, limit: int = 100) -> list[dict]:
         with self._conn.cursor() as cur:
             cur.execute(
@@ -763,6 +826,74 @@ class PostgresStore:
             rows = cur.fetchall()
         self._conn.commit()
         return rows
+
+    def count_child_tasks(self, workflow_id: str) -> int:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM tasks WHERE workflow_id=%s", (workflow_id,)
+            )
+            row = cur.fetchone()
+        self._conn.commit()
+        return int(row["n"]) if row else 0
+
+    def has_pending_tool_calls(self, workflow_id: str) -> bool:
+        """True when a tool call is claimed-but-unfinished or finished-but-undelivered.
+
+        The workflow verifier uses this to avoid completing a workflow while a Sr
+        call is still in flight or its result has not reached Sr yet.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM sr_tool_calls WHERE workflow_id=%s "
+                "AND (finished_at IS NULL OR delivered_at IS NULL) LIMIT 1",
+                (workflow_id,),
+            )
+            row = cur.fetchone()
+        self._conn.commit()
+        return row is not None
+
+    # -------------------------------------------------------- workflow state
+    def workflow_progress(self, workflow_id: str) -> dict[str, int]:
+        """Counts by category, from durable task state only."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT state, count(*) AS n FROM tasks WHERE workflow_id=%s "
+                "GROUP BY state",
+                (workflow_id,),
+            )
+            rows = cur.fetchall()
+        self._conn.commit()
+        counts = {r["state"]: int(r["n"]) for r in rows}
+        completed = counts.get(TaskState.COMPLETED.value, 0)
+        cancelled = counts.get(TaskState.CANCELLED.value, 0)
+        blocked = counts.get(TaskState.BLOCKED.value, 0)
+        failed = (counts.get(TaskState.FAILED.value, 0)
+                  + counts.get(TaskState.DEAD_LETTER.value, 0))
+        active = sum(
+            counts.get(s.value, 0)
+            for s in (TaskState.QUEUED, TaskState.ASSIGNED, TaskState.RUNNING,
+                      TaskState.VERIFYING, TaskState.RECOVERING)
+        )
+        return {
+            "total": sum(counts.values()),
+            "completed": completed,
+            "cancelled": cancelled,
+            "blocked": blocked,
+            "failed": failed,
+            "active": active,
+        }
+
+    def set_workflow_state(self, workflow_id: str, state: str) -> None:
+        """Move a workflow to *state*. Only the verifier calls this."""
+        with self._tx() as cur:
+            cur.execute(
+                "UPDATE workflows SET state=%s, updated_at=now() WHERE id=%s",
+                (state, workflow_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFound(f"workflow {workflow_id}")
+            self._event(cur, "workflow_state", workflow_id=workflow_id,
+                        detail={"state": state})
 
 
 def _row_to_task(row: dict[str, Any]) -> Task:

@@ -110,6 +110,7 @@ class CloudConversation:
     selected_branch: str | None
     conversation_url: str | None
     sub_conversation_ids: list[str] = field(default_factory=list)
+    tags: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -158,6 +159,12 @@ class CloudClient:
             if e.code == 422:
                 raise CloudValidationError(
                     f"{method} {path} -> 422: {json.dumps(payload)[:300]}"
+                ) from e
+            if e.code == 429:
+                # Rate limit / daily quota: transient by nature, must not burn an
+                # attempt or dead-letter a task.
+                raise CloudUnavailable(
+                    f"{method} {path} -> 429: {json.dumps(payload)[:200]}"
                 ) from e
             if e.code >= 500:
                 raise CloudUnavailable(f"{method} {path} -> {e.code}") from e
@@ -241,12 +248,21 @@ class CloudClient:
         return _conversation(item)
 
     def search_conversations(
-        self, *, limit: int = 50, page_id: str | None = None
+        self, *, limit: int = 50, page_id: str | None = None,
+        tag: tuple[str, str] | None = None,
     ) -> tuple[list[CloudConversation], str | None]:
-        """``GET /api/v1/app-conversations/search`` -> ``(items, next_page_id)``."""
+        """``GET /api/v1/app-conversations/search`` -> ``(items, next_page_id)``.
+
+        ``tag`` adds a ``tags__contains`` filter (repeatable ``key=value``, all
+        must match), which is how an orphaned conversation is found by the tag we
+        put on it instead of starting a second one.
+        """
         path = f"/api/v1/app-conversations/search?limit={limit}"
         if page_id:
             path += f"&page_id={page_id}"
+        if tag is not None:
+            key, value = tag
+            path += f"&tags__contains={key}%3D{value}"
         status, payload = self._request("GET", path)
         if status != 200 or not isinstance(payload, dict):
             raise CloudError(f"search_conversations -> {status}")
@@ -291,21 +307,34 @@ class CloudClient:
     MAX_EVENTS_PER_PAGE = 100
 
     def list_events(
-        self, conversation_id: str, *, limit: int = MAX_EVENTS_PER_PAGE
+        self, conversation_id: str, *, limit: int = MAX_EVENTS_PER_PAGE,
+        max_pages: int = 10,
     ) -> list[dict[str, Any]]:
-        """``GET /api/v1/conversation/{id}/events/search``.
+        """``GET /api/v1/conversation/{id}/events/search`` (all pages).
 
-        There is no ``agent_final_response`` endpoint on Cloud V1; the final
-        answer is read from the assistant message in the event stream.
-        ``limit`` is capped at 100, which the server enforces.
+        The server caps a page at 100 events, so a conversation with more than
+        100 events would hide older ``ActionEvent`` s and lose the tool call.
+        This walks ``next_page_id`` until the pages are exhausted (bounded by
+        ``max_pages``). The default sort is ascending, so the pages concatenate
+        into oldest-first order, which is what callers expect.
         """
         limit = min(limit, self.MAX_EVENTS_PER_PAGE)
-        status, payload = self._request(
-            "GET", f"/api/v1/conversation/{conversation_id}/events/search?limit={limit}"
-        )
-        if status != 200 or not isinstance(payload, dict):
-            raise CloudError(f"list_events -> {status}")
-        return list(payload.get("items") or [])
+        collected: list[dict[str, Any]] = []
+        page_id: str | None = None
+        for _ in range(max_pages):
+            path = (
+                f"/api/v1/conversation/{conversation_id}/events/search?limit={limit}"
+            )
+            if page_id:
+                path += f"&page_id={page_id}"
+            status, payload = self._request("GET", path)
+            if status != 200 or not isinstance(payload, dict):
+                raise CloudError(f"list_events -> {status}")
+            collected.extend(payload.get("items") or [])
+            page_id = payload.get("next_page_id")
+            if not page_id:
+                break
+        return collected
 
     def final_response(
         self, conversation_id: str, *, limit: int = MAX_EVENTS_PER_PAGE
@@ -361,5 +390,6 @@ def _conversation(payload: dict[str, Any]) -> CloudConversation:
         selected_branch=payload.get("selected_branch"),
         conversation_url=payload.get("conversation_url"),
         sub_conversation_ids=list(payload.get("sub_conversation_ids") or []),
+        tags=dict(payload.get("tags") or {}),
         raw=payload,
     )

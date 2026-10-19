@@ -43,6 +43,11 @@ MIGRATION_2 = os.path.join(
     "migrations",
     "0002_sr_runtime.sql",
 )
+MIGRATION_3 = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "migrations",
+    "0003_tool_call_recovery.sql",
+)
 
 
 def _reset_schema() -> None:
@@ -56,6 +61,7 @@ def _reset_schema() -> None:
             )
             cur.execute(open(MIGRATION).read())
             cur.execute(open(MIGRATION_2).read())
+            cur.execute(open(MIGRATION_3).read())
 
 
 @pytest.fixture(autouse=True)
@@ -224,25 +230,25 @@ def test_sr_tools_full_cycle(store, cloud, dispatcher, tools):
     res = tools.create_task("child work", workflow_id=wf)
     tid = res.data["task_id"]
 
-    status = tools.get_task_status(tid)
+    status = tools.get_task_status(tid, workflow_id=wf)
     assert status.ok and status.data["state"] == "queued"
 
     kids = tools.list_child_tasks(workflow_id=wf)
     assert len(kids.data["tasks"]) == 1
 
     dispatcher.tick()
-    assert tools.get_task_status(tid).data["state"] == "running"
+    assert tools.get_task_status(tid, workflow_id=wf).data["state"] == "running"
 
     conv = store.conversation_for(tid)["external_conversation_id"]
     cloud.cloud.conversations[conv]["execution_status"] = "finished"
     cloud.cloud.add_assistant_message(conv, "result text")
     dispatcher.tick()
 
-    report = tools.get_task_report(tid)
+    report = tools.get_task_report(tid, workflow_id=wf)
     assert report.data["state"] == "completed"
     assert report.data["result"] == "result text"
 
-    acc = tools.accept_task_result(tid, accepted=True, note="looks good")
+    acc = tools.accept_task_result(tid, accepted=True, note="looks good", workflow_id=wf)
     assert acc.ok
 
 
@@ -252,7 +258,7 @@ def test_request_revision_delivers_and_requeues(store, cloud, dispatcher, tools)
     dispatcher.tick()
     conv = store.conversation_for(tid)["external_conversation_id"]
 
-    res = tools.request_task_revision(tid, "please add tests")
+    res = tools.request_task_revision(tid, "please add tests", workflow_id=wf)
     assert res.ok
     assert store.get_task(tid).state is TaskState.QUEUED
     assert cloud.cloud.messages[conv] == ["please add tests"]
@@ -261,7 +267,7 @@ def test_request_revision_delivers_and_requeues(store, cloud, dispatcher, tools)
 def test_cancel_task(store, dispatcher, tools):
     wf = store.create_workflow("wf")
     tid = tools.create_task("child work", workflow_id=wf).data["task_id"]
-    assert tools.cancel_task(tid).ok
+    assert tools.cancel_task(tid, workflow_id=wf).ok
     assert store.get_task(tid).state is TaskState.CANCELLED
 
 
@@ -300,7 +306,13 @@ def test_auth_failure_dead_letters_with_evidence(store, dispatcher):
     t = store.submit_task("do work", workflow_id=wf)
 
     class _NoKey(CloudClient):
+        # A bad key fails every call, including the orphan-search that now runs
+        # before a start.
         def start_conversation(self, **kw):  # type: ignore[override]
+            from orchestration.cloud_client import CloudAuthError
+            raise CloudAuthError("401")
+
+        def search_conversations(self, **kw):  # type: ignore[override]
             from orchestration.cloud_client import CloudAuthError
             raise CloudAuthError("401")
 

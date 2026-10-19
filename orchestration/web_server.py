@@ -52,6 +52,7 @@ from .cloud_store import (
 )
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
+from .workflow_verifier import WorkflowVerifier
 
 log = logging.getLogger("web_server")
 
@@ -257,9 +258,14 @@ setInterval(loadWorkflows, 5000);
 class App:
     """Wires the store, Cloud client, Sr runtime and Jr dispatcher together."""
 
-    def __init__(self, dsn: str, *, worker_id: str = "web", poll_interval: float = 5.0):
+    def __init__(self, dsn: str, *, worker_id: str = "web", poll_interval: float = 5.0,
+                 token: str | None = None):
         self.store = PostgresStore(dsn)
         self.client = CloudClient()
+        # Bearer token for the write API. Without one, only read-only requests
+        # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
+        # stranger to start Cloud conversations. ``None`` means "not set".
+        self.token = token if token is not None else os.environ.get("WEB_AUTH_TOKEN")
         self.dispatcher = CloudDispatcher(
             self.store, self.client, worker_id=worker_id,
             start_poll_interval=2.0, start_poll_attempts=40,
@@ -268,6 +274,7 @@ class App:
             self.store, self.client, SrTools(self.store, self.dispatcher),
             worker_id=worker_id, start_poll_interval=2.0, start_poll_attempts=40,
         )
+        self.verifier = WorkflowVerifier(self.store, self.client)
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         self._loop: threading.Thread | None = None
@@ -289,7 +296,8 @@ class App:
             try:
                 sr = self.runtime.tick().as_dict()
                 jr = self.dispatcher.tick().as_dict()
-                self.last_tick = {"at": time.time(), "sr": sr, "jr": jr}
+                vf = self.verifier.tick().as_dict()
+                self.last_tick = {"at": time.time(), "sr": sr, "jr": jr, "verify": vf}
             except CloudError as e:
                 self.last_tick = {"at": time.time(), "cloud_error": str(e)}
             except Exception as e:  # noqa: BLE001 - the loop must survive
@@ -377,6 +385,18 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             raise ValueError("body is not valid JSON")
 
+    def _authorized(self) -> bool:
+        """Writes require the configured bearer token; reads never do.
+
+        When no token is configured the server is read-only, which is the safe
+        default for a process that can spend Cloud quota.
+        """
+        token = getattr(self.app, "token", None)
+        if not token:
+            return False
+        header = self.headers.get("Authorization", "")
+        return header == f"Bearer {token}"
+
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -410,6 +430,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {
                     "store": True,
                     "cloud": self.app.client.health(),
+                    "writes_require_auth": bool(getattr(self.app, "token", None)),
                     "last_tick": self.app.last_tick,
                 })
             return self._json(404, {"error": "not found"})
@@ -422,6 +443,8 @@ class Handler(BaseHTTPRequestHandler):
     # ----------------------------------------------------------------- POST
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if not self._authorized():
+            return self._json(401, {"error": "unauthorized"})
         try:
             body = self._body()
             if path == "/api/repositories":
@@ -504,6 +527,11 @@ def main() -> int:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--poll-interval", type=float, default=5.0)
+    ap.add_argument(
+        "--token",
+        default=os.environ.get("WEB_AUTH_TOKEN"),
+        help="bearer token required for writes (default: $WEB_AUTH_TOKEN)",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
 
@@ -511,8 +539,11 @@ def main() -> int:
     if not dsn:
         print("set SUPABASE_DB_URL")
         return 2
+    if args.host not in ("127.0.0.1", "localhost") and not args.token:
+        print("refusing to bind a public interface without --token/WEB_AUTH_TOKEN")
+        return 2
     try:
-        app = App(dsn, poll_interval=args.poll_interval)
+        app = App(dsn, poll_interval=args.poll_interval, token=args.token)
     except StoreError as e:
         print(f"store error: {e}")
         return 2

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,7 +33,7 @@ class FakeCloud:
         self.calls: list[tuple[str, str]] = []
 
     def make_conversation(self, *, title, repo=None, branch=None,
-                          execution_status="running") -> str:
+                          execution_status="running", tags=None) -> str:
         cid = str(uuid.uuid4())
         self.conversations[cid] = {
             "id": cid,
@@ -44,6 +45,7 @@ class FakeCloud:
             "selected_branch": branch,
             "conversation_url": f"https://cloud.example/api/conversations/{cid}",
             "sub_conversation_ids": [],
+            "tags": dict(tags or {}),
         }
         self.events[cid] = []
         self.messages[cid] = []
@@ -119,6 +121,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/app-conversations/search":
             items = list(self.cloud.conversations.values())
+            # tags__contains is a repeatable key=value filter; all must match.
+            for raw in self._query_all("tags__contains"):
+                key, _, value = raw.partition("=")
+                items = [c for c in items if (c.get("tags") or {}).get(key) == value]
             return self._json(200, {"items": items, "next_page_id": None})
 
         if path == "/api/v1/app-conversations/start-tasks":
@@ -135,9 +141,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/v1/conversation/") and path.endswith("/events/search"):
             cid = path.split("/")[4]
-            return self._json(200, {"items": self.cloud.events.get(cid, []),
-                                    "next_page_id": None})
-
+            events = self.cloud.events.get(cid, [])
+            page = int(self._query("page_id") or 0)
+            limit = int(self._query("limit") or 100)
+            start = page * limit
+            chunk = events[start:start + limit]
+            nxt = str(page + 1) if start + limit < len(events) else None
+            return self._json(200, {"items": chunk, "next_page_id": nxt})
         return self._json(404, {"detail": "not found"})
 
     # ----------------------------------------------------------------- POST
@@ -157,6 +167,7 @@ class _Handler(BaseHTTPRequestHandler):
                 title=body.get("title") or "conversation",
                 repo=body.get("selected_repository"),
                 branch=body.get("selected_branch"),
+                tags=body.get("tags"),
             )
             self.cloud.client_tools[cid] = body.get("client_tools") or []
             self.cloud.events[cid].append(
@@ -194,8 +205,18 @@ class _Handler(BaseHTTPRequestHandler):
         for pair in qs.split("&"):
             k, _, v = pair.partition("=")
             if k == key:
-                return v
+                return urllib.parse.unquote(v)
         return ""
+
+    def _query_all(self, key: str) -> list[str]:
+        if "?" not in self.path:
+            return []
+        out = []
+        for pair in self.path.split("?", 1)[1].split("&"):
+            k, _, v = pair.partition("=")
+            if k == key:
+                out.append(urllib.parse.unquote(v))
+        return out
 
 
 class FakeCloudServer:
