@@ -11,6 +11,26 @@ Russian; product and technical names (OpenHands, MCP, Sr/Jr) stay as-is.
 
 from __future__ import annotations
 
+#: Favicon served at /favicon.ico and /favicon.svg. An SVG document works in
+#: every browser that renders this dashboard, and it keeps the asset a single
+#: inline string with no binary in the repo. The mark is the brand accent tile
+#: with the dispatcher glyph cut out of it: one source node branching to three
+#: tasks. Drawn bold and inverted (dark glyph on the accent) because the dark
+#: surface used elsewhere turns to mush at the 16px tab size.
+FAVICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="15" fill="#5b8cff"/>
+<g stroke="#0b0d12" stroke-width="6" fill="none" stroke-linecap="round">
+<path d="M22 32h8"/><path d="M30 32h6"/>
+<path d="M36 32c7 0 5-11 12-11"/><path d="M36 32h12"/>
+<path d="M36 32c7 0 5 11 12 11"/>
+</g>
+<circle cx="18" cy="32" r="7" fill="#0b0d12"/>
+<circle cx="51" cy="21" r="5.5" fill="#0b0d12"/>
+<circle cx="51" cy="32" r="5.5" fill="#0b0d12"/>
+<circle cx="51" cy="43" r="5.5" fill="#0b0d12"/>
+</svg>
+"""
+
 #: Stylesheet served at /static/app.css. Plain CSS, no build step.
 APP_CSS = r"""
 :root {
@@ -222,6 +242,7 @@ APP_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Диспетчер OpenHands</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>

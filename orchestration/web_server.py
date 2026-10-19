@@ -80,7 +80,7 @@ from .web_auth import (
     parse_cookie,
     session_cookie_header,
 )
-from .web_ui import APP_CSS, APP_HTML, APP_JS
+from .web_ui import APP_CSS, APP_HTML, APP_JS, FAVICON_SVG
 from .workflow_verifier import WorkflowVerifier
 
 log = logging.getLogger("web_server")
@@ -103,6 +103,7 @@ LOGIN_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Вход — Диспетчер OpenHands</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="auth-body">
@@ -430,7 +431,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/static/app.js":
                 return self._static(200, APP_JS, "application/javascript; charset=utf-8")
             if path == "/favicon.ico":
-                return self._json(404, {"error": "not found"})
+                # SVG works as a favicon in every browser that renders this
+                # dashboard; declaring it in the markup avoids a 404 for the
+                # default /favicon.ico probe.
+                return self._static(200, FAVICON_SVG, "image/svg+xml")
+            if path == "/favicon.svg":
+                return self._static(200, FAVICON_SVG, "image/svg+xml")
 
             # --- everything below requires authentication ---
             if path == "/":

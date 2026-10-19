@@ -127,6 +127,48 @@ def test_page_is_served(http):
     assert "/static/app.js" in text
 
 
+def _get_with_headers(base: str, path: str, token: str | None = None):
+    req = urllib.request.Request(base + path)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def test_favicon_is_served_as_svg(server):
+    """The browser's automatic /favicon.ico probe must not 404."""
+    base = f"http://127.0.0.1:{server.port}"
+    st, headers, body = _get_with_headers(base, "/favicon.ico")
+    assert st == 200
+    assert headers["Content-Type"] == "image/svg+xml"
+    assert b"<svg" in body
+
+    st, headers, body = _get_with_headers(base, "/favicon.svg")
+    assert st == 200
+    assert headers["Content-Type"] == "image/svg+xml"
+
+
+def test_favicon_is_public_and_has_no_secret(server):
+    """The icon loads before login, so it must reveal nothing."""
+    base = f"http://127.0.0.1:{server.port}"
+    st, _, body = _get_with_headers(base, "/favicon.svg")
+    assert st == 200
+    text = body.decode()
+    for needle in ("key", "token", "password", "secret"):
+        assert needle not in text.lower()
+
+
+def test_pages_declare_the_favicon(http):
+    """Both pages must point at the icon so the tab shows the mark."""
+    for path in ("/", "/login"):
+        st, text = http.get_text(path)
+        assert st == 200
+        assert 'rel="icon"' in text and "/favicon.svg" in text
+
+
 def test_login_page_is_public(server):
     anon = Client(f"http://127.0.0.1:{server.port}")
     st, text = anon.get_text("/login")
