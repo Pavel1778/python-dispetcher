@@ -169,11 +169,27 @@ authorise tool calls.
 * **Better Stack** — `HEARTBEAT_URL` is fired only after a fully successful
   dispatch cycle. No monitor is configured yet.
 
+## Verified locally
+
+* Full suite: `96 passed` against real PostgreSQL 17 (including migrations,
+  leases, and `FOR UPDATE SKIP LOCKED`).
+* Bridge on PostgreSQL: `POST /jr/tasks` creates a Jr task end-to-end; `/ready`
+  reports `database: true`.
+* Transaction-pooler behaviour, measured against the server's own
+  `pg_prepared_statements`: with `DATABASE_TRANSACTION_POOLER=true` psycopg
+  reports `prepare_threshold=None` and **0** server-side prepared statements
+  after repeated identical queries; with `false` it prepares (1 statement).
+  This is exactly the property PgBouncer requires.
+* MCP transport: a real MCP client over HTTP creates a Jr child (see
+  `tests/test_mcp_http_e2e.py`).
+
 ## Not yet verified
 
-1. **Supabase credentials.** No real Supabase project has been connected; only
-   local PostgreSQL has been exercised. The Transaction-pooler code path
-   (`prepare_threshold=None`) is unit-tested but not run against a live pooler.
-2. **Live OpenHands Cloud.** All OpenHands API interaction is exercised through
+1. **Live Supabase.** Verified against local PostgreSQL 17 with the pooler flag;
+   no Supabase project has been connected, so the pooler has not been exercised
+   through PgBouncer itself.
+2. **Render deployment.** `render.yaml` is written but no service has been
+   created; no `RENDER_API_KEY` is available in this environment.
+3. **Live OpenHands Cloud.** All OpenHands API interaction is exercised through
    a fake client; no end-to-end run against the real API has been performed.
-3. **Better Stack.** No monitor configured.
+4. **Better Stack.** No monitor configured.
