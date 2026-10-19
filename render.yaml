@@ -19,6 +19,10 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: DATABASE_TRANSACTION_POOLER
+        value: "true"
       - key: JR_BRIDGE_TOKEN
         sync: false
       - key: HEARTBEAT_URL

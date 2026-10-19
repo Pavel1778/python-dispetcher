@@ -47,13 +47,18 @@ runtime = _Runtime()
 
 
 def build_store(settings: Settings) -> StateStore:
-    if settings.database_url:
+    if settings.resolved_database_url:
         return PostgresStateStore(
-            settings.database_url,
+            settings.resolved_database_url,
             pool_min=settings.database_pool_min_size,
             pool_max=settings.database_pool_max_size,
+            connect_timeout=settings.database_connect_timeout_seconds,
+            transaction_pooler=settings.database_transaction_pooler,
         )
-    logger.warning("DATABASE_URL not set; using in-memory store (state is not durable)")
+    logger.warning(
+        "no database URL set (DATABASE_URL / SUPABASE_DB_URL); "
+        "using in-memory store (state is not durable)"
+    )
     return InMemoryStateStore()
 
 

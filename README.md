@@ -97,6 +97,21 @@ Migrations live in `app/migrations/` and are applied automatically on startup
 
 Tables: `workflows`, `tasks`, `task_events`, `notifications`, `schema_migrations`.
 
+### Supabase (Transaction pooler)
+
+Connection string is read from `DATABASE_URL`, falling back to `SUPABASE_DB_URL`.
+Set it in the Render dashboard (or local `.env`) — never in code.
+
+The **Transaction pooler** (PgBouncer, port `6543`) does not support server-side
+prepared statements. psycopg 3 prepares statements automatically after a few
+executions, which breaks under PgBouncer, so the store sets
+`prepare_threshold=None` when `DATABASE_TRANSACTION_POOLER=true` (the default).
+For a direct/session connection (port `5432`) set it to `false`.
+
+Use the pooler connection string with a URL-encoded password. Because the
+pooler multiplexes connections, keep `DATABASE_POOL_MAX_SIZE` small (the
+default is 5).
+
 ## Render deployment
 
 `render.yaml` is a Blueprint for a free web service. Set `OPENHANDS_CLOUD_API_KEY`,

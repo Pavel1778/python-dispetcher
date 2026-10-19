@@ -80,23 +80,42 @@ def _row_to_workflow(row: dict[str, Any]) -> Workflow:
 
 
 class PostgresStateStore(StateStore):
-    def __init__(self, database_url: str, *, pool_min: int = 1, pool_max: int = 5) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        pool_min: int = 1,
+        pool_max: int = 5,
+        connect_timeout: int = 10,
+        transaction_pooler: bool = True,
+    ) -> None:
         self._database_url = database_url
         self._pool_min = pool_min
         self._pool_max = pool_max
+        self._connect_timeout = connect_timeout
+        # PgBouncer (Supabase transaction pooler) cannot use server-side
+        # prepared statements; psycopg prepares them automatically, so disable.
+        self._transaction_pooler = transaction_pooler
         self._pool: AsyncConnectionPool | None = None
 
     async def connect(self) -> None:
         if self._pool is None:
+            conn_kwargs: dict[str, Any] = {
+                "row_factory": dict_row,
+                "autocommit": True,
+                "connect_timeout": self._connect_timeout,
+            }
+            if self._transaction_pooler:
+                conn_kwargs["prepare_threshold"] = None
             self._pool = AsyncConnectionPool(
                 conninfo=self._database_url,
                 min_size=self._pool_min,
                 max_size=self._pool_max,
                 open=False,
-                kwargs={"row_factory": dict_row, "autocommit": True},
+                kwargs=conn_kwargs,
             )
         try:
-            await self._pool.open(wait=True, timeout=10)
+            await self._pool.open(wait=True, timeout=self._connect_timeout)
         except Exception as exc:  # noqa: BLE001 - surfaced as StoreUnavailableError
             raise StoreUnavailableError("could not connect to database") from exc
 

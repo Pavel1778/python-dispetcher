@@ -31,10 +31,18 @@ class Settings(BaseSettings):
     openhands_http_backoff_max_seconds: float = 10.0
 
     # --- Persistence ---
+    # Supabase connection strings are read from DATABASE_URL, falling back to
+    # SUPABASE_DB_URL. The password is only ever supplied via the environment.
     database_url: str | None = None
+    supabase_db_url: str | None = None
     database_connect_timeout_seconds: int = 10
     database_pool_min_size: int = 1
     database_pool_max_size: int = 5
+    # Supabase "Transaction pooler" runs PgBouncer in transaction mode, which
+    # does not support server-side prepared statements. psycopg 3 prepares
+    # statements automatically after a few executions, so this must be disabled
+    # when connecting through the pooler (port 6543).
+    database_transaction_pooler: bool = True
 
     # --- Dispatcher loop ---
     service_name: str = "openhands-dispatcher"
@@ -63,6 +71,11 @@ class Settings(BaseSettings):
         """Return the OpenHands API key, preferring the explicit cloud variable."""
         return self.openhands_cloud_api_key or self.openhands_api_key
 
+    @property
+    def resolved_database_url(self) -> str | None:
+        """PostgreSQL DSN, preferring DATABASE_URL over SUPABASE_DB_URL."""
+        return self.database_url or self.supabase_db_url
+
     def redaction_secrets(self) -> list[str]:
         """Secret values that must never appear in logs or API responses."""
         candidates = [
@@ -70,6 +83,7 @@ class Settings(BaseSettings):
             self.openhands_api_key,
             self.jr_bridge_token,
             self.database_url,
+            self.supabase_db_url,
         ]
         return [c for c in candidates if c]
 
