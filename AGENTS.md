@@ -19,6 +19,20 @@ agent-server.
   signals.
 - `INTEGRATION-MAP.md` — every confirmed API fact. Read it before changing the
   adapter.
+- `CLOUD-INTEGRATION-MAP.md` — the same for the **Cloud V1** adapter. Read it
+  before changing anything under `cloud_*`.
+- `orchestration/cloud_client.py` — stdlib-only REST adapter for **OpenHands
+  Cloud V1** (`/api/v1/app-conversations`, Bearer auth).
+- `orchestration/cloud_store.py` — PostgreSQL/Supabase task store. Atomic claim
+  via `SELECT ... FOR UPDATE SKIP LOCKED`; legal-path recovery via
+  `force_transition`.
+- `orchestration/cloud_dispatcher.py` — Cloud dispatcher. Two-phase create
+  (start task → poll → bind), allowlist, bounded retry, recovery.
+- `orchestration/sr_tools.py` — Sr operations (create/list/status/report/
+  revise/accept/cancel) with real, durable effects.
+- `migrations/0001_init.sql` — Supabase schema. Idempotent; apply with `psql`.
+- `tests/fake_cloud.py` — a real local HTTP server speaking the Cloud V1
+  surface. Cloud tests use it, not mocks of the client.
 - `tests/fake_runtime.py` — a real local HTTP server speaking the confirmed
   v1.50.1 surface. Tests use it, not mocks of the client.
 - `tests/e2e_*.py` — manual scripts against the real runtime. Not collected by
@@ -27,9 +41,14 @@ agent-server.
 ## Commands
 
 ```bash
-# Tests (needs the venv that has pytest; the system python does not)
+# Tests (needs the venv that has pytest; the system python does not).
+# Cloud tests need a PostgreSQL DSN; without it they skip cleanly.
+TEST_SUPABASE_DB_URL="postgresql://user:pw@127.0.0.1:5432/db" \
 /workspace/project/4119041ca5254315a7b6e95fdc85ae8a/scratch/sdk-main/.venv/bin/python \
   -m pytest tests/ -q -p no:cacheprovider
+
+# Apply the Supabase schema (idempotent).
+psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 
 # Manual end-to-end against the live runtime (creates and deletes its own
 # conversation; the three long-lived conversations are never touched)

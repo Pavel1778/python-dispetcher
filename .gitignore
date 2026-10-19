@@ -5,3 +5,7 @@ state/
 *.db
 *.db-wal
 *.db-shm
+.env
+.env.*
+!.env.example
+.audit-baseline/
