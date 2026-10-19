@@ -9,13 +9,14 @@ services:
     runtime: python
     plan: free
     region: oregon
-    # The code lives on this branch; ``main`` only holds the initial LICENSE.
-    branch: python-dispetcher
+    branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    autoDeploy: false
+    autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
       - key: OPENHANDS_CLOUD_API_KEY
         sync: false
       - key: DATABASE_URL
