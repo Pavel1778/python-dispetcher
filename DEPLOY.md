@@ -98,8 +98,13 @@ pip install -r requirements.txt
 
 ## Migrations
 
-Migrations are plain SQL under `migrations/` and are **idempotent**. Apply them
-in order, before the first start and after any pull that adds a file:
+Migrations are plain SQL under `migrations/` and are **idempotent**. The process
+applies them itself on first connect, in filename order, and records each file's
+checksum in `schema_migrations` so a restart does not re-run one. This is what
+makes the Render free plan deployable at all: free instances have no shell, so
+there is nowhere to run `psql` before the service starts.
+
+To apply them by hand instead, set `AUTO_MIGRATE=false` and run:
 
 ```
 psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
@@ -108,9 +113,20 @@ psql "$SUPABASE_DB_URL" -f migrations/0003_tool_call_recovery.sql
 psql "$SUPABASE_DB_URL" -f migrations/0004_auth.sql
 ```
 
-Do not run migrations against production without authorization. There is no
-automatic migration on boot by design, so a schema change is always a
-deliberate, reviewable step.
+Do not run migrations against production without authorization. Applying them on
+boot is still a deliberate step: it happens once per file, the SQL is
+idempotent, and `AUTO_MIGRATE=false` turns it off for environments that manage
+the schema out of band.
+
+## Connection pooling
+
+Set `DATABASE_TRANSACTION_POOLER=true` when `SUPABASE_DB_URL` points at
+Supabase's transaction pooler (PgBouncer, port 6543). The pooler may hand the
+same server connection to a different client between statements, so psycopg's
+automatic server-side preparation (default: after the fifth execution) can fail
+with `prepared statement ... does not exist`. The flag disables preparation
+(`prepare_threshold=None`), which is asserted by
+`tests/test_schema_bootstrap.py`.
 
 ## Render
 
@@ -118,6 +134,13 @@ deliberate, reviewable step.
 required variables are marked `sync: false` and must be set in the dashboard.
 The health check path is `/healthz`, which returns `{"status": "ok"}` and
 nothing else.
+
+The blueprint uses the **free** plan, which means:
+
+* the instance spins down after roughly 15 minutes idle and cold-starts on the
+  next request, so the background loop is not continuously running;
+* there is no shell and no persistent disk — all state is in PostgreSQL;
+* run exactly one instance: the loop is not partitioned between instances.
 
 
 ## Account capabilities (read-only)

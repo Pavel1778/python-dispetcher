@@ -24,12 +24,14 @@ and never logged. The service-role credential must stay server-side.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
 
 try:  # psycopg3
@@ -187,7 +189,8 @@ def _legal_path(frm: TaskState, to: TaskState) -> list[TaskState] | None:
 class PostgresStore:
     """Durable task store on PostgreSQL / Supabase."""
 
-    def __init__(self, dsn: str | None = None, *, connect_timeout: float = 10.0):
+    def __init__(self, dsn: str | None = None, *, connect_timeout: float = 10.0,
+                 auto_migrate: bool = True):
         if psycopg is None:  # pragma: no cover
             raise StoreError("psycopg is required: pip install 'psycopg[binary]'")
         self.dsn = dsn or os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
@@ -197,10 +200,69 @@ class PostgresStore:
         # A single connection is enough for one dispatcher process; the atomic
         # claim still protects against *other* processes. Callers needing more
         # concurrency can open one store per worker.
-        self._conn = psycopg.connect(
-            self.dsn, row_factory=dict_row, autocommit=False,
-            connect_timeout=connect_timeout,
-        )
+        #
+        # Supabase's transaction pooler (PgBouncer, port 6543) hands a server
+        # connection to a different client between statements, so a server-side
+        # prepared statement can be missing on the next execute. Disabling
+        # psycopg's automatic preparation keeps every statement unparameterised
+        # on the server. The default (5) prepares a statement after its fifth
+        # execution, which fails behind the pooler with
+        # "prepared statement ... does not exist".
+        pooler = os.environ.get("DATABASE_TRANSACTION_POOLER", "").lower() in ("1", "true", "yes")
+        connect_kwargs: dict[str, Any] = {
+            "row_factory": dict_row,
+            "autocommit": False,
+            "connect_timeout": connect_timeout,
+        }
+        if pooler:
+            connect_kwargs["prepare_threshold"] = None
+        self._conn = psycopg.connect(self.dsn, **connect_kwargs)
+        # Render's free plan has no shell to run ``psql`` in, so the schema must
+        # be applied by the process itself. The migrations are idempotent, and
+        # ``AUTO_MIGRATE=false`` opts out for environments that apply them out of
+        # band (a release step, a DBA).
+        if auto_migrate and os.environ.get("AUTO_MIGRATE", "true").lower() not in ("0", "false", "no"):
+            self.apply_migrations()
+
+    # ------------------------------------------------------------ migrations
+    def apply_migrations(self, directory: str | None = None) -> list[str]:
+        """Apply every ``*.sql`` migration in order, skipping applied ones.
+
+        Returns the names of the files actually run. A file whose checksum was
+        already recorded is skipped, so a restart does not re-execute it; the
+        SQL is idempotent regardless, so a partially-applied run still converges.
+        """
+        base = Path(directory) if directory else Path(__file__).resolve().parent.parent / "migrations"
+        files = sorted(base.glob("*.sql"))
+        if not files:
+            return []
+        applied: list[str] = []
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "  filename text PRIMARY KEY,"
+                "  checksum text NOT NULL,"
+                "  applied_at timestamptz NOT NULL DEFAULT now())"
+            )
+            self._conn.commit()
+            for path in files:
+                sql = path.read_text(encoding="utf-8")
+                checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+                cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
+                            (path.name,))
+                row = cur.fetchone()
+                if row is not None and row["checksum"] == checksum:
+                    continue
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s) "
+                    "ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum,"
+                    " applied_at = now()",
+                    (path.name, checksum),
+                )
+                self._conn.commit()
+                applied.append(path.name)
+        return applied
 
     def close(self) -> None:
         self._conn.close()
