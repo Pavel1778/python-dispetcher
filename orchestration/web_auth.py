@@ -66,6 +66,25 @@ class AuthError(RuntimeError):
     """Raised for an authentication failure that must not leak its reason."""
 
 
+class LoginLocked(AuthError):
+    """Raised when the (username, IP) pair is temporarily locked.
+
+    Distinct from a wrong password so the operator sees "too many attempts"
+    instead of "wrong login or password", which sent them looking at their
+    credentials. It reveals nothing about whether the account exists: the lock
+    key is derived from the submitted username and the client IP.
+    """
+
+    def __init__(self, retry_after: int):
+        self.retry_after = max(0, int(retry_after))
+        super().__init__(f"too many failed attempts; retry in {self.retry_after}s")
+
+
+#: Upper bound on the iteration count read from a stored hash. A corrupt or
+#: hostile value must not turn a login into an unbounded CPU burn.
+MAX_PBKDF2_ITERATIONS = 10_000_000
+
+
 def hash_password(password: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
     """Return a storable hash of *password* (salt and params included)."""
     salt = secrets.token_bytes(_SALT_BYTES)
@@ -80,21 +99,86 @@ def hash_password(password: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
     )
 
 
+def parse_hash(stored: str | None) -> tuple[bytes, bytes, int] | None:
+    """Return ``(salt, expected_digest, iterations)`` for *stored*, or ``None``.
+
+    Accepts only the format :func:`hash_password` produces. ``None`` means the
+    value is unusable, which is what a caller needs to tell a misconfigured
+    ``AUTH_PASSWORD_HASH`` apart from a genuinely wrong password.
+    """
+    if not stored or not isinstance(stored, str):
+        return None
+    parts = stored.split("$")
+    if len(parts) != 4:
+        return None
+    algo, iters, salt_b64, hash_b64 = parts
+    if algo != PBKDF2_ALGO:
+        return None
+    try:
+        iterations = int(iters)
+    except (TypeError, ValueError):
+        return None
+    if iterations < 1 or iterations > MAX_PBKDF2_ITERATIONS:
+        return None
+    try:
+        salt = base64.b64decode(salt_b64, validate=True)
+        expected = base64.b64decode(hash_b64, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if not salt or not expected:
+        return None
+    return salt, expected, iterations
+
+
+def password_hash_problem(stored: str | None) -> str | None:
+    """Describe why *stored* is not a usable hash, or ``None`` if it is fine.
+
+    The returned text never contains the value itself, so it is safe to log and
+    to show on the login page.
+    """
+    if not stored:
+        return "AUTH_PASSWORD_HASH is empty"
+    parts = stored.split("$")
+    if len(parts) != 4:
+        if "$" not in stored:
+            return ("AUTH_PASSWORD_HASH does not look like a hash; it may be the "
+                    "raw password. Run: python -m orchestration.web_auth hash")
+        return ("AUTH_PASSWORD_HASH is not in the "
+                "pbkdf2_sha256$<iterations>$<salt>$<hash> format")
+    algo, iters, salt_b64, hash_b64 = parts
+    if algo != PBKDF2_ALGO:
+        return (f"AUTH_PASSWORD_HASH uses an unsupported algorithm ({algo!r}); "
+                f"expected {PBKDF2_ALGO!r}")
+    try:
+        iterations = int(iters)
+    except (TypeError, ValueError):
+        return "AUTH_PASSWORD_HASH has a non-numeric iteration count"
+    if iterations < 1:
+        return "AUTH_PASSWORD_HASH has an iteration count below 1"
+    if iterations > MAX_PBKDF2_ITERATIONS:
+        return "AUTH_PASSWORD_HASH has an implausibly high iteration count"
+    try:
+        if not base64.b64decode(salt_b64, validate=True):
+            return "AUTH_PASSWORD_HASH has an empty salt"
+        if not base64.b64decode(hash_b64, validate=True):
+            return "AUTH_PASSWORD_HASH has an empty digest"
+    except (ValueError, TypeError):
+        return "AUTH_PASSWORD_HASH is not valid base64"
+    return None
+
+
 def verify_password(password: str, stored: str) -> bool:
     """Constant-time check of *password* against a stored hash.
 
     Returns ``False`` for any malformed value instead of raising, so a corrupt
-    setting cannot turn into an authentication bypass.
+    setting cannot turn into an authentication bypass or a 500 on the login
+    page. The iteration count is validated before use: a hostile or corrupt
+    value cannot force an unbounded amount of work.
     """
-    try:
-        algo, iters, salt_b64, hash_b64 = stored.split("$")
-        if algo != PBKDF2_ALGO:
-            return False
-        salt = base64.b64decode(salt_b64)
-        expected = base64.b64decode(hash_b64)
-        iterations = int(iters)
-    except (ValueError, TypeError):
+    parsed = parse_hash(stored)
+    if parsed is None:
         return False
+    salt, expected, iterations = parsed
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
     return hmac.compare_digest(digest, expected)
 
@@ -130,15 +214,21 @@ class AuthService:
         lockout_seconds: int = LOCKOUT_SECONDS,
     ):
         self.store = store
-        self.username = username if username is not None else os.environ.get("AUTH_USERNAME")
-        self.password_hash = (
+        # The login form strips the submitted username, so the configured one is
+        # stripped too: a stray space in the Render dashboard value would
+        # otherwise make every login fail with no visible cause.
+        username_env = username if username is not None else os.environ.get("AUTH_USERNAME")
+        self.username = username_env.strip() if isinstance(username_env, str) else username_env
+        hash_env = (
             password_hash if password_hash is not None
             else os.environ.get("AUTH_PASSWORD_HASH")
         )
-        self.session_secret = (
+        self.password_hash = hash_env.strip() if isinstance(hash_env, str) else hash_env
+        secret_env = (
             session_secret if session_secret is not None
             else os.environ.get("AUTH_SESSION_SECRET")
         )
+        self.session_secret = secret_env.strip() if isinstance(secret_env, str) else secret_env
         self.session_ttl = session_ttl
         self.max_failures = max_failures
         self.lockout_seconds = lockout_seconds
@@ -146,18 +236,37 @@ class AuthService:
     # -------------------------------------------------------------- config
     @property
     def configured(self) -> bool:
-        """True when login can work at all (all three settings present)."""
-        return bool(self.username and self.password_hash and self.session_secret)
+        """True when login can actually succeed.
+
+        A non-empty but unusable ``AUTH_PASSWORD_HASH`` (the raw password, a
+        truncated paste, a hash from another tool) does not count: that state
+        rejected every login with "wrong credentials", which hid the real
+        problem. ``config_errors`` explains it.
+        """
+        return not self.config_errors()
+
+    def config_errors(self) -> list[str]:
+        """Reasons login cannot work. Never contains a secret value."""
+        errors: list[str] = []
+        if not self.username:
+            errors.append("AUTH_USERNAME is not set")
+        problem = password_hash_problem(self.password_hash)
+        if problem:
+            errors.append(problem)
+        if not self.session_secret:
+            errors.append("AUTH_SESSION_SECRET is not set")
+        return errors
 
     def missing_settings(self) -> list[str]:
-        missing = []
+        """Names of the settings that are absent or unusable (no values)."""
+        names: list[str] = []
         if not self.username:
-            missing.append("AUTH_USERNAME")
-        if not self.password_hash:
-            missing.append("AUTH_PASSWORD_HASH")
+            names.append("AUTH_USERNAME")
+        if password_hash_problem(self.password_hash):
+            names.append("AUTH_PASSWORD_HASH")
         if not self.session_secret:
-            missing.append("AUTH_SESSION_SECRET")
-        return missing
+            names.append("AUTH_SESSION_SECRET")
+        return names
 
     # --------------------------------------------------------------- login
     def login(self, username: str, password: str, *, client_ip: str) -> Session | None:
@@ -170,9 +279,10 @@ class AuthService:
         if not self.configured:
             raise AuthError("login is not configured")
         key = self._attempt_key(username, client_ip)
-        if self.store.login_locked(key):
-            log.warning("login blocked by rate limit")
-            return None
+        retry_after = self.store.login_locked_for(key)
+        if retry_after > 0:
+            log.warning("login blocked by rate limit (retry in %ss)", retry_after)
+            raise LoginLocked(retry_after)
         # Constant-time-ish comparison: always verify *something*.
         if username == self.username:
             ok = verify_password(password, self.password_hash)
@@ -298,6 +408,16 @@ def _cli() -> int:
     if sys.argv[1] == "secret":
         print(secrets.token_urlsafe(48))
         return 0
+    # The password is typed at a prompt, never passed as an argument, so it does
+    # not reach the shell history or the process list. That requires a terminal;
+    # without one getpass would block on /dev/tty, which looks like a hang.
+    if not sys.stdin.isatty():
+        print(
+            "error: `hash` needs an interactive terminal to read the password.\n"
+            "Run it directly in a terminal (not through a pipe or a script).",
+            file=sys.stderr,
+        )
+        return 2
     pw = getpass.getpass("password: ")
     again = getpass.getpass("repeat:   ")
     if pw != again:

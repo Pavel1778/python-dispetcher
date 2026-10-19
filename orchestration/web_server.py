@@ -75,6 +75,7 @@ from .web_auth import (
     SESSION_COOKIE,
     AuthError,
     AuthService,
+    LoginLocked,
     cleared_cookie_header,
     parse_cookie,
     session_cookie_header,
@@ -272,6 +273,9 @@ class App:
                 "writes_require_auth": bool(self.token),
                 "login_configured": self.auth.configured,
                 "login_missing": self.auth.missing_settings(),
+                # Reasons only, never a value: makes a bad AUTH_PASSWORD_HASH
+                # visible from the API without leaking the hash.
+                "login_errors": self.auth.config_errors(),
             },
             "build": {
                 "version": os.environ.get("APP_VERSION") or _version(),
@@ -560,16 +564,32 @@ class Handler(BaseHTTPRequestHandler):
         username = (form.get("username") or "").strip()
         password = form.get("password") or ""
         if not self.app.auth.configured:
+            reasons = self.app.auth.config_errors()
+            log.error("login is not configured: %s", "; ".join(reasons))
             return self._html(
                 503,
                 LOGIN_PAGE.replace(
                     "__ERROR__",
-                    "Вход не настроен на сервере. Задайте AUTH_USERNAME, "
-                    "AUTH_PASSWORD_HASH и AUTH_SESSION_SECRET.",
+                    "Вход не настроен на сервере: "
+                    + "; ".join(reasons)
+                    + ". Сгенерируйте хеш командой "
+                    "`python -m orchestration.web_auth hash` и задайте "
+                    "AUTH_PASSWORD_HASH в Render.",
                 ),
             )
         try:
             session = self.app.auth.login(username, password, client_ip=self._client_ip())
+        except LoginLocked as e:
+            minutes = max(1, (e.retry_after + 59) // 60)
+            return self._html(
+                429,
+                LOGIN_PAGE.replace(
+                    "__ERROR__",
+                    "Слишком много неудачных попыток. Повторите через "
+                    f"{minutes} мин. Если пароль забыт, хеш можно пересоздать "
+                    "(см. DEPLOY.md).",
+                ),
+            )
         except AuthError:
             session = None
         if session is None:
@@ -641,13 +661,17 @@ def main() -> int:
         print("refusing to bind a public interface without --token/WEB_AUTH_TOKEN")
         return 2
     # Login must be configured before exposing the server: without it, a public
-    # deployment would have no way to authenticate a human.
-    missing = AuthService(
+    # deployment would have no way to authenticate a human. A non-empty but
+    # unusable AUTH_PASSWORD_HASH counts as unconfigured, so a bad paste fails at
+    # boot with a reason instead of rejecting every login as "wrong password".
+    config_errors = AuthService(
         store=None,  # type: ignore[arg-type] - only reading env here
-    ).missing_settings()
-    if args.host not in ("127.0.0.1", "localhost") and missing:
-        print("refusing to bind a public interface without login configured: "
-              + ", ".join(missing))
+    ).config_errors()
+    if args.host not in ("127.0.0.1", "localhost") and config_errors:
+        print("refusing to bind a public interface without login configured:")
+        for reason in config_errors:
+            print(f"  - {reason}")
+        print("generate a hash with: python -m orchestration.web_auth hash")
         return 2
     try:
         app = App(dsn, poll_interval=args.poll_interval, token=args.token)

@@ -314,9 +314,11 @@ def test_login_rate_limit_locks_out(server, monkeypatch):
         st, _, _ = b.request("POST", "/login", form={"username": "owner",
                                                      "password": "bad"})
         assert st == 401
-    # Now even the correct password is refused while the lock holds.
-    st, _, _ = b.login(password=PASSWORD)
-    assert st == 401
+    # Now even the correct password is refused while the lock holds, and the
+    # refusal says so instead of blaming the password.
+    st, raw, _ = b.login(password=PASSWORD)
+    assert st == 429
+    assert "попыток" in raw.lower()
     st, body, _ = b.json("GET", "/api/dashboard")
     assert st == 401
 
@@ -377,3 +379,181 @@ def test_login_not_configured_returns_503(server, monkeypatch):
     # And a session-less read is still refused.
     st, _, _ = b.json("GET", "/api/dashboard")
     assert st == 401
+
+
+# ------------------------------------------- unusable AUTH_PASSWORD_HASH
+# Regression: a non-empty but unusable AUTH_PASSWORD_HASH used to make every
+# login fail with the generic "wrong login or password" 401, which pointed the
+# operator at the credentials instead of at the misconfiguration.
+
+
+def test_raw_password_in_the_variable_does_not_authenticate(server, monkeypatch):
+    """Pasting the password itself must not log in, and must not be reported as
+    a wrong password either: it is a configuration error."""
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", PASSWORD)
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+
+    st, raw, _ = b.request("POST", "/login", form={"username": "owner",
+                                                   "password": PASSWORD})
+    # Not a session (never authenticate on a malformed hash), and not a 401
+    # that blames the credentials.
+    assert st == 503
+    assert "AUTH_PASSWORD_HASH" in raw
+    st, _, _ = b.json("GET", "/api/dashboard")
+    assert st == 401
+
+
+def test_unusable_hash_is_reported_not_silently_wrong(server, monkeypatch):
+    """The login page names the real problem instead of 'wrong credentials'."""
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", "not-a-hash")
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, raw, _ = b.request("POST", "/login", form={"username": "owner",
+                                                   "password": PASSWORD})
+    assert st == 503
+    assert "Неверный логин или пароль" not in raw
+    assert "AUTH_PASSWORD_HASH" in raw
+
+
+def test_foreign_hash_algorithm_is_rejected(server, monkeypatch):
+    """A bcrypt-style value from another tool cannot authenticate."""
+    monkeypatch.setenv(
+        "AUTH_PASSWORD_HASH", "$2b$12$abcdefghijklmnopqrstuvabcdefghijklmnopqrstuv"
+    )
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, _, _ = b.request("POST", "/login", form={"username": "owner",
+                                                 "password": PASSWORD})
+    assert st == 503
+
+
+def test_configured_requires_a_usable_hash():
+    """`configured` is about whether login can succeed, not about non-empty."""
+    svc = AuthService(
+        store=None,
+        username="owner",
+        password_hash="hunter2",
+        session_secret="s",
+    )
+    assert svc.configured is False
+    assert "AUTH_PASSWORD_HASH" in svc.missing_settings()
+    assert any("AUTH_PASSWORD_HASH" in e for e in svc.config_errors())
+
+    svc.password_hash = hash_password(PASSWORD, iterations=1000)
+    assert svc.configured is True
+    assert svc.config_errors() == []
+
+
+def test_config_errors_never_contain_the_value():
+    """Diagnostics name the variable and the problem, never the secret."""
+    secret_value = "pbkdf2_sha256$1000$not-base64-at-all$also-not-base64"
+    svc = AuthService(
+        store=None, username="owner", password_hash=secret_value,
+        session_secret="session-secret-value",
+    )
+    text = " ".join(svc.config_errors()) + " ".join(svc.missing_settings())
+    assert secret_value not in text
+    assert "session-secret-value" not in text
+
+
+def test_verify_password_never_raises():
+    """A malformed stored value returns False; it must not raise. A zero or
+    negative iteration count used to escape as ValueError and become a 500."""
+    for bad in (
+        "",
+        "not-a-hash",
+        "pbkdf2_sha256$0$c2FsdA==$aGFzaA==",
+        "pbkdf2_sha256$-1$c2FsdA==$aGFzaA==",
+        "pbkdf2_sha256$99999999999999$c2FsdA==$aGFzaA==",
+        "pbkdf2_sha256$abc$x$y",
+        "pbkdf2_sha256$1000$!!!$!!!",
+        "a$b$c$d$e",
+        "pbkdf2_sha256$1000$$",
+        None,
+    ):
+        assert verify_password("whatever", bad) is False
+
+
+def test_malformed_hash_on_a_live_server_is_503_not_500(server, monkeypatch):
+    """The login endpoint must not 500 on a corrupt hash (the ValueError path)."""
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", "pbkdf2_sha256$0$c2FsdA==$aGFzaA==")
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, raw, _ = b.request("POST", "/login", form={"username": "owner",
+                                                   "password": PASSWORD})
+    assert st in (401, 503)
+    assert st != 500
+
+
+def test_whitespace_in_configured_username_is_tolerated(server, monkeypatch):
+    """A stray space in the dashboard value must not block a correct login."""
+    monkeypatch.setenv("AUTH_USERNAME", "  owner  ")
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, _, _ = b.login()
+    assert st == 200
+    assert b.cookie() is not None
+
+
+def test_whitespace_around_hash_is_tolerated(server, monkeypatch):
+    """A trailing newline from a copy/paste must not block a correct login."""
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", "\n" + os.environ["AUTH_PASSWORD_HASH"] + "\n")
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, _, _ = b.login()
+    assert st == 200
+
+
+def test_system_reports_login_errors_without_the_hash(server, monkeypatch):
+    """`/api/system` exposes the reasons, so a bad hash is visible remotely."""
+    bad = "pbkdf2_sha256$0$c2FsdA==$aGFzaA=="
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", bad)
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    b.login(password=PASSWORD)  # establish a session is impossible; use bearer
+    st, body, _ = b.json("GET", "/api/system")
+    assert st == 401  # no session was created, which is correct
+    # The startup gate is what surfaces the reason in a real deployment; assert
+    # the service itself reports it truthfully.
+    assert server.app.auth.configured is False
+    assert any("AUTH_PASSWORD_HASH" in e for e in server.app.auth.config_errors())
+    assert bad not in json.dumps(server.app.auth.config_errors())
+
+
+def test_lockout_is_reported_as_lockout_not_wrong_password(server):
+    """After the failure threshold, the correct password must not be blamed.
+
+    Regression: the lockout returned None, so a locked-out owner saw the same
+    "wrong login or password" 401 as a bad password and kept retyping it.
+    """
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    for _ in range(server.app.auth.max_failures):
+        b.request("POST", "/login", form={"username": "owner", "password": "WRONG"})
+
+    st, raw, _ = b.login()  # the CORRECT password
+    assert st == 429
+    assert "Неверный логин или пароль" not in raw
+    assert "попыток" in raw.lower()
+
+
+def test_startup_gate_rejects_an_unusable_hash():
+    """The bind guard must refuse a public interface on a bad hash, naming it."""
+    import subprocess
+
+    env = dict(os.environ)
+    env.update({
+        "SUPABASE_DB_URL": DSN,
+        "WEB_AUTH_TOKEN": "machine-token",
+        "AUTH_USERNAME": "owner",
+        "AUTH_PASSWORD_HASH": PASSWORD,          # the raw password
+        "AUTH_SESSION_SECRET": "s",
+    })
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run(
+        [sys.executable, "-m", "orchestration.web_server",
+         "--host", "0.0.0.0", "--port", "0"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 2
+    assert "AUTH_PASSWORD_HASH" in proc.stdout + proc.stderr

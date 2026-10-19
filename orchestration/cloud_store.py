@@ -1017,17 +1017,24 @@ class PostgresStore:
             cur.execute("DELETE FROM sessions WHERE expires_at <= now()")
             return cur.rowcount
 
-    def login_locked(self, key: str) -> bool:
+    def login_locked_for(self, key: str) -> int:
+        """Seconds until the lock on *key* expires, or 0 if it is not locked.
+
+        Returning the remaining time (rather than a bool) lets the login page
+        say "try again in N minutes" instead of blaming the credentials.
+        """
         with self._tx() as cur:
             cur.execute(
                 "SELECT locked_until FROM login_attempts WHERE key=%s", (key,)
             )
             row = cur.fetchone()
         if not row or row["locked_until"] is None:
-            return False
-        cur_time = time.time()
-        locked = row["locked_until"].timestamp() > cur_time
-        return locked
+            return 0
+        remaining = row["locked_until"].timestamp() - time.time()
+        return int(remaining) + 1 if remaining > 0 else 0
+
+    def login_locked(self, key: str) -> bool:
+        return self.login_locked_for(key) > 0
 
     def record_login_failure(self, key: str, *, max_failures: int,
                              lockout_seconds: int) -> None:

@@ -75,7 +75,8 @@ contains a secret.
 
 ### Generating the two auth secrets
 
-Once, locally:
+Once, locally, in an interactive terminal (the `hash` command reads the password
+from a prompt, so it cannot be piped or run from a script):
 
 ```
 python -m orchestration.web_auth secret
@@ -87,6 +88,61 @@ python -m orchestration.web_auth hash
 
 The password is read from a prompt, never from the command line, so it does not
 end up in your shell history. The same password verifies only against that hash.
+
+The printed value must look like
+`pbkdf2_sha256$600000$<salt>$<digest>`. Paste it **exactly** — all four parts,
+including the `$` characters. `AUTH_PASSWORD_HASH` is the hash, never the
+password.
+
+### Login fails with "Неверный логин или пароль"
+
+That message means the submitted credentials did not match the configured ones.
+Work through this in order:
+
+1. Read the reason from the deployment. `GET /api/system` returns
+   `config.login_errors`, a list of human-readable problems, and a start-up
+   refusal prints the same reasons. A bad `AUTH_PASSWORD_HASH` is named there.
+2. If `AUTH_PASSWORD_HASH` holds the password itself, or a truncated paste, or a
+   hash produced by another tool (bcrypt, argon2, Django, `openssl passwd`),
+   every login fails. Only the `pbkdf2_sha256$...` format from this repository is
+   accepted.
+3. Confirm `AUTH_USERNAME` matches exactly what you type. Leading and trailing
+   spaces are trimmed on both sides, but the comparison is case-sensitive.
+4. `AUTH_SESSION_SECRET` only signs the session. A wrong value breaks the
+   *existing* session, not the login itself.
+
+If the hash cannot be repaired — for example it was produced by another tool —
+regenerate it (next section).
+
+### Regenerating AUTH_PASSWORD_HASH on Render
+
+Do this only when the existing value is unusable. It replaces the password for
+the owner login; nothing else changes.
+
+1. Locally, in an interactive terminal:
+
+   ```
+   python -m orchestration.web_auth hash
+   ```
+
+   Type the new password twice. The command prints one line, the hash. It never
+   prints the password back.
+
+2. In the Render dashboard, open the service → **Environment**, edit
+   `AUTH_PASSWORD_HASH`, and paste the whole printed line as the value. Do not
+   wrap it in quotes and do not escape the `$` characters: Render stores the
+   literal string. Save.
+
+3. Render redeploys automatically on an environment change. If it does not,
+   trigger **Manual Deploy → Deploy latest commit**.
+
+4. Verify: the service log must not contain the "refusing to bind a public
+   interface without login configured" message, and `GET /api/system` must show
+   an empty `config.login_errors`. Then log in.
+
+Neither the password, the hash nor the session secret is ever written to a log,
+a response body or an error message; the messages name the variable and the
+problem, never the value.
 
 ## Build
 

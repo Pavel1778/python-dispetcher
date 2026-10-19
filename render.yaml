@@ -15,8 +15,8 @@
 #   * There is no shell and no persistent disk; all state lives in PostgreSQL.
 #
 # Before the first deploy, generate the two secrets once (see DEPLOY.md):
-#   AUTH_PASSWORD_HASH   from `python -m orchestration.web_auth`
-#   AUTH_SESSION_SECRET  from `python -c "import secrets;print(secrets.token_urlsafe(48))"`
+#   AUTH_PASSWORD_HASH   from `python -m orchestration.web_auth hash`
+#   AUTH_SESSION_SECRET  from `python -m orchestration.web_auth secret`
 services:
   - type: web
     name: python-dispetcher
