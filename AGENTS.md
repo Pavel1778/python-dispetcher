@@ -176,3 +176,29 @@ successful-completion e2e needs a valid key and is not yet exercised.
 - The UI (`orchestration/web_ui.py`) is static strings: dark theme, Russian,
   responsive. It must not embed any secret, and every button must call a real
   endpoint.
+
+## GitHub repository discovery
+
+- `orchestration/github_client.py` reads `GITHUB_TOKEN` and calls
+  `GET /user/repos`. It is **read-only** against GitHub: nothing there writes to
+  a repository, and the only write on a sync is to the local `repositories`
+  table. `_request` must stay the single place the token is attached.
+- The token value must never be logged, returned by the API or rendered in the
+  UI. `GitHubClient.__repr__` is redacted on purpose; keep it that way. Only
+  `configured` (a bool) is exposed, and `/api/system` and `/api/capabilities`
+  report presence only. `tests/test_github_client.py` asserts this.
+- A `403` with `X-RateLimit-Remaining: 0` means the token is **valid** and only
+  the quota is spent, so it maps to `GitHubUnavailable` (503), not
+  `GitHubAuthError` (400). Asking the operator to rotate a working token is a
+  wrong instruction; do not "simplify" this back to a plain 403 -> auth mapping.
+- `sync_repositories` refreshes only what GitHub is authoritative about
+  (default branch, provider). It must never re-enable a repository an operator
+  disabled, nor clear `allowed_branches`. The whole list is fetched before
+  anything is stored, so a GitHub outage leaves the allowlist unchanged.
+- Archived repositories are skipped: GitHub makes them read-only, so a task
+  dispatched into one could never land a change.
+- `/api/capabilities` gathers the GitHub/discovery block **before** calling the
+  account API, and returns it even on a 502 from Cloud. Whether the allowlist is
+  usable is what the operator needs during a Cloud outage.
+- `tests/fake_github.py` is a real HTTP server, not a mock of the client: the
+  client under test makes real requests over a socket.

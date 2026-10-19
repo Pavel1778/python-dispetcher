@@ -66,6 +66,12 @@ services:
       # Distinct from the login; a machine client sends it instead of a session.
       - key: WEB_AUTH_TOKEN
         sync: false
+      # Optional. GitHub token used to discover the account's repositories so
+      # the allowlist can fill itself in ("Загрузить из GitHub"). Needs only
+      # read access to repositories; never returned by the API or the UI.
+      # Set it in the dashboard. Leave unset to add repositories by hand.
+      - key: GITHUB_TOKEN
+        sync: false
       # Optional. Override only for a self-hosted Cloud/Enterprise instance.
       - key: OPENHANDS_CLOUD_URL
         sync: false

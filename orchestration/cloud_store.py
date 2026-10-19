@@ -401,7 +401,8 @@ class PostgresStore:
                 VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (full_name) DO UPDATE
                   SET allowed_branches = EXCLUDED.allowed_branches,
-                      default_branch   = EXCLUDED.default_branch
+                      default_branch   = EXCLUDED.default_branch,
+                      provider         = EXCLUDED.provider
                 RETURNING id
                 """,
                 (rid, provider, full_name, default_branch,
@@ -409,6 +410,50 @@ class PostgresStore:
             )
             rid = cur.fetchone()["id"]
         return rid
+
+    def remove_repository(self, full_name: str) -> bool:
+        """Delete a repository from the allowlist. Returns whether a row went."""
+        with self._tx() as cur:
+            cur.execute(
+                "DELETE FROM repositories WHERE full_name=%s", (full_name,)
+            )
+            return cur.rowcount > 0
+
+    def sync_repositories(self, repos: list[dict[str, Any]]) -> dict[str, Any]:
+        """Upsert discovered repositories in one transaction.
+
+        Existing rows keep their ``allowed_branches`` and ``enabled`` flag: a
+        sync must not silently re-enable a repository an operator turned off,
+        nor drop a branch restriction they set. Only the fields GitHub is
+        authoritative about (default branch, provider) are refreshed.
+        """
+        added = updated = 0
+        with self._tx() as cur:
+            for repo in repos:
+                full_name = repo["full_name"]
+                cur.execute(
+                    "SELECT id, default_branch FROM repositories WHERE full_name=%s",
+                    (full_name,),
+                )
+                existing = cur.fetchone()
+                if existing is None:
+                    cur.execute(
+                        "INSERT INTO repositories(id, provider, full_name, "
+                        "default_branch, allowed_branches) VALUES (%s,%s,%s,%s,%s)",
+                        (_new_id(), repo.get("provider", "github"), full_name,
+                         repo.get("default_branch") or "main", []),
+                    )
+                    added += 1
+                    continue
+                if existing["default_branch"] != repo.get("default_branch"):
+                    cur.execute(
+                        "UPDATE repositories SET default_branch=%s, provider=%s "
+                        "WHERE full_name=%s",
+                        (repo.get("default_branch") or "main",
+                         repo.get("provider", "github"), full_name),
+                    )
+                    updated += 1
+        return {"added": added, "updated": updated, "total": len(repos)}
 
     def allowed_repository(self, full_name: str) -> dict[str, Any] | None:
         with self._tx() as cur:

@@ -200,6 +200,12 @@ pre {
 .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
 .toolbar .grow { flex: 1 1 200px; }
 .hidden { display: none !important; }
+details summary { list-style: none; }
+details summary::-webkit-details-marker { display: none; }
+details summary::before { content: "▸ "; color: var(--fg-faint); }
+details[open] summary::before { content: "▾ "; }
+details summary:hover { color: var(--fg); }
+.card-head .spacer { flex: 0 0 0; }
 
 /* ---------------------------------------------------------------- login */
 .auth-body { display: grid; place-items: center; min-height: 100vh; padding: 20px; }
@@ -335,6 +341,42 @@ APP_HTML = r"""<!doctype html>
     <div class="card">
       <div class="card-head"><h3>Состояние системы</h3></div>
       <dl class="kv" id="sysinfo"><dt>Загрузка…</dt><dd></dd></dl>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <h3>Репозитории</h3>
+        <div class="spacer" style="flex:1"></div>
+        <span class="muted small" id="repocount"></span>
+        <button class="ghost" id="reposync" type="button">Загрузить из GitHub</button>
+      </div>
+      <p class="muted small">
+        Задача с репозиторием запустится только в том, что есть в этом списке.
+        «Загрузить из GitHub» берёт список из вашего аккаунта — вводить имена вручную не нужно.
+      </p>
+      <div id="repomsg" class="small" style="min-height:1.2em"></div>
+      <div class="tablewrap" style="margin-top:8px">
+        <table>
+          <thead><tr><th>Репозиторий</th><th>Ветка по умолчанию</th><th></th></tr></thead>
+          <tbody id="repos"><tr><td colspan="3" class="empty">Загрузка…</td></tr></tbody>
+        </table>
+      </div>
+      <details style="margin-top:14px">
+        <summary class="muted small" style="cursor:pointer">Добавить вручную</summary>
+        <div class="row" style="margin-top:10px">
+          <div>
+            <label for="repo-name">Репозиторий (owner/name)</label>
+            <input id="repo-name" placeholder="Pavel1778/python-dispetcher" maxlength="200">
+          </div>
+          <div>
+            <label for="repo-branch">Ветка по умолчанию</label>
+            <input id="repo-branch" placeholder="main" maxlength="200">
+          </div>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="repoadd" type="button">Добавить</button>
+          <span id="repo-err" class="field-error"></span>
+        </div>
+      </details>
     </div>
     <div class="card">
       <div class="card-head"><h3>Возможности аккаунта OpenHands</h3></div>
@@ -582,6 +624,7 @@ async function loadSystem() {
       ['OpenHands Cloud', s.cloud.ok ? 'доступен' : ('недоступен: ' + (s.cloud.error || ''))],
       ['URL Cloud', s.cloud.url || '—'],
       ['Ключ Cloud настроен', s.config.cloud_key ? 'да' : 'нет'],
+      ['Токен GitHub', s.config.github_token ? 'настроен' : 'нет'],
       ['Запись требует токен', s.config.writes_require_auth ? 'да' : 'нет'],
       ['Версия приложения', s.build.version || 'неизвестно'],
       ['Сборка', s.build.commit || 'неизвестно'],
@@ -596,23 +639,116 @@ async function loadSystem() {
   }
   try {
     const c = await api('/api/capabilities');
+    const ghToken = c.github && c.github.token_configured;
+    const ghRepos = (c.github && c.github.allowlisted) || 0;
     let h = '<dl class="kv">' +
       '<dt>LLM-ключ аккаунта</dt><dd>' + (c.llm_api_key_set ? 'настроен' : 'нет') + '</dd>' +
       '<dt>Активный профиль</dt><dd class="mono">' + esc(c.active_agent_profile_id || 'наследуется из аккаунта') + '</dd>' +
       '<dt>MCP-серверы</dt><dd class="mono">' + (c.mcp_servers.length ? esc(c.mcp_servers.join(', ')) : 'нет') + '</dd>' +
       '<dt>Marketplaces</dt><dd>' + esc(c.registered_marketplaces) + '</dd>' +
-      '<dt>GitHub-провайдер</dt><dd>' +
-        (c.provider_tokens_set && c.provider_tokens_set.github ? 'подключён' : '<span class="warn">не подключён</span>') + '</dd>' +
+      '<dt>Токен GitHub</dt><dd>' +
+        (ghToken ? 'настроен' : '<span class="warn">не настроен</span>') + '</dd>' +
+      '<dt>Репозиториев в списке</dt><dd>' + esc(ghRepos) + '</dd>' +
       '<dt>Выбор диспетчера</dt><dd class="mono">профиль: ' +
         esc(c.dispatcher.agent_profile_id || 'аккаунт') + ', плагинов: ' + esc((c.dispatcher.plugins || []).length) + '</dd>' +
       '</dl>';
-    if (!(c.provider_tokens_set && c.provider_tokens_set.github)) {
-      h += '<div class="banner">GitHub-провайдер не подключён к аккаунту. Задачи с репозиторием ' +
-           'могут не запуститься, пока провайдер не подключён в настройках OpenHands Cloud.</div>';
+    // The account API reports ``provider_tokens_set.github`` as unset for a
+    // GitHub App installation (it issues short-lived tokens, not a stored PAT),
+    // so that field alone would warn on a perfectly connected account. Warn
+    // only when there is neither a discovery token nor a single repository.
+    if (!ghToken && ghRepos === 0) {
+      h += '<div class="banner">Токен GitHub не настроен и список репозиториев пуст. ' +
+           'Добавьте <span class="mono">GITHUB_TOKEN</span> в переменные окружения ' +
+           'и нажмите «Загрузить из GitHub», либо выдайте доступ к репозиториям ' +
+           'в настройках OpenHands Cloud.</div>';
+    } else if (ghRepos === 0) {
+      h += '<div class="banner info">Репозитории ещё не добавлены. Откройте «Загрузить из GitHub», ' +
+           'чтобы подтянуть список из аккаунта.</div>';
     }
     $('#caps').innerHTML = h;
   } catch (e) {
     $('#caps').innerHTML = '<p class="err">Не удалось получить возможности: ' + esc(e.message) + '</p>';
+  }
+  await loadRepos();
+}
+
+/* ----------------------------------------------------------- repositories */
+async function loadRepos() {
+  try {
+    const r = await api('/api/repositories');
+    REPOS = r.repositories || [];
+    $('#repocount').textContent = REPOS.length ? (REPOS.length + ' шт.') : 'пусто';
+    const body = $('#repos');
+    if (!REPOS.length) {
+      body.innerHTML = '<tr><td colspan="3" class="empty">Список пуст. ' +
+        'Нажмите «Загрузить из GitHub».</td></tr>';
+      return;
+    }
+    body.innerHTML = REPOS.map(x =>
+      '<tr>' +
+        '<td class="mono">' + esc(x.full_name) + '</td>' +
+        '<td class="mono faint">' + esc(x.default_branch || '—') + '</td>' +
+        '<td style="text-align:right"><button class="link" type="button" ' +
+          'data-remove="' + esc(x.full_name) + '">убрать</button></td>' +
+      '</tr>').join('');
+    body.querySelectorAll('button[data-remove]').forEach(b => {
+      b.onclick = async () => {
+        const name = b.getAttribute('data-remove');
+        if (!window.confirm('Убрать ' + name + ' из списка?')) return;
+        try {
+          await api('/api/repositories/remove', {method:'POST', body: JSON.stringify({full_name: name})});
+          await loadRepos();
+          await refreshRepoSel();
+        } catch (e) {
+          $('#repomsg').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+        }
+      };
+    });
+  } catch (e) {
+    $('#repos').innerHTML = '<tr><td colspan="3" class="err">' + esc(e.message) + '</td></tr>';
+  }
+}
+
+/* Rebuild the dropdown on the "new task" tab without a full page refresh. */
+async function refreshRepoSel() {
+  const sel = $('#repo');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— без репозитория (только анализ) —</option>' +
+    REPOS.map(x => '<option value="' + esc(x.full_name) + '">' + esc(x.full_name) + '</option>').join('');
+  sel.value = cur;
+}
+
+async function syncRepos() {
+  const btn = $('#reposync');
+  btn.disabled = true;
+  $('#repomsg').textContent = 'Запрашиваем список из GitHub…';
+  try {
+    const d = await api('/api/repositories/sync', {method:'POST', body: JSON.stringify({})});
+    $('#repomsg').innerHTML = '<span class="ok">Готово: добавлено ' + esc(d.added) +
+      ', обновлено ' + esc(d.updated) + ', всего ' + esc(d.total) + '.</span>';
+    await loadRepos();
+    await refreshRepoSel();
+  } catch (e) {
+    $('#repomsg').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+  } finally { btn.disabled = false; }
+}
+
+async function addRepo() {
+  const name = $('#repo-name').value.trim();
+  $('#repo-err').textContent = '';
+  if (!name) { $('#repo-err').textContent = 'Введите owner/name.'; return; }
+  try {
+    await api('/api/repositories', {method:'POST', body: JSON.stringify({
+      full_name: name,
+      default_branch: $('#repo-branch').value.trim() || 'main'
+    })});
+    $('#repo-name').value = ''; $('#repo-branch').value = '';
+    $('#repomsg').innerHTML = '<span class="ok">Добавлено: ' + esc(name) + '</span>';
+    await loadRepos();
+    await refreshRepoSel();
+  } catch (e) {
+    $('#repo-err').textContent = e.message;
   }
 }
 
@@ -629,11 +765,7 @@ async function refresh() {
   try {
     const r = await api('/api/repositories');
     REPOS = r.repositories || [];
-    const sel = $('#repo');
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">— без репозитория (только анализ) —</option>' +
-      REPOS.map(x => '<option value="' + esc(x.full_name) + '">' + esc(x.full_name) + '</option>').join('');
-    sel.value = cur;
+    await refreshRepoSel();
   } catch (e) { /* the banner already explains a Cloud problem */ }
   try {
     const t = await api('/api/tasks');
@@ -661,6 +793,9 @@ async function boot() {
     if (tab.id === 'tab-system') loadSystem();
   });
   $('#dclose').onclick = () => $('#detail').classList.add('hidden');
+  $('#reposync').onclick = syncRepos;
+  $('#repoadd').onclick = addRepo;
+  $('#repo-name').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); addRepo(); } };
   $('#search').oninput = renderTasks;
   $('#statefilter').onchange = renderTasks;
   $('#sortby').onchange = renderTasks;

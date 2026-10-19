@@ -222,6 +222,157 @@ def test_add_repository_rejects_bad_name(http):
     assert st == 400 and "owner/name" in body["error"]
 
 
+# ------------------------------------------------------ github auto-connect
+@pytest.fixture
+def gh_server():
+    from tests.fake_github import FakeGitHubServer
+
+    with FakeGitHubServer() as s:
+        yield s
+
+
+@pytest.fixture
+def gh_http(server, gh_server):
+    """The web client, with the App's GitHub client pointed at the fake."""
+    from orchestration.github_client import GitHubClient
+
+    server.app.github = GitHubClient(
+        gh_server.base_url, token="ghp_test_token", timeout=5.0
+    )
+    return Client(f"http://127.0.0.1:{server.port}", token="test-token")
+
+
+def test_sync_imports_repositories_without_typing_names(gh_http):
+    st, body = gh_http.post("/api/repositories/sync", {})
+    assert st == 200
+    assert body["added"] >= 2
+    assert body["total"] >= 2
+
+    st, listed = gh_http.get("/api/repositories")
+    names = [r["full_name"] for r in listed["repositories"]]
+    assert "Pavel1778/python-dispetcher" in names
+    assert "Pavel1778/Klyrshift" in names
+
+
+def test_sync_skips_archived_repositories(gh_http):
+    gh_http.post("/api/repositories/sync", {})
+    st, listed = gh_http.get("/api/repositories")
+    names = [r["full_name"] for r in listed["repositories"]]
+    assert "Pavel1778/old-archive" not in names
+
+
+def test_sync_keeps_default_branch_from_github(gh_http):
+    gh_http.post("/api/repositories/sync", {})
+    st, listed = gh_http.get("/api/repositories")
+    row = {r["full_name"]: r for r in listed["repositories"]}["Pavel1778/python-dispetcher"]
+    assert row["default_branch"] == "main"
+
+
+def test_sync_is_idempotent(gh_http):
+    st, first = gh_http.post("/api/repositories/sync", {})
+    assert first["added"] >= 2
+    st, second = gh_http.post("/api/repositories/sync", {})
+    assert second["added"] == 0
+    assert second["total"] == first["total"]
+
+
+def test_sync_does_not_reenable_a_repository_an_operator_disabled(gh_http, server):
+    """A sync refreshes metadata; it must not undo an operator's decision."""
+    gh_http.post("/api/repositories/sync", {})
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE repositories SET enabled=false WHERE full_name=%s",
+            ("Pavel1778/Klyrshift",),
+        )
+    gh_http.post("/api/repositories/sync", {})
+    st, listed = gh_http.get("/api/repositories")
+    names = [r["full_name"] for r in listed["repositories"]]
+    assert "Pavel1778/Klyrshift" not in names
+
+
+def test_sync_reports_auth_failure_without_corrupting_the_list(http, server):
+    from orchestration.github_client import GitHubClient
+
+    server.app.github = GitHubClient("http://127.0.0.1:1", token="x", timeout=2.0)
+    st, body = http.post("/api/repositories/sync", {})
+    assert st == 503
+    assert "unavailable" in body["error"]
+    # The allowlist is untouched by a failed discovery.
+    st, listed = http.get("/api/repositories")
+    assert listed["repositories"] == []
+
+
+def test_github_preview_does_not_write(gh_http):
+    st, body = gh_http.get("/api/github/repositories")
+    assert st == 200
+    assert body["count"] >= 2
+    # Preview only: nothing landed in the allowlist.
+    st, listed = gh_http.get("/api/repositories")
+    assert listed["repositories"] == []
+
+
+def test_github_preview_needs_a_token(server, http, monkeypatch):
+    from orchestration.github_client import GitHubClient
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    server.app.github = GitHubClient(token="", timeout=2.0)
+    st, body = http.get("/api/github/repositories")
+    assert st == 400 and "auth" in body["error"]
+
+
+def test_remove_repository(http):
+    http.post("/api/repositories", {"full_name": "acme/gone"})
+    st, body = http.post("/api/repositories/remove", {"full_name": "acme/gone"})
+    assert st == 200 and body["removed"] == "acme/gone"
+    st, listed = http.get("/api/repositories")
+    assert "acme/gone" not in [r["full_name"] for r in listed["repositories"]]
+
+
+def test_remove_unknown_repository_is_404(http):
+    st, body = http.post("/api/repositories/remove", {"full_name": "nope/none"})
+    assert st == 404
+
+
+def test_repository_writes_require_auth(server):
+    anon = Client(f"http://127.0.0.1:{server.port}")
+    for path in ("/api/repositories/sync", "/api/repositories/remove"):
+        st, _ = anon.post(path, {"full_name": "a/b"})
+        assert st == 401, path
+
+
+def test_system_reports_github_token_presence_not_value(http, server, monkeypatch):
+    from orchestration.github_client import GitHubClient
+
+    server.app.github = GitHubClient(token="ghp_super_secret_value", timeout=2.0)
+    st, body = http.get("/api/system")
+    assert st == 200
+    assert body["config"]["github_token"] is True
+    assert "ghp_super_secret_value" not in json.dumps(body)
+
+
+def test_capabilities_report_github_discovery_state(gh_http):
+    st, body = gh_http.get("/api/capabilities")
+    assert st == 200
+    assert body["github"]["token_configured"] is True
+    assert body["github"]["allowlisted"] == 0
+    gh_http.post("/api/repositories/sync", {})
+    st, body = gh_http.get("/api/capabilities")
+    assert body["github"]["allowlisted"] >= 2
+
+
+def test_capabilities_still_report_github_when_cloud_is_down(http, server):
+    """A Cloud outage must not hide whether the allowlist is usable."""
+    from orchestration.cloud_client import CloudClient
+
+    http.post("/api/repositories", {"full_name": "acme/known"})
+    server.app.client = CloudClient("http://127.0.0.1:1", api_key="x", timeout=2.0)
+    st, body = http.get("/api/capabilities")
+    assert st == 502
+    assert body["github"]["allowlisted"] == 1
+
+
 # --------------------------------------------------------------- workflows
 def test_start_workflow_creates_sr(http, server, fake):
     st, body = http.post("/api/workflows", {"goal": "ship the feature"})

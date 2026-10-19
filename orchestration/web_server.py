@@ -36,7 +36,10 @@ Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
     GET  /api/dashboard          real counts + store/Cloud health
     GET  /api/config             whether a Cloud key is configured
     GET  /api/repositories       the repository allowlist
+    GET  /api/github/repositories  preview repos discoverable via GITHUB_TOKEN
     POST /api/repositories       add/update a repository        (CSRF)
+    POST /api/repositories/sync  import GitHub repos into the allowlist (CSRF)
+    POST /api/repositories/remove  drop one repository from the allowlist (CSRF)
     POST /api/workflows          {goal, repository?, branch?}   (CSRF)
     GET  /api/workflows          list workflows
     GET  /api/workflows/<id>     one workflow with tasks, events, tool calls
@@ -68,6 +71,7 @@ from .cloud_store import (
     PostgresStore,
     StoreError,
 )
+from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
 from .web_auth import (
@@ -140,6 +144,9 @@ class App:
                  auth: AuthService | None = None):
         self.store = PostgresStore(dsn)
         self.client = CloudClient()
+        # Repository discovery for the allowlist. Reads GITHUB_TOKEN; the value
+        # is never exposed through the API or the UI, only its presence.
+        self.github = GitHubClient()
         # Bearer token for the machine API. Without one, only read-only requests
         # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
         # stranger to start Cloud conversations. ``None`` means "not set".
@@ -213,6 +220,26 @@ class App:
             raise
         return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id}
 
+    def sync_github_repositories(self, *, include_archived: bool = False) -> dict[str, Any]:
+        """Pull the account's GitHub repositories into the allowlist.
+
+        Discovery is read-only against GitHub; the only write is to this
+        dispatcher's own ``repositories`` table. A GitHub outage therefore
+        cannot corrupt the allowlist: the list is fetched completely before
+        anything is stored, and the store call is one transaction.
+        """
+        repos = self.github.list_repositories(include_archived=include_archived)
+        payload = [
+            {"full_name": r.full_name, "default_branch": r.default_branch,
+             "provider": "github"}
+            for r in repos
+        ]
+        result = self.store.sync_repositories(payload)
+        result["repositories"] = [
+            r.as_dict() for r in repos
+        ]
+        return result
+
     def workflow_detail(self, workflow_id: str) -> dict[str, Any]:
         if not re.fullmatch(r"[0-9a-fA-F-]{36}", workflow_id):
             raise NotFound(workflow_id)
@@ -278,6 +305,8 @@ class App:
             "config": {
                 "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
                 "writes_require_auth": bool(self.token),
+                # Presence only. The token value never leaves the environment.
+                "github_token": self.github.configured,
                 "login_configured": self.auth.configured,
                 "login_missing": self.auth.missing_settings(),
                 # Reasons only, never a value: makes a bad AUTH_PASSWORD_HASH
@@ -465,6 +494,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {
                     "repositories": self.app.store.list_repositories()
                 })
+            if path == "/api/github/repositories":
+                # Preview what a sync would pull, without writing anything. Lets
+                # the UI show the discovered list before the operator commits.
+                try:
+                    repos = self.app.github.list_repositories()
+                except GitHubAuthError as e:
+                    return self._json(400, {"error": f"github auth: {e}"})
+                except GitHubUnavailable as e:
+                    return self._json(503, {"error": f"github unavailable: {e}"})
+                except GitHubError as e:
+                    return self._json(502, {"error": f"github: {e}"})
+                return self._json(200, {
+                    "repositories": [r.as_dict() for r in repos],
+                    "count": len(repos),
+                })
             if path == "/api/tasks":
                 return self._json(200, {"tasks": self.app.store.list_tasks_all()})
             if path == "/api/workflows":
@@ -493,14 +537,28 @@ class Handler(BaseHTTPRequestHandler):
                 # Read-only. Reports the account-level configuration the
                 # dispatcher will inherit; it never changes anything and never
                 # returns secret values.
+                #
+                # Repository discovery state is gathered first and always
+                # included: a Cloud outage must not hide whether the allowlist
+                # is populated or whether a GitHub token is set, because those
+                # two facts are what the operator needs to act on.
+                try:
+                    allowlisted = len(self.app.store.list_repositories())
+                except StoreError:
+                    allowlisted = 0
+                github = {
+                    "token_configured": self.app.github.configured,
+                    "allowlisted": allowlisted,
+                }
                 try:
                     caps = self.app.client.account_capabilities()
                 except CloudError as e:
-                    return self._json(502, {"error": f"cloud: {e}"})
+                    return self._json(502, {"error": f"cloud: {e}", "github": github})
                 caps["dispatcher"] = {
                     "agent_profile_id": self.app.runtime.agent_profile_id,
                     "plugins": self.app.runtime.plugins or [],
                 }
+                caps["github"] = github
                 return self._json(200, caps)
             return self._json(404, {"error": "not found"})
         except NotFound:
@@ -540,6 +598,28 @@ class Handler(BaseHTTPRequestHandler):
                     allowed_branches=body.get("allowed_branches") or [],
                 )
                 return self._json(200, {"repository_id": rid})
+            if path == "/api/repositories/sync":
+                # One-shot import of the account's GitHub repositories. This is
+                # the "let GitHub fill itself in" path: no hand-typed names.
+                try:
+                    out = self.app.sync_github_repositories(
+                        include_archived=bool(body.get("include_archived")),
+                    )
+                except GitHubAuthError as e:
+                    return self._json(400, {"error": f"github auth: {e}"})
+                except GitHubUnavailable as e:
+                    return self._json(503, {"error": f"github unavailable: {e}"})
+                except GitHubError as e:
+                    return self._json(502, {"error": f"github: {e}"})
+                return self._json(200, out)
+            if path == "/api/repositories/remove":
+                name = (body.get("full_name") or "").strip()
+                if not name:
+                    return self._json(400, {"error": "full_name is required"})
+                removed = self.app.store.remove_repository(name)
+                if not removed:
+                    return self._json(404, {"error": "repository not found"})
+                return self._json(200, {"removed": name})
             if path == "/api/workflows":
                 out = self.app.start_workflow(
                     body.get("goal") or "",

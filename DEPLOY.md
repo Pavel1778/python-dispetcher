@@ -58,6 +58,7 @@ Read from the source, not assumed. Names must match exactly.
 | `AUTH_PASSWORD_HASH` | yes | `web_auth.py` | PBKDF2 hash of the owner password. |
 | `AUTH_SESSION_SECRET` | yes | `web_auth.py` | Separate secret that signs sessions. |
 | `WEB_AUTH_TOKEN` | yes | `web_server.py` | Bearer token for the machine API. |
+| `GITHUB_TOKEN` | no | `github_client.py` | Read-only GitHub token used to discover repositories for the allowlist. Unset → repositories must be added by hand. Never returned by the API or the UI. |
 | `OPENHANDS_CLOUD_URL` | no | `cloud_client.py` | Override for a self-hosted Cloud. Default `https://app.all-hands.dev`. |
 | `OPENHANDS_AGENT_PROFILE_ID` | no | `web_server.py` | Select an account agent profile by id. Unset = inherit the account's active profile. |
 | `WEB_COOKIE_SECURE` | no | `web_server.py` | Force the `Secure` cookie flag on/off. Default: on when `X-Forwarded-Proto: https`. |
@@ -280,3 +281,42 @@ nothing and returns no secret values. It distinguishes **configured** (present
 in settings) from **available** (loaded into a specific conversation, via
 `GET /api/v1/app-conversations/{id}/skills`). Only an observed tool call proves
 a capability was **exercised**.
+
+## GitHub repository discovery
+
+The dispatcher only runs a task in a repository that is in its own allowlist.
+Instead of typing `owner/name` by hand, set `GITHUB_TOKEN` and press
+**Загрузить из GitHub** on the System screen; the same thing is available as an
+API call:
+
+```bash
+curl -X POST -H "Authorization: Bearer $WEB_AUTH_TOKEN" \
+  https://<service>/api/repositories/sync
+```
+
+What the token needs and how it is handled:
+
+* Scope: read access to repositories (`repo` for private repositories, or
+  `public_repo` for public only). The dispatcher never writes to GitHub.
+* The token is read from the environment on each call, sent as a bearer header,
+  and is **never** logged, returned by the API, or written to the database.
+  `GET /api/system` and `GET /api/capabilities` report only whether it is set.
+* Archived repositories are skipped: they are read-only on GitHub, so a task
+  dispatched into one could never land a change.
+* A sync refreshes the default branch and provider of repositories already in
+  the list. It never re-enables one an operator disabled, and never clears an
+  `allowed_branches` restriction. A GitHub outage leaves the allowlist as it
+  was, because the whole list is fetched before anything is stored.
+
+Endpoints:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/github/repositories` | Preview what a sync would import. Writes nothing. |
+| `POST` | `/api/repositories/sync` | Import discovered repositories into the allowlist. |
+| `POST` | `/api/repositories/remove` | Drop one repository from the allowlist. |
+
+A `403` from GitHub with the rate-limit budget at zero is reported as a
+transient problem (503), not as an auth failure: the token is valid and only the
+quota has to reset. Rotating a working token would not help, so the dispatcher
+does not ask for it.
