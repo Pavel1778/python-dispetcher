@@ -3,8 +3,9 @@
 Autonomous Sr/Jr task dispatcher for [OpenHands Cloud](https://app.all-hands.dev),
 designed to run on **Render Free** with durable state in **PostgreSQL/Supabase**.
 
-> Status: **pre-production**. Unit, store-contract, and MCP HTTP end-to-end tests
-> pass locally. Supabase, Render, and Better Stack are **not yet verified against
+> Status: **pre-production**. Unit, store-contract, dashboard, and MCP HTTP
+> end-to-end tests pass locally, and the OpenHands API schema is verified against
+> the live spec. Supabase, Render, and Better Stack are **not yet verified against
 > live services**. See "Not yet verified".
 
 ## Architecture
@@ -14,6 +15,10 @@ FastAPI (app/main.py, built by create_app())
   ├── GET  /health          liveness only (process is up)
   ├── GET  /ready           dependency readiness (DB + API key + last cycle)
   ├── POST /jr/tasks        protected HTTP bridge: Sr spawns a Jr child task
+  ├── GET  / , /login       operator dashboard (HTML, session + CSRF protected)
+  ├── GET  /workflows/{id}  per-workflow detail and audit log
+  ├── GET  /api/config      dashboard JSON (booleans/allowlist only, no secrets)
+  ├── GET  /api/health      dashboard JSON health
   └── MOUNT /mcp            MCP streamable-HTTP server exposing create_jr_task
 
 Background loop (app/main.py: dispatcher_loop)
@@ -114,6 +119,33 @@ Use the pooler connection string with a URL-encoded password. Because the
 pooler multiplexes connections, keep `DATABASE_POOL_MAX_SIZE` small (the
 default is 5).
 
+## Operator dashboard (HTML UI)
+
+A small server-rendered control panel lives at `/`. It has no build step and no
+extra dependencies (stdlib `html` + FastAPI responses), so it adds nothing to the
+Render Free footprint.
+
+* `/login` — password form. Passwords are stored only as a **scrypt hash**; the
+  plaintext never reaches the process.
+* `/` — health summary plus a form to create a Sr task, and the last 50 tasks
+  with live statuses.
+* `/workflows/{id}` — task detail and the audit-event log for one workflow.
+* `/api/config`, `/api/health` — JSON for the page, session-protected.
+
+**Security.** The dashboard is **disabled unless both `DASHBOARD_USERNAME` and
+`DASHBOARD_PASSWORD_HASH` are set** — a half-configured deployment fails closed
+rather than exposing an unprotected panel. Sessions are stateless HMAC-signed
+tokens in an `HttpOnly` cookie; state-changing requests are `POST` and require a
+CSRF token derived from the session. `/api/config` returns booleans and
+allowlists only — never a key, a DSN, or any secret value.
+
+Generate the two required values:
+
+```bash
+python -c "from app.auth import hash_password; print(hash_password('your-password'))"
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # DASHBOARD_SESSION_SECRET
+```
+
 ## Render deployment
 
 `render.yaml` is a Blueprint for a free web service. Set `OPENHANDS_CLOUD_API_KEY`,
@@ -171,17 +203,26 @@ authorise tool calls.
 
 ## Verified locally
 
-* Full suite: `96 passed` against real PostgreSQL 17 (including migrations,
-  leases, and `FOR UPDATE SKIP LOCKED`).
+* Full suite: **154 passed** against real PostgreSQL 17 (including migrations,
+  leases, `FOR UPDATE SKIP LOCKED`, dashboard auth/CSRF, and store contracts).
+  Without `TEST_DATABASE_URL` the 6 store-contract tests skip.
+* Live-API schema checks (read-only, no quota): `plugins` and
+  `system_message_suffix` are accepted by `POST /api/v1/app-conversations`, and
+  `initial_message.content` **must** be a list of blocks (a string returns 422).
 * Bridge on PostgreSQL: `POST /jr/tasks` creates a Jr task end-to-end; `/ready`
   reports `database: true`.
+* Dashboard over HTTP: anonymous `/` redirects to `/login`; wrong credentials
+  return 401; the session cookie is `HttpOnly`; missing CSRF returns 403; creating
+  a task from the UI writes a real `workflows`/`tasks` row; `/api/config` exposes
+  booleans and the allowlist but no secret value.
 * Transaction-pooler behaviour, measured against the server's own
   `pg_prepared_statements`: with `DATABASE_TRANSACTION_POOLER=true` psycopg
   reports `prepare_threshold=None` and **0** server-side prepared statements
   after repeated identical queries; with `false` it prepares (1 statement).
   This is exactly the property PgBouncer requires.
 * MCP transport: a real MCP client over HTTP creates a Jr child (see
-  `tests/test_mcp_http_e2e.py`).
+  `tests/test_mcp_http_e2e.py`); `/mcp` returns 401 without the bearer token and
+  200 with it.
 
 ## Not yet verified
 
@@ -190,6 +231,8 @@ authorise tool calls.
    through PgBouncer itself.
 2. **Render deployment.** `render.yaml` is written but no service has been
    created; no `RENDER_API_KEY` is available in this environment.
-3. **Live OpenHands Cloud.** All OpenHands API interaction is exercised through
-   a fake client; no end-to-end run against the real API has been performed.
+3. **Live OpenHands Cloud end-to-end.** The API is reachable and the request
+   schema is verified, but the account's daily conversation quota was exhausted
+   (HTTP 429, `daily_conversation_limit_reached`) before a full run, so no
+   conversation was actually executed.
 4. **Better Stack.** No monitor configured.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -76,6 +78,41 @@ async def test_start_conversation_parses_async_start_task():
     assert start.status == "WORKING"
     assert start.app_conversation_id is None
     assert not start.is_terminal
+
+
+@respx.mock
+async def test_start_conversation_sends_content_as_block_list():
+    """``initial_message.content`` must be a list of blocks, not a bare string.
+
+    The live API rejects a string with HTTP 422 (``list_type``), which would make
+    every dispatch fail before a conversation is even created.
+    """
+    route = respx.post(f"{BASE}/api/v1/app-conversations").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "start-124",
+                "status": "WORKING",
+                "app_conversation_id": None,
+                "sandbox_id": None,
+                "detail": None,
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "request": {},
+            },
+        )
+    )
+    client = make_client()
+    try:
+        await client.start_conversation(title="t", initial_message="do work")
+    finally:
+        await client.aclose()
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["initial_message"] == {
+        "role": "user",
+        "content": [{"type": "text", "text": "do work"}],
+    }
 
 
 @respx.mock
@@ -157,6 +194,54 @@ async def test_client_error_is_not_retried():
     finally:
         await client.aclose()
     assert route.call_count == 1
+
+
+@respx.mock
+async def test_get_conversation_result_returns_last_agent_message():
+    respx.get(f"{BASE}/api/v1/conversation/conv-1/events/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "kind": "MessageEvent",
+                        "source": "user",
+                        "llm_message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "user text"}],
+                        },
+                    },
+                    {
+                        "kind": "MessageEvent",
+                        "source": "agent",
+                        "llm_message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "agent final answer"}],
+                        },
+                    },
+                ]
+            },
+        )
+    )
+    client = make_client()
+    try:
+        text = await client.get_conversation_result("conv-1")
+    finally:
+        await client.aclose()
+    assert text == "agent final answer"
+
+
+@respx.mock
+async def test_get_conversation_result_none_when_no_agent_message():
+    respx.get(f"{BASE}/api/v1/conversation/conv-2/events/search").mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+    client = make_client()
+    try:
+        text = await client.get_conversation_result("conv-2")
+    finally:
+        await client.aclose()
+    assert text is None
 
 
 async def test_missing_key_raises_auth_error():

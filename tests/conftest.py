@@ -30,7 +30,9 @@ class FakeOpenHandsClient:
         self.start_task_queue: list[StartTask] = []
         self.start_task_lookup: dict[str, StartTask] = {}
         self.conversation_lookup: dict[str, Conversation] = {}
+        self.result_lookup: dict[str, str] = {}
         self.fail_with: Exception | None = None
+        self.result_fail_with: Exception | None = None
         self._counter = 0
 
     @property
@@ -43,6 +45,9 @@ class FakeOpenHandsClient:
 
     def queue_conversation(self, conv: Conversation) -> None:
         self.conversation_lookup[conv.id] = conv
+
+    def queue_result(self, conversation_id: str, text: str) -> None:
+        self.result_lookup[conversation_id] = text
 
     async def start_conversation(self, **kwargs) -> StartTask:
         if self.fail_with is not None:
@@ -69,6 +74,11 @@ class FakeOpenHandsClient:
 
     async def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self.conversation_lookup.get(conversation_id)
+
+    async def get_conversation_result(self, conversation_id: str) -> str | None:
+        if self.result_fail_with is not None:
+            raise self.result_fail_with
+        return self.result_lookup.get(conversation_id)
 
     async def get_conversations(self, ids):
         return [self.conversation_lookup[i] for i in ids if i in self.conversation_lookup]

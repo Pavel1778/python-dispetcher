@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -89,6 +88,17 @@ class Settings(BaseSettings):
     heartbeat_url: str | None = None
     heartbeat_timeout_seconds: float = 10.0
 
+    # --- Operator dashboard (HTML UI) ---
+    # The dashboard is disabled unless a username AND a password hash are set,
+    # so a half-configured deployment fails closed instead of exposing an
+    # unprotected control panel.
+    dashboard_enabled: bool = True
+    dashboard_username: str | None = None
+    dashboard_password_hash: str | None = None
+    dashboard_session_secret: str | None = None
+    dashboard_session_ttl_seconds: int = 12 * 60 * 60
+    dashboard_cookie_secure: bool = True
+
     log_level: str = "INFO"
     default_repository: str | None = None
     default_branch: str | None = None
@@ -97,6 +107,11 @@ class Settings(BaseSettings):
     def resolved_api_key(self) -> str | None:
         """Return the OpenHands API key, preferring the explicit cloud variable."""
         return self.openhands_cloud_api_key or self.openhands_api_key
+
+    @property
+    def dashboard_configured(self) -> bool:
+        """True only when the dashboard has both a username and a password hash."""
+        return bool(self.dashboard_username and self.dashboard_password_hash)
 
     @property
     def resolved_database_url(self) -> str | None:
@@ -118,6 +133,8 @@ class Settings(BaseSettings):
             self.mcp_bearer_token,
             self.database_url,
             self.supabase_db_url,
+            self.dashboard_password_hash,
+            self.dashboard_session_secret,
         ]
         return [c for c in candidates if c]
 

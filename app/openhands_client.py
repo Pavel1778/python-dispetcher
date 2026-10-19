@@ -280,7 +280,12 @@ class OpenHandsClient:
         if title is not None:
             body["title"] = title
         if initial_message is not None:
-            body["initial_message"] = {"role": "user", "content": initial_message}
+            # The API requires ``content`` to be a list of content blocks, not a
+            # bare string: a string is rejected with HTTP 422 (``list_type``).
+            body["initial_message"] = {
+                "role": "user",
+                "content": [{"type": "text", "text": initial_message}],
+            }
         if selected_repository is not None:
             body["selected_repository"] = selected_repository
         if selected_branch is not None:
@@ -382,6 +387,55 @@ class OpenHandsClient:
         if isinstance(data, list):
             return [d for d in data if isinstance(d, dict)]
         return []
+
+    async def get_conversation_result(self, conversation_id: str) -> str | None:
+        """Return the last agent message text, or ``None`` if there is none.
+
+        Used to distinguish a conversation that genuinely produced a result from
+        one that ended without output. An empty return must never be treated as
+        success by the caller.
+
+        Uses ``GET /api/v1/conversation/{id}/events/search`` (newest first) and
+        keeps only ``MessageEvent`` records emitted by the agent.
+        """
+        data = await self._request(
+            "GET",
+            f"/api/v1/conversation/{conversation_id}/events/search",
+            params={
+                "kind__eq": "MessageEvent",
+                "sort_order": "TIMESTAMP_DESC",
+                "limit": 20,
+            },
+        )
+        for item in _page_items(data):
+            if item.get("kind") != "MessageEvent":
+                continue
+            if item.get("source") != "agent":
+                continue
+            text = _message_text(item.get("llm_message"))
+            if text:
+                return text
+        return None
+
+
+def _message_text(message: Any) -> str | None:
+    """Extract concatenated text from an ``llm_message`` payload.
+
+    ``Message.content`` is a list of ``TextContent``/``ImageContent`` blocks, so
+    only ``text`` fields are joined; everything else is ignored.
+    """
+    if not isinstance(message, Mapping):
+        return None
+    parts: list[str] = []
+    content = message.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, Mapping):
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+    joined = "\n".join(parts).strip()
+    return joined or None
 
 
 def _page_items(data: Any) -> list[Mapping[str, Any]]:

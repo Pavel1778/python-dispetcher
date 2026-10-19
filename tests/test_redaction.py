@@ -76,3 +76,50 @@ def test_configure_logging_installs_redaction(capsys):
     captured = capsys.readouterr()
     assert SECRET not in captured.out
     assert "<redacted>" in captured.out
+
+
+def test_json_formatter_scrubs_safe_extra_fields():
+    """D8: secrets passed as ``extra_fields`` must be scrubbed too.
+
+    ``safe_extra`` fields bypass ``record.msg``, so without an explicit scrub a
+    secret handed to a log call as a field would be serialised verbatim.
+    """
+    redaction = RedactionFilter([SECRET, BRIDGE])
+    formatter = JsonFormatter()
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="task failed",
+        args=(),
+        exc_info=None,
+    )
+    record.extra_fields = {
+        "task_id": "task-1",
+        "authorization": f"Bearer {BRIDGE}",
+        "detail": f"upstream echoed {SECRET}",
+        "nested": {"sandbox_api_key": SECRET},
+    }
+    redaction.filter(record)
+    rendered = formatter.format(record)
+    assert SECRET not in rendered
+    assert BRIDGE not in rendered
+    payload = json.loads(rendered)
+    assert payload["task_id"] == "task-1"
+    assert payload["nested"]["sandbox_api_key"] == "<redacted>"
+
+
+def test_extra_fields_scrub_does_not_break_plain_records():
+    redaction = RedactionFilter([SECRET])
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="nothing sensitive",
+        args=(),
+        exc_info=None,
+    )
+    assert redaction.filter(record) is True
+    assert JsonFormatter().format(record)

@@ -9,7 +9,8 @@ services:
     runtime: python
     plan: free
     region: oregon
-    branch: main
+    # The code lives on this branch; ``main`` only holds the initial LICENSE.
+    branch: python-dispetcher
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
@@ -37,6 +38,14 @@ services:
         sync: false
       - key: HEARTBEAT_URL
         sync: false
+      - key: DASHBOARD_USERNAME
+        sync: false
+      - key: DASHBOARD_PASSWORD_HASH
+        sync: false
+      - key: DASHBOARD_SESSION_SECRET
+        generateValue: true
+      - key: DASHBOARD_COOKIE_SECURE
+        value: "true"
       - key: DISPATCHER_ENABLE_BACKGROUND_LOOP
         value: "true"
       - key: DISPATCHER_POLL_INTERVAL_SECONDS

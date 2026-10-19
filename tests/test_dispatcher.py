@@ -219,7 +219,12 @@ async def test_workflow_completed_only_when_all_children_completed(dispatcher, s
         idempotency_key="wf-1-jr",
         parent_task_id=task.id,
     )
-    await store.update_task(jr.id, status=TaskStatus.COMPLETED.value, release_lease=True)
+    await store.update_task(
+        jr.id,
+        status=TaskStatus.COMPLETED.value,
+        result_summary="child output",
+        release_lease=True,
+    )
     await store.update_workflow_status(wf.id, WorkflowStatus.RUNNING.value)
 
     completed = await dispatcher.verify_workflows()
@@ -227,6 +232,28 @@ async def test_workflow_completed_only_when_all_children_completed(dispatcher, s
     assert completed == 1
     wf_after = await store.get_workflow(wf.id)
     assert wf_after.status == WorkflowStatus.COMPLETED.value
+
+
+async def test_completed_child_without_result_does_not_complete_workflow(dispatcher, store):
+    """A child marked COMPLETED with no recorded result is not a success."""
+    wf, task = await _make_workflow(store)
+    await store.update_task(task.id, status=TaskStatus.VERIFYING.value, release_lease=True)
+    jr, _ = await store.create_task(
+        workflow_id=wf.id,
+        role="JR",
+        title="jr",
+        prompt="do",
+        idempotency_key="wf-1-jr",
+        parent_task_id=task.id,
+    )
+    await store.update_task(jr.id, status=TaskStatus.COMPLETED.value, release_lease=True)
+    await store.update_workflow_status(wf.id, WorkflowStatus.RUNNING.value)
+
+    completed = await dispatcher.verify_workflows()
+
+    assert completed == 0
+    wf_after = await store.get_workflow(wf.id)
+    assert wf_after.status != WorkflowStatus.COMPLETED.value
 
 
 async def test_orchestrator_creates_child_task(settings, store):
@@ -266,3 +293,173 @@ async def test_cycle_marks_success_flag(dispatcher, store, fake_client):
     assert dispatcher.last_cycle_succeeded is True
     assert stats["dispatched"] == 1
     assert dispatcher.last_cycle_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Full lifecycle regression (D1)
+#
+# These tests drive the *dispatcher* end to end. They never call
+# ``store.update_task(..., COMPLETED)`` themselves: the only way a task reaches
+# COMPLETED is through the dispatcher's own state machine, which is the whole
+# point of the regression.
+# ---------------------------------------------------------------------------
+
+
+async def _make_full_workflow(store, key="wf-full"):
+    """A workflow with one Sr and one Jr child, both freshly created."""
+    wf = await store.create_workflow(name="full", idempotency_key=key)
+    sr, _ = await store.create_task(
+        workflow_id=wf.id,
+        role="SR",
+        title="sr",
+        prompt="plan",
+        idempotency_key=f"{key}-sr",
+        selected_repository="acme/widgets",
+    )
+    await store.update_workflow_status(wf.id, WorkflowStatus.RUNNING.value, sr_task_id=sr.id)
+    jr, _ = await store.create_task(
+        workflow_id=wf.id,
+        role="JR",
+        title="jr",
+        prompt="do the work",
+        idempotency_key=f"{key}-jr",
+        parent_task_id=sr.id,
+        selected_repository="acme/widgets",
+    )
+    return wf, sr, jr
+
+
+async def _drive_to_completion(dispatcher, fake_client, *, max_cycles=20):
+    """Run full cycles until nothing changes. Returns the cycle count."""
+    for i in range(max_cycles):
+        await dispatcher.run_cycle()
+        if not await _has_pending_work(dispatcher):
+            return i + 1
+    return max_cycles
+
+
+async def _has_pending_work(dispatcher) -> bool:
+    tasks = await dispatcher._store.list_tasks_by_status(
+        [TaskStatus.QUEUED.value, TaskStatus.STARTING.value, TaskStatus.RUNNING.value]
+    )
+    return bool(tasks)
+
+
+async def test_full_lifecycle_reaches_completed_without_manual_status(
+    dispatcher, store, fake_client
+):
+    """Sr and Jr both finish -> workflow COMPLETED, driven only by the dispatcher."""
+    wf, sr, jr = await _make_full_workflow(store)
+
+    # Two start tasks, one per conversation, then both become READY.
+    fake_client.queue_start_task(_start_task("start-sr", "WORKING"))
+    fake_client.queue_start_task(_start_task("start-jr", "WORKING"))
+    await dispatcher.dispatch()
+
+    fake_client.start_task_lookup["start-sr"] = _start_task("start-sr", "READY", conv="conv-sr")
+    fake_client.start_task_lookup["start-jr"] = _start_task("start-jr", "READY", conv="conv-jr")
+    await dispatcher.advance()
+
+    # Both conversations finish, each with a real result.
+    fake_client.queue_conversation(_conv("conv-sr", "finished"))
+    fake_client.queue_conversation(_conv("conv-jr", "finished"))
+    fake_client.queue_result("conv-sr", "Sr summary: delegated and verified.")
+    fake_client.queue_result("conv-jr", "Jr summary: implemented the change.")
+
+    await _drive_to_completion(dispatcher, fake_client)
+
+    jr_after = await store.get_task(jr.id)
+    sr_after = await store.get_task(sr.id)
+    wf_after = await store.get_workflow(wf.id)
+
+    # The Jr reached COMPLETED through the dispatcher, not by a manual update.
+    assert jr_after.status == TaskStatus.COMPLETED.value
+    assert jr_after.result_summary == "Jr summary: implemented the change."
+    assert sr_after.status == TaskStatus.COMPLETED.value
+    assert wf_after.status == WorkflowStatus.COMPLETED.value
+
+
+async def test_full_lifecycle_blocks_child_without_result(dispatcher, store, fake_client):
+    """A Jr that finishes with no result is BLOCKED and never completes the wf."""
+    wf, sr, jr = await _make_full_workflow(store, key="wf-noresult")
+
+    fake_client.queue_start_task(_start_task("start-sr", "WORKING"))
+    fake_client.queue_start_task(_start_task("start-jr", "WORKING"))
+    await dispatcher.dispatch()
+    fake_client.start_task_lookup["start-sr"] = _start_task("start-sr", "READY", conv="conv-sr")
+    fake_client.start_task_lookup["start-jr"] = _start_task("start-jr", "READY", conv="conv-jr")
+    await dispatcher.advance()
+
+    fake_client.queue_conversation(_conv("conv-sr", "finished"))
+    fake_client.queue_conversation(_conv("conv-jr", "finished"))
+    fake_client.queue_result("conv-sr", "Sr done")
+    # conv-jr produced nothing at all.
+
+    await _drive_to_completion(dispatcher, fake_client)
+
+    jr_after = await store.get_task(jr.id)
+    wf_after = await store.get_workflow(wf.id)
+    assert jr_after.status == TaskStatus.BLOCKED.value
+    assert wf_after.status != WorkflowStatus.COMPLETED.value
+
+
+async def test_child_result_lookup_error_defers_not_blocks(dispatcher, store, fake_client):
+    """A transient error reading the child result must retry, not fail the child."""
+    wf, sr, jr = await _make_full_workflow(store, key="wf-lookup-error")
+    await store.update_task(
+        jr.id, status=TaskStatus.RUNNING.value, app_conversation_id="conv-jr", release_lease=True
+    )
+    fake_client.queue_conversation(_conv("conv-jr", "finished"))
+    fake_client.result_fail_with = OpenHandsTransientError("network")
+
+    await dispatcher.advance()
+
+    jr_after = await store.get_task(jr.id)
+    assert jr_after.status != TaskStatus.COMPLETED.value
+    assert jr_after.status != TaskStatus.BLOCKED.value
+    assert jr_after.attempts == 1
+
+
+async def test_sr_cannot_complete_workflow_while_child_running(dispatcher, store, fake_client):
+    """Sr finishing is not enough: a still-running child withholds COMPLETED."""
+    wf, sr, jr = await _make_full_workflow(store, key="wf-sr-early")
+    await store.update_task(
+        sr.id, status=TaskStatus.RUNNING.value, app_conversation_id="conv-sr", release_lease=True
+    )
+    await store.update_task(
+        jr.id, status=TaskStatus.RUNNING.value, app_conversation_id="conv-jr", release_lease=True
+    )
+    fake_client.queue_conversation(_conv("conv-sr", "finished"))
+    fake_client.queue_result("conv-sr", "Sr claims done")
+    # Jr is still running.
+    fake_client.queue_conversation(_conv("conv-jr", "running"))
+
+    await dispatcher.advance()
+    await dispatcher.verify_workflows()
+
+    sr_after = await store.get_task(sr.id)
+    wf_after = await store.get_workflow(wf.id)
+    assert sr_after.status == TaskStatus.VERIFYING.value
+    assert wf_after.status != WorkflowStatus.COMPLETED.value
+
+
+async def test_upstream_error_detail_is_scrubbed_before_persist(settings, store, fake_client):
+    """D8: a secret echoed in an upstream ``detail`` must not be persisted."""
+    from app.dispatcher.core import Dispatcher
+    from app.openhands_client import OpenHandsRequestError
+
+    settings.openhands_cloud_api_key = "sk-live-secret-value-abcdef"
+    dispatcher = Dispatcher(settings=settings, store=store, client=fake_client)
+    wf, task = await _make_workflow(store, key="wf-leak")
+    # The upstream error text echoes the API key back at us.
+    fake_client.fail_with = OpenHandsRequestError(
+        "bad request: key sk-live-secret-value-abcdef rejected", status_code=400
+    )
+
+    await dispatcher.dispatch()
+
+    updated = await store.get_task(task.id)
+    assert updated.status == TaskStatus.FAILED.value
+    assert "sk-live-secret-value-abcdef" not in (updated.last_error or "")
+    assert "<redacted>" in (updated.last_error or "")
+

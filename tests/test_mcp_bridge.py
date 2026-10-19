@@ -10,6 +10,7 @@ error text actually work end to end over the MCP surface.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -167,7 +168,12 @@ async def test_status_and_result_tools():
     assert "status=QUEUED" in _text(status)
 
     # Simulate the dispatcher recording a result from the child conversation.
-    await store.update_task(jr_id, result_summary="tests added", status=TaskStatus.COMPLETED.value)
+    await store.update_task(
+        jr_id,
+        result_summary="tests added",
+        status=TaskStatus.COMPLETED.value,
+        finished_at=datetime.now(timezone.utc),
+    )
     result = await server.call_tool(
         "get_jr_task_result",
         {"scope_token": token, "workflow_id": wf.id, "task_id": sr.id, "jr_task_id": jr_id},

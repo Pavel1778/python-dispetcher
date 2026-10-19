@@ -90,6 +90,12 @@ class RedactionFilter(logging.Filter):
         try:
             record.msg = scrub_text(str(record.getMessage()), self._secrets)
             record.args = ()
+            # ``safe_extra`` fields bypass the message and land in
+            # ``extra_fields``; scrub them too, or a secret passed as a field
+            # would be serialised verbatim by JsonFormatter.
+            extra = getattr(record, "extra_fields", None)
+            if isinstance(extra, dict):
+                record.extra_fields = scrub_mapping(extra, self._secrets)
         except Exception:  # pragma: no cover - never break logging
             pass
         return True

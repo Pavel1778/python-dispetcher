@@ -73,6 +73,37 @@ def build_plugin_spec(settings: Settings) -> dict[str, Any] | None:
     return spec
 
 
+def mcp_tools_attached(settings: Settings) -> bool:
+    """Whether a new conversation can actually be given the dispatcher MCP tools.
+
+    There are only two supported attach paths (see the module docstring): a
+    git-hosted plugin, or a server registered in account settings. If neither
+    is configured the tools are unreachable, and a Sr conversation must not be
+    told to call them.
+    """
+    if not settings.mcp_enabled:
+        return False
+    if build_plugin_spec(settings) is not None:
+        return True
+    # No plugin: the only remaining path is an account-level registration, which
+    # requires a public base URL to have been configured.
+    return bool(settings.mcp_public_base_url)
+
+
+def build_plugin_spec_if_buildable(settings: Settings) -> dict[str, Any] | None:
+    """Return the plugin spec only when its MCP config can be built.
+
+    A plugin whose ``.mcp.json`` cannot be generated (missing
+    ``MCP_PUBLIC_BASE_URL``) would point the sandbox at an unusable endpoint,
+    so it is not attached at all.
+    """
+    spec = build_plugin_spec(settings)
+    if spec is None:
+        return None
+    build_mcp_config(settings)  # raises ValueError when not buildable
+    return spec
+
+
 def build_plugin_mcp_json(settings: Settings) -> str:
     """Render the ``.mcp.json`` a plugin repository must contain."""
     return json.dumps(build_mcp_config(settings), indent=2)
@@ -93,11 +124,16 @@ def build_scope_instructions(
     task_id: str,
     scope_token: str,
     tool_names: list[str] | None = None,
+    tools_attached: bool = True,
 ) -> str:
     """System-prompt suffix telling Sr how to call the bridge.
 
     The scope token is injected here (not via a header) because MCP tool
     arguments are the only channel that works uniformly across transports.
+
+    ``tools_attached`` must reflect whether the MCP server was actually attached
+    to this conversation. When it was not, the instructions must not name tools
+    the Sr does not have - that would make it call a tool that does not exist.
     """
     tools = tool_names or [
         "create_jr_task",
@@ -106,6 +142,15 @@ def build_scope_instructions(
         "list_workflow_tasks",
         "request_workflow_verification",
     ]
+    if not tools_attached:
+        return (
+            "\n\n## Dispatcher bridge\n"
+            f"Your workflow_id is `{workflow_id}` and your task_id is `{task_id}`.\n"
+            "The dispatcher bridge tools are NOT available in this conversation, "
+            "so you cannot delegate to Jr conversations or report verification. "
+            "Do the work you can yourself and summarise clearly what remains for "
+            "an operator to dispatch.\n"
+        )
     return (
         "\n\n## Dispatcher bridge\n"
         "You can delegate work to Jr conversations through the dispatcher MCP "

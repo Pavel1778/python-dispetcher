@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timezone
+import hmac
 from typing import Any
 
 import httpx
@@ -19,7 +19,9 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .asgi_auth import BearerTokenMiddleware
 from .config import Settings, get_settings
+from .dashboard import DashboardDeps, build_dashboard
 from .dispatcher.core import Dispatcher
 from .logging_config import configure_logging, get_logger, safe_extra
 from .openhands_client import OpenHandsClient
@@ -194,7 +196,16 @@ def _mount_mcp(app: FastAPI, settings: Settings, orchestrator: Orchestrator):
         )
         return None
     bridge = McpBridge(orchestrator, scope_secret=settings.jr_scope_secret)
-    app.mount(settings.mcp_mount_path, bridge.asgi_app)
+    asgi_app: Any = bridge.asgi_app
+    if settings.mcp_bearer_token:
+        # Defence in depth: the scope token authorises individual tool calls,
+        # this guard keeps unauthenticated callers out of the MCP handshake.
+        asgi_app = BearerTokenMiddleware(asgi_app, settings.mcp_bearer_token)
+    else:
+        logger.warning(
+            "MCP endpoint has no bearer token; rely on the scope token and TLS"
+        )
+    app.mount(settings.mcp_mount_path, asgi_app)
     logger.info("mounted MCP bridge transport", **safe_extra(path=settings.mcp_mount_path))
     return bridge
 
@@ -293,7 +304,9 @@ def require_bridge_token(
     if not settings.jr_bridge_token:
         raise HTTPException(status_code=503, detail="Jr bridge not configured")
     expected = f"Bearer {settings.jr_bridge_token}"
-    if authorization != expected:
+    # Constant-time comparison: a plain ``!=`` leaks the shared token byte by
+    # byte through response timing.
+    if not hmac.compare_digest(authorization or "", expected):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -326,6 +339,25 @@ async def create_jr_task(
     return JrTaskResponse(task_id=view.task_id, created=view.created, status=view.status)
 
 
+class _RuntimeProxy:
+    """Forward attribute access to the live object on ``runtime``.
+
+    The dashboard is wired at ``create_app()`` time, but ``runtime.store`` and
+    friends are only populated during startup (and are swapped out by tests).
+    A proxy keeps the dashboard bound to whatever is current, instead of
+    capturing a ``None`` seen at import time.
+    """
+
+    def __init__(self, attribute: str) -> None:
+        self._attribute = attribute
+
+    def _target(self) -> Any:
+        return getattr(runtime, self._attribute)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target(), name)
+
+
 def create_app(*, settings: Settings | None = None) -> FastAPI:
     """Build a fresh FastAPI app.
 
@@ -340,6 +372,18 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     application.include_router(router)
     if settings is not None:
         runtime.settings = settings
+    # The dashboard resolves settings/store through proxies so it always sees
+    # the live runtime state, including after startup populates the store.
+    dashboard_router, workflow_router = build_dashboard(
+        DashboardDeps(
+            settings=runtime.settings or get_settings(),
+            store=_RuntimeProxy("store"),
+            dispatcher=_RuntimeProxy("dispatcher"),
+            orchestrator=_RuntimeProxy("orchestrator"),
+        )
+    )
+    application.include_router(workflow_router)
+    application.include_router(dashboard_router)
     return application
 
 

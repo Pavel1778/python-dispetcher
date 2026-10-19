@@ -24,8 +24,8 @@ from typing import Any
 from .config import Settings
 from .logging_config import get_logger, safe_extra
 from .status import TaskRole, TaskStatus, WorkflowStatus
-from .store.base import StateStore, StoreUnavailableError
-from .store.models import Task, Workflow
+from .store.base import StateStore
+from .store.models import Task
 
 logger = get_logger(__name__)
 

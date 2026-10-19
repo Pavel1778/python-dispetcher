@@ -71,7 +71,11 @@ async def test_sr_conversation_receives_scope_token_in_system_suffix():
     client = FakeOpenHandsClient()
     client.queue_start_task(_start())
 
-    await _dispatch_one(_settings(), store, client)
+    # A public base URL means the MCP tools can actually be attached, which is
+    # the only case in which the Sr is given a scope token.
+    await _dispatch_one(
+        _settings(mcp_public_base_url="https://dispatcher.example.com"), store, client
+    )
 
     assert len(client.start_calls) == 1
     suffix = client.start_calls[0]["extra_body"]["system_message_suffix"]
@@ -86,6 +90,53 @@ async def test_sr_conversation_receives_scope_token_in_system_suffix():
     )
     assert scope.workflow_id == wf.id
     assert scope.task_id == task.id
+
+
+async def test_sr_without_attachable_tools_is_not_told_about_them():
+    """D2: never advertise bridge tools the Sr conversation does not have."""
+    store = InMemoryStateStore()
+    await store.connect()
+    wf, task = await _sr_task(store)
+    client = FakeOpenHandsClient()
+    client.queue_start_task(_start())
+
+    # No public base URL and no plugin: nothing can attach the MCP server.
+    await _dispatch_one(_settings(), store, client)
+
+    extra = client.start_calls[0]["extra_body"]
+    suffix = extra["system_message_suffix"]
+    for tool in (
+        "create_jr_task",
+        "get_jr_task_status",
+        "get_jr_task_result",
+        "list_workflow_tasks",
+        "request_workflow_verification",
+    ):
+        assert tool not in suffix
+    assert "NOT available" in suffix
+    # No tools means no capability token is handed out either.
+    assert "scope token" not in suffix
+    assert "plugins" not in extra
+
+
+async def test_plugin_not_attached_without_public_base_url():
+    """A plugin whose .mcp.json cannot be built must not be attached."""
+    store = InMemoryStateStore()
+    await store.connect()
+    wf, task = await _sr_task(store)
+    client = FakeOpenHandsClient()
+    client.queue_start_task(_start())
+
+    await _dispatch_one(
+        _settings(
+            mcp_public_base_url=None,
+            mcp_plugin_source="github:acme/plugin",
+        ),
+        store,
+        client,
+    )
+
+    assert "plugins" not in client.start_calls[0]["extra_body"]
 
 
 async def test_jr_conversation_receives_no_bridge():

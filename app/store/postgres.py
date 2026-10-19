@@ -15,7 +15,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
