@@ -620,14 +620,14 @@ def test_cli_hash_output_authenticates_over_http(server, monkeypatch, tmp_path):
 
 
 def test_cli_check_accepts_the_generated_hash(monkeypatch):
-    """`check` exits 0 for a hash the generator produced."""
+    """`check --stdin` exits 0 for a hash the generator produced."""
     import subprocess
 
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     good = hash_password(PASSWORD, iterations=1000)
-    monkeypatch.delenv("AUTH_PASSWORD_HASH", raising=False)  # exercise stdin
+    monkeypatch.delenv("AUTH_PASSWORD_HASH", raising=False)
     proc = subprocess.run(
-        [sys.executable, "-m", "orchestration.web_auth", "check"],
+        [sys.executable, "-m", "orchestration.web_auth", "check", "--stdin"],
         cwd=repo, input=good, capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
@@ -643,7 +643,7 @@ def test_cli_check_rejects_a_corrupt_hash_without_echoing_it(monkeypatch):
     bad = "pbkdf2_sha256$1000$AAAA$BBB"        # digest is not padded base64
     monkeypatch.delenv("AUTH_PASSWORD_HASH", raising=False)
     proc = subprocess.run(
-        [sys.executable, "-m", "orchestration.web_auth", "check"],
+        [sys.executable, "-m", "orchestration.web_auth", "check", "--stdin"],
         cwd=repo, input=bad, capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 1
@@ -666,6 +666,26 @@ def test_cli_check_prefers_the_environment_over_stdin(monkeypatch):
     )
     assert proc.returncode == 0, proc.stderr
     assert "AUTH_PASSWORD_HASH" in proc.stdout
+
+
+def test_cli_check_stdin_ignores_an_exported_variable(monkeypatch):
+    """`check --stdin` must verify the piped value, not an exported one.
+
+    Regression: with AUTH_PASSWORD_HASH already set, a piped new hash was
+    silently ignored, so `check` reported OK for the *old* value and the operator
+    deployed the wrong one.
+    """
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", "not-a-hash")
+    good = hash_password(PASSWORD, iterations=1000)
+    proc = subprocess.run(
+        [sys.executable, "-m", "orchestration.web_auth", "check", "--stdin"],
+        cwd=repo, input=good, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "stdin" in proc.stdout
 
 
 def test_cli_usage_names_every_subcommand():

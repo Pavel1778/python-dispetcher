@@ -445,10 +445,10 @@ def _cli() -> int:
     import sys
 
     usage = ("usage: python -m orchestration.web_auth {hash|secret|check}\n"
-             "  hash    prompt for a password and print its hash\n"
-             "  secret  print a new AUTH_SESSION_SECRET\n"
-             "  check   verify the AUTH_PASSWORD_HASH currently in the "
-             "environment")
+             "  hash             prompt for a password and print its hash\n"
+             "  secret           print a new AUTH_SESSION_SECRET\n"
+             "  check [--stdin]  verify AUTH_PASSWORD_HASH (or a piped value)\n"
+             "                   add --password to confirm a password matches")
     if len(sys.argv) < 2 or sys.argv[1] not in ("hash", "secret", "check"):
         print(usage, file=sys.stderr)
         return 2
@@ -491,15 +491,23 @@ def _cli() -> int:
 
 
 def _check_cli(argv: list[str]) -> int:
-    """Verify a stored hash without printing it. Returns 0 when it is usable."""
+    """Verify a stored hash without printing it. Returns 0 when it is usable.
+
+    The value comes from ``AUTH_PASSWORD_HASH`` by default. ``--stdin`` reads it
+    from stdin instead, which matters when that variable is already exported:
+    otherwise a piped value would be silently ignored and the *ambient* one
+    verified, telling the operator their new hash is fine when the old bad one is
+    what the server would read.
+    """
     import sys
 
     want_password = "--password" in argv
-    stored = os.environ.get("AUTH_PASSWORD_HASH")
+    from_stdin = "--stdin" in argv
+    stored = None if from_stdin else os.environ.get("AUTH_PASSWORD_HASH")
     source = "AUTH_PASSWORD_HASH"
     if not stored:
         if sys.stdin.isatty():
-            print("AUTH_PASSWORD_HASH is not set and no value was piped in",
+            print("no value: set AUTH_PASSWORD_HASH or pipe one in with --stdin",
                   file=sys.stderr)
             return 2
         stored = sys.stdin.read()
@@ -507,7 +515,7 @@ def _check_cli(argv: list[str]) -> int:
 
     problem = password_hash_problem(stored)
     if problem:
-        print(f"INVALID: {problem}", file=sys.stderr)
+        print(f"INVALID ({source}): {problem}", file=sys.stderr)
         return 1
     salt, expected, iterations = parse_hash(stored)
     print(f"OK: {source} is a usable hash "

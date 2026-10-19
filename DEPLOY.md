@@ -125,10 +125,22 @@ Before deploying, confirm the value the server will read:
 python -m orchestration.web_auth check
 ```
 
-It reads `AUTH_PASSWORD_HASH` from the environment (or from stdin if it is not
-set), prints `OK` with the algorithm, iteration count and sizes, or `INVALID`
-with the specific problem and the fix. It never prints the value. Add
-`--password` to also confirm that a password matches the hash.
+It reads `AUTH_PASSWORD_HASH` from the environment, prints `OK` with the
+algorithm, iteration count and sizes, or `INVALID` with the specific problem and
+the fix. It never prints the value. Add `--password` to also confirm that a
+password matches the hash.
+
+To check a value that is not in your environment, pass it on stdin with
+`--stdin` (single-quoted, so the shell leaves the `$` alone):
+
+```
+printf '%s' 'pbkdf2_sha256$...' | python -m orchestration.web_auth check --stdin
+```
+
+`--stdin` is required whenever `AUTH_PASSWORD_HASH` is already set: without it
+the environment wins and you would verify the old value, not the new one. Note
+that `hash` reads the password from a prompt and therefore cannot be piped into
+`check`; run `hash` first, copy the value it prints, then check that.
 
 ### Login fails with "Неверный логин или пароль"
 
@@ -164,15 +176,15 @@ owner login; nothing else changes.
    Type the new password twice. The command prints one line, the hash, and an
    `export ...='...'` line on stderr. It never prints the password back.
 
-2. Verify before pasting:
+2. Verify before pasting. Copy the hash from step 1 and check it (the `--stdin`
+   is needed when `AUTH_PASSWORD_HASH` is already set in your shell; otherwise
+   plain `check` reads the environment):
 
    ```
-   python -m orchestration.web_auth check      # reads the env var
-   # or, without touching your environment:
-   printf '%s' 'pbkdf2_sha256$...' | python -m orchestration.web_auth check
+   printf '%s' 'paste-the-hash-here' | python -m orchestration.web_auth check --stdin
    ```
 
-   Expect `OK: ... is a usable hash`.
+   Expect `OK: stdin is a usable hash (...)`. Then paste the hash into Render.
 
 3. In the Render dashboard, open the service → **Environment**, edit
    `AUTH_PASSWORD_HASH`, and paste the hash line verbatim as the value. Do not
