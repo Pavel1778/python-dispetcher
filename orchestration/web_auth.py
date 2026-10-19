@@ -99,16 +99,29 @@ def hash_password(password: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
     )
 
 
+def _without_whitespace(value: str) -> str:
+    """Remove every whitespace character from *value*.
+
+    The hash format has no meaningful whitespace, but a terminal wraps a long
+    line and a wrapped paste inserts a newline in the middle; ``.env`` files and
+    Windows clipboards add a trailing one. Whitespace in a stored hash is
+    therefore always an accident. Only the *stored* value is normalised here —
+    the password is never touched, and the salt and digest are still fully
+    verified, so this cannot weaken authentication.
+    """
+    return "".join(value.split())
+
+
 def parse_hash(stored: str | None) -> tuple[bytes, bytes, int] | None:
     """Return ``(salt, expected_digest, iterations)`` for *stored*, or ``None``.
 
-    Accepts only the format :func:`hash_password` produces. ``None`` means the
-    value is unusable, which is what a caller needs to tell a misconfigured
-    ``AUTH_PASSWORD_HASH`` apart from a genuinely wrong password.
+    Accepts the format :func:`hash_password` produces, ignoring whitespace.
+    ``None`` means the value is unusable, which is what a caller needs to tell a
+    misconfigured ``AUTH_PASSWORD_HASH`` apart from a genuinely wrong password.
     """
     if not stored or not isinstance(stored, str):
         return None
-    parts = stored.split("$")
+    parts = _without_whitespace(stored).split("$")
     if len(parts) != 4:
         return None
     algo, iters, salt_b64, hash_b64 = parts
@@ -133,22 +146,41 @@ def parse_hash(stored: str | None) -> tuple[bytes, bytes, int] | None:
 def password_hash_problem(stored: str | None) -> str | None:
     """Describe why *stored* is not a usable hash, or ``None`` if it is fine.
 
-    The returned text never contains the value itself, so it is safe to log and
-    to show on the login page.
+    The text names the variable, the problem and the fix, but never the value, so
+    it is safe to log and to show on the login page. A value the generator
+    produced is always accepted; anything else is explained specifically, because
+    "may be the raw password" sent an operator to regenerate a hash that was
+    already correct when the real problem was a shell that ate the ``$``.
     """
     if not stored:
         return "AUTH_PASSWORD_HASH is empty"
-    parts = stored.split("$")
+    if not isinstance(stored, str):
+        return "AUTH_PASSWORD_HASH is not a string"
+    if parse_hash(stored) is not None:
+        return None
+
+    parts = _without_whitespace(stored).split("$")
+    if len(parts) == 1:
+        if "pbkdf2" in parts[0].lower():
+            return ("AUTH_PASSWORD_HASH lost its '$' separators, which a shell "
+                    "consumes; export it in single quotes. Expected "
+                    "pbkdf2_sha256$<iterations>$<salt>$<digest>")
+        return ("AUTH_PASSWORD_HASH does not look like a hash; it may be the raw "
+                "password. Generate one with: "
+                "python -m orchestration.web_auth hash")
     if len(parts) != 4:
-        if "$" not in stored:
-            return ("AUTH_PASSWORD_HASH does not look like a hash; it may be the "
-                    "raw password. Run: python -m orchestration.web_auth hash")
-        return ("AUTH_PASSWORD_HASH is not in the "
-                "pbkdf2_sha256$<iterations>$<salt>$<hash> format")
+        return (f"AUTH_PASSWORD_HASH has {len(parts) - 1} '$' separators, expected "
+                "3 (pbkdf2_sha256$<iterations>$<salt>$<digest>); a shell or a "
+                "paste removed some")
+
     algo, iters, salt_b64, hash_b64 = parts
     if algo != PBKDF2_ALGO:
-        return (f"AUTH_PASSWORD_HASH uses an unsupported algorithm ({algo!r}); "
-                f"expected {PBKDF2_ALGO!r}")
+        if algo[:1] in ("'", '"') or algo.endswith(("'", '"')):
+            return ("AUTH_PASSWORD_HASH is wrapped in quotes; paste the value "
+                    "without them")
+        return (f"AUTH_PASSWORD_HASH uses an unsupported algorithm ({algo!r}), "
+                f"expected {PBKDF2_ALGO!r}; only hashes from "
+                "`python -m orchestration.web_auth hash` are accepted")
     try:
         iterations = int(iters)
     except (TypeError, ValueError):
@@ -157,14 +189,21 @@ def password_hash_problem(stored: str | None) -> str | None:
         return "AUTH_PASSWORD_HASH has an iteration count below 1"
     if iterations > MAX_PBKDF2_ITERATIONS:
         return "AUTH_PASSWORD_HASH has an implausibly high iteration count"
-    try:
-        if not base64.b64decode(salt_b64, validate=True):
-            return "AUTH_PASSWORD_HASH has an empty salt"
-        if not base64.b64decode(hash_b64, validate=True):
-            return "AUTH_PASSWORD_HASH has an empty digest"
-    except (ValueError, TypeError):
-        return "AUTH_PASSWORD_HASH is not valid base64"
-    return None
+    for label, segment in (("salt", salt_b64), ("digest", hash_b64)):
+        if "-" in segment or "_" in segment:
+            return (f"AUTH_PASSWORD_HASH {label} uses the URL-safe base64 alphabet "
+                    "(- and _); this format uses standard base64 (+ and /)")
+        if len(segment) % 4 != 0:
+            return (f"AUTH_PASSWORD_HASH {label} is missing its base64 padding "
+                    "(=); the value was truncated")
+        try:
+            decoded = base64.b64decode(segment, validate=True)
+        except (ValueError, TypeError):
+            return (f"AUTH_PASSWORD_HASH {label} is not valid base64; the value "
+                    "was truncated or altered in transit")
+        if not decoded:
+            return f"AUTH_PASSWORD_HASH has an empty {label}"
+    return "AUTH_PASSWORD_HASH does not match the expected format"
 
 
 def verify_password(password: str, stored: str) -> bool:
@@ -389,25 +428,39 @@ def _now() -> float:
 
 
 def _cli() -> int:
-    """Generate the secrets the deployment needs, without printing the password.
+    """Generate and verify the secrets the deployment needs.
 
     Usage::
 
-        python -m orchestration.web_auth hash           # prompts, prints the hash
-        python -m orchestration.web_auth secret         # prints a session secret
+        python -m orchestration.web_auth hash             # prompt, print the hash
+        python -m orchestration.web_auth secret           # print a session secret
+        python -m orchestration.web_auth check            # verify $AUTH_PASSWORD_HASH
 
-    The password is read from a prompt (never from argv), so it does not land in
-    the shell history.
+    ``hash`` reads the password from a prompt (never from argv), so it does not
+    land in the shell history. ``check`` reads the *stored* value from
+    ``AUTH_PASSWORD_HASH`` (or stdin) and prints only a verdict, never the value;
+    with ``--password`` it also confirms that a password matches.
     """
     import getpass
     import sys
 
-    if len(sys.argv) != 2 or sys.argv[1] not in ("hash", "secret"):
-        print("usage: python -m orchestration.web_auth {hash|secret}", file=sys.stderr)
+    usage = ("usage: python -m orchestration.web_auth {hash|secret|check}\n"
+             "  hash    prompt for a password and print its hash\n"
+             "  secret  print a new AUTH_SESSION_SECRET\n"
+             "  check   verify the AUTH_PASSWORD_HASH currently in the "
+             "environment")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("hash", "secret", "check"):
+        print(usage, file=sys.stderr)
         return 2
-    if sys.argv[1] == "secret":
+    command = sys.argv[1]
+
+    if command == "secret":
         print(secrets.token_urlsafe(48))
         return 0
+
+    if command == "check":
+        return _check_cli(sys.argv[2:])
+
     # The password is typed at a prompt, never passed as an argument, so it does
     # not reach the shell history or the process list. That requires a terminal;
     # without one getpass would block on /dev/tty, which looks like a hang.
@@ -426,7 +479,52 @@ def _cli() -> int:
     if len(pw) < 12:
         print("choose a password of at least 12 characters", file=sys.stderr)
         return 1
-    print(hash_password(pw))
+    value = hash_password(pw)
+    print(value)
+    print(file=sys.stderr)
+    # Single quotes, because the value contains '$' and a shell would expand it
+    # inside double quotes or a heredoc. This line is safe to paste into a shell.
+    print("paste into Render as AUTH_PASSWORD_HASH; for a local shell use:",
+          file=sys.stderr)
+    print(f"  export AUTH_PASSWORD_HASH='{value}'", file=sys.stderr)
+    return 0
+
+
+def _check_cli(argv: list[str]) -> int:
+    """Verify a stored hash without printing it. Returns 0 when it is usable."""
+    import sys
+
+    want_password = "--password" in argv
+    stored = os.environ.get("AUTH_PASSWORD_HASH")
+    source = "AUTH_PASSWORD_HASH"
+    if not stored:
+        if sys.stdin.isatty():
+            print("AUTH_PASSWORD_HASH is not set and no value was piped in",
+                  file=sys.stderr)
+            return 2
+        stored = sys.stdin.read()
+        source = "stdin"
+
+    problem = password_hash_problem(stored)
+    if problem:
+        print(f"INVALID: {problem}", file=sys.stderr)
+        return 1
+    salt, expected, iterations = parse_hash(stored)
+    print(f"OK: {source} is a usable hash "
+          f"({PBKDF2_ALGO}, {iterations} iterations, "
+          f"{len(salt)}-byte salt, {len(expected)}-byte digest)")
+
+    if want_password:
+        import getpass
+        if not sys.stdin.isatty():
+            print("--password needs an interactive terminal", file=sys.stderr)
+            return 2
+        pw = getpass.getpass("password to confirm: ")
+        if verify_password(pw, stored):
+            print("OK: the password matches this hash")
+            return 0
+        print("MISMATCH: the password does not match this hash", file=sys.stderr)
+        return 1
     return 0
 
 

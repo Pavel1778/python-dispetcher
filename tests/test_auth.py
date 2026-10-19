@@ -11,6 +11,7 @@ import http.cookiejar
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +25,8 @@ from orchestration.web_auth import (  # noqa: E402
     SESSION_COOKIE,
     AuthService,
     hash_password,
+    parse_hash,
+    password_hash_problem,
     verify_password,
 )
 from orchestration.web_server import App, WebServer  # noqa: E402
@@ -557,3 +560,196 @@ def test_startup_gate_rejects_an_unusable_hash():
     )
     assert proc.returncode == 2
     assert "AUTH_PASSWORD_HASH" in proc.stdout + proc.stderr
+
+
+# ------------------------------------- generator and validator must agree
+# Regression: the deployment rejected a hash the shipped generator produced.
+# The generator and the validator have to round-trip through the real CLI and
+# the real login endpoint, not just through the helper functions.
+
+
+def test_cli_hash_output_authenticates_over_http(server, monkeypatch, tmp_path):
+    """A hash from `python -m orchestration.web_auth hash` must log in.
+
+    Runs the real CLI under a pty (it reads the password from a prompt), takes
+    the hash it prints, and uses it to authenticate against the real server.
+    """
+    import pty
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    password = "generator-and-validator-must-agree"
+
+    pid, fd = pty.fork()
+    if pid == 0:  # child: run the CLI as the operator would
+        os.chdir(repo)
+        os.execv(sys.executable, [sys.executable, "-m", "orchestration.web_auth",
+                                  "hash"])
+    time.sleep(0.5)
+    for _ in range(2):
+        os.write(fd, password.encode() + b"\n")
+        time.sleep(0.5)
+    time.sleep(1.5)
+    raw = b""
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        pass
+    os.waitpid(pid, 0)
+
+    text = raw.decode(errors="replace")
+    match = re.search(r"pbkdf2_sha256\$[0-9]+\$[^\s']+", text)
+    assert match, f"the CLI printed no hash: {text!r}"
+    printed = match.group(0)
+
+    # The printed value must be exactly what the server accepts.
+    assert parse_hash(printed) is not None
+    assert password_hash_problem(printed) is None
+    assert verify_password(password, printed) is True
+
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", printed)
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, _, _ = b.login(password=password)
+    assert st == 200, "a hash from the shipped generator failed to log in"
+    assert b.cookie() is not None
+
+
+def test_cli_check_accepts_the_generated_hash(monkeypatch):
+    """`check` exits 0 for a hash the generator produced."""
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    good = hash_password(PASSWORD, iterations=1000)
+    monkeypatch.delenv("AUTH_PASSWORD_HASH", raising=False)  # exercise stdin
+    proc = subprocess.run(
+        [sys.executable, "-m", "orchestration.web_auth", "check"],
+        cwd=repo, input=good, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+    assert good not in proc.stdout  # the value is never echoed
+
+
+def test_cli_check_rejects_a_corrupt_hash_without_echoing_it(monkeypatch):
+    """`check` exits 1 and names the problem, but never prints the value."""
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bad = "pbkdf2_sha256$1000$AAAA$BBB"        # digest is not padded base64
+    monkeypatch.delenv("AUTH_PASSWORD_HASH", raising=False)
+    proc = subprocess.run(
+        [sys.executable, "-m", "orchestration.web_auth", "check"],
+        cwd=repo, input=bad, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "INVALID" in proc.stderr
+    assert bad not in proc.stdout + proc.stderr
+
+
+def test_cli_check_prefers_the_environment_over_stdin(monkeypatch):
+    """`check` with no argument verifies AUTH_PASSWORD_HASH; it must not block on
+    stdin, so the environment wins and the reported source says so."""
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    good = hash_password(PASSWORD, iterations=1000)
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", good)
+    proc = subprocess.run(
+        [sys.executable, "-m", "orchestration.web_auth", "check"],
+        cwd=repo, input="junk-on-stdin", capture_output=True, text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "AUTH_PASSWORD_HASH" in proc.stdout
+
+
+def test_cli_usage_names_every_subcommand():
+    """The blueprint once documented a command with no subcommand; make the
+    usage text list them so a bare invocation is self-correcting."""
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run(
+        [sys.executable, "-m", "orchestration.web_auth"],
+        cwd=repo, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 2
+    for sub in ("hash", "secret", "check"):
+        assert sub in proc.stderr
+
+
+# ------------------------------------ whitespace and transport corruption
+# Regression: a terminal wraps the long hash, and the newline in the middle made
+# the value "not valid base64", which the operator could not act on.
+
+
+@pytest.mark.parametrize("wrap", [
+    lambda h: h + "\n",                       # trailing newline (.env, paste)
+    lambda h: "\n" + h,                       # leading newline
+    lambda h: h + "\r\n",                     # Windows clipboard
+    lambda h: h[:40] + "\n" + h[40:],         # terminal wrap, mid-value
+    lambda h: "  " + h + "  ",                # stray spaces
+    lambda h: h[:30] + "\t" + h[30:],         # tab
+])
+def test_whitespace_from_a_wrapped_paste_still_logs_in(server, monkeypatch, wrap):
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", wrap(hash_password(PASSWORD,
+                                                                iterations=1000)))
+    server.app.auth = AuthService(server.app.store)
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    st, _, _ = b.login()
+    assert st == 200, "whitespace introduced by a wrapped paste blocked the login"
+
+
+def test_whitespace_is_ignored_but_the_password_is_not_normalised():
+    """Only the stored value is normalised; the password must still be exact."""
+    stored = hash_password(PASSWORD, iterations=1000)
+    assert verify_password(PASSWORD, " " + stored + " ") is True
+    assert verify_password(PASSWORD + " ", stored) is False
+    assert verify_password(" " + PASSWORD, stored) is False
+
+
+@pytest.mark.parametrize("label,corrupt,expect", [
+    ("shell ate the $ separators",
+     lambda h: h.replace("$", ""),
+     "lost its '$' separators"),
+    ("quotes included",
+     lambda h: '"' + h + '"',
+     "wrapped in quotes"),
+    ("urlsafe base64 alphabet",
+     lambda h: h.replace("+", "-").replace("/", "_"),
+     "URL-safe base64"),
+    ("padding stripped",
+     lambda h: h.rstrip("="),
+     "padding"),
+    ("raw password",
+     lambda h: PASSWORD,
+     "raw password"),
+])
+def test_each_corruption_is_named_specifically(label, corrupt, expect):
+    """Each realistic corruption gets its own message, so the operator knows
+    what to fix instead of being told to regenerate a good hash."""
+    # A fixed hash that contains both '+' and '/', so the URL-safe corruption
+    # actually changes the alphabet instead of being a no-op.
+    stored = ("pbkdf2_sha256$1000$+a/bC1dEf2gH3iJ4kL5mN6oQ=="
+              "$Zm9v+GJhci9iYXo=")
+    corrupted = corrupt(stored)
+    problem = password_hash_problem(corrupted)
+    assert problem is not None, label
+    assert expect in problem, f"{label}: got {problem!r}"
+
+
+def test_diagnostics_never_contain_the_value():
+    """Every message is safe to log and to show on the login page."""
+    stored = hash_password(PASSWORD, iterations=1000)
+    variants = [stored, stored.replace("$", ""), '"' + stored + '"',
+                stored.rstrip("="), PASSWORD, "junk"]
+    for value in variants:
+        problem = password_hash_problem(value)
+        if problem:
+            assert value not in problem
+            assert stored not in problem

@@ -17,6 +17,12 @@
 # Before the first deploy, generate the two secrets once (see DEPLOY.md):
 #   AUTH_PASSWORD_HASH   from `python -m orchestration.web_auth hash`
 #   AUTH_SESSION_SECRET  from `python -m orchestration.web_auth secret`
+# The hash contains '$' separators. A shell expands or removes them inside double
+# quotes, a heredoc and an unquoted assignment, which corrupts the value. Paste it
+# into the Render dashboard verbatim, and quote it in single quotes in a shell:
+#   export AUTH_PASSWORD_HASH='pbkdf2_sha256$<iterations>$<salt>$<digest>'
+# Verify the value that is actually set before deploying:
+#   python -m orchestration.web_auth check
 services:
   - type: web
     name: python-dispetcher

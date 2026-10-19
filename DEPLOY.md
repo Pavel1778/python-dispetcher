@@ -90,34 +90,70 @@ The password is read from a prompt, never from the command line, so it does not
 end up in your shell history. The same password verifies only against that hash.
 
 The printed value must look like
-`pbkdf2_sha256$600000$<salt>$<digest>`. Paste it **exactly** — all four parts,
-including the `$` characters. `AUTH_PASSWORD_HASH` is the hash, never the
+
+```
+pbkdf2_sha256$600000$<salt>$<digest>
+```
+
+four parts separated by three `$`, where `<salt>` and `<digest>` are standard
+base64 (`+`, `/`, `=` allowed). `AUTH_PASSWORD_HASH` is the hash, never the
 password.
+
+### The `$` characters: the one thing that breaks this
+
+`$` is special to a shell. Inside double quotes, a heredoc, or an unquoted
+assignment, a shell expands `$600000` and friends and the value loses its
+separators — that is why the log can say "does not look like a hash" for a hash
+that was generated correctly. Rules:
+
+* In the Render dashboard, paste the line verbatim. Render stores a literal
+  string; there is nothing to escape and no quotes to add.
+* In a shell, always single quotes, which do not expand `$`:
+
+  ```
+  export AUTH_PASSWORD_HASH='pbkdf2_sha256$600000$<salt>$<digest>'
+  ```
+
+* The `hash` command prints exactly that `export` line to stderr, so you can
+  copy it instead of retyping the value.
+
+### Verify the value that is actually set
+
+Before deploying, confirm the value the server will read:
+
+```
+python -m orchestration.web_auth check
+```
+
+It reads `AUTH_PASSWORD_HASH` from the environment (or from stdin if it is not
+set), prints `OK` with the algorithm, iteration count and sizes, or `INVALID`
+with the specific problem and the fix. It never prints the value. Add
+`--password` to also confirm that a password matches the hash.
 
 ### Login fails with "Неверный логин или пароль"
 
 That message means the submitted credentials did not match the configured ones.
 Work through this in order:
 
-1. Read the reason from the deployment. `GET /api/system` returns
-   `config.login_errors`, a list of human-readable problems, and a start-up
-   refusal prints the same reasons. A bad `AUTH_PASSWORD_HASH` is named there.
-2. If `AUTH_PASSWORD_HASH` holds the password itself, or a truncated paste, or a
-   hash produced by another tool (bcrypt, argon2, Django, `openssl passwd`),
-   every login fails. Only the `pbkdf2_sha256$...` format from this repository is
-   accepted.
-3. Confirm `AUTH_USERNAME` matches exactly what you type. Leading and trailing
+1. Run `python -m orchestration.web_auth check`. It names the exact problem.
+   `GET /api/system` returns the same reasons in `config.login_errors`, and a
+   start-up refusal prints them too.
+2. If the value lost its `$` separators, or is wrapped in quotes, or uses the
+   URL-safe base64 alphabet (`-` and `_`), or is missing its `=` padding, the
+   message says which. Re-export with single quotes and re-paste.
+3. If `AUTH_PASSWORD_HASH` holds the password itself, or a hash from another tool
+   (bcrypt, argon2, Django, `openssl passwd`), every login fails. Only the
+   `pbkdf2_sha256$...` format from this repository is accepted.
+4. Confirm `AUTH_USERNAME` matches exactly what you type. Leading and trailing
    spaces are trimmed on both sides, but the comparison is case-sensitive.
-4. `AUTH_SESSION_SECRET` only signs the session. A wrong value breaks the
+5. `AUTH_SESSION_SECRET` only signs the session. A wrong value breaks the
    *existing* session, not the login itself.
-
-If the hash cannot be repaired — for example it was produced by another tool —
-regenerate it (next section).
 
 ### Regenerating AUTH_PASSWORD_HASH on Render
 
-Do this only when the existing value is unusable. It replaces the password for
-the owner login; nothing else changes.
+Do this only when the existing value is unusable — `check` says `INVALID` and the
+problem is not one of the quoting cases above. It replaces the password for the
+owner login; nothing else changes.
 
 1. Locally, in an interactive terminal:
 
@@ -125,18 +161,27 @@ the owner login; nothing else changes.
    python -m orchestration.web_auth hash
    ```
 
-   Type the new password twice. The command prints one line, the hash. It never
-   prints the password back.
+   Type the new password twice. The command prints one line, the hash, and an
+   `export ...='...'` line on stderr. It never prints the password back.
 
-2. In the Render dashboard, open the service → **Environment**, edit
-   `AUTH_PASSWORD_HASH`, and paste the whole printed line as the value. Do not
-   wrap it in quotes and do not escape the `$` characters: Render stores the
-   literal string. Save.
+2. Verify before pasting:
 
-3. Render redeploys automatically on an environment change. If it does not,
+   ```
+   python -m orchestration.web_auth check      # reads the env var
+   # or, without touching your environment:
+   printf '%s' 'pbkdf2_sha256$...' | python -m orchestration.web_auth check
+   ```
+
+   Expect `OK: ... is a usable hash`.
+
+3. In the Render dashboard, open the service → **Environment**, edit
+   `AUTH_PASSWORD_HASH`, and paste the hash line verbatim as the value. Do not
+   add quotes and do not escape the `$` characters. Save.
+
+4. Render redeploys automatically on an environment change. If it does not,
    trigger **Manual Deploy → Deploy latest commit**.
 
-4. Verify: the service log must not contain the "refusing to bind a public
+5. Verify: the service log must not contain the "refusing to bind a public
    interface without login configured" message, and `GET /api/system` must show
    an empty `config.login_errors`. Then log in.
 
