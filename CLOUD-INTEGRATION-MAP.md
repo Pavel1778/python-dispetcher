@@ -107,3 +107,57 @@ HTTP server; it needs a connected provider to run against live Cloud.
 - `assigned` has no direct edge to `queued` or `dead_letter`; recovery walks a
   legal path (`force_transition`) instead of forcing an impossible move.
 - The Cloud key is read from the environment and never logged or persisted.
+
+## Client tools: how Sr actually acts (verified live)
+
+A Cloud conversation is not, by itself, able to call back into our system. The
+documented way to let the agent act is the `client_tools` field on
+`POST /api/v1/app-conversations` (schema `ClientToolSpec`: `name`,
+`description`, `parameters`, `annotations`). Verified against the live API:
+
+1. Start a conversation with `client_tools`.
+2. When the agent calls one, the server emits an **`ActionEvent`** in the
+   conversation's event stream with `tool_name` set and
+   `action.kind == "ClientAction_<name>"`. The agent receives only an
+   acknowledgment `ObservationEvent` and continues.
+3. The client polls `GET /api/v1/conversation/{id}/events/search`, executes the
+   call, and delivers the result back with `send-message`.
+
+Confirmed live: a probe conversation called `jr_probe` and produced exactly
+`ActionEvent(tool=jr_probe, action={"value":42,"kind":"ClientAction_jr_probe"})`
+plus an `ObservationEvent` acknowledgment.
+
+### Trap: a client tool name that collides with a built-in is a 422
+
+A `ClientToolSpec` whose `name` equals a built-in tool name is rejected by the
+agent server with **422** during conversation start (the start task reaches
+`ERROR`). Confirmed live: `create_task` and `list_child_tasks` both collide (the
+SDK registry contains `task`/`task_tool_set` and `task_tracker`), while the same
+schemas under unique names start fine. The Sr tools are therefore named with an
+`sr_` prefix (`sr_create_task`, `sr_list_child_tasks`, ...) and the prefix is
+unwrapped in `sr_runtime`.
+
+### Trap: the model invents `workflow_id`
+
+Observed live: given a `workflow_id` parameter, the model passed a made-up string
+(`"sr-delegation-single-unit"`), which the store rejected as a bad uuid. The
+bridge therefore removes `workflow_id` from the tool schemas and always
+substitutes the real one from context; the model never supplies it.
+
+### Daily conversation quota
+
+The account enforces a **daily conversation limit (20/day)**; exceeding it is a
+**429** `daily_conversation_limit_reached`. Schema probing consumed the quota for
+the day, so the full live Sr->Jr chain could not be re-run after the fixes. The
+chain is covered by tests against a real local HTTP server that reproduces the
+`client_tools`/`ActionEvent` behaviour, and the earlier live probe confirms the
+mechanism itself.
+
+## Web control panel
+
+`orchestration/web_server.py` is a stdlib-only HTTP server. `POST /api/workflows`
+creates a workflow and starts a real Sr conversation with the Sr client tools
+attached; a background loop runs `SrRuntime.tick()` (Sr tool calls -> Jr tasks)
+and `CloudDispatcher.tick()` (Jr tasks -> Cloud conversations). The page lists
+workflows and shows each workflow's tasks and Sr tool calls. The Cloud key is
+read from the environment and never sent to the browser.

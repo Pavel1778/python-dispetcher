@@ -642,6 +642,128 @@ class PostgresStore:
         self._conn.commit()
         return rows
 
+    # ------------------------------------------------------------- Sr runtime
+    def bind_sr(
+        self,
+        workflow_id: str,
+        *,
+        conversation_id: str | None = None,
+        start_task_id: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        """Record the Sr conversation for a workflow (one Sr per workflow)."""
+        with self._tx() as cur:
+            cur.execute(
+                """
+                UPDATE workflows
+                   SET sr_conversation_id = COALESCE(%s, sr_conversation_id),
+                       sr_start_task_id   = COALESCE(%s, sr_start_task_id),
+                       sr_status          = COALESCE(%s, sr_status),
+                       updated_at = now()
+                 WHERE id = %s
+                """,
+                (conversation_id, start_task_id, status, workflow_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFound(f"workflow {workflow_id}")
+            self._event(cur, "sr_bound", workflow_id=workflow_id,
+                        detail={"conversation_id": conversation_id,
+                                "start_task_id": start_task_id, "status": status})
+
+    def sr_for(self, workflow_id: str) -> dict[str, Any] | None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT sr_conversation_id, sr_start_task_id, sr_status, goal, state "
+                "FROM workflows WHERE id=%s",
+                (workflow_id,),
+            )
+            row = cur.fetchone()
+        self._conn.commit()
+        return row
+
+    def list_workflows(self) -> list[dict[str, Any]]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, goal, state, sr_conversation_id, sr_status, created_at "
+                "FROM workflows ORDER BY created_at"
+            )
+            rows = cur.fetchall()
+        self._conn.commit()
+        return rows
+
+    def list_repositories(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
+        sql = "SELECT id, provider, full_name, default_branch, allowed_branches, enabled FROM repositories"
+        if enabled_only:
+            sql += " WHERE enabled"
+        sql += " ORDER BY full_name"
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        self._conn.commit()
+        return rows
+
+    def claim_tool_call(
+        self,
+        event_id: str,
+        *,
+        workflow_id: str | None,
+        name: str,
+        args: dict[str, Any],
+    ) -> bool:
+        """Atomically claim a client-tool call for execution.
+
+        Returns True when this caller inserted the row (so it must run the tool),
+        False when another poll already claimed the same Cloud event id. The
+        primary key on ``event_id`` is what makes execution exactly-once across
+        polls and restarts.
+        """
+        try:
+            with self._tx() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO sr_tool_calls(event_id, workflow_id, name, args)
+                    VALUES (%s,%s,%s,%s)
+                    """,
+                    (event_id, workflow_id, name, json.dumps(args)),
+                )
+                self._event(cur, "sr_tool_call_claimed", workflow_id=workflow_id,
+                            detail={"event_id": event_id, "name": name})
+        except psycopg.errors.UniqueViolation:
+            return False
+        return True
+
+    def finish_tool_call(
+        self,
+        event_id: str,
+        *,
+        result: dict[str, Any],
+        is_error: bool = False,
+        task_id: str | None = None,
+    ) -> None:
+        with self._tx() as cur:
+            cur.execute(
+                """
+                UPDATE sr_tool_calls
+                   SET result=%s, is_error=%s, task_id=COALESCE(%s, task_id),
+                       finished_at=now()
+                 WHERE event_id=%s
+                """,
+                (json.dumps(result, default=str), is_error, task_id, event_id),
+            )
+            self._event(cur, "sr_tool_call_finished", task_id=task_id,
+                        detail={"event_id": event_id, "is_error": is_error})
+
+    def tool_calls(self, *, workflow_id: str, limit: int = 100) -> list[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM sr_tool_calls WHERE workflow_id=%s "
+                "ORDER BY created_at DESC LIMIT %s",
+                (workflow_id, limit),
+            )
+            rows = cur.fetchall()
+        self._conn.commit()
+        return rows
+
 
 def _row_to_task(row: dict[str, Any]) -> Task:
     deps = row.get("dependencies")

@@ -92,3 +92,18 @@ These were found by running against the live server, not from docs:
 The runtime at `127.0.0.1:60000` in this sandbox has **no working LLM key**
 (auth fails). That is why the e2e scripts assert the dead-letter path. A
 successful-completion e2e needs a valid key and is not yet exercised.
+
+## Sr tool bridge and web UI
+
+- Sr acts only through **client tools**: `start_conversation(..., client_tools=...)`,
+  then poll `events/search` for `ActionEvent` and deliver results with
+  `send-message`. See `orchestration/sr_runtime.py`.
+- Client-tool names **must not collide with built-in tool names** (422). Sr tool
+  names carry an `sr_` prefix for this reason. Do not rename them back.
+- `workflow_id` is **never** taken from the model; the bridge substitutes the real
+  one. Keep `workflow_id` out of `SrTools.tool_schemas()`.
+- `orchestration/web_server.py` is the UI (`python -m orchestration.web_server`).
+  Run tests with `TEST_SUPABASE_DB_URL` set; without a DB the DB-backed modules
+  skip cleanly.
+- The account has a **daily conversation limit**; probing schemas can exhaust it.
+  Prefer the fake Cloud server in `tests/fake_cloud.py` for iteration.

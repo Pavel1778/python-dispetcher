@@ -176,6 +176,7 @@ class CloudClient:
         parent_conversation_id: str | None = None,
         tags: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        client_tools: list[dict[str, Any]] | None = None,
     ) -> StartTask:
         """``POST /api/v1/app-conversations`` -> a start task to poll.
 
@@ -183,6 +184,12 @@ class CloudClient:
         fields (schema ``AppConversationStartRequest``). ``secrets`` is the
         documented channel for per-conversation tokens; it is write-only and is
         never persisted here.
+
+        ``client_tools`` is the documented ``ClientToolSpec`` list. When it is
+        present the server injects those tools into the agent, and a call emits
+        an ``ActionEvent`` in the conversation's event stream (confirmed against
+        the live API). The caller is responsible for executing the call and
+        returning the result; see :mod:`orchestration.sr_runtime`.
         """
         body: dict[str, Any] = {
             "initial_message": {
@@ -204,6 +211,8 @@ class CloudClient:
             body["tags"] = tags
         if secrets is not None:
             body["secrets"] = secrets
+        if client_tools is not None:
+            body["client_tools"] = client_tools
         status, payload = self._request("POST", "/api/v1/app-conversations", body)
         if status not in (200, 201):
             raise CloudError(f"start_conversation -> {status}")

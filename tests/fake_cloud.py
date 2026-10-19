@@ -25,6 +25,7 @@ class FakeCloud:
         self.conversations: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}
         self.messages: dict[str, list[str]] = {}
+        self.client_tools: dict[str, list[dict]] = {}
         # Controls: how many polls a start task needs before READY.
         self.start_polls_required = 0
         self.start_fail = False
@@ -54,6 +55,26 @@ class FakeCloud:
              "llm_message": {"role": "assistant",
                              "content": [{"type": "text", "text": text}]}}
         )
+
+    def add_client_tool_action(self, cid: str, name: str, args: dict,
+                               event_id: str | None = None) -> str:
+        """Append an ActionEvent as the live server emits for a client tool call.
+
+        The live server sets ``tool_name`` and an ``action`` payload that carries
+        the arguments plus a ``kind`` of ``ClientAction_<name>``; the id is
+        stable across polls, which is what makes execution exactly-once.
+        """
+        eid = event_id or str(uuid.uuid4())
+        self.events[cid].append(
+            {
+                "id": eid,
+                "kind": "ActionEvent",
+                "tool_name": name,
+                "action": {**args, "kind": f"ClientAction_{name}"},
+                "source": "agent",
+            }
+        )
+        return eid
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -137,6 +158,7 @@ class _Handler(BaseHTTPRequestHandler):
                 repo=body.get("selected_repository"),
                 branch=body.get("selected_branch"),
             )
+            self.cloud.client_tools[cid] = body.get("client_tools") or []
             self.cloud.events[cid].append(
                 {"kind": "MessageEvent",
                  "llm_message": {"role": "user",

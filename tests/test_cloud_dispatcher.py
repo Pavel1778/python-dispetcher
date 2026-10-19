@@ -38,6 +38,11 @@ MIGRATION = os.path.join(
     "migrations",
     "0001_init.sql",
 )
+MIGRATION_2 = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "migrations",
+    "0002_sr_runtime.sql",
+)
 
 
 def _reset_schema() -> None:
@@ -46,10 +51,11 @@ def _reset_schema() -> None:
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DROP TABLE IF EXISTS task_events, conversations, tasks, "
-                "repositories, workflows CASCADE"
+                "DROP TABLE IF EXISTS sr_tool_calls, task_events, conversations, "
+                "tasks, repositories, workflows CASCADE"
             )
             cur.execute(open(MIGRATION).read())
+            cur.execute(open(MIGRATION_2).read())
 
 
 @pytest.fixture(autouse=True)

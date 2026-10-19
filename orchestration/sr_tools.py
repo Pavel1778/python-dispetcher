@@ -222,37 +222,41 @@ class SrTools:
     # --------------------------------------------------------------- schemas
     @staticmethod
     def tool_schemas() -> list[dict[str, Any]]:
-        """OpenAI-style function schemas Sr can be given."""
+        """``ClientToolSpec``-shaped schemas for the Sr conversation.
+
+        Names are prefixed ``sr_`` on purpose: a client tool whose name collides
+        with a built-in tool is rejected by the agent server with a 422
+        (``create_task`` and ``list_child_tasks`` both collide — confirmed live).
+        The prefix keeps the names unique and the mapping is unwrapped in
+        :mod:`orchestration.sr_runtime`.
+        """
         return [
             {
-                "name": "create_task",
+                "name": "sr_create_task",
                 "description": "Create a child (Jr) task in a repository and enqueue it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "goal": {"type": "string"},
-                        "workflow_id": {"type": "string"},
                         "request": {"type": "string"},
                         "acceptance": {"type": "string"},
                         "repository": {"type": "string"},
                         "branch": {"type": "string"},
                         "dependencies": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["goal", "workflow_id"],
+                    "required": ["goal"],
                 },
             },
             {
-                "name": "list_child_tasks",
+                "name": "sr_list_child_tasks",
                 "description": "List tasks in a workflow, optionally under a parent.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"workflow_id": {"type": "string"},
-                                   "parent_task_id": {"type": "string"}},
-                    "required": ["workflow_id"],
+                    "properties": {"parent_task_id": {"type": "string"}},
                 },
             },
             {
-                "name": "get_task_status",
+                "name": "sr_get_task_status",
                 "description": "Return the current state and conversation of a task.",
                 "parameters": {
                     "type": "object",
@@ -261,7 +265,7 @@ class SrTools:
                 },
             },
             {
-                "name": "get_task_report",
+                "name": "sr_get_task_report",
                 "description": "Return a task's result, evidence and recent events.",
                 "parameters": {
                     "type": "object",
@@ -270,7 +274,7 @@ class SrTools:
                 },
             },
             {
-                "name": "request_task_revision",
+                "name": "sr_request_task_revision",
                 "description": "Send feedback and re-queue a task for another attempt.",
                 "parameters": {
                     "type": "object",
@@ -280,7 +284,7 @@ class SrTools:
                 },
             },
             {
-                "name": "accept_task_result",
+                "name": "sr_accept_task_result",
                 "description": "Accept or reject a verified task result.",
                 "parameters": {
                     "type": "object",
@@ -291,7 +295,7 @@ class SrTools:
                 },
             },
             {
-                "name": "cancel_task",
+                "name": "sr_cancel_task",
                 "description": "Cancel a task that is no longer needed.",
                 "parameters": {
                     "type": "object",
