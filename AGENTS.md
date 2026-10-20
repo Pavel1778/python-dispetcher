@@ -338,6 +338,18 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
 - There is no `RENDER_API_KEY` or deploy hook in this environment, so a deploy
   cannot be triggered from here. Rebuilding by hand in the Render dashboard is
   the reliable path.
+- **Server-side prepared statements are off by default** (`prepare_threshold=None`
+  in `PostgresStore`). Do not re-enable them behind a pooler. The failure they
+  cause needs a restart to appear, which is why it read as a random startup
+  crash: a start runs one statement past psycopg's default threshold (5), the
+  pooler keeps the server session, and the next start prepares the same
+  generated name and dies with `DuplicatePreparedStatement: prepared statement
+  "_pg3_0" already exists` inside `apply_migrations`. A fresh schema hides it,
+  because the migration DDL makes psycopg send `DEALLOCATE ALL`; reproduce it on
+  a *warm* schema. `tests/test_schema_bootstrap.py` has the end-to-end case,
+  gated on `TEST_POOLER_DSN` (point it at a PgBouncer in `pool_mode=transaction`
+  with `max_prepared_statements=0`; newer PgBouncer manages prepared statements
+  itself and masks the bug, Supabase's pooler does not).
 - Tests: `tests/test_workflow_actions.py` (actions, auth, `sr_url`, and the
   malformed-id 404 block) and the workspace-conflict block at the end of
   `tests/test_reliability.py`. The fake Cloud implements `PATCH`/`DELETE` so

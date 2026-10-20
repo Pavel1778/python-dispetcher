@@ -202,21 +202,37 @@ class PostgresStore:
         # claim still protects against *other* processes. Callers needing more
         # concurrency can open one store per worker.
         #
-        # Supabase's transaction pooler (PgBouncer, port 6543) hands a server
-        # connection to a different client between statements, so a server-side
-        # prepared statement can be missing on the next execute. Disabling
-        # psycopg's automatic preparation keeps every statement unparameterised
-        # on the server. The default (5) prepares a statement after its fifth
-        # execution, which fails behind the pooler with
-        # "prepared statement ... does not exist".
-        pooler = os.environ.get("DATABASE_TRANSACTION_POOLER", "").lower() in ("1", "true", "yes")
+        # Server-side prepared statements are off by default. A pooler in
+        # transaction mode (Supabase port 6543, PgBouncer) hands the server
+        # connection to a different client between statements, and by default it
+        # does not reset the session, so a statement prepared by one process is
+        # still present on the backend when the next process prepares its own
+        # first statement -- with the same generated name. The next start then
+        # dies with `DuplicatePreparedStatement: prepared statement "_pg3_0"
+        # already exists`. psycopg's default is to prepare after the fifth
+        # execution of a statement, which a long-running poll loop reaches
+        # quickly, so the failure needs a restart to appear and is easy to miss.
+        # Disabling preparation keeps every statement unparameterised on the
+        # server and removes the shared-state failure entirely.
+        #
+        # The switch is kept for a direct (session-mode) connection, where
+        # preparation is a pure win and is safe. It is *additive*: a pooler
+        # deployment never re-enables preparation by setting it, because the
+        # failure is silent until a restart and the flag is the thing most
+        # likely to be wrong in production. Set PSYCOPG_PREPARE=session to opt
+        # in.
+        prepare = os.environ.get("PSYCOPG_PREPARE", "").strip().lower()
+        if prepare in ("session", "on", "enabled", "true", "1"):
+            prepare_threshold: int | None = 5
+        else:
+            prepare_threshold = None
         connect_kwargs: dict[str, Any] = {
             "row_factory": dict_row,
             "autocommit": False,
             "connect_timeout": connect_timeout,
+            "prepare_threshold": prepare_threshold,
         }
-        if pooler:
-            connect_kwargs["prepare_threshold"] = None
+        self.prepare_threshold = prepare_threshold
         self._conn = psycopg.connect(self.dsn, **connect_kwargs)
         # psycopg connections are not thread-safe, but the web server answers
         # each request on its own thread while sharing this one connection.

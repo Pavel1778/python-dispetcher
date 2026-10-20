@@ -293,13 +293,31 @@ the schema out of band.
 
 ## Connection pooling
 
-Set `DATABASE_TRANSACTION_POOLER=true` when `SUPABASE_DB_URL` points at
-Supabase's transaction pooler (PgBouncer, port 6543). The pooler may hand the
-same server connection to a different client between statements, so psycopg's
-automatic server-side preparation (default: after the fifth execution) can fail
-with `prepared statement ... does not exist`. The flag disables preparation
-(`prepare_threshold=None`), which is asserted by
-`tests/test_schema_bootstrap.py`.
+Server-side prepared statements are **off by default** (`prepare_threshold=None`).
+That is the safe choice behind any transaction-mode pooler: Supabase's PgBouncer
+on port 6543, and any other pooler that reuses a server session. The failure it
+prevents is not the missing-statement one, it is the opposite, and it only shows
+up on a restart:
+
+1. The process starts, the poll loop runs one statement more than psycopg's
+   default threshold (5), and psycopg prepares it server-side as `_pg3_0`.
+2. The process is recycled -- a Render free-plan cold start, a deploy, a crash.
+   The pooler does not reset the server session, so `_pg3_0` is still present on
+   the backend.
+3. The next start runs the same statement, psycopg decides to prepare it and
+   generates `_pg3_0` again, and PostgreSQL rejects it with
+   `DuplicatePreparedStatement: prepared statement "_pg3_0" already exists`.
+
+Because the first start is fine, this looks like a random startup failure rather
+than a pooling bug. Reproduced against a real PgBouncer in `pool_mode=transaction`
+with `max_prepared_statements=0` (newer PgBouncer manages prepared statements
+itself and hides the bug; Supabase's pooler does not): two consecutive clients
+running the same query produced exactly `prepared statement "_pg3_0" already
+exists`, and `prepare_threshold=None` made it disappear.
+
+Preparation is a pure win on a direct session-mode connection, so it can be
+re-enabled there with `PSYCOPG_PREPARE=session`. Do not set it behind a pooler.
+The default is asserted by `tests/test_schema_bootstrap.py`.
 
 ## Schema check at startup
 

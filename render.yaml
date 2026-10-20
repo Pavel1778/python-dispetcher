@@ -36,14 +36,16 @@ services:
     autoDeploy: true
     envVars:
       # Required. PostgreSQL/Supabase DSN. Set in the dashboard, never here.
-      # Use the transaction pooler URI (port 6543) and keep the flag below on.
+      # The transaction pooler URI (port 6543) is fine: server-side prepared
+      # statements are off by default, so the pooler cannot hand a session with
+      # a stale prepared statement to the next start.
       - key: SUPABASE_DB_URL
         sync: false
-      # Supabase's transaction pooler (PgBouncer) cannot hold server-side
-      # prepared statements across statements; psycopg's auto-prepare must be
-      # off. Leave true when the DSN points at port 6543.
-      - key: DATABASE_TRANSACTION_POOLER
-        value: "true"
+      # Optional. Server-side prepared statements are disabled by default; set
+      # this to "session" only for a direct (session-mode) connection, where
+      # preparation is safe and faster. Do not set it behind a pooler.
+      - key: PSYCOPG_PREPARE
+        sync: false
       # Apply the idempotent migrations on start. The free plan has no shell, so
       # this is the only way to create the schema; set false to manage it
       # out of band.
