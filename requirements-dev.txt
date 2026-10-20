@@ -1,0 +1,6 @@
+# Test and lint tooling. Not required to run the service.
+#
+# Pinned to the versions the suite and the lint were last verified against, so
+# CI and a local run agree. The runtime dependencies live in requirements.txt.
+pytest==9.0.3
+ruff==0.13.1

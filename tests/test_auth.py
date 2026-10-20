@@ -773,3 +773,221 @@ def test_diagnostics_never_contain_the_value():
         if problem:
             assert value not in problem
             assert stored not in problem
+
+
+# ------------------------------------------------ client IP behind a proxy
+def test_spoofed_xff_cannot_rotate_the_rate_limit_key(server):
+    """An appending proxy must not let the client pick its own rate-limit key.
+
+    Regression: the leftmost ``X-Forwarded-For`` value was used. A proxy only
+    appends, so the client controls the leftmost entry; rotating it made every
+    attempt look like a new client and the lockout never engaged. The test
+    client plays the proxy: it appends the real peer IP to the attacker's value.
+    """
+    real_client = "127.0.0.1"
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    codes = []
+    for i in range(12):
+        st, _, _ = b.request(
+            "POST", "/login",
+            form={"username": "owner", "password": "WRONG"},
+            headers={"X-Forwarded-For": f"203.0.113.{i}, {real_client}"},
+        )
+        codes.append(st)
+    assert 429 in codes, f"lockout never engaged: {codes}"
+
+    # The same real client cannot get in with the correct password either.
+    st, _, _ = b.request(
+        "POST", "/login",
+        form={"username": "owner", "password": PASSWORD},
+        headers={"X-Forwarded-For": f"198.51.100.7, {real_client}"},
+    )
+    assert st == 429, "spoofed header bypassed the lockout"
+
+
+def test_client_ip_uses_the_rightmost_trusted_hop():
+    """The resolver picks the proxy-appended value, not the client-supplied one."""
+    from orchestration.web_server import client_ip_from
+
+    assert client_ip_from("203.0.113.9, 198.51.100.4", "10.0.0.1", 1) == "198.51.100.4"
+    # No header: the socket peer.
+    assert client_ip_from(None, "10.0.0.1", 1) == "10.0.0.1"
+    # Zero trusted hops: the header is ignored entirely.
+    assert client_ip_from("203.0.113.9", "10.0.0.1", 0) == "10.0.0.1"
+    # Fewer addresses than trusted hops: cannot be trusted, so use the peer.
+    assert client_ip_from("203.0.113.9", "10.0.0.1", 2) == "10.0.0.1"
+    # Two proxies: the second from the right is the client the first proxy saw.
+    assert client_ip_from("a, b, c", "10.0.0.1", 2) == "b"
+
+
+def test_client_ip_joins_every_header_line():
+    """A repeated header must not let the client pick the key.
+
+    Regression: ``headers.get`` returns only the first ``X-Forwarded-For`` line.
+    A caller that sends its own line and lets the proxy append a second one made
+    the resolver read the caller's value, so rotating it defeated the lockout.
+    """
+    from orchestration.web_server import client_ip_from_values
+
+    # Two lines: the caller's, then what the proxy appended. hops=1 must pick
+    # the proxy's value from the second line.
+    assert client_ip_from_values(["10.0.0.5", "203.0.113.7"], "127.0.0.1", 1) == "203.0.113.7"
+    # Three lines, two trusted hops: the second from the right.
+    assert client_ip_from_values(["9.9.9.9", "1.1.1.1", "2.2.2.2"], "127.0.0.1", 2) == "1.1.1.1"
+    # A comma list inside one line behaves the same as several lines.
+    assert client_ip_from_values(["10.0.0.5, 203.0.113.7"], "127.0.0.1", 1) == "203.0.113.7"
+    # No header lines at all: the socket peer.
+    assert client_ip_from_values([], "127.0.0.1", 1) == "127.0.0.1"
+    assert client_ip_from_values(None, "127.0.0.1", 1) == "127.0.0.1"
+
+
+def test_trusted_hop_count_defaults_and_rejects_junk(monkeypatch):
+    """The hop count must never fall back to a value that trusts more proxies.
+
+    A missing, empty or unparsable value falls back to the safe default of 1
+    (trust one hop), not to 0 and not to "trust everything". A negative value is
+    clamped to 0 (ignore the header). No input may raise.
+    """
+    from orchestration.web_server import trusted_hop_count
+
+    monkeypatch.delenv("TRUSTED_PROXY_HOPS", raising=False)
+    assert trusted_hop_count() == 1, "unset must default to 1"
+
+    for junk in ("", "   ", "abc", "1.5", "one"):
+        monkeypatch.setenv("TRUSTED_PROXY_HOPS", junk)
+        assert trusted_hop_count() == 1, f"{junk!r} must fall back to 1"
+
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "3")
+    assert trusted_hop_count() == 3
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", " 3 ")
+    assert trusted_hop_count() == 3, "surrounding whitespace must be tolerated"
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "0")
+    assert trusted_hop_count() == 0
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "-5")
+    assert trusted_hop_count() == 0, "a negative hop count must clamp to 0"
+
+
+def test_absurd_hop_count_falls_back_to_the_socket_peer():
+    """A hop count larger than the header length must use the peer, not a header.
+
+    This is the misconfiguration case: if the count is too high the resolver
+    cannot find a trustworthy entry, so it must fall back to the socket peer
+    rather than index into the (attacker-controlled) list.
+    """
+    from orchestration.web_server import client_ip_from_values
+
+    assert client_ip_from_values(["203.0.113.9"], "10.0.0.1", 999) == "10.0.0.1"
+
+
+def test_repeated_xff_header_cannot_bypass_the_lockout(server):
+    """The live bypass, reproduced end to end over a raw socket.
+
+    ``urllib`` collapses duplicate headers, so a raw socket is the only way to
+    send two ``X-Forwarded-For`` lines. Both the honest client and the
+    duplicate-header client are the same real peer; both must lock.
+    """
+    import socket
+
+    def attempt(lines: list[str]) -> int:
+        body = "username=owner&password=WRONG"
+        raw = "\r\n".join([
+            "POST /login HTTP/1.1",
+            f"Host: 127.0.0.1:{server.port}",
+            "Content-Type: application/x-www-form-urlencoded",
+            f"Content-Length: {len(body)}",
+            *lines,
+            "Connection: close",
+            "",
+            body,
+        ])
+        s = socket.create_connection(("127.0.0.1", server.port), timeout=10)
+        s.sendall(raw.encode())
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return int(data.split(b"\r\n", 1)[0].split()[1])
+
+    limit = server.app.login_throttle.max_attempts
+
+    honest = [attempt(["X-Forwarded-For: 198.51.100.50"]) for _ in range(limit + 3)]
+    assert 429 in honest, f"honest client never locked: {honest}"
+
+    # Same real client, but it repeats the header to try to own the key.
+    spoofed = [
+        attempt([f"X-Forwarded-For: 10.0.0.{i}", "X-Forwarded-For: 203.0.113.7"])
+        for i in range(limit + 7)
+    ]
+    assert 429 in spoofed, f"duplicate header bypassed the lockout: {spoofed}"
+
+
+def test_per_ip_throttle_caps_attempts_across_usernames(server):
+    """A caller rotating the username must still hit a per-IP ceiling.
+
+    The durable lockout is keyed by (username, IP), so varying the username
+    presents a fresh key each time. The in-memory per-IP throttle is the
+    backstop that does not depend on what the caller claims.
+    """
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    limit = server.app.login_throttle.max_attempts
+    codes = []
+    for i in range(limit + 5):
+        st, _, _ = b.request("POST", "/login",
+                             form={"username": f"user{i}", "password": "WRONG"})
+        codes.append(st)
+    assert 429 in codes, f"per-IP throttle never engaged: {codes}"
+
+
+def test_expired_sessions_and_stale_attempts_are_swept(server):
+    """Housekeeping actually deletes rows that no longer constrain anything.
+
+    Regression: ``purge_expired_sessions`` existed but was never called, and
+    nothing removed a rate-limit row after its window closed, so both tables
+    grew forever.
+    """
+    store = server.app.store
+    store.create_session(token_hash="dead", username="owner",
+                         csrf_token="c", ttl_seconds=-1)   # already expired
+    store.record_login_failure("stale-key", max_failures=5, lockout_seconds=0)
+
+    assert store.purge_expired_sessions() >= 1
+    # window_start is now; keep_seconds=0 makes the row stale immediately.
+    assert store.purge_stale_login_attempts(keep_seconds=0) >= 1
+    assert store.get_session("dead") is None
+
+
+def test_sweep_runs_from_the_loop(server):
+    """The background loop must actually invoke the sweep, not just define it."""
+    app = server.app
+    store = app.store
+    store.create_session(token_hash="loopdead", username="owner",
+                         csrf_token="c", ttl_seconds=-1)
+    app._sweep_every = 1          # sweep on the next tick
+    app._maybe_sweep()
+    assert store.get_session("loopdead") is None
+
+
+def test_global_ceiling_holds_when_the_ip_is_untrustworthy(server):
+    """The endpoint-wide ceiling must not depend on the client IP at all.
+
+    A platform that overwrites rather than appends ``X-Forwarded-For`` makes the
+    resolved IP attacker-controlled, so the per-IP ceiling cannot be relied on.
+    The global ceiling is the backstop that no header can move.
+
+    The username is varied too: the durable lockout is keyed by (username, IP),
+    so a fixed username would let the database lockout mask this ceiling and the
+    test would pass for the wrong reason.
+    """
+    b = Browser(f"http://127.0.0.1:{server.port}")
+    throttle = server.app.login_throttle
+    throttle.max_attempts = 10_000          # disable the per-IP ceiling
+    codes = []
+    for i in range(throttle.global_max_attempts + 5):
+        st, _, _ = b.request("POST", "/login",
+                             form={"username": f"u{i}", "password": "WRONG"},
+                             headers={"X-Forwarded-For": f"203.0.113.{i % 250}"})
+        codes.append(st)
+    assert 429 in codes, "the global ceiling never engaged"

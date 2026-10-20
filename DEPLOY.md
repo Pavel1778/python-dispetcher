@@ -42,6 +42,16 @@ There are two independent authentication paths, and neither weakens the other:
 * Failed logins are rate limited per (username, IP); after 5 failures the pair
   is locked for 15 minutes. The stored key is a hash, so the table holds no
   readable usernames or IP addresses.
+* Two in-memory ceilings back that up, because the client IP is not fully
+  trustworthy: per IP (`LOGIN_MAX_ATTEMPTS_PER_IP`, default 30/min) and
+  endpoint-wide (`LOGIN_MAX_ATTEMPTS_GLOBAL`, default 120/min). The global one
+  cannot be moved by any request header.
+* The client IP is taken from the rightmost trusted hop of `X-Forwarded-For`,
+  not the leftmost value, which a caller controls. Set `TRUSTED_PROXY_HOPS` to
+  the number of proxies you actually run behind (default 1). A client that
+  rotates or repeats the header therefore cannot pick its own rate-limit key.
+* Expired sessions and stale rate-limit rows are swept periodically by the
+  background loop, so neither table grows without bound.
 * A wrong username and a wrong password give the same status and the same
   message, and take the same time, so the login page cannot be used to discover
   whether an account exists.
@@ -59,9 +69,12 @@ Read from the source, not assumed. Names must match exactly.
 | `AUTH_SESSION_SECRET` | yes | `web_auth.py` | Separate secret that signs sessions. |
 | `WEB_AUTH_TOKEN` | yes | `web_server.py` | Bearer token for the machine API. |
 | `GITHUB_TOKEN` | no | `github_client.py` | Read-only GitHub token used to discover repositories for the allowlist. Unset → repositories must be added by hand. Never returned by the API or the UI. |
-| `OPENHANDS_CLOUD_URL` | no | `cloud_client.py` | Override for a self-hosted Cloud. Default `https://app.all-hands.dev`. |
+| `OPENHANDS_CLOUD_URL` | no | `cloud_client.py` | Override for a self-hosted Cloud. Default `https://app.all-hands.dev`. Must be `http(s)`: any other scheme is refused at startup. |
 | `OPENHANDS_AGENT_PROFILE_ID` | no | `web_server.py` | Select an account agent profile by id. Unset = inherit the account's active profile. |
 | `WEB_COOKIE_SECURE` | no | `web_server.py` | Force the `Secure` cookie flag on/off. Default: on when `X-Forwarded-Proto: https`. |
+| `TRUSTED_PROXY_HOPS` | no | `web_server.py` | Number of trusted proxies in front of the app, used to pick the client IP from `X-Forwarded-For`. Default `1`. Set `0` to ignore the header entirely (direct connection, no proxy). A missing, empty or unparsable value falls back to `1`; a negative value is clamped to `0`. |
+| `LOGIN_MAX_ATTEMPTS_PER_IP` | no | `web_server.py` | In-memory per-IP login ceiling per minute. Default `30`. |
+| `LOGIN_MAX_ATTEMPTS_GLOBAL` | no | `web_server.py` | In-memory endpoint-wide login ceiling per minute, independent of the client IP. Default `120`. |
 | `APP_VERSION` / `RENDER_GIT_COMMIT` | no | `web_server.py` | Shown on the System screen. |
 | `TEST_SUPABASE_DB_URL` | tests only | `tests/` | DSN for the test suite. |
 

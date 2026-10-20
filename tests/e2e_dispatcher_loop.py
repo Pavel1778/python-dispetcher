@@ -10,6 +10,7 @@ Only the conversations this run creates are deleted at the end.
 
 import os
 import sys
+import time
 import urllib.request
 
 sys.path.insert(0, "/workspace/platform")
@@ -45,7 +46,6 @@ print("state:", t.state.value, "| conversation:", t.conversation_id)
 cid = t.conversation_id
 
 print("--- ticks 2..12 (track) ---")
-import time
 
 for i in range(2, 13):
     time.sleep(6)

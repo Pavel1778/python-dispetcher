@@ -636,13 +636,17 @@ class PostgresStore:
         where: list[str] = []
         params: list[Any] = []
         if workflow_id is not None:
-            where.append("workflow_id=%s"); params.append(workflow_id)
+            where.append("workflow_id=%s")
+            params.append(workflow_id)
         if parent_task_id is not None:
-            where.append("parent_task_id=%s"); params.append(parent_task_id)
+            where.append("parent_task_id=%s")
+            params.append(parent_task_id)
         if state is not None:
-            where.append("state=%s"); params.append(state.value)
+            where.append("state=%s")
+            params.append(state.value)
         if owner is not None:
-            where.append("owner=%s"); params.append(owner)
+            where.append("owner=%s")
+            params.append(owner)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY priority DESC, created_at"
@@ -783,11 +787,15 @@ class PostgresStore:
             clear_lease = False
             attempt = task.attempt
             if to is TaskState.QUEUED:
-                new_owner = None; clear_lease = True
+                new_owner = None
+                clear_lease = True
             if to is TaskState.FAILED:
-                attempt = task.attempt + 1; new_owner = None; clear_lease = True
+                attempt = task.attempt + 1
+                new_owner = None
+                clear_lease = True
             if to is TaskState.DEAD_LETTER:
-                new_owner = None; clear_lease = True
+                new_owner = None
+                clear_lease = True
 
             new_evidence = list(task.evidence)
             if evidence:
@@ -945,9 +953,11 @@ class PostgresStore:
         where: list[str] = []
         params: list[Any] = []
         if task_id is not None:
-            where.append("task_id=%s"); params.append(task_id)
+            where.append("task_id=%s")
+            params.append(task_id)
         if workflow_id is not None:
-            where.append("workflow_id=%s"); params.append(workflow_id)
+            where.append("workflow_id=%s")
+            params.append(workflow_id)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY seq DESC LIMIT %s"
@@ -1491,6 +1501,23 @@ class PostgresStore:
     def purge_expired_sessions(self) -> int:
         with self._tx() as cur:
             cur.execute("DELETE FROM sessions WHERE expires_at <= now()")
+            return cur.rowcount
+
+    def purge_stale_login_attempts(self, *, keep_seconds: int = 24 * 3600) -> int:
+        """Delete rate-limit rows that no longer constrain anything.
+
+        A row only matters while it is locked or while its 15-minute counting
+        window is open. Without this sweep every distinct (username, IP) pair
+        that ever failed a login leaves a row forever, so the table grows with
+        the number of guesses made - which is exactly what an attacker inflates.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                "DELETE FROM login_attempts "
+                "WHERE (locked_until IS NULL OR locked_until < now()) "
+                "  AND window_start < now() - make_interval(secs => %s)",
+                (keep_seconds,),
+            )
             return cur.rowcount
 
     def login_locked_for(self, key: str) -> int:

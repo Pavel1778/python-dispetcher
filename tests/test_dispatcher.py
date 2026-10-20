@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -18,6 +20,7 @@ from orchestration.dispatcher import Dispatcher  # noqa: E402
 from orchestration.openhands_client import (  # noqa: E402
     ApiUnavailable,
     OpenHandsClient,
+    _origin,
     task_conversation_id,
 )
 from tests.fake_runtime import FakeServer  # noqa: E402
@@ -390,3 +393,145 @@ def test_no_api_key_sent_when_not_configured(cp, server):
     Dispatcher(cp, client, worker_id="w1", workspace_root="/workspace/project").tick()
     assert server.runtime.seen_keys, "client must send a key"
     assert all(k == KEY for k in server.runtime.seen_keys)
+
+
+# --------------------------------------------------- redirect key confinement
+#
+# The session key travels in a header, and ``urlopen`` re-sends request headers
+# to whatever host a 3xx names. These tests drive two real listeners so the
+# claim "the key never reaches another origin" is observed, not assumed.
+
+KEY_LEAK_CANARY = "SESSION_KEY_CANARY_XYZ"
+
+
+def _serve(handler_cls):
+    """Start a throwaway HTTP server on a free loopback port."""
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+class _RecordingSink(BaseHTTPRequestHandler):
+    """Records the session key it was sent, then answers 200."""
+
+    seen: list[str | None] = []
+
+    def do_GET(self):
+        type(self).seen.append(self.headers.get("X-Session-API-Key"))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def log_message(self, *a):
+        pass
+
+
+def _redirector(location):
+    """A handler that answers every request with a 302 to ``location``."""
+
+    class _Redirector(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    return _Redirector
+
+
+def _probe_redirect(location_for_sink, *, api_key=KEY_LEAK_CANARY):
+    """Point a client at a redirector and return what the sink received."""
+    _RecordingSink.seen = []
+    sink = _serve(_RecordingSink)
+    sink_port = sink.server_address[1]
+    redirector = _serve(_redirector(location_for_sink(sink_port)))
+    client = OpenHandsClient(
+        f"http://127.0.0.1:{redirector.server_address[1]}", api_key=api_key, timeout=5.0
+    )
+    error = None
+    try:
+        client._request("GET", "/health")
+    except Exception as exc:  # noqa: BLE001 - the refusal is the point
+        error = exc
+    finally:
+        redirector.shutdown()
+        sink.shutdown()
+    return _RecordingSink.seen, error
+
+
+def test_cross_host_redirect_does_not_leak_the_session_key():
+    """A redirect to another port (different origin) must not carry the key."""
+    seen, error = _probe_redirect(lambda p: f"http://127.0.0.1:{p}/steal")
+    assert seen == [], f"the session key leaked to the redirect target: {seen}"
+    assert isinstance(error, ApiUnavailable), "the client must refuse, not silently follow"
+
+
+def test_redirect_to_another_host_does_not_leak_the_session_key():
+    """A redirect to a different hostname must not carry the key.
+
+    ``localhost`` and ``127.0.0.1`` resolve to the same machine, so the sink
+    really does receive the request if the client follows it; only the origin
+    check stops the key from being sent.
+    """
+    seen, error = _probe_redirect(lambda p: f"http://localhost:{p}/steal")
+    assert seen == [], f"the session key leaked to another host: {seen}"
+    assert isinstance(error, ApiUnavailable)
+
+
+def test_scheme_downgrade_redirect_is_refused():
+    """https -> http is a different origin even on the same host and port."""
+    seen, error = _probe_redirect(lambda p: f"https://127.0.0.1:{p}/steal")
+    assert seen == []
+    assert isinstance(error, ApiUnavailable)
+
+
+def test_same_origin_redirect_is_still_followed():
+    """Refusing cross-origin must not break a same-origin redirect."""
+    hits: list[str] = []
+
+    class _SameOrigin(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            if self.path == "/from":
+                self.send_response(302)
+                self.send_header("Location", "/to")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, *a):
+            pass
+
+    httpd = _serve(_SameOrigin)
+    client = OpenHandsClient(
+        f"http://127.0.0.1:{httpd.server_address[1]}", api_key=KEY_LEAK_CANARY, timeout=5.0
+    )
+    try:
+        status, payload = client._request("GET", "/from")
+    finally:
+        httpd.shutdown()
+    assert status == 200
+    assert payload == {"ok": True}
+    assert hits == ["/from", "/to"], "a same-origin redirect must still be followed"
+
+
+def test_origin_normalises_default_ports():
+    """An omitted port and the explicit default are the same origin."""
+    assert _origin("http://h/a") == _origin("http://h:80/a")
+    assert _origin("https://h/a") == _origin("https://h:443/a")
+    assert _origin("HTTP://H:80/a") == _origin("http://h/a")
+    assert _origin("https://h/a") != _origin("http://h/a")
+    assert _origin("http://h/a") != _origin("http://h:8080/a")
+    assert _origin("http://h/a") != _origin("http://other/a")
+
+
+def test_unparsable_port_is_never_treated_as_same_origin():
+    """A malformed port must refuse rather than compare as equal."""
+    assert _origin("http://h:notaport/a") != _origin("http://h/a")
+    assert _origin("http://h:notaport/a")[2] == -1

@@ -1,0 +1,52 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The Cloud integration tests run against a real PostgreSQL server and skip
+    # cleanly when it is absent, so the service is only here to keep them
+    # running. No repository secret is needed: the DSN below is a throwaway
+    # local credential. The tests apply migrations/ themselves.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: oh_test
+          POSTGRES_PASSWORD: oh_test_pw
+          POSTGRES_DB: orchestrator
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U oh_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_SUPABASE_DB_URL: postgresql://oh_test:oh_test_pw@127.0.0.1:5432/orchestrator
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the PYTHON_VERSION set for the Render service in render.yaml.
+          python-version: "3.12.6"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q -p no:cacheprovider

@@ -310,3 +310,79 @@ def test_capabilities_never_leak_secret_values(store, cloud, client):
     caps = client.account_capabilities()
     assert "SUPERSECRET" not in repr(caps)
     assert caps["provider_tokens_set"] == {"github": True}
+
+
+# --------------------------------------------------- base URL validation
+@pytest.mark.parametrize("bad", [
+    "file:///etc/passwd", "ftp://host/", "javascript:alert(1)",
+    "not-a-url", "//no-scheme-host",
+])
+def test_cloud_base_url_rejects_non_http_schemes(bad):
+    """``urlopen`` would honour ``file://``; the client must refuse it first."""
+    from orchestration.cloud_client import CloudClient, CloudError
+
+    with pytest.raises(CloudError):
+        CloudClient(bad, api_key="k")
+
+
+def test_cloud_base_url_accepts_http_and_https():
+    from orchestration.cloud_client import CloudClient
+
+    assert CloudClient("https://app.all-hands.dev", api_key="k").base_url == \
+        "https://app.all-hands.dev"
+    # A trailing slash is normalised away so paths do not double up.
+    assert CloudClient("http://127.0.0.1:8000/", api_key="k").base_url == \
+        "http://127.0.0.1:8000"
+
+
+def test_cloud_client_refuses_redirects_so_the_key_is_not_leaked():
+    """A 3xx must not be followed: it would re-send the bearer key elsewhere.
+
+    Proven with two real listeners: the "API" redirects to a second host that
+    records the Authorization header. The client must refuse and the second
+    host must never see the key.
+    """
+    import http.server
+    import socketserver
+    import threading
+
+    from orchestration.cloud_client import CloudClient, CloudError
+
+    seen: dict[str, str | None] = {}
+
+    class Inner(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["auth"] = self.headers.get("Authorization")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, *a):
+            pass
+
+    inner = socketserver.TCPServer(("127.0.0.1", 0), Inner)
+    inner_port = inner.server_address[1]
+    threading.Thread(target=inner.serve_forever, daemon=True).start()
+
+    class Public(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{inner_port}/steal")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    public = socketserver.TCPServer(("127.0.0.1", 0), Public)
+    public_port = public.server_address[1]
+    threading.Thread(target=public.serve_forever, daemon=True).start()
+    try:
+        client = CloudClient(f"http://127.0.0.1:{public_port}",
+                             api_key="SECRET_KEY_XYZ", timeout=5.0)
+        with pytest.raises(CloudError):
+            client._request("GET", "/api/v1/x")
+        assert seen.get("auth") is None, "the API key leaked to the redirect target"
+    finally:
+        public.shutdown()
+        inner.shutdown()

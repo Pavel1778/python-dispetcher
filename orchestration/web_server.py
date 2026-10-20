@@ -135,6 +135,126 @@ LOGIN_PAGE = """<!doctype html>
 """
 
 
+def _int_env(name: str, default: int) -> int:
+    """Read a positive integer from the environment, or *default*."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    return value if value > 0 else default
+
+
+def trusted_hop_count() -> int:
+    """How many trusted proxies sit in front of this process.
+
+    ``X-Forwarded-For`` is client-controlled on the left: a caller can prepend
+    any value, and a proxy only appends. So the *n*-th address from the right,
+    where *n* is the number of proxies we actually run behind, is the first one
+    a trusted hop wrote. Reading the leftmost value (the naive approach) lets an
+    attacker rotate the header and defeat the login rate limit entirely.
+
+    ``TRUSTED_PROXY_HOPS`` defaults to 1, which matches a single platform load
+    balancer such as Render's. Treat that default as an assumption to verify,
+    not a fact: Render documents Cloudflare in front of its load balancers and
+    does not publish how many ``X-Forwarded-For`` entries a deployment adds. Set
+    it to 0 to ignore the header completely (a direct connection, or a
+    deployment with no proxy), and raise it for each additional proxy of your
+    own in front of the app.
+    """
+    raw = os.environ.get("TRUSTED_PROXY_HOPS", "1").strip()
+    try:
+        hops = int(raw)
+    except ValueError:
+        log.warning("TRUSTED_PROXY_HOPS=%r is not an integer; using 1", raw)
+        return 1
+    return max(0, hops)
+
+
+def client_ip_from_values(values: list[str] | None, peer: str | None, hops: int) -> str:
+    """Return the client IP, trusting only the rightmost *hops* addresses.
+
+    *values* is every ``X-Forwarded-For`` header line, in order. A caller may
+    send the header more than once, and each proxy appends its own line, so the
+    lines must be joined before the list is indexed: reading only the first line
+    (``headers.get``) hands the key back to the caller, who simply repeats the
+    header. With ``hops=0`` the header is ignored and the socket peer is used.
+    A list shorter than *hops* cannot be trusted (a proxy that should have
+    appended did not), so the socket peer is used instead of a spoofable value.
+    """
+    peer = peer or "unknown"
+    if hops <= 0 or not values:
+        return peer
+    joined = ",".join(v for v in values if v)
+    addresses = [part.strip() for part in joined.split(",") if part.strip()]
+    if len(addresses) < hops:
+        log.warning(
+            "X-Forwarded-For has %d address(es) but %d proxy hop(s) are "
+            "configured; using the socket peer", len(addresses), hops,
+        )
+        return peer
+    return addresses[len(addresses) - hops]
+
+
+def client_ip_from(forwarded_for: str | None, peer: str | None, hops: int) -> str:
+    """Single-header convenience wrapper around :func:`client_ip_from_values`."""
+    return client_ip_from_values([forwarded_for] if forwarded_for else [], peer, hops)
+
+
+class _LoginThrottle:
+    """Cap login attempts, per client IP and globally.
+
+    Two ceilings, because the client IP is not fully trustworthy:
+
+    * **Per IP** caps a single source. It relies on the resolved client IP, so it
+      is only as good as the proxy configuration (see ``trusted_hop_count``).
+    * **Global** caps the whole endpoint regardless of the claimed IP. It is the
+      backstop for the case where the IP is spoofable - a platform that
+      overwrites rather than appends ``X-Forwarded-For``, or a header we
+      misconfigured. It cannot be bypassed by any request header.
+
+    In-memory on purpose: this is a backstop against online guessing, not the
+    source of truth, so losing it on restart is acceptable.
+    """
+
+    def __init__(self, max_attempts: int = 30, window_seconds: float = 60.0,
+                 global_max_attempts: int = 120, global_window_seconds: float = 60.0):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.global_max_attempts = global_max_attempts
+        self.global_window_seconds = global_window_seconds
+        self._hits: dict[str, list[float]] = {}
+        self._global: list[float] = []
+        self._lock = threading.Lock()
+
+    def check(self, ip: str) -> int:
+        """Record an attempt for *ip*. Return seconds to wait, or 0 if allowed."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+        g_cutoff = now - self.global_window_seconds
+        with self._lock:
+            self._global = [t for t in self._global if t > g_cutoff]
+            if len(self._global) >= self.global_max_attempts:
+                return int(self._global[0] + self.global_window_seconds - now) + 1
+            hits = [t for t in self._hits.get(ip, ()) if t > cutoff]
+            if len(hits) >= self.max_attempts:
+                self._hits[ip] = hits
+                return int(hits[0] + self.window_seconds - now) + 1
+            hits.append(now)
+            self._hits[ip] = hits
+            self._global.append(now)
+            if len(self._hits) > 10_000:  # bound memory under a spray of IPs
+                self._hits = {k: v for k, v in self._hits.items() if v and v[-1] > cutoff}
+            return 0
+
+    def reset(self, ip: str) -> None:
+        with self._lock:
+            self._hits.pop(ip, None)
+
+
 class App:
     """Wires the store, Cloud client, Sr runtime and Jr dispatcher together."""
 
@@ -169,9 +289,21 @@ class App:
         )
         self.verifier = WorkflowVerifier(self.store, self.client)
         self.poll_interval = poll_interval
+        # Client-IP resolution depends on how many proxies we trust; see
+        # ``trusted_hop_count``. Read once so a request never re-parses the env.
+        self.trusted_hops = trusted_hop_count()
+        # In-memory per-IP backstop for login attempts (see ``_LoginThrottle``).
+        self.login_throttle = _LoginThrottle(
+            max_attempts=_int_env("LOGIN_MAX_ATTEMPTS_PER_IP", 30),
+            global_max_attempts=_int_env("LOGIN_MAX_ATTEMPTS_GLOBAL", 120),
+        )
         self._stop = threading.Event()
         self._loop: threading.Thread | None = None
         self.last_tick: dict[str, Any] = {}
+        # Sweep expired sessions and stale rate-limit rows occasionally, not
+        # every tick: they are housekeeping, not dispatch work.
+        self._sweep_every = 60
+        self._sweeps_done = 0
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
@@ -191,12 +323,33 @@ class App:
                 jr = self.dispatcher.tick().as_dict()
                 vf = self.verifier.tick().as_dict()
                 self.last_tick = {"at": time.time(), "sr": sr, "jr": jr, "verify": vf}
+                self._maybe_sweep()
             except CloudError as e:
                 self.last_tick = {"at": time.time(), "cloud_error": str(e)}
             except Exception as e:  # noqa: BLE001 - the loop must survive
                 log.exception("tick failed")
                 self.last_tick = {"at": time.time(), "error": f"{type(e).__name__}: {e}"}
             self._stop.wait(self.poll_interval)
+
+    def _maybe_sweep(self) -> None:
+        """Occasionally drop expired sessions and stale rate-limit rows.
+
+        Without this the ``sessions`` and ``login_attempts`` tables grow without
+        bound: nothing else deletes an expired session row or a rate-limit row
+        whose window has passed. A failure here must never stop the dispatch
+        loop, so it is swallowed and logged.
+        """
+        self._sweeps_done += 1
+        if self._sweeps_done % self._sweep_every:
+            return
+        try:
+            sessions = self.store.purge_expired_sessions()
+            attempts = self.store.purge_stale_login_attempts()
+            if sessions or attempts:
+                log.info("swept %d expired session(s), %d stale login row(s)",
+                         sessions, attempts)
+        except Exception:  # noqa: BLE001 - housekeeping must not break dispatch
+            log.exception("sweep failed")
 
     # ------------------------------------------------------------- actions
     def start_workflow(self, goal: str, repository: str | None = None,
@@ -484,11 +637,15 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
     def _client_ip(self) -> str:
-        # Render terminates TLS and sets X-Forwarded-For; take the first hop.
-        fwd = self.headers.get("X-Forwarded-For")
-        if fwd:
-            return fwd.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "unknown"
+        # Trust only the hops we actually run behind. The leftmost value is
+        # client-supplied and must never key a security decision; see
+        # ``client_ip_from_values`` for why the rightmost trusted hop is the one
+        # used, and why every header line is considered (not just the first).
+        return client_ip_from_values(
+            self.headers.get_all("X-Forwarded-For"),
+            self.client_address[0] if self.client_address else None,
+            self.app.trusted_hops,
+        )
 
     def _cookie_secure(self) -> bool:
         """Mark cookies Secure when the request arrived over HTTPS."""
@@ -783,8 +940,23 @@ class Handler(BaseHTTPRequestHandler):
                     "AUTH_PASSWORD_HASH в Render.",
                 ),
             )
+        client_ip = self._client_ip()
+        # Coarse per-IP ceiling first. The durable lockout is keyed by
+        # (username, IP), which a caller defeats by presenting a fresh username;
+        # this caps attempts from one source regardless of what it claims.
+        wait = self.app.login_throttle.check(client_ip)
+        if wait > 0:
+            log.warning("login throttled by IP (retry in %ss)", wait)
+            return self._html(
+                429,
+                LOGIN_PAGE.replace(
+                    "__ERROR__",
+                    "Слишком много попыток входа с этого адреса. Повторите "
+                    f"через {max(1, (wait + 59) // 60)} мин.",
+                ),
+            )
         try:
-            session = self.app.auth.login(username, password, client_ip=self._client_ip())
+            session = self.app.auth.login(username, password, client_ip=client_ip)
         except LoginLocked as e:
             minutes = max(1, (e.retry_after + 59) // 60)
             return self._html(
@@ -809,6 +981,9 @@ class Handler(BaseHTTPRequestHandler):
         cookie = session_cookie_header(
             session.token, ttl=self.app.auth.session_ttl, secure=self._cookie_secure()
         )
+        # A successful login clears this IP's throttle, so a legitimate owner
+        # who mistyped a few times is not held back after getting in.
+        self.app.login_throttle.reset(client_ip)
         return self._redirect("/", cookie=cookie)
 
 

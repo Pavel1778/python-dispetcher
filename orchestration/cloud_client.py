@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
@@ -34,8 +35,36 @@ class CloudError(RuntimeError):
     """Base class for Cloud API failures."""
 
 
+def validate_base_url(url: str) -> str:
+    """Return *url* if it is a usable http(s) base, else raise ``CloudError``.
+
+    ``urlopen`` honours whatever scheme it is handed, including ``file://``.
+    ``OPENHANDS_CLOUD_URL`` is operator-supplied, so a typo or a hostile value
+    must fail loudly at construction instead of letting the client read a local
+    file or speak a non-HTTP protocol to something that is not the Cloud API.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise CloudError(
+            "OPENHANDS_CLOUD_URL must be an http(s) URL, got "
+            f"{parsed.scheme or '(none)'}"
+        )
+    return url
+
+
 class CloudUnavailable(CloudError):
     """Transport failure or 5xx. Transient: retry with backoff."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn any redirect into an error instead of following it.
+
+    Following one would re-send the ``Authorization`` header to a host the
+    operator did not configure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise CloudError(f"refusing to follow redirect ({code}) to {newurl!r}")
 
 
 class CloudAuthError(CloudError):
@@ -124,11 +153,22 @@ class CloudClient:
         api_key: str | None = None,
         timeout: float = 30.0,
     ):
-        self.base_url = (
+        self.base_url = validate_base_url(
             base_url or os.environ.get("OPENHANDS_CLOUD_URL") or DEFAULT_CLOUD_BASE_URL
         ).rstrip("/")
         self._api_key = api_key or os.environ.get("OPENHANDS_API_KEY") or ""
         self.timeout = timeout
+
+    def _opener(self) -> urllib.request.OpenerDirector:
+        """An opener that never follows a redirect.
+
+        ``urlopen`` re-sends every request header, ``Authorization`` included,
+        to whatever host a ``3xx`` points at - proven locally against two
+        listeners. A redirect therefore leaks the Cloud API key to a host we did
+        not choose. The API answers with the resource or an error, never with a
+        redirect we should chase, so a ``3xx`` is surfaced as an error instead.
+        """
+        return urllib.request.build_opener(_NoRedirect)
 
     # ------------------------------------------------------------------ http
     def _request(
@@ -143,7 +183,7 @@ class CloudClient:
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._opener().open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as e:

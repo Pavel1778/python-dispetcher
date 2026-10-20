@@ -47,6 +47,10 @@ TEST_SUPABASE_DB_URL="postgresql://user:pw@127.0.0.1:5432/db" \
 /workspace/project/4119041ca5254315a7b6e95fdc85ae8a/scratch/sdk-main/.venv/bin/python \
   -m pytest tests/ -q -p no:cacheprovider
 
+# Lint (same version as CI, pinned in requirements-dev.txt).
+/workspace/project/4119041ca5254315a7b6e95fdc85ae8a/scratch/sdk-main/.venv/bin/python \
+  -m ruff check .
+
 # Apply the Supabase schema (idempotent).
 psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 
@@ -246,4 +250,38 @@ successful-completion e2e needs a valid key and is not yet exercised.
   only with `--confirm`; `tools/classify_cloud_sessions.py` is read-only and
   separates dispatcher-created sessions (tags, or a dispatcher persona in the
   event stream) from the user's own.
+
+## Client IP, redirects and login ceilings (security hardening)
+
+Three defects were fixed here; each has a test that fails if the fix is undone.
+
+- **The client IP was the leftmost `X-Forwarded-For` value.** A proxy only
+  *appends*, so the leftmost entry is whatever the caller sent. Rotating it made
+  every login attempt look like a new client and the (username, IP) lockout never
+  engaged. `client_ip_from_values` now takes the rightmost *trusted* hop, joining
+  every header line first: `headers.get` returns only the first line, so a caller
+  that sends its own line and lets the proxy append a second one still owned the
+  key. `TRUSTED_PROXY_HOPS` (default 1) is how many proxies we run behind; a
+  missing/junk value falls back to 1, a negative value clamps to 0, and a header
+  shorter than the hop count falls back to the socket peer rather than indexing a
+  spoofable list. Do not "simplify" this back to `split(",")[0]`.
+- **The HTTP clients followed redirects.** `urlopen` re-sends every request
+  header, `Authorization`/`X-Session-API-Key` included, to whatever host a `3xx`
+  names, so a redirect leaked the key. `CloudClient` refuses *any* redirect
+  (`_NoRedirect`); `OpenHandsClient` follows one only while scheme, host and port
+  all stay identical (`_SameOriginRedirect`, via `_origin`, which normalises
+  default ports and refuses an unparsable one). `OPENHANDS_CLOUD_URL` is also
+  validated as `http(s)` at construction, because `urlopen` would otherwise
+  honour `file://`.
+- **Login had no ceiling that a header could not move.** The durable lockout is
+  keyed by (username, IP), which a caller defeats by varying the username.
+  `_LoginThrottle` adds two in-memory ceilings: per IP
+  (`LOGIN_MAX_ATTEMPTS_PER_IP`, 30/min) and endpoint-wide
+  (`LOGIN_MAX_ATTEMPTS_GLOBAL`, 120/min). The global one is the backstop for a
+  platform that overwrites `X-Forwarded-For`, so it must not depend on the IP.
+  `purge_stale_login_attempts` (swept from the loop by `_maybe_sweep`, along with
+  `purge_expired_sessions`) keeps `login_attempts` and `sessions` from growing
+  forever. Tests: `tests/test_auth.py` (proxy/lockout section),
+  `tests/test_dispatcher.py` (redirect section),
+  `tests/test_cloud_integration.py` (base URL / redirect).
 
