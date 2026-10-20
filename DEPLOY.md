@@ -71,8 +71,10 @@ What is confirmed from official sources:
 * Render does **not** strip an incoming `X-Forwarded-For`; it only appends
   (Render feedback thread "Send the correct X_FORWARDED_FOR", and a Render
   community thread where a user reproduced the spoof). Render's own DDoS article
-  says traffic passes through Cloudflare *and* Render's load balancers and tells
-  you to read `x-forwarded-for`.
+  says, verbatim: "Because traffic passes through Cloudflare and Render's load
+  balancers, your app sees the proxy's IP by default. To get the real client IP,
+  read the `x-forwarded-for` header." Two layers are named there, but the number
+  of header entries they add is still not stated.
 
 What is **not** confirmed:
 
