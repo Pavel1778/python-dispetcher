@@ -56,6 +56,49 @@ There are two independent authentication paths, and neither weakens the other:
   message, and take the same time, so the login page cannot be used to discover
   whether an account exists.
 
+## Client IP behind Render (unconfirmed hop count)
+
+`TRUSTED_PROXY_HOPS` decides which `X-Forwarded-For` entry is trusted, so it is
+a security setting, not a tuning knob. **The correct value for this Render
+service is not confirmed.**
+
+What is confirmed from official sources:
+
+* Cloudflare (which fronts Render, confirmed by the live response headers
+  `server: cloudflare` and `cf-ray`) *appends* to `X-Forwarded-For` rather than
+  replacing it, and writes the client IP to `CF-Connecting-IP`, which it does
+  overwrite (Cloudflare Fundamentals, "HTTP request headers").
+* Render does **not** strip an incoming `X-Forwarded-For`; it only appends
+  (Render feedback thread "Send the correct X_FORWARDED_FOR", and a Render
+  community thread where a user reproduced the spoof). Render's own DDoS article
+  says traffic passes through Cloudflare *and* Render's load balancers and tells
+  you to read `x-forwarded-for`.
+
+What is **not** confirmed:
+
+* The exact number of `X-Forwarded-For` entries Render adds for this service.
+  Render publishes no hop count, and Cloudflare + the Render load balancer means
+  the real number is likely 2, not 1.
+
+Consequences to weigh:
+
+* `TRUSTED_PROXY_HOPS=1` (the default) reads the entry Render's load balancer
+  appended. A caller can still prepend entries, but they are ignored, so a
+  rotating header no longer changes the key. This is the safe default and is
+  what the login throttle relies on.
+* Setting it **too high** is the dangerous direction: with 2 configured against
+  a 1-hop chain the resolver refuses the short chain and falls back to the socket
+  peer, but if the chain ever matches the wrong count the resolver can return a
+  caller-supplied entry. Never raise it above the number of proxies you actually
+  operate.
+* The endpoint-wide `LOGIN_MAX_ATTEMPTS_GLOBAL` ceiling does not depend on the IP
+  at all, so it still caps login guessing even if this value is wrong.
+
+How to confirm the value (read-only, no spoofed headers to production): log the
+resolved IP once behind the real edge for a known client, or check Render's
+request logs. Until that is done, treat `1` as a conservative default, not a
+verified fact.
+
 ## Required environment variables
 
 Read from the source, not assumed. Names must match exactly.
@@ -72,7 +115,7 @@ Read from the source, not assumed. Names must match exactly.
 | `OPENHANDS_CLOUD_URL` | no | `cloud_client.py` | Override for a self-hosted Cloud. Default `https://app.all-hands.dev`. Must be `http(s)`: any other scheme is refused at startup. |
 | `OPENHANDS_AGENT_PROFILE_ID` | no | `web_server.py` | Select an account agent profile by id. Unset = inherit the account's active profile. |
 | `WEB_COOKIE_SECURE` | no | `web_server.py` | Force the `Secure` cookie flag on/off. Default: on when `X-Forwarded-Proto: https`. |
-| `TRUSTED_PROXY_HOPS` | no | `web_server.py` | Number of trusted proxies in front of the app, used to pick the client IP from `X-Forwarded-For`. Default `1`. Set `0` to ignore the header entirely (direct connection, no proxy). A missing, empty or unparsable value falls back to `1`; a negative value is clamped to `0`. |
+| `TRUSTED_PROXY_HOPS` | no | `web_server.py` | Number of trusted proxies in front of the app, used to pick the client IP from `X-Forwarded-For`. Default `1`. Set `0` to ignore the header entirely (direct connection, no proxy). A missing, empty or unparsable value falls back to `1`; a negative value is clamped to `0`. **The correct value for this Render service is not confirmed** — see "Client IP behind Render" below. |
 | `LOGIN_MAX_ATTEMPTS_PER_IP` | no | `web_server.py` | In-memory per-IP login ceiling per minute. Default `30`. |
 | `LOGIN_MAX_ATTEMPTS_GLOBAL` | no | `web_server.py` | In-memory endpoint-wide login ceiling per minute, independent of the client IP. Default `120`. |
 | `APP_VERSION` / `RENDER_GIT_COMMIT` | no | `web_server.py` | Shown on the System screen. |

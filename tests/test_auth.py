@@ -879,6 +879,41 @@ def test_absurd_hop_count_falls_back_to_the_socket_peer():
     assert client_ip_from_values(["203.0.113.9"], "10.0.0.1", 999) == "10.0.0.1"
 
 
+def test_empty_and_garbage_entries_are_skipped_not_trusted():
+    """Blank entries must not shift the index onto a caller-supplied value.
+
+    A caller can pad the header with empty fields (``X-Forwarded-For: , ,``).
+    If those counted as addresses, the ``len < hops`` guard would pass and the
+    index would land on an entry the caller chose. Only non-empty entries count.
+    """
+    from orchestration.web_server import client_ip_from_values
+
+    # All-empty header: nothing to trust, so the socket peer.
+    assert client_ip_from_values([", , ,"], "10.0.0.1", 1) == "10.0.0.1"
+    assert client_ip_from_values(["", "  ", ","], "10.0.0.1", 1) == "10.0.0.1"
+    # Empty padding before the real, proxy-appended value must be ignored.
+    assert client_ip_from_values([" , , 203.0.113.9"], "10.0.0.1", 1) == "203.0.113.9"
+    assert client_ip_from_values([", 203.0.113.9"], "10.0.0.1", 1) == "203.0.113.9"
+
+
+def test_over_configured_hop_count_can_return_a_caller_supplied_value():
+    """Pin the direction of the risk: a hop count above the real chain is unsafe.
+
+    With more hops configured than the chain actually has, the resolver walks
+    left past the proxy-appended entries and can land on one the caller
+    prepended. This is why the default is 1 and why it must never be raised
+    above the number of proxies actually operated. It documents the hazard; it
+    is not a behaviour to rely on.
+    """
+    from orchestration.web_server import client_ip_from_values
+
+    # Real chain is one hop (the platform proxy appended 203.0.113.9); the
+    # caller prepended 1.1.1.1. hops=1 is correct and ignores the caller.
+    assert client_ip_from_values(["1.1.1.1", "203.0.113.9"], "10.0.0.1", 1) == "203.0.113.9"
+    # hops=2 over-reaches and returns the caller's own value.
+    assert client_ip_from_values(["1.1.1.1", "203.0.113.9"], "10.0.0.1", 2) == "1.1.1.1"
+
+
 def test_repeated_xff_header_cannot_bypass_the_lockout(server):
     """The live bypass, reproduced end to end over a raw socket.
 
