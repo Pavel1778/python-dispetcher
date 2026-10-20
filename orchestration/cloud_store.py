@@ -302,7 +302,7 @@ class PostgresStore:
         "workflows": ("id", "goal", "state", "created_at", "updated_at",
                       "sr_conversation_id", "sr_attempt", "sr_last_error",
                       "sr_next_attempt_at", "idempotency_key",
-                      "sr_start_lease_expires"),
+                      "sr_start_lease_expires", "sr_started_at"),
         "repositories": ("id", "full_name", "default_branch", "allowed_branches",
                          "enabled"),
         "tasks": ("id", "workflow_id", "goal", "state", "priority", "owner",
@@ -1089,6 +1089,11 @@ class PostgresStore:
         first, then creates the conversation; a crash in between would otherwise
         leave a real sandbox with no way to find it again, so the id is written
         here as soon as it exists and carried forward by :meth:`mark_sr_started`.
+
+        ``sr_started_at`` is stamped the first time a conversation id is
+        recorded, and only then: a later ``bind_sr`` that re-records the same
+        conversation (or records a start task) must not reset the clock the
+        verifier uses to detect a wedged Sr.
         """
         with self._tx() as cur:
             cur.execute(
@@ -1098,12 +1103,16 @@ class PostgresStore:
                        sr_start_task_id   = COALESCE(%s, sr_start_task_id),
                        sr_status          = COALESCE(%s, sr_status),
                        sr_sandbox_id      = COALESCE(%s, sr_sandbox_id),
+                       sr_started_at      = CASE
+                           WHEN %s::text IS NOT NULL AND sr_started_at IS NULL
+                           THEN now() ELSE sr_started_at END,
                        sr_start_owner     = NULL,
                        sr_start_lease_expires = NULL,
                        updated_at = now()
                  WHERE id = %s
                 """,
-                (conversation_id, start_task_id, status, eager_sandbox_id, workflow_id),
+                (conversation_id, start_task_id, status, eager_sandbox_id,
+                 conversation_id, workflow_id),
             )
             if cur.rowcount == 0:
                 raise NotFound(f"workflow {workflow_id}")
@@ -1116,7 +1125,7 @@ class PostgresStore:
         with self._tx() as cur:
             cur.execute(
                 "SELECT sr_conversation_id, sr_start_task_id, sr_status, goal, state, "
-                "sr_attempt, sr_last_error, sr_next_attempt_at "
+                "sr_attempt, sr_last_error, sr_next_attempt_at, sr_started_at "
                 "FROM workflows WHERE id=%s",
                 (workflow_id,),
             )
@@ -1546,6 +1555,8 @@ class PostgresStore:
                 "sr_start_owner=NULL, sr_start_lease_expires=NULL, "
                 "sr_status = CASE WHEN sr_conversation_id IS NULL THEN NULL "
                 "                 ELSE sr_status END, "
+                "sr_started_at = CASE WHEN sr_conversation_id IS NULL THEN NULL "
+                "                     ELSE sr_started_at END, "
                 "updated_at=now() WHERE id=%s",
                 (workflow_id,),
             )
