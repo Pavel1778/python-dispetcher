@@ -319,13 +319,27 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
   renames (created a throwaway conversation, renamed it, confirmed the title,
   deleted it). A missing id gives `404 {"detail":"unknown_app_conversation"}`,
   which is how you tell the route exists but the resource does not.
-- Render does **not** appear to auto-deploy on merge to `main` for this service
-  (`render.yaml` says `autoDeploy: true`, but after merging #4 the live
-  `static/app.js` was still byte-identical to the previous merge). There is no
-  `RENDER_API_KEY` or deploy hook in this environment, so a deploy cannot be
-  triggered from here. Rebuilding by hand in the Render dashboard is the
-  reliable path; check `static/app.js` for a new marker string afterwards.
-- Tests: `tests/test_workflow_actions.py` (actions, auth, `sr_url`) and the
-  workspace-conflict block at the end of `tests/test_reliability.py`. The fake
-  Cloud implements `PATCH`/`DELETE` so rename runs over real HTTP.
+- Render deploy state (checked 2026-10-20, corrected). The live service is
+  `python-dispetcher-1.onrender.com`, behind Cloudflare (`server: cloudflare`,
+  `cf-ray`) with Render's own edge (`x-render-origin-server`). The deployed
+  `static/app.js` is byte-identical to `main` at the merge of PR #4
+  (md5 `744dcf86b64982c6d28798c99137d126`, and it contains the cancel/resume UI
+  that PR #4 added), so **a deploy did happen after PR #4** -- the earlier note
+  claiming otherwise was wrong. Caveat: the live process reports Python 3.14.8
+  while `render.yaml` pins `PYTHON_VERSION=3.12.6`, so the running service was
+  likely created by hand in the dashboard rather than from the blueprint.
+- PR #5 and PR #7 change **nothing observable without a session**: no
+  `web_ui.py`/`static` change, and the login page and the unauthenticated 401s
+  are identical before and after. So a deploy of them can be neither confirmed
+  nor ruled out from outside; `GET /healthz` and the headers look the same
+  either way. Confirm the running commit from the System screen
+  (`/api/system` -> `build.commit`, which reads `RENDER_GIT_COMMIT`) after
+  signing in, or from the Render dashboard.
+- There is no `RENDER_API_KEY` or deploy hook in this environment, so a deploy
+  cannot be triggered from here. Rebuilding by hand in the Render dashboard is
+  the reliable path.
+- Tests: `tests/test_workflow_actions.py` (actions, auth, `sr_url`, and the
+  malformed-id 404 block) and the workspace-conflict block at the end of
+  `tests/test_reliability.py`. The fake Cloud implements `PATCH`/`DELETE` so
+  rename runs over real HTTP.
 
