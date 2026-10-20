@@ -325,3 +325,82 @@ def test_verifier_waits_on_pending_tool_call(store, cloud, client):
     vf = WorkflowVerifier(store, client)
     vf.tick()
     assert store.sr_for(wf)["state"] != "completed"
+
+
+# ------------------------------------------------------- workspace conflicts
+def test_two_tasks_on_one_workspace_do_not_run_together(store, cloud, dispatcher):
+    """Two conversations editing one checkout would clobber each other.
+
+    The second task must wait, not start, so its commits cannot be silently
+    overwritten by the first.
+    """
+    repo = _repo(store)
+    wf = store.create_workflow("wf")
+    a = store.submit_task("first", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    b = store.submit_task("second", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+
+    report = dispatcher.tick()
+    started = {s["task"] for s in report.started}
+    assert a.id in started
+    assert b.id not in started
+    assert store.get_task(b.id).state is TaskState.QUEUED
+    # Only one conversation exists for the contended workspace.
+    assert len(cloud.cloud.conversations) == 1
+
+
+def test_different_branches_of_one_repo_may_run_together(store, cloud, dispatcher):
+    """Serialization is per repository+branch, not per repository."""
+    repo = _repo(store)
+    wf = store.create_workflow("wf")
+    a = store.submit_task("main work", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    b = store.submit_task("dev work", workflow_id=wf, selected_repository=repo,
+                          selected_branch="dev")
+
+    report = dispatcher.tick()
+    started = {s["task"] for s in report.started}
+    assert {a.id, b.id} <= started
+    assert len(cloud.cloud.conversations) == 2
+
+
+def test_workspace_frees_after_the_holder_finishes(store, cloud, dispatcher):
+    repo = _repo(store)
+    wf = store.create_workflow("wf")
+    a = store.submit_task("first", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    b = store.submit_task("second", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+
+    dispatcher.tick()
+    assert store.get_task(b.id).state is TaskState.QUEUED
+
+    # Finish the holder; the waiting task may now run.
+    store.transition(a.id, TaskState.VERIFYING)
+    store.transition(a.id, TaskState.COMPLETED, result="done")
+    report = dispatcher.tick()
+    assert b.id in {s["task"] for s in report.started}
+
+
+def test_repositoryless_tasks_never_contend(store, cloud, dispatcher):
+    wf = store.create_workflow("wf")
+    a = store.submit_task("analysis a", workflow_id=wf)
+    b = store.submit_task("analysis b", workflow_id=wf)
+    report = dispatcher.tick()
+    started = {s["task"] for s in report.started}
+    assert {a.id, b.id} <= started
+
+
+def test_claim_of_a_busy_workspace_by_id_is_refused(store, cloud, dispatcher):
+    from orchestration.cloud_store import InvalidTransition
+
+    repo = _repo(store)
+    wf = store.create_workflow("wf")
+    a = store.submit_task("first", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    b = store.submit_task("second", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    store.claim_task("w1", task_id=a.id)
+    with pytest.raises(InvalidTransition):
+        store.claim_task("w2", task_id=b.id)

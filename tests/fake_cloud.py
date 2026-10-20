@@ -235,6 +235,41 @@ class _Handler(BaseHTTPRequestHandler):
 
         return self._json(404, {"detail": "not found"})
 
+    # ----------------------------------------------------------------- PATCH
+    def do_PATCH(self):
+        if not self._auth_ok():
+            return self._json(401, {"detail": "unauthorized"})
+        path = self.path.split("?")[0]
+        self.cloud.calls.append(("PATCH", path))
+        if (path.startswith("/api/v1/app-conversations/")
+                and path.count("/") == 4):
+            cid = path.split("/")[4]
+            conv = self.cloud.conversations.get(cid)
+            if conv is None:
+                return self._json(404, {"detail": "not found"})
+            body = self._read_body()
+            # The live server applies only the fields that are sent.
+            if body.get("title") is not None:
+                conv["title"] = body["title"]
+            return self._json(200, conv)
+        return self._json(404, {"detail": "not found"})
+
+    # ---------------------------------------------------------------- DELETE
+    def do_DELETE(self):
+        if not self._auth_ok():
+            return self._json(401, {"detail": "unauthorized"})
+        path = self.path.split("?")[0]
+        self.cloud.calls.append(("DELETE", path))
+        if (path.startswith("/api/v1/app-conversations/")
+                and path.count("/") == 4):
+            cid = path.split("/")[4]
+            if cid not in self.cloud.conversations:
+                return self._json(404, {"detail": "not found"})
+            del self.cloud.conversations[cid]
+            self.cloud.events.pop(cid, None)
+            return self._json(200, {"success": True})
+        return self._json(404, {"detail": "not found"})
+
     # --------------------------------------------------------------- helpers
     def _query(self, key: str) -> str:
         if "?" not in self.path:
