@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -25,11 +26,52 @@ from enum import Enum
 from typing import Any
 
 
+#: Scheme default ports, so an omitted port and an explicit default compare equal.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    """Return ``(scheme, hostname, port)`` with the default port filled in.
+
+    Used to decide whether a redirect stays on the same origin. A missing port
+    and an explicit default port are the same origin, so both normalise to the
+    default number rather than to ``None``. An unparsable port yields ``-1``,
+    which can never equal a real origin, so it is refused rather than trusted.
+    """
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return scheme, (parts.hostname or "").lower(), -1
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme, -1)
+    return scheme, (parts.hostname or "").lower(), port
+
+
 class ApiUnavailable(RuntimeError):
     """The runtime could not be reached, or answered with a server error.
 
     Callers must treat this as transient: the task stays leased and is retried.
     """
+
+
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only while scheme, host and port all stay identical.
+
+    The session key is sent as a header, and ``urlopen`` re-sends headers to
+    whatever host a ``3xx`` names, so a cross-origin redirect leaks the key.
+    Checking the hostname alone is not enough: a downgrade from https to http,
+    or a move to another port, is still a different destination and is refused.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _origin(newurl) != _origin(req.full_url):
+            raise ApiUnavailable(
+                f"refusing cross-origin redirect ({code}): "
+                f"{_origin(req.full_url)} -> {_origin(newurl)}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class ConversationGone(RuntimeError):
@@ -105,6 +147,16 @@ class OpenHandsClient:
         self._api_key = api_key or os.environ.get("SESSION_API_KEY") or ""
         self.timeout = timeout
 
+    def _opener(self) -> urllib.request.OpenerDirector:
+        """An opener that sends the session key only to the configured origin.
+
+        ``urlopen`` follows a ``3xx`` and re-sends every request header, so a
+        redirect to another host would hand ``X-Session-API-Key`` to that host.
+        A same-origin redirect is still followed, because that keeps the key on
+        the host it was meant for.
+        """
+        return urllib.request.build_opener(_SameOriginRedirect)
+
     # ------------------------------------------------------------------ http
     def _request(
         self,
@@ -121,7 +173,7 @@ class OpenHandsClient:
         if self._api_key:
             req.add_header("X-Session-API-Key", self._api_key)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._opener().open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as e:

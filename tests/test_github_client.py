@@ -19,7 +19,7 @@ from orchestration.github_client import (  # noqa: E402
     GitHubError,
     GitHubUnavailable,
 )
-from tests.fake_github import FakeGitHub, FakeGitHubServer  # noqa: E402
+from tests.fake_github import FakeGitHubServer  # noqa: E402
 
 TOKEN = "ghp_test_token_value_never_logged"
 
