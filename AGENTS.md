@@ -380,4 +380,28 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
   malformed-id 404 block) and the workspace-conflict block at the end of
   `tests/test_reliability.py`. The fake Cloud implements `PATCH`/`DELETE` so
   rename runs over real HTTP.
+- **Sr lifecycle (PR #10).** One workflow must have exactly one Sr, and a
+  childless workflow must not wait forever. Two traps, both proven:
+  - `SrRuntime.ensure_sr` recovers in strength order: recorded
+    `sr_conversation_id` -> recorded `sr_start_task_id` (`_resume_start_task`,
+    the same recovery the Jr path does with `external_start_task_id`) -> tagged
+    orphan search. **Never swallow a transient error from the orphan search**:
+    `_find_orphan_sr` used to catch every `CloudError`, so a search outage read
+    as "no orphan" and started a duplicate Sr. It now lets `CloudUnavailable`
+    propagate so the retry backs off.
+  - `WorkflowVerifier` blocks a childless workflow after
+    `sr_idle_timeout_seconds` (default 1800s) using the durable
+    `workflows.sr_started_at`, not `updated_at` (which moves on every event).
+    Without it, an Sr the Cloud never advances past `idle`/`running` left the
+    workflow non-terminal forever with no operator signal.
+  - `bind_sr` stamps `sr_started_at` only when it first records a conversation
+    id; a later re-bind must not reset the clock. `resume_workflow` clears it
+    when Sr is gone.
+  - The fake Cloud withholds `app_conversation_id` until the start task is
+    READY, matching the live API. A test that sets `start_polls_required > 0`
+    therefore exercises the real two-phase start; a caller that binds before
+    READY is caught.
+  - Regression tests: `tests/test_sr_lifecycle.py` (12 cases, including the
+    duplicate-Sr reproduction and the full one-workflow->one-Sr->one-Jr
+    acceptance chain).
 

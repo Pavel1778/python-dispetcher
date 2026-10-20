@@ -58,9 +58,16 @@ class VerifierReport:
 
 
 class WorkflowVerifier:
-    def __init__(self, store: PostgresStore, client: Any):
+    def __init__(self, store: PostgresStore, client: Any, *,
+                 sr_idle_timeout_seconds: float = 1800.0):
         self.store = store
         self.client = client
+        # How long an Sr may hold a workflow open without delegating anything.
+        # A freshly started Sr legitimately has no children for a while; one that
+        # never delegates and never stops is wedged (a sandbox that never came
+        # up, a start that never became READY) and must be blocked for a human
+        # instead of leaving the workflow non-terminal forever.
+        self.sr_idle_timeout_seconds = sr_idle_timeout_seconds
 
     def tick(self) -> VerifierReport:
         report = VerifierReport()
@@ -72,6 +79,18 @@ class WorkflowVerifier:
             except CloudUnavailable:
                 report.unavailable.append(wf["id"])
         return report
+
+    def _sr_idle_expired(self, sr: dict[str, Any]) -> bool:
+        """True when an Sr has held the workflow open past the idle window."""
+        started = (sr or {}).get("sr_started_at")
+        if started is None:
+            return False
+        from datetime import datetime, timezone
+
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - started).total_seconds()
+        return age >= self.sr_idle_timeout_seconds
 
     # ---------------------------------------------------------------- decide
     def _verify(self, workflow_id: str, report: VerifierReport) -> None:
@@ -105,14 +124,17 @@ class WorkflowVerifier:
 
         progress = self.store.workflow_progress(workflow_id)
         if progress["total"] == 0:
-            # Sr has not delegated anything yet. If Sr has stopped, or its
-            # conversation is gone, no work will ever arrive: block for a human
-            # rather than wait forever. Only a still-running Sr is "waiting".
+            # Sr has not delegated anything yet. If Sr has stopped, its
+            # conversation is gone, or it has held the workflow open past the
+            # idle window, no work will ever arrive: block for a human rather
+            # than wait forever. Only a recently started, still-running Sr is
+            # genuinely "waiting".
             stopped = view is not None and (
                 view.execution_status == ExecutionStatus.FINISHED.value
             )
             gone = view is None and bool(conversation_id)
-            if stopped or gone:
+            idle_expired = conversation_id is not None and self._sr_idle_expired(sr)
+            if stopped or gone or idle_expired:
                 self.store.set_workflow_state(workflow_id, "blocked")
                 report.blocked.append(workflow_id)
             else:

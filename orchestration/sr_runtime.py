@@ -143,19 +143,34 @@ class SrRuntime:
     def ensure_sr(self, workflow_id: str, *, repository: str | None = None) -> str:
         """Start the Sr conversation for a workflow, or return the existing one.
 
-        Idempotent: ``workflows.sr_conversation_id`` is checked first, so a
-        restart or a second call never creates a second Sr.
+        Idempotent in three steps, strongest evidence first:
+
+        1. ``workflows.sr_conversation_id`` is checked first, so a restart or a
+           second call never creates a second Sr.
+        2. A recorded ``sr_start_task_id`` is resumed. A crash after
+           ``start_conversation`` but before ``bind_sr`` leaves a real start task
+           with no conversation id; polling it back to READY recovers the
+           conversation that already exists instead of starting another one. This
+           is the same recovery the Jr path does with
+           ``external_start_task_id``.
+        3. Only then is the Cloud searched for a tagged orphan. A failure of that
+           search propagates instead of being read as "no orphan": treating a
+           search outage as absence is exactly what starts a duplicate Sr.
         """
         existing = self.store.sr_for(workflow_id)
         if existing and existing.get("sr_conversation_id"):
             return existing["sr_conversation_id"]
-        # A crash after start_conversation but before bind_sr leaves a real Sr
-        # conversation with no local record. Find it by its tag instead of
-        # starting a second Sr for the same workflow.
+
+        resumed = self._resume_start_task(workflow_id, existing or {})
+        if resumed is not None:
+            return resumed
+
         orphan = self._find_orphan_sr(workflow_id)
         if orphan is not None:
             self.store.bind_sr(workflow_id, conversation_id=orphan, status="running")
+            self._mark_running(workflow_id)
             return orphan
+
         goal = (existing or {}).get("goal") or "workflow"
         repos = self.store.list_repositories()
         start = self.client.start_conversation(
@@ -174,17 +189,71 @@ class SrRuntime:
         self.store.bind_sr(
             workflow_id, conversation_id=conversation_id, status="running"
         )
+        self._mark_running(workflow_id)
         return conversation_id
 
-    def _find_orphan_sr(self, workflow_id: str) -> str | None:
-        """A previously started Sr conversation tagged for this workflow."""
-        value = workflow_id.replace("-", "")
-        try:
-            items, _ = self.client.search_conversations(
-                limit=50, tag=("orchestratorsr", value)
-            )
-        except CloudError:
+    def _resume_start_task(
+        self, workflow_id: str, existing: dict[str, Any]
+    ) -> str | None:
+        """Recover the conversation from a start task we already recorded.
+
+        Returns the conversation id when the recorded start task is (or becomes)
+        READY. Returns ``None`` when there is no start task to resume, when it
+        failed, or when it disappeared -- the caller then falls back to the
+        tagged-orphan search. A transport error propagates, so a retry backs off
+        instead of starting a second Sr.
+        """
+        start_task_id = existing.get("sr_start_task_id")
+        if not start_task_id:
             return None
+        start = self.client.get_start_task(start_task_id)
+        if start is None or start.failed:
+            return None
+        if not start.app_conversation_id:
+            # Not READY yet; poll it the same way a fresh start is polled.
+            try:
+                conversation_id = self._await_start(start)
+            except CloudError:
+                return None
+            self.store.bind_sr(
+                workflow_id, conversation_id=conversation_id, status="running"
+            )
+            self._mark_running(workflow_id)
+            return conversation_id
+        self.store.bind_sr(
+            workflow_id, conversation_id=start.app_conversation_id, status="running"
+        )
+        self._mark_running(workflow_id)
+        return start.app_conversation_id
+
+    def _mark_running(self, workflow_id: str) -> None:
+        """Reflect a started Sr in the workflow state.
+
+        The web server starts Sr inline on creation, but the workflow row was
+        left in ``queued``. The UI then showed a queued task while an Sr was
+        already running for it. Once a conversation is bound, the workflow is
+        ``running``; the verifier only moves it on from there.
+        """
+        try:
+            row = self.store.sr_for(workflow_id) or {}
+            if row.get("state") == "queued":
+                self.store.set_workflow_state(workflow_id, "running")
+        except Exception as e:  # noqa: BLE001 - state hint must not fail a start
+            log.warning("could not mark workflow %s running: %s", workflow_id, e)
+
+    def _find_orphan_sr(self, workflow_id: str) -> str | None:
+        """A previously started Sr conversation tagged for this workflow.
+
+        A transient search failure propagates as ``CloudUnavailable``: the caller
+        retries with backoff. Returning ``None`` on a search outage would read as
+        "no orphan exists" and start a duplicate Sr for the same workflow, which
+        is the duplication this guards against. Only a genuinely absent
+        conversation yields ``None``.
+        """
+        value = workflow_id.replace("-", "")
+        items, _ = self.client.search_conversations(
+            limit=50, tag=("orchestratorsr", value)
+        )
         for conv in items:
             if conv.tags.get("orchestratorsr") == value:
                 return conv.id

@@ -50,6 +50,9 @@ class FakeCloud:
         #: (e.g. 429). Lets a test drive the workflow-level rate-limit path.
         self.start_status = 0
         self.start_status_times = 0
+        #: When set, ``app-conversations/search`` fails with this status code.
+        #: Lets a test drive the "orphan lookup is down" path.
+        self.search_status = 0
         self.calls: list[tuple[str, str]] = []
 
     def make_conversation(self, *, title, repo=None, branch=None,
@@ -140,6 +143,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, out)
 
         if path == "/api/v1/app-conversations/search":
+            if self.cloud.search_status:
+                return self._json(self.cloud.search_status, {"detail": "unavailable"})
             items = list(self.cloud.conversations.values())
             # tags__contains is a repeatable key=value filter; all must match.
             for raw in self._query_all("tags__contains"):
@@ -169,6 +174,9 @@ class _Handler(BaseHTTPRequestHandler):
                     st["_polls"] = st.get("_polls", 0) + 1
                     if st["_polls"] > self.cloud.start_polls_required:
                         st["status"] = "ERROR" if self.cloud.start_fail else "READY"
+                        if st["status"] == "READY":
+                            # The id appears only once READY, as on the live API.
+                            st["app_conversation_id"] = st.get("_cid")
                 out.append(st)
             return self._json(200, out)
 
@@ -214,10 +222,16 @@ class _Handler(BaseHTTPRequestHandler):
                                  "content": [{"type": "text", "text": text}]}}
             )
             st_id = str(uuid.uuid4())
+            # The real API withholds ``app_conversation_id`` until the start
+            # task reaches READY. When a test asks for extra polls, mirror that:
+            # expose the id only once READY, so a caller that ignores the status
+            # and binds early is caught.
+            ready_now = self.cloud.start_polls_required == 0
             self.cloud.start_tasks[st_id] = {
                 "id": st_id,
-                "status": "WORKING",
-                "app_conversation_id": cid,
+                "status": "READY" if ready_now else "WORKING",
+                "app_conversation_id": cid if ready_now else None,
+                "_cid": cid,
                 "sandbox_id": self.cloud.conversations[cid]["sandbox_id"],
                 "agent_server_url": None,
                 "detail": None,
