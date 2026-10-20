@@ -101,6 +101,15 @@ def _version() -> str:
 #: Minimal liveness page. Reveals nothing about configuration.
 HEALTHZ = {"status": "ok"}
 
+# Ids are UUIDs. ``[0-9a-fA-F-]{36}`` is too weak: 36 hyphens match it and then
+# reach PostgreSQL, which rejects the value and turns a bad request into a 500
+# that echoes the database error. Require the real 8-4-4-4-12 shape so a
+# malformed id is a 404 before any query runs.
+UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
 LOGIN_PAGE = """<!doctype html>
 <html lang="ru">
 <head>
@@ -422,14 +431,20 @@ class App:
         the dispatcher's own state becomes terminal, so nothing is dispatched or
         polled for it again.
         """
+        if not UUID_RE.fullmatch(workflow_id):
+            raise NotFound(workflow_id)
         return self.store.cancel_workflow(workflow_id)
 
     def resume_workflow(self, workflow_id: str) -> dict[str, Any]:
         """Reopen a blocked or failed workflow and requeue its retryable tasks."""
+        if not UUID_RE.fullmatch(workflow_id):
+            raise NotFound(workflow_id)
         return self.store.resume_workflow(workflow_id)
 
     def retry_task(self, task_id: str) -> dict[str, Any]:
         """Requeue one task for another attempt."""
+        if not UUID_RE.fullmatch(task_id):
+            raise NotFound(task_id)
         task = self.store.retry_task(task_id)
         return {"task_id": task.id, "state": task.state.value}
 
@@ -446,6 +461,8 @@ class App:
             raise ValueError("title is required")
         if len(title) > 200:
             raise ValueError("title is too long (max 200)")
+        if not UUID_RE.fullmatch(workflow_id):
+            raise NotFound(workflow_id)
         sr = self.store.sr_for(workflow_id)
         if sr is None:
             raise NotFound(f"workflow {workflow_id}")
@@ -477,7 +494,7 @@ class App:
         return result
 
     def workflow_detail(self, workflow_id: str) -> dict[str, Any]:
-        if not re.fullmatch(r"[0-9a-fA-F-]{36}", workflow_id):
+        if not UUID_RE.fullmatch(workflow_id):
             raise NotFound(workflow_id)
         wf = self.store.sr_for(workflow_id)
         if wf is None:
@@ -889,6 +906,8 @@ class Handler(BaseHTTPRequestHandler):
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._json(400, {"error": "text is required"})
+                if not UUID_RE.fullmatch(workflow_id):
+                    return self._json(404, {"error": "not found"})
                 sr = self.app.store.sr_for(workflow_id)
                 if not sr or not sr.get("sr_conversation_id"):
                     return self._json(409, {"error": "Sr conversation not ready"})

@@ -348,3 +348,58 @@ def test_actions_require_authentication(app, fake, base):
         except urllib.error.HTTPError as e:
             raised = e.code == 401
         assert raised, path
+
+
+# ------------------------------------------------- malformed id is not a 500
+def test_malformed_workflow_id_is_404_not_500(app, fake, base):
+    """A non-UUID id must be a 404, never a 500 that echoes a database error.
+
+    Regression: the route handlers passed the raw path segment straight to a
+    ``WHERE id=%s`` on a ``uuid`` column. A value like ``nope`` made PostgreSQL
+    raise ``InvalidTextRepresentation``, which the generic handler turned into
+    a 500 whose body contained the database error text. A bad id is a bad
+    request, not a server fault, and the error text must not leak.
+    """
+    for bad in ("nope", "123", "%20", "a" * 40):
+        status, d = _req("GET", base, f"/api/workflows/{bad}")
+        assert status == 404, (bad, status, d)
+        assert "InvalidTextRepresentation" not in json.dumps(d)
+
+    for action in ("cancel", "resume", "rename", "message"):
+        status, d = _req("POST", base, f"/api/workflows/nope/{action}",
+                         {"title": "x", "text": "x"})
+        assert status == 404, (action, status, d)
+        assert "invalid input syntax" not in json.dumps(d)
+
+    status, d = _req("POST", base, "/api/tasks/nope/retry")
+    assert status == 404, (status, d)
+    assert "invalid input syntax" not in json.dumps(d)
+
+
+def test_thirty_six_hyphens_is_404_not_500(app, fake, base):
+    """The old guard ``[0-9a-fA-F-]{36}`` let 36 hyphens through to the database.
+
+    That string has the right length and only allowed characters, so the
+    ``fullmatch`` check passed, the query ran, and PostgreSQL rejected it --
+    a 500 with the database error in the body. The guard now requires the real
+    8-4-4-4-12 UUID shape, so this is a 404 before any query.
+    """
+    dashes = "-" * 36
+    status, d = _req("GET", base, f"/api/workflows/{dashes}")
+    assert status == 404, (status, d)
+    assert "invalid input syntax" not in json.dumps(d)
+
+    status, d = _req("POST", base, f"/api/workflows/{dashes}/cancel")
+    assert status == 404, (status, d)
+    assert "invalid input syntax" not in json.dumps(d)
+
+
+def test_well_formed_but_unknown_uuid_is_404(app, fake, base):
+    """A valid-shaped id that does not exist is still a clean 404."""
+    unknown = "00000000-0000-4000-8000-000000000000"
+    status, d = _req("GET", base, f"/api/workflows/{unknown}")
+    assert status == 404, (status, d)
+    status, d = _req("POST", base, f"/api/workflows/{unknown}/cancel")
+    assert status == 404, (status, d)
+    status, d = _req("POST", base, f"/api/tasks/{unknown}/retry")
+    assert status == 404, (status, d)
