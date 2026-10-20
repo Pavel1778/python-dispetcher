@@ -200,25 +200,66 @@ class App:
 
     # ------------------------------------------------------------- actions
     def start_workflow(self, goal: str, repository: str | None = None,
-                       branch: str | None = None) -> dict[str, Any]:
+                       branch: str | None = None,
+                       request_id: str | None = None) -> dict[str, Any]:
+        """Create a workflow and start its Sr conversation.
+
+        ``request_id`` makes this idempotent: the same logical request (the same
+        id) reuses the workflow and its Sr conversation instead of creating
+        another. This is what stops a retried HTTP request -- a client timeout
+        followed by a resubmit, a double submit, a proxy retry -- from producing
+        several Sr conversations for one user intent. Without it, every retry
+        minted a new workflow id and started a new Sr, which is exactly the
+        duplication observed in production.
+
+        The uniqueness is enforced by ``workflows.idempotency_key``, so two
+        concurrent requests with the same id cannot both create a workflow.
+        """
         if not goal.strip():
             raise ValueError("goal is required")
         if repository is not None and self.store.allowed_repository(repository) is None:
             raise ValueError(f"repository not allowed: {repository}")
-        workflow_id = self.store.create_workflow(goal)
+
+        if request_id:
+            workflow_id, created = self.store.create_workflow_idempotent(
+                goal, request_id
+            )
+        else:
+            workflow_id, created = self.store.create_workflow_once(goal)
+
+        existing = self.store.sr_for(workflow_id)
+        if not created and existing and existing.get("sr_conversation_id"):
+            # A previous attempt already owns the Sr for this request. Return it
+            # rather than starting a second conversation.
+            return {"workflow_id": workflow_id,
+                    "sr_conversation_id": existing["sr_conversation_id"],
+                    "reused": True}
+
+        # Reserve the start before touching the Cloud. Two concurrent requests
+        # with the same request id both reach this point (the loser of the
+        # workflow insert reuses the winner's row), and without the claim both
+        # would start an Sr. The loser returns immediately; the background loop
+        # completes the start the winner began.
+        if not self.store.claim_sr_start(workflow_id, self.dispatcher.worker_id,
+                                         lease_seconds=max(
+                                             self.dispatcher.lease_seconds, 120.0)):
+            return {"workflow_id": workflow_id, "sr_conversation_id": None,
+                    "reused": True, "starting": True}
+
         try:
             conversation_id = self.runtime.ensure_sr(workflow_id)
         except CloudError as e:
-            # Keep the workflow so the user can see it failed to start Sr. The Sr
-            # loop owns the retry policy: it retries a transient failure (429,
-            # 5xx) with backoff and blocks on a permanent one, so nothing here
-            # decides. Retry promptly, since this request already waited.
+            # Release the lease so the Sr loop can retry promptly. Keep the
+            # workflow so the user can see it failed to start Sr; the loop owns
+            # the retry policy (transient -> backoff, permanent -> block).
+            self.store.release_sr_start(workflow_id)
             self.store.record_sr_failure(
                 workflow_id, error=f"{type(e).__name__}: {e}", attempt=1,
                 backoff_seconds=0.0, give_up=False,
             )
             raise
-        return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id}
+        return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id,
+                "reused": not created}
 
     def sync_github_repositories(self, *, include_archived: bool = False) -> dict[str, Any]:
         """Pull the account's GitHub repositories into the allowlist.
@@ -621,10 +662,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(404, {"error": "repository not found"})
                 return self._json(200, {"removed": name})
             if path == "/api/workflows":
+                # A stable request id makes this endpoint safe to retry. The
+                # browser sends one per logical submission (see app.js); a
+                # machine client may send ``Idempotency-Key``. Without either,
+                # the call behaves as before (always creates).
+                request_id = (
+                    self.headers.get("Idempotency-Key")
+                    or (body.get("request_id") or "").strip()
+                    or None
+                )
                 out = self.app.start_workflow(
                     body.get("goal") or "",
                     body.get("repository"),
                     body.get("branch"),
+                    request_id=request_id,
                 )
                 return self._json(200, out)
             if path.startswith("/api/workflows/") and path.endswith("/message"):

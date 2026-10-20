@@ -33,20 +33,9 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="set TEST_SUPABASE_DB_URL to run Cloud dispatcher tests"
 )
 
-MIGRATION = os.path.join(
+MIGRATIONS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "migrations",
-    "0001_init.sql",
-)
-MIGRATION_2 = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "migrations",
-    "0002_sr_runtime.sql",
-)
-MIGRATION_3 = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "migrations",
-    "0003_tool_call_recovery.sql",
 )
 
 
@@ -59,9 +48,11 @@ def _reset_schema() -> None:
                 "DROP TABLE IF EXISTS sr_tool_calls, task_events, conversations, "
                 "tasks, repositories, workflows CASCADE"
             )
-            cur.execute(open(MIGRATION).read())
-            cur.execute(open(MIGRATION_2).read())
-            cur.execute(open(MIGRATION_3).read())
+            # Apply every migration, in order. Listing them by hand here meant a
+            # new migration could be added without this suite exercising it.
+            for name in sorted(os.listdir(MIGRATIONS_DIR)):
+                if name.endswith(".sql"):
+                    cur.execute(open(os.path.join(MIGRATIONS_DIR, name)).read())
 
 
 @pytest.fixture(autouse=True)
