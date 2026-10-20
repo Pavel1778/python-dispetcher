@@ -330,10 +330,10 @@ class CloudClient:
             body["title"] = title
         if not body:
             return True
-        status, payload = self._request(
+        status, _ = self._request(
             "PATCH", f"/api/v1/app-conversations/{conversation_id}", body
         )
-        return status == 200 and bool(payload or True)
+        return status == 200
 
     def web_url(self, conversation_id: str) -> str:
         """The human-facing URL for a conversation.
