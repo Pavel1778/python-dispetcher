@@ -54,7 +54,8 @@ def _reset_schema() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "DROP TABLE IF EXISTS sessions, login_attempts, sr_tool_calls, "
-                "task_events, conversations, tasks, repositories, workflows CASCADE"
+                "task_events, conversations, conversation_routes, cloud_sandboxes, "
+                "tasks, repositories, workflows CASCADE"
             )
             for name in sorted(os.listdir(_MIG)):
                 if name.endswith(".sql"):
