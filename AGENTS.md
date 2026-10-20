@@ -22,10 +22,17 @@ agent-server.
 - `CLOUD-INTEGRATION-MAP.md` — the same for the **Cloud V1** adapter. Read it
   before changing anything under `cloud_*`.
 - `orchestration/cloud_client.py` — stdlib-only REST adapter for **OpenHands
-  Cloud V1** (`/api/v1/app-conversations`, Bearer auth).
+  Cloud V1** (`/api/v1/app-conversations`, Bearer auth). Also the account-level
+  sandbox calls (`start_sandbox`, `wait_for_sandbox`, `pause/resume/delete`).
+- `orchestration/cloud_direct.py` — the **direct** transport: provision a
+  sandbox, drive its agent-server. Implements the same client surface as
+  `cloud_client.py`, so the dispatcher and Sr runtime do not know which is in
+  use. `build_cloud_client` picks between them from `OPENHANDS_TRANSPORT`.
+- `orchestration/local_runtime.py` — the same client surface against a *local*
+  agent-server, for the end-to-end tests.
 - `orchestration/cloud_store.py` — PostgreSQL/Supabase task store. Atomic claim
   via `SELECT ... FOR UPDATE SKIP LOCKED`; legal-path recovery via
-  `force_transition`.
+  `force_transition`. Holds the sandbox/conversation route table.
 - `orchestration/cloud_dispatcher.py` — Cloud dispatcher. Two-phase create
   (start task → poll → bind), allowlist, bounded retry, recovery.
 - `orchestration/sr_tools.py` — Sr operations (create/list/status/report/

@@ -115,6 +115,8 @@ Read from the source, not assumed. Names must match exactly.
 | `WEB_AUTH_TOKEN` | yes | `web_server.py` | Bearer token for the machine API. |
 | `GITHUB_TOKEN` | no | `github_client.py` | Read-only GitHub token used to discover repositories for the allowlist. Unset → repositories must be added by hand. Never returned by the API or the UI. |
 | `OPENHANDS_CLOUD_URL` | no | `cloud_client.py` | Override for a self-hosted Cloud. Default `https://app.all-hands.dev`. Must be `http(s)`: any other scheme is refused at startup. |
+| `OPENHANDS_TRANSPORT` | no | `cloud_direct.py` | `direct` (default) provisions a sandbox and drives its agent-server; `app` uses the legacy app-conversation endpoint. See "Cloud transport" below. |
+| `OPENHANDS_DEFAULT_MODEL` | no | `cloud_direct.py` | Model forced on every sandbox conversation. Set it when a bare sandbox's default model has no key. |
 | `OPENHANDS_AGENT_PROFILE_ID` | no | `web_server.py` | Select an account agent profile by id. Unset = inherit the account's active profile. |
 | `WEB_COOKIE_SECURE` | no | `web_server.py` | Force the `Secure` cookie flag on/off. Default: on when `X-Forwarded-Proto: https`. |
 | `TRUSTED_PROXY_HOPS` | no | `web_server.py` | Number of trusted proxies in front of the app, used to pick the client IP from `X-Forwarded-For`. Default `1`. Set `0` to ignore the header entirely (direct connection, no proxy). A missing, empty or unparsable value falls back to `1`; a negative value is clamped to `0`. **The correct value for this Render service is not confirmed** — see "Client IP behind Render" below. |
@@ -284,6 +286,8 @@ psql "$SUPABASE_DB_URL" -f migrations/0002_sr_runtime.sql
 psql "$SUPABASE_DB_URL" -f migrations/0003_tool_call_recovery.sql
 psql "$SUPABASE_DB_URL" -f migrations/0004_auth.sql
 psql "$SUPABASE_DB_URL" -f migrations/0005_sr_start_retry.sql
+psql "$SUPABASE_DB_URL" -f migrations/0006_workflow_idempotency.sql
+psql "$SUPABASE_DB_URL" -f migrations/0007_cloud_direct.sql
 ```
 
 Do not run migrations against production without authorization. Applying them on
@@ -347,6 +351,40 @@ The blueprint uses the **free** plan, which means:
 * there is no shell and no persistent disk — all state is in PostgreSQL;
 * run exactly one instance: the loop is not partitioned between instances.
 
+
+## Cloud transport: `direct` and `app`
+
+The dispatcher can start Cloud conversations two ways. `OPENHANDS_TRANSPORT`
+selects which; the default is `direct`.
+
+**`direct` (default).** Provision a sandbox yourself
+(`POST /api/v1/sandboxes`), wait for it to be `RUNNING`, then create the
+conversation on that sandbox's agent-server with the sandbox's own
+`session_api_key`. Each conversation is bound to its sandbox in the
+`conversation_routes` table, so a read from a later process still finds it.
+
+**`app` (legacy).** `POST /api/v1/app-conversations`, which provisions a sandbox
+*and* creates the conversation for you, as a two-phase start task.
+
+Use `direct` unless you have a reason not to. The `app` endpoint can fail with
+`HTTP 500` on the live service when it asks a just-provisioned sandbox to create
+a conversation: the start task reaches `STARTING_CONVERSATION` and then errors,
+and a start without an initial message is `READY` but `send-message` returns
+`502`. When that happens the whole dispatcher is inert, because nothing can
+reach a running conversation. The `direct` transport avoids that inner call
+entirely and was verified end to end against the live service.
+
+Two consequences of `direct`:
+
+* A bare sandbox may default to a model whose key is not present, and a
+  conversation on it then fails with an LLM auth error. Set
+  `OPENHANDS_DEFAULT_MODEL` to a model the sandbox can reach.
+* Get-or-create reuses one `RUNNING` sandbox across conversations to avoid
+  provisioning a sandbox per task. A conversation that needs its own client
+  tools (that is, the Sr conversation) gets its own sandbox, so a long-running
+  Sr cannot share a sandbox with a Jr that is being reset between tasks.
+
+Set `OPENHANDS_TRANSPORT=app` to fall back without a code change.
 
 ## Account capabilities (read-only)
 

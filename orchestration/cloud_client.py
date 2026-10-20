@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -350,6 +351,80 @@ class CloudClient:
         """``POST /api/v1/sandboxes/{sandbox_id}/resume``."""
         status, _ = self._request("POST", f"/api/v1/sandboxes/{sandbox_id}/resume")
         return status == 200
+
+    def start_sandbox(
+        self, *, sandbox_spec_id: str | None = None
+    ) -> dict[str, Any]:
+        """``POST /api/v1/sandboxes`` -> a raw ``SandboxInfo``.
+
+        This is the sandbox-first path used when the app-conversation endpoint
+        cannot provision a running conversation. The response carries the
+        sandbox's ``session_api_key`` and, once it is RUNNING, its exposed
+        ``AGENT_SERVER`` URL, which together let the caller talk to that
+        sandbox's agent-server directly.
+        """
+        body: dict[str, Any] = {}
+        if sandbox_spec_id is not None:
+            body["sandbox_spec_id"] = sandbox_spec_id
+        status, payload = self._request("POST", "/api/v1/sandboxes", body)
+        if status not in (200, 201) or not isinstance(payload, dict):
+            raise CloudError(f"start_sandbox -> {status}")
+        return payload
+
+    def get_sandbox(self, sandbox_id: str) -> dict[str, Any]:
+        """``GET /api/v1/sandboxes?id=<id>`` -> one ``SandboxInfo``."""
+        status, payload = self._request("GET", f"/api/v1/sandboxes?id={sandbox_id}")
+        if status == 404:
+            raise CloudNotFound(sandbox_id)
+        if status != 200:
+            raise CloudError(f"get_sandbox -> {status}")
+        items = payload if isinstance(payload, list) else [payload]
+        if not items or not items[0]:
+            raise CloudNotFound(sandbox_id)
+        return items[0]
+
+    def delete_sandbox(self, sandbox_id: str) -> bool:
+        """``DELETE /api/v1/sandboxes/{id}`` (id also passed as a query param)."""
+        status, _ = self._request(
+            "DELETE", f"/api/v1/sandboxes/{sandbox_id}?sandbox_id={sandbox_id}"
+        )
+        return status in (200, 204)
+
+    def wait_for_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        attempts: int = 40,
+        interval: float = 5.0,
+    ) -> dict[str, Any]:
+        """Poll a sandbox until it is RUNNING, returning the final ``SandboxInfo``.
+
+        Raises :class:`CloudUnavailable` if it does not reach RUNNING in time and
+        :class:`CloudError` if it lands in ERROR/PAUSED, so a caller never
+        proceeds to talk to a sandbox that cannot serve.
+        """
+        current: dict[str, Any] = {}
+        for _ in range(max(1, attempts)):
+            current = self.get_sandbox(sandbox_id)
+            state = current.get("status")
+            if state == "RUNNING":
+                return current
+            if state in ("ERROR",):
+                raise CloudError(
+                    f"sandbox {sandbox_id} -> {state}: {current.get('status_detail')}"
+                )
+            time.sleep(interval)
+        raise CloudUnavailable(
+            f"sandbox {sandbox_id} not RUNNING after {attempts} polls"
+        )
+
+    @staticmethod
+    def agent_server_url(sandbox: dict[str, Any]) -> str | None:
+        """The ``AGENT_SERVER`` exposed URL from a ``SandboxInfo``, if present."""
+        for entry in sandbox.get("exposed_urls") or []:
+            if str(entry.get("name", "")).upper() == "AGENT_SERVER":
+                return entry.get("url")
+        return None
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """``DELETE /api/v1/app-conversations/{id}``."""

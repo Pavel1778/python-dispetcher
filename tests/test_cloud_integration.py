@@ -46,6 +46,7 @@ def _reset_schema() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "DROP TABLE IF EXISTS sr_tool_calls, task_events, conversations, "
+                "conversation_routes, cloud_sandboxes, "
                 "tasks, repositories, workflows CASCADE"
             )
             for name in sorted(os.listdir(_MIG)):

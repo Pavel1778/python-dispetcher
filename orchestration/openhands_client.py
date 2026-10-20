@@ -158,20 +158,43 @@ class OpenHandsClient:
         return urllib.request.build_opener(_SameOriginRedirect)
 
     # ------------------------------------------------------------------ http
+    def _base_url(self) -> str:
+        """The server root for requests. Overridable for lazily-resolved hosts."""
+        return self.base_url
+
+    def _auth_key(self) -> str:
+        """The API key for requests. Overridable for lazily-resolved keys."""
+        return self._api_key
+
     def _request(
         self,
         method: str,
         path: str,
         body: dict[str, Any] | None = None,
     ) -> tuple[int, Any]:
-        url = f"{self.base_url}{path}"
+        return self._request_to(self._base_url(), self._auth_key(), method, path, body)
+
+    def _request_to(
+        self,
+        base_url: str,
+        key: str,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[int, Any]:
+        """Issue a request against an explicit host and key.
+
+        The default ``_request`` uses the client's own host; adapters that route
+        different conversations to different sandboxes call this directly.
+        """
+        url = f"{base_url.rstrip('/')}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Accept", "application/json")
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        if self._api_key:
-            req.add_header("X-Session-API-Key", self._api_key)
+        if key:
+            req.add_header("X-Session-API-Key", key)
         try:
             with self._opener().open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
@@ -206,6 +229,7 @@ class OpenHandsClient:
         title: str | None = None,
         max_iterations: int | None = None,
         agent_settings: dict[str, Any] | None = None,
+        client_tools: list[dict[str, Any]] | None = None,
     ) -> tuple[ConversationView, bool]:
         """Create a conversation, or return the existing one.
 
@@ -218,6 +242,13 @@ class OpenHandsClient:
         ``agent_profile_id`` is present. Callers pass what
         :meth:`agent_settings` returned; the value is forwarded opaquely and
         never logged.
+
+        ``client_tools`` is the documented ``ClientToolSpec`` list. When it is
+        present the runtime injects those tools into the agent and emits an
+        ``ActionEvent`` (``action.kind == "ClientAction_<name>"``) when the agent
+        calls one. This is the mechanism the Sr bridge relies on and it is
+        available on the local agent-server v1.50.1, unlike the Cloud V1 app
+        endpoint which has no such field on the app-server request.
         """
         body: dict[str, Any] = {
             "conversation_id": conversation_id,
@@ -229,6 +260,8 @@ class OpenHandsClient:
             body["max_iterations"] = max_iterations
         if agent_settings is not None:
             body["agent_settings"] = agent_settings
+        if client_tools is not None:
+            body["client_tools"] = client_tools
         status, payload = self._request("POST", "/api/conversations", body)
         if status == 429:
             raise ApiUnavailable("conversation capacity full")

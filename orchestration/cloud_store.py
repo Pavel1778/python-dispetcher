@@ -869,6 +869,95 @@ class PostgresStore:
             row = cur.fetchone()
         return row
 
+    # ------------------------------------------------------- direct transport
+    def save_conversation_route(
+        self,
+        conversation_id: str,
+        *,
+        sandbox_id: str,
+        agent_server_url: str,
+        session_api_key: str,
+    ) -> None:
+        """Bind a conversation to the sandbox that hosts it.
+
+        The direct transport creates each conversation *on* a sandbox, so every
+        later read must be sent back to that sandbox. Keyed by conversation id,
+        which covers both the Sr (on ``workflows``) and Jr (on ``tasks``) sides.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO conversation_routes(external_conversation_id, sandbox_id,
+                                                agent_server_url, session_api_key)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (external_conversation_id) DO UPDATE
+                   SET sandbox_id = EXCLUDED.sandbox_id,
+                       agent_server_url = EXCLUDED.agent_server_url,
+                       session_api_key = EXCLUDED.session_api_key
+                """,
+                (conversation_id, sandbox_id, agent_server_url, session_api_key),
+            )
+
+    def conversation_route(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT sandbox_id, agent_server_url, session_api_key "
+                "FROM conversation_routes WHERE external_conversation_id=%s",
+                (conversation_id,),
+            )
+            return cur.fetchone()
+
+    def save_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        agent_server_url: str,
+        session_api_key: str,
+        status: str = "RUNNING",
+    ) -> None:
+        """Record a started sandbox so a later dispatch can reuse it."""
+        with self._tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO cloud_sandboxes(sandbox_id, agent_server_url,
+                                            session_api_key, status)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (sandbox_id) DO UPDATE
+                   SET agent_server_url = EXCLUDED.agent_server_url,
+                       session_api_key = EXCLUDED.session_api_key,
+                       status = EXCLUDED.status,
+                       updated_at = now()
+                """,
+                (sandbox_id, agent_server_url, session_api_key, status),
+            )
+
+    def running_sandbox(self) -> dict[str, Any] | None:
+        """The most recently seen running sandbox, if any."""
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT sandbox_id, agent_server_url, session_api_key, status "
+                "FROM cloud_sandboxes WHERE status='RUNNING' "
+                "ORDER BY updated_at DESC LIMIT 1"
+            )
+            return cur.fetchone()
+
+    def mark_sandbox_status(self, sandbox_id: str, status: str) -> None:
+        with self._tx() as cur:
+            cur.execute(
+                "UPDATE cloud_sandboxes SET status=%s, updated_at=now() WHERE sandbox_id=%s",
+                (status, sandbox_id),
+            )
+
+    def list_sandboxes(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Sandboxes this application knows about, most recent first."""
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT sandbox_id, agent_server_url, session_api_key, status "
+                "FROM cloud_sandboxes ORDER BY updated_at DESC LIMIT %s",
+                (limit,),
+            )
+            return cur.fetchall()
+
     def set_result(self, task_id: str, result: str) -> Task:
         with self._tx() as cur:
             cur.execute(
@@ -991,8 +1080,16 @@ class PostgresStore:
         conversation_id: str | None = None,
         start_task_id: str | None = None,
         status: str | None = None,
+        eager_sandbox_id: str | None = None,
     ) -> None:
-        """Record the Sr conversation for a workflow (one Sr per workflow)."""
+        """Record the Sr conversation for a workflow (one Sr per workflow).
+
+        ``eager_sandbox_id`` records the sandbox the Sr was started on *before*
+        the conversation id is known. The direct transport provisions a sandbox
+        first, then creates the conversation; a crash in between would otherwise
+        leave a real sandbox with no way to find it again, so the id is written
+        here as soon as it exists and carried forward by :meth:`mark_sr_started`.
+        """
         with self._tx() as cur:
             cur.execute(
                 """
@@ -1000,18 +1097,20 @@ class PostgresStore:
                    SET sr_conversation_id = COALESCE(%s, sr_conversation_id),
                        sr_start_task_id   = COALESCE(%s, sr_start_task_id),
                        sr_status          = COALESCE(%s, sr_status),
+                       sr_sandbox_id      = COALESCE(%s, sr_sandbox_id),
                        sr_start_owner     = NULL,
                        sr_start_lease_expires = NULL,
                        updated_at = now()
                  WHERE id = %s
                 """,
-                (conversation_id, start_task_id, status, workflow_id),
+                (conversation_id, start_task_id, status, eager_sandbox_id, workflow_id),
             )
             if cur.rowcount == 0:
                 raise NotFound(f"workflow {workflow_id}")
             self._event(cur, "sr_bound", workflow_id=workflow_id,
                         detail={"conversation_id": conversation_id,
-                                "start_task_id": start_task_id, "status": status})
+                                "start_task_id": start_task_id, "status": status,
+                                "sandbox_id": eager_sandbox_id})
 
     def sr_for(self, workflow_id: str) -> dict[str, Any] | None:
         with self._tx() as cur:

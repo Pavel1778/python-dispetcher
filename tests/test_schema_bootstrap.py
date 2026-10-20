@@ -47,6 +47,7 @@ def _drop_schema() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "DROP TABLE IF EXISTS schema_migrations, sr_tool_calls, task_events, "
+                "conversation_routes, cloud_sandboxes, "
                 "conversations, tasks, repositories, workflows, sessions, "
                 "login_attempts CASCADE"
             )

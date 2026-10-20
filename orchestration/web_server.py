@@ -63,7 +63,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from .cloud_client import CloudClient, CloudError
+from .cloud_client import CloudError
+from .cloud_direct import build_cloud_client
 from .cloud_dispatcher import CloudDispatcher
 from .cloud_store import (
     InvalidTransition,
@@ -272,7 +273,10 @@ class App:
                  plugins: list[dict[str, Any]] | None = None,
                  auth: AuthService | None = None):
         self.store = PostgresStore(dsn)
-        self.client = CloudClient()
+        # The Cloud transport. "direct" (default) provisions a sandbox and talks
+        # to its agent-server -- the only path that yields a running conversation
+        # on the live service; "app" keeps the legacy app-conversation client.
+        self.client = build_cloud_client(self.store)
         # Repository discovery for the allowlist. Reads GITHUB_TOKEN; the value
         # is never exposed through the API or the UI, only its presence.
         self.github = GitHubClient()
