@@ -88,6 +88,25 @@ These were found by running against the live server, not from docs:
    authoritative: `false` means retrying cannot succeed, so the task is
    dead-lettered at once. Do not retry auth/config errors.
 6. **`POST /run` returning 409 means already running**, which is success.
+7. **The app-conversation endpoint cannot always provision a conversation.**
+   On the live service `POST /api/v1/app-conversations` can reach
+   `STARTING_CONVERSATION` and then fail with `HTTP 500` from the inner
+   create-conversation call to the sandbox; a start with no initial message is
+   `READY` but `send-message` returns `502`. The failure is on the account side
+   (the runtime rejects the account's legacy string `security_analyzer`), not
+   in this code. The `direct` transport (`cloud_direct.py`) sidesteps it: it
+   starts a sandbox itself and creates the conversation on that sandbox's
+   agent-server. That path was verified end to end and is the default.
+8. **A bare sandbox defaults to a model whose key may be absent.** A
+   conversation created on a fresh sandbox then fails with an LLM auth error.
+   Pass `OPENHANDS_DEFAULT_MODEL` (or `llm_model=`) to force one the sandbox can
+   reach; `openhands/deepseek-v4.1-flash` worked when `gpt-5.x` did not.
+9. **`DELETE /api/v1/sandboxes/{id}` needs the id as a query param too**
+   (`?sandbox_id=<id>`), or it returns `422 Field required`.
+10. **`client_tools` is a local/agent-server feature.** The local agent-server
+    accepts `client_tools` on create and emits `ActionEvent`s for them; the
+    Cloud V1 app-conversation request has no such field. The Sr tool bridge
+    therefore needs the agent-server path, which is what `direct` provides.
 
 ## Invariants to keep
 
