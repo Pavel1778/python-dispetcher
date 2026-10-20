@@ -4,10 +4,11 @@ Two properties that only matter in production, so they are asserted directly
 rather than assumed:
 
 * the process can create its own schema (the free plan has no shell for psql),
-* behind the transaction pooler no server-side prepared statement is left to
-  be reused by another client.
+* server-side prepared statements are off by default, so a pooled server session
+  handed to the next process cannot collide on a prepared statement name.
 
-Both run against a real PostgreSQL; the module is skipped without one.
+Both run against a real PostgreSQL; the module is skipped without one. The
+pooler-specific reproduction additionally needs ``TEST_POOLER_DSN``.
 """
 
 from __future__ import annotations
@@ -22,6 +23,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from orchestration.cloud_store import PostgresStore  # noqa: E402
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
+
+# A DSN that goes through a transaction-mode pooler. Point this at a PgBouncer
+# (or Supabase's pooler) to run the end-to-end reproduction; without it the
+# pooler-specific test is skipped, because a direct connection cannot show the
+# failure (the server session is fresh for every client).
+POOLER_DSN = os.environ.get("TEST_POOLER_DSN")
 
 pytestmark = pytest.mark.skipif(
     not DSN, reason="set TEST_SUPABASE_DB_URL to run schema bootstrap tests"
@@ -95,17 +102,23 @@ def test_auto_migrate_can_be_disabled() -> None:
     )
 
 
-def test_pooler_mode_leaves_no_prepared_statements() -> None:
-    _drop_schema()
-    os.environ["DATABASE_TRANSACTION_POOLER"] = "true"
-    try:
-        store = PostgresStore(DSN)
-    finally:
-        os.environ.pop("DATABASE_TRANSACTION_POOLER", None)
+def test_prepared_statements_are_off_by_default() -> None:
+    """Preparation is disabled unless the operator opts in with PSYCOPG_PREPARE.
 
+    Behind a transaction-mode pooler a server session can be reused by the next
+    process with a prepared statement still on it, so psycopg's default
+    (prepare after the fifth execution) makes the *next* start fail with
+    ``DuplicatePreparedStatement``. The first start is fine, which is why the
+    default has to be the safe one.
+    """
+    _drop_schema()
+    os.environ.pop("PSYCOPG_PREPARE", None)
+    os.environ.pop("DATABASE_TRANSACTION_POOLER", None)
+    store = PostgresStore(DSN)
     try:
         # None is what psycopg uses to mean "never prepare server-side".
         assert store._conn.prepare_threshold is None
+        assert store.prepare_threshold is None
         # Execute the same statement more than the default threshold (5); with
         # preparation disabled the server must not hold a prepared statement,
         # because a pooled connection may be handed to another client.
@@ -117,3 +130,45 @@ def test_pooler_mode_leaves_no_prepared_statements() -> None:
             assert cur.fetchone()["n"] == 0
     finally:
         store.close()
+
+
+def test_prepare_can_be_opted_in_for_a_direct_connection() -> None:
+    """PSYCOPG_PREPARE=session restores psycopg's default for a direct DSN."""
+    _drop_schema()
+    os.environ["PSYCOPG_PREPARE"] = "session"
+    try:
+        store = PostgresStore(DSN)
+    finally:
+        os.environ.pop("PSYCOPG_PREPARE", None)
+    try:
+        assert store._conn.prepare_threshold == 5
+        assert store.prepare_threshold == 5
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(
+    not POOLER_DSN,
+    reason="set TEST_POOLER_DSN to a transaction-mode pooler to run this",
+)
+def test_restart_on_a_migrated_schema_behind_a_pooler() -> None:
+    """End-to-end reproduction of the production startup failure.
+
+    The schema must already be migrated: a fresh-schema start runs DDL, and
+    psycopg reacts to ``ALTER``/``DROP`` by sending ``DEALLOCATE ALL``, which
+    wipes the server-side prepared state and hides the bug. On a warm schema a
+    start runs only SELECTs, so psycopg prepares the checksum query on the sixth
+    execution and the pooler keeps it on the server session. The next start then
+    tries to prepare the same generated name, ``_pg3_0``, and PostgreSQL rejects
+    it -- which is the error seen in production, inside ``apply_migrations``.
+    """
+    _drop_schema()
+    PostgresStore(DSN).close()  # migrate once; DDL clears any prepared state
+
+    first = PostgresStore(POOLER_DSN)
+    first.close()
+
+    # This is the restart. With server-side preparation on, its apply_migrations
+    # raises DuplicatePreparedStatement: prepared statement "_pg3_0" already exists.
+    second = PostgresStore(POOLER_DSN)
+    second.close()
