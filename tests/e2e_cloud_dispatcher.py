@@ -27,9 +27,9 @@ from orchestration.cloud_dispatcher import CloudDispatcher  # noqa: E402
 from orchestration.cloud_store import PostgresStore  # noqa: E402
 from orchestration.sr_tools import SrTools  # noqa: E402
 
-MIGRATION = os.path.join(
+MIGRATIONS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "migrations", "0001_init.sql",
+    "migrations",
 )
 
 
@@ -42,7 +42,9 @@ def main() -> int:
     import psycopg
     with psycopg.connect(dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute(open(MIGRATION).read())
+            for name in sorted(os.listdir(MIGRATIONS_DIR)):
+                if name.endswith(".sql"):
+                    cur.execute(open(os.path.join(MIGRATIONS_DIR, name)).read())
 
     store = PostgresStore(dsn)
     client = CloudClient()

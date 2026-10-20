@@ -285,7 +285,8 @@ class PostgresStore:
     REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
         "workflows": ("id", "goal", "state", "created_at", "updated_at",
                       "sr_conversation_id", "sr_attempt", "sr_last_error",
-                      "sr_next_attempt_at"),
+                      "sr_next_attempt_at", "idempotency_key",
+                      "sr_start_lease_expires"),
         "repositories": ("id", "full_name", "default_branch", "allowed_branches",
                          "enabled"),
         "tasks": ("id", "workflow_id", "goal", "state", "priority", "owner",
@@ -376,16 +377,92 @@ class PostgresStore:
 
     # ------------------------------------------------------------ workflows
     def create_workflow(self, goal: str, *, workflow_id: str | None = None,
-                        metadata: dict[str, Any] | None = None) -> str:
+                        metadata: dict[str, Any] | None = None,
+                        idempotency_key: str | None = None) -> str:
+        """Create a workflow, or return the one a previous call already made.
+
+        When *idempotency_key* is given the insert is guarded by the UNIQUE
+        index on ``workflows.idempotency_key``: a retried request (a client
+        timeout, a double submit, a proxy retry) reuses the existing workflow
+        instead of minting a second one, and therefore reuses its Sr
+        conversation instead of starting another. The check is in the database,
+        so it holds even when two requests arrive at the same instant.
+
+        Returns the workflow id. Use :meth:`create_workflow_once` when the
+        caller needs to know whether it created the row.
+        """
+        wid, _ = self.create_workflow_once(
+            goal, workflow_id=workflow_id, metadata=metadata,
+            idempotency_key=idempotency_key,
+        )
+        return wid
+
+    def create_workflow_once(self, goal: str, *, workflow_id: str | None = None,
+                             metadata: dict[str, Any] | None = None,
+                             idempotency_key: str | None = None) -> tuple[str, bool]:
+        """Create-or-reuse a workflow, returning ``(workflow_id, created)``.
+
+        ``created`` is False when an existing workflow was reused, which is the
+        signal that the caller must not start a second Sr conversation.
+        """
         wid = workflow_id or _new_id()
         with self._tx() as cur:
             cur.execute(
-                "INSERT INTO workflows(id, goal, metadata) VALUES (%s,%s,%s) "
-                "ON CONFLICT (id) DO NOTHING",
-                (wid, goal, json.dumps(metadata or {})),
+                """
+                INSERT INTO workflows(id, goal, metadata, idempotency_key)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (wid, goal, json.dumps(metadata or {}), idempotency_key),
             )
+            created = cur.rowcount > 0
+            if not created:
+                # Same id already present: treat as reuse.
+                return wid, False
             self._event(cur, "workflow_created", workflow_id=wid, detail={"goal": goal})
-        return wid
+        return wid, True
+
+    def workflow_by_idempotency(self, key: str) -> dict[str, Any] | None:
+        """The workflow a previous call created for *key*, if any."""
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT id, goal, state, sr_conversation_id, sr_status "
+                "FROM workflows WHERE idempotency_key=%s",
+                (key,),
+            )
+            row = cur.fetchone()
+        if row is not None:
+            row["id"] = str(row["id"])
+        return row
+
+    def create_workflow_idempotent(self, goal: str, key: str, *,
+                                   metadata: dict[str, Any] | None = None
+                                   ) -> tuple[str, bool]:
+        """Atomically create-or-reuse a workflow for *key*.
+
+        Unlike :meth:`create_workflow_once` this does not rely on a pre-generated
+        id: two concurrent requests with the same key race on the UNIQUE index,
+        the loser reads the winner's row, and exactly one workflow results. That
+        is the property a retried HTTP request needs.
+        """
+        wid = _new_id()
+        try:
+            with self._tx() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO workflows(id, goal, metadata, idempotency_key)
+                    VALUES (%s,%s,%s,%s)
+                    """,
+                    (wid, goal, json.dumps(metadata or {}), key),
+                )
+                self._event(cur, "workflow_created", workflow_id=wid,
+                            detail={"goal": goal, "idempotency_key": key})
+            return wid, True
+        except psycopg.errors.UniqueViolation:
+            existing = self.workflow_by_idempotency(key)
+            if existing is None:
+                raise
+            return existing["id"], False
 
     # --------------------------------------------------------- repositories
     def add_repository(self, full_name: str, *, provider: str = "github",
@@ -837,6 +914,8 @@ class PostgresStore:
                    SET sr_conversation_id = COALESCE(%s, sr_conversation_id),
                        sr_start_task_id   = COALESCE(%s, sr_start_task_id),
                        sr_status          = COALESCE(%s, sr_status),
+                       sr_start_owner     = NULL,
+                       sr_start_lease_expires = NULL,
                        updated_at = now()
                  WHERE id = %s
                 """,
@@ -866,6 +945,17 @@ class PostgresStore:
         in ``queued`` with no conversation. Nothing else revisits it, so the loop
         scans for these. ``sr_next_attempt_at IS NULL`` means "never attempted";
         a future timestamp is a backoff that has not elapsed.
+
+        A workflow whose ``sr_start_lease_expires`` is still in the future is
+        being started by another worker right now, so it is excluded: without
+        that, two concurrent ticks would both start Sr and create two
+        conversations for one workflow.
+
+        ``blocked`` is excluded too. That is the state ``record_sr_failure``
+        writes when it gives up, and it leaves ``sr_next_attempt_at`` NULL, so
+        without this the scan would re-select a permanently failed workflow
+        forever and keep trying to start conversations for it. A blocked
+        workflow is waiting for a human.
         """
         with self._tx() as cur:
             cur.execute(
@@ -873,8 +963,11 @@ class PostgresStore:
                 SELECT id, goal, sr_attempt, sr_last_error
                   FROM workflows
                  WHERE sr_conversation_id IS NULL
-                   AND state NOT IN ('completed', 'cancelled', 'failed')
+                   AND state NOT IN ('completed', 'cancelled', 'failed',
+                                     'blocked')
                    AND (sr_next_attempt_at IS NULL OR sr_next_attempt_at <= now())
+                   AND (sr_start_lease_expires IS NULL
+                        OR sr_start_lease_expires < now())
                  ORDER BY created_at
                  LIMIT %s
                 """,
@@ -884,6 +977,47 @@ class PostgresStore:
         for row in rows:
             row["id"] = str(row["id"])
         return rows
+
+    def claim_sr_start(self, workflow_id: str, owner: str, *,
+                       lease_seconds: float = 120.0) -> bool:
+        """Atomically reserve the right to start Sr for *workflow_id*.
+
+        Returns True when this caller may start the conversation. ``FOR UPDATE
+        SKIP LOCKED`` plus the lease means two concurrent ticks cannot both win:
+        the second sees a live lease and returns False, so exactly one Sr
+        conversation is created per workflow. The lease expires, so a crash
+        between claiming and starting does not strand the workflow.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                """
+                SELECT id FROM workflows
+                 WHERE id=%s
+                   AND sr_conversation_id IS NULL
+                   AND (sr_start_lease_expires IS NULL
+                        OR sr_start_lease_expires < now())
+                 FOR UPDATE SKIP LOCKED
+                """,
+                (workflow_id,),
+            )
+            if cur.fetchone() is None:
+                return False
+            cur.execute(
+                "UPDATE workflows SET sr_start_owner=%s, "
+                "sr_start_lease_expires = now() + make_interval(secs => %s), "
+                "updated_at = now() WHERE id=%s",
+                (owner, lease_seconds, workflow_id),
+            )
+        return True
+
+    def release_sr_start(self, workflow_id: str) -> None:
+        """Drop the start lease so another worker may retry immediately."""
+        with self._tx() as cur:
+            cur.execute(
+                "UPDATE workflows SET sr_start_owner=NULL, "
+                "sr_start_lease_expires=NULL, updated_at=now() WHERE id=%s",
+                (workflow_id,),
+            )
 
     def record_sr_failure(
         self,

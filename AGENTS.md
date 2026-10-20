@@ -202,3 +202,48 @@ successful-completion e2e needs a valid key and is not yet exercised.
   usable is what the operator needs during a Cloud outage.
 - `tests/fake_github.py` is a real HTTP server, not a mock of the client: the
   client under test makes real requests over a socket.
+
+## One request, one workflow (idempotency)
+
+- A user request must create exactly **one** workflow and **one** Sr. The
+  incident that made this explicit: one submission of «Привет, создай новую
+  сессию и назови ее: Тест1» produced three workflows with byte-identical goals,
+  three Sr conversations and three Jr tasks, ~63s apart (three distinct
+  `orchestratorsr` tags). Each Sr had called `sr_create_task` once, so Sr/Jr
+  semantics were fine -- the duplication was at the workflow level.
+- Root cause: `App.start_workflow` minted a fresh workflow id per call and
+  started an Sr for it, and `workflows` had no idempotency key. A retried
+  request (client timeout then resubmit, double submit, proxy retry) therefore
+  made another workflow/Sr/Jr. `tasks.idempotency_key` existed; the workflow
+  path needed the same.
+- The fix is enforced in the database, not in the UI: `workflows.idempotency_key`
+  is UNIQUE (migration `0006_workflow_idempotency.sql`) and
+  `create_workflow_idempotent` races on it, so the loser of a concurrent pair
+  reads the winner's row. `start_workflow` takes the request id from the
+  `Idempotency-Key` header or a `request_id` body field; the UI generates one
+  `crypto.randomUUID()` per logical submission and reuses it on retry. Do **not**
+  move this to a client-side check -- a retry and a double submit must both be
+  absorbed by the server.
+- Starting Sr is claimed with `claim_sr_start` (`FOR UPDATE SKIP LOCKED` plus a
+  lease, mirroring `claim_task`). Without it, two ticks (two Render instances, or
+  a tick overlapping a slow inline start) both saw "no Sr yet" and both started
+  one. `bind_sr` clears the lease; `release_sr_start` returns it on failure.
+- `pending_sr_starts` excludes `blocked`: `record_sr_failure(give_up=True)`
+  blocks a workflow and clears the backoff, so without the exclusion the scan
+  would retry a permanently failed workflow forever and keep starting
+  conversations for it.
+- Do not "fix" duplicates by filtering them in the UI or by merging rows. The
+  duplicates are real rows; hiding them leaves the extra conversations running.
+  Existing duplicates are left untouched -- deleting user-visible history is an
+  operator decision.
+- Tests: `tests/test_duplicate_requests.py`. It asserts one workflow per request
+  (sequential, concurrent, in-flight retry, after restart), one Sr per workflow,
+  one task per Cloud tool event, and that read endpoints and ticks never create
+  anything. Reverting the idempotency logic makes 6 of them fail, so they are
+  load-bearing, not decorative.
+- Deleting Cloud conversations is a separate, guarded action:
+  `tools/delete_cloud_sessions.py` deletes only ids named on the command line and
+  only with `--confirm`; `tools/classify_cloud_sessions.py` is read-only and
+  separates dispatcher-created sessions (tags, or a dispatcher persona in the
+  event stream) from the user's own.
+

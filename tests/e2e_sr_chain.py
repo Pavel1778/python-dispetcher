@@ -48,8 +48,9 @@ def main() -> int:
     with psycopg.connect(dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(open(os.path.join(MIGRATIONS, "0001_init.sql")).read())
-            cur.execute(open(os.path.join(MIGRATIONS, "0002_sr_runtime.sql")).read())
-            cur.execute(open(os.path.join(MIGRATIONS, "0003_tool_call_recovery.sql")).read())
+            for name in sorted(os.listdir(MIGRATIONS)):
+                if name.endswith(".sql"):
+                    cur.execute(open(os.path.join(MIGRATIONS, name)).read())
 
     store = PostgresStore(dsn)
     client = CloudClient()

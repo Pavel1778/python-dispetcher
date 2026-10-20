@@ -221,17 +221,25 @@ class SrRuntime:
         """
         for row in self.store.pending_sr_starts(limit=10):
             workflow_id = row["id"]
+            # Reserve the workflow before touching the Cloud. Without this two
+            # concurrent ticks (two instances, or a tick overlapping a slow
+            # inline start) would both see "no Sr yet" and both start one,
+            # creating two conversations for a single workflow.
+            if not self.store.claim_sr_start(workflow_id, self.worker_id):
+                continue
             used = int(row.get("sr_attempt") or 0) + 1
             try:
                 self.ensure_sr(workflow_id)
             except CloudAuthError as e:
                 # A bad key is permanent: retrying only wastes the quota.
+                self.store.release_sr_start(workflow_id)
                 self.store.record_sr_failure(
                     workflow_id, error=f"cloud auth failure: {e}", attempt=used,
                     backoff_seconds=0, give_up=True,
                 )
                 report.retry_blocked.append(workflow_id)
             except CloudError as e:
+                self.store.release_sr_start(workflow_id)
                 give_up = used >= self.sr_start_max_attempts
                 backoff = min(
                     self.sr_start_backoff_base * (2 ** (used - 1)), 900.0
@@ -247,6 +255,13 @@ class SrRuntime:
                         {"workflow": workflow_id, "attempt": used,
                          "retry_in": backoff}
                     )
+            except Exception as e:  # noqa: BLE001 - never leave a lease held
+                self.store.release_sr_start(workflow_id)
+                log.warning("Sr start failed for %s: %s: %s",
+                            workflow_id, type(e).__name__, e)
+                report.retried.append(
+                    {"workflow": workflow_id, "attempt": used, "retry_in": 0.0}
+                )
             else:
                 self.store.mark_sr_started(workflow_id)
                 report.started.append({"workflow": workflow_id,

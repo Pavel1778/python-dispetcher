@@ -813,8 +813,20 @@ async function boot() {
       if ($('#repo').value) body.repository = $('#repo').value;
       const branch = $('#branch').value.trim();
       if (branch) body.branch = branch;
+      // One id per logical submission, not per HTTP attempt: the same key is
+      // sent again when the request is retried, so a retry adopts the workflow
+      // and Sr conversation the first attempt created instead of making a
+      // second pair. Held on the form so a click that follows a timeout reuses
+      // it, and cleared once the submission succeeds.
+      if (!$('#newform').dataset.requestId) {
+        $('#newform').dataset.requestId =
+          (crypto.randomUUID ? crypto.randomUUID()
+                             : 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+      }
+      body.request_id = $('#newform').dataset.requestId;
       const d = await api('/api/workflows', {method:'POST', body: JSON.stringify(body)});
       $('#newmsg').innerHTML = 'Создано: <span class="mono">' + esc(d.workflow_id) + '</span>';
+      delete $('#newform').dataset.requestId;
       $('#goal').value = ''; $('#branch').value = '';
       await refresh();
       openDetail(d.workflow_id);
