@@ -247,3 +247,48 @@ successful-completion e2e needs a valid key and is not yet exercised.
   separates dispatcher-created sessions (tags, or a dispatcher persona in the
   event stream) from the user's own.
 
+
+## Operator controls and the workspace lock (PR #4)
+
+- Workflow lifecycle actions live in `cloud_store` (`cancel_workflow`,
+  `resume_workflow`, `retry_task`) with routes in `web_server` and buttons in
+  the detail panel of `web_ui`. The UI renders only the actions the current
+  state can accept, so there are no buttons that fail by design. If you add an
+  action, gate it the same way rather than relying on the server's 409.
+- `cancel` is terminal and idempotent. It does **not** delete the Sr
+  conversation: the transcript is the record of why work stopped. It does
+  cancel in-flight child tasks, otherwise the Jr dispatcher keeps polling
+  conversations for an abandoned workflow.
+- `resume` requeues only children with attempts left (`attempt < max_attempts`).
+  Resuming a workflow is not consent to spend an attempt a task does not have.
+  A `completed`/`cancelled` workflow is refused with 409, never silently
+  no-op'd.
+- `retry_task` goes through `force_transition`, so a state with no legal route
+  back to `queued` is refused instead of forced.
+- `rename_sr` PATCHes the real Cloud conversation (`update_conversation`)
+  *before* reporting success, so local and Cloud state cannot disagree. The
+  workflow goal is never changed by a rename.
+- `CloudClient.web_url` derives the browser URL from the API URL Cloud returns
+  (`.../api/conversations/<id>` -> `<base>/conversations/<id>`). The UI read
+  `w.sr_url` for a long time while the server never sent it, so the "open in
+  Cloud" link silently never rendered; `workflow_detail` now sends it.
+- **One task per repository+branch at a time.** `claim_task` refuses (by id) or
+  skips (when scanning) a candidate whose workspace is occupied. Without it two
+  conversations edit one checkout and the loser's commits vanish with no error.
+  Occupancy is the states `assigned|running|verifying|blocked|recovering` --
+  `queued` must NOT count, or two queued siblings block each other before
+  either starts. The check runs inside the claiming transaction.
+- Live verification (2026-10-20): `PATCH /api/v1/app-conversations/{id}` really
+  renames (created a throwaway conversation, renamed it, confirmed the title,
+  deleted it). A missing id gives `404 {"detail":"unknown_app_conversation"}`,
+  which is how you tell the route exists but the resource does not.
+- Render does **not** appear to auto-deploy on merge to `main` for this service
+  (`render.yaml` says `autoDeploy: true`, but after merging #4 the live
+  `static/app.js` was still byte-identical to the previous merge). There is no
+  `RENDER_API_KEY` or deploy hook in this environment, so a deploy cannot be
+  triggered from here. Rebuilding by hand in the Render dashboard is the
+  reliable path; check `static/app.js` for a new marker string afterwards.
+- Tests: `tests/test_workflow_actions.py` (actions, auth, `sr_url`) and the
+  workspace-conflict block at the end of `tests/test_reliability.py`. The fake
+  Cloud implements `PATCH`/`DELETE` so rename runs over real HTTP.
+
