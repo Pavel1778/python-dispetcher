@@ -318,6 +318,33 @@ class CloudClient:
         )
         return status == 200 and bool((payload or {}).get("success", True))
 
+    def update_conversation(self, conversation_id: str, *,
+                            title: str | None = None) -> bool:
+        """``PATCH /api/v1/app-conversations/{id}`` (title only, here).
+
+        The schema (``AppConversationUpdateRequest``) applies only the fields
+        that are sent, so a rename leaves tags, repository and status untouched.
+        """
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if not body:
+            return True
+        status, payload = self._request(
+            "PATCH", f"/api/v1/app-conversations/{conversation_id}", body
+        )
+        return status == 200 and bool(payload or True)
+
+    def web_url(self, conversation_id: str) -> str:
+        """The human-facing URL for a conversation.
+
+        ``GET`` returns an ``api`` URL (``.../api/conversations/<id>``), which
+        renders JSON in a browser. The dashboard's own route is the same path
+        without the ``/api`` segment, so it is derived rather than stored.
+        """
+        base = self.base_url.rstrip("/")
+        return f"{base}/conversations/{conversation_id}"
+
     #: Confirmed by the live server: ``limit`` above 100 is a 422.
     MAX_EVENTS_PER_PAGE = 100
 

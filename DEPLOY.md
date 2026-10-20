@@ -320,3 +320,53 @@ A `403` from GitHub with the rate-limit budget at zero is reported as a
 transient problem (503), not as an auth failure: the token is valid and only the
 quota has to reset. Rotating a working token would not help, so the dispatcher
 does not ask for it.
+
+## Operator controls on a workflow
+
+Every workflow is inspectable and steerable from its detail panel on the
+**Очередь и задачи** screen. Each action is also a JSON API call, and the UI
+offers only the actions the workflow's current state can actually accept, so
+there are no buttons that fail by design.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/workflows/{id}/message` | Send the Sr agent a message. |
+| `POST` | `/api/workflows/{id}/cancel` | Stop the workflow for good. |
+| `POST` | `/api/workflows/{id}/resume` | Reopen a blocked or failed workflow. |
+| `POST` | `/api/workflows/{id}/rename` | Rename the Sr conversation in Cloud. |
+| `POST` | `/api/tasks/{id}/retry` | Requeue one Jr task for another attempt. |
+
+How each behaves, and why:
+
+* **cancel** is terminal and idempotent. It moves the workflow to `cancelled`,
+  which the Sr loop and the verifier both skip, and cancels its in-flight child
+  tasks so the Jr dispatcher stops polling their conversations. The Sr
+  conversation is **not** deleted: the transcript is the record of why the work
+  stopped. A second cancel is a no-op, so a double click is harmless.
+* **resume** is for a workflow that stopped and needs a human nudge: it clears
+  the Sr start backoff and returns the workflow to `queued`, then requeues the
+  child tasks that still have attempts left. A task that exhausted its
+  `max_attempts` is left as it is, because resuming the workflow is not consent
+  to spend an attempt the task does not have. Resuming a `completed` or
+  `cancelled` workflow is a `409`, not a silent no-op.
+* **rename** applies the title to the real Cloud conversation (`PATCH
+  /api/v1/app-conversations/{id}`) and only then reports success; it never
+  changes the workflow's goal. A rename before the Sr conversation exists is a
+  `400`.
+* **retry** requeues one task through the state machine's legal path, so a task
+  in a state with no route back to `queued` is refused with a `409` rather than
+  forced.
+
+### One task per repository and branch at a time
+
+A Jr task holds its workspace (`selected_repository` + `selected_branch`) from
+the moment it is claimed until it reaches a terminal state. While it does, the
+dispatcher will not claim another task for the same repository and branch; the
+second task waits its turn in the queue. Two conversations editing one checkout
+would overwrite each other's commits, and the loser's work would disappear with
+no error.
+
+The lock is per **branch**, so work on `main` and work on `dev` in the same
+repository still run in parallel. A task with no repository is analysis-only and
+never takes a lock. The check runs inside the claiming transaction, so it cannot
+go stale between the check and the claim.

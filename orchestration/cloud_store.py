@@ -658,34 +658,67 @@ class PostgresStore:
         ``FOR UPDATE SKIP LOCKED`` means two dispatchers running at the same
         time never claim the same row: the second skips a row the first has
         locked. Returns None when nothing is ready.
+
+        **One task per repository+branch at a time.** Two conversations editing
+        the same checkout would clobber each other's commits, and the loser's
+        work would vanish with no error. A candidate whose repository and branch
+        are already held by another non-terminal task is therefore skipped (or,
+        for an explicit *task_id*, refused), so the second task waits its turn.
+        Tasks with no repository are analysis-only and never contend.
         """
         with self._tx() as cur:
             if task_id is not None:
                 cur.execute(
                     "SELECT * FROM tasks WHERE id=%s FOR UPDATE", (task_id,)
                 )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                task = _row_to_task(row)
+                if task.owner is not None and task.lease_live and task.owner != owner:
+                    raise LeaseConflict(f"task {task.id} leased by {task.owner}")
+                unmet = self._unmet_dependencies(cur, task)
+                if unmet:
+                    raise InvalidTransition(f"unmet dependencies: {unmet}")
+                if task.requires_approval and task.approved is not True:
+                    raise InvalidTransition("approval required")
+                holder = self._workspace_holder(cur, task)
+                if holder is not None:
+                    raise InvalidTransition(
+                        f"workspace {task.selected_repository}"
+                        f"@{task.selected_branch or 'default'} is held by {holder}"
+                    )
             else:
-                cur.execute(
-                    """
-                    SELECT * FROM tasks
-                     WHERE state IN ('queued','recovering','failed')
-                       AND (lease_expires IS NULL OR lease_expires < now())
-                     ORDER BY priority DESC, created_at
-                     FOR UPDATE SKIP LOCKED
-                     LIMIT 1
-                    """
-                )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            task = _row_to_task(row)
-            if task.owner is not None and task.lease_live and task.owner != owner:
-                raise LeaseConflict(f"task {task.id} leased by {task.owner}")
-            unmet = self._unmet_dependencies(cur, task)
-            if unmet:
-                raise InvalidTransition(f"unmet dependencies: {unmet}")
-            if task.requires_approval and task.approved is not True:
-                raise InvalidTransition("approval required")
+                # Scan candidates in order, skipping any whose workspace is busy,
+                # so one contended repository does not stall the whole queue.
+                tried: list[str] = []
+                while True:
+                    cur.execute(
+                        """
+                        SELECT * FROM tasks
+                         WHERE state IN ('queued','recovering','failed')
+                           AND (lease_expires IS NULL OR lease_expires < now())
+                           AND id::text <> ALL(%s)
+                         ORDER BY priority DESC, created_at
+                         FOR UPDATE SKIP LOCKED
+                         LIMIT 1
+                        """,
+                        (tried,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    task = _row_to_task(row)
+                    if task.owner is not None and task.lease_live and task.owner != owner:
+                        raise LeaseConflict(f"task {task.id} leased by {task.owner}")
+                    unmet = self._unmet_dependencies(cur, task)
+                    if unmet:
+                        raise InvalidTransition(f"unmet dependencies: {unmet}")
+                    if task.requires_approval and task.approved is not True:
+                        raise InvalidTransition("approval required")
+                    if self._workspace_holder(cur, task) is None:
+                        break
+                    tried.append(task.id)
             cur.execute(
                 "UPDATE tasks SET state='assigned', owner=%s, "
                 "lease_expires=now() + make_interval(secs => %s), updated_at=now() "
@@ -695,6 +728,33 @@ class PostgresStore:
             self._event(cur, "task_claimed", task_id=task.id, session_id=owner,
                         detail={"lease_seconds": lease_seconds})
         return self.get_task(task.id)
+
+    def _workspace_holder(self, cur: Any, task: Task) -> str | None:
+        """The id of a task already occupying *task*'s workspace.
+
+        ``None`` means the workspace is free (or the task needs none). Called
+        inside the claiming transaction so the answer cannot go stale between the
+        check and the claim.
+
+        Only states that mean "a conversation may be editing this checkout right
+        now" count: a merely ``queued`` sibling holds nothing, so two queued
+        tasks on one repository do not block each other before either starts.
+        """
+        if not task.selected_repository:
+            return None
+        cur.execute(
+            """
+            SELECT id FROM tasks
+             WHERE id <> %s
+               AND selected_repository = %s
+               AND selected_branch IS NOT DISTINCT FROM %s
+               AND state IN ('assigned','running','verifying','blocked','recovering')
+             LIMIT 1
+            """,
+            (task.id, task.selected_repository, task.selected_branch),
+        )
+        row = cur.fetchone()
+        return str(row["id"]) if row is not None else None
 
     def _unmet_dependencies(self, cur: Any, task: Task) -> list[str]:
         unmet: list[str] = []
@@ -1287,6 +1347,114 @@ class PostgresStore:
                 raise NotFound(f"workflow {workflow_id}")
             self._event(cur, "workflow_state", workflow_id=workflow_id,
                         detail={"state": state})
+
+    def cancel_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Cancel a workflow: a terminal, operator-chosen stop.
+
+        ``cancelled`` is terminal for the verifier and for ``SrRuntime.tick``,
+        which both skip it, so no further Sr tool call is serviced and no task is
+        dispatched. Cancelling a workflow that is already terminal is a no-op
+        rather than an error, so a double click is harmless.
+
+        Child tasks still in flight are moved to ``cancelled`` too; without that
+        the Jr dispatcher would keep polling their Cloud conversations after the
+        workflow they belong to has been abandoned.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT state FROM workflows WHERE id=%s FOR UPDATE", (workflow_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound(f"workflow {workflow_id}")
+            already = row["state"] == "cancelled"
+            cur.execute(
+                "UPDATE workflows SET state='cancelled', sr_status='cancelled', "
+                "sr_next_attempt_at=NULL, updated_at=now() WHERE id=%s",
+                (workflow_id,),
+            )
+            if not already:
+                self._event(cur, "workflow_state", workflow_id=workflow_id,
+                            detail={"state": "cancelled", "by": "operator"})
+            cur.execute(
+                "SELECT id, state FROM tasks WHERE workflow_id=%s", (workflow_id,)
+            )
+            children = cur.fetchall()
+        cancelled: list[str] = []
+        for child in children:
+            if TaskState(child["state"]) in TERMINAL_STATES:
+                continue
+            try:
+                self.force_transition(child["id"], TaskState.CANCELLED)
+                cancelled.append(str(child["id"]))
+            except (InvalidTransition, NotFound):
+                # A task that cannot legally be cancelled (already terminal) is
+                # left alone; cancellation is best-effort per child.
+                pass
+        return {"workflow_id": workflow_id, "cancelled": already,
+                "tasks_cancelled": cancelled}
+
+    def resume_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Reopen a blocked or failed workflow so it is serviced again.
+
+        Clears the Sr start backoff and puts the workflow back to ``queued``, so
+        the verifier re-evaluates it and the Sr loop may retry a start that had
+        given up. Child tasks that are retryable (``blocked``/``failed`` with
+        attempts left) are requeued; a dead-lettered task is left dead, because a
+        human asking to resume the *workflow* is not the same as asking to spend
+        another attempt on a task that exhausted its budget.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT state FROM workflows WHERE id=%s FOR UPDATE", (workflow_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound(f"workflow {workflow_id}")
+            if row["state"] in ("completed", "cancelled"):
+                raise InvalidTransition(
+                    f"workflow {workflow_id} is {row['state']}, cannot resume"
+                )
+            cur.execute(
+                "UPDATE workflows SET state='queued', sr_attempt=0, "
+                "sr_last_error=NULL, sr_next_attempt_at=NULL, "
+                "sr_start_owner=NULL, sr_start_lease_expires=NULL, "
+                "sr_status = CASE WHEN sr_conversation_id IS NULL THEN NULL "
+                "                 ELSE sr_status END, "
+                "updated_at=now() WHERE id=%s",
+                (workflow_id,),
+            )
+            self._event(cur, "workflow_resumed", workflow_id=workflow_id,
+                        detail={"state": "queued"})
+            cur.execute(
+                "SELECT id, state, attempt, max_attempts FROM tasks "
+                "WHERE workflow_id=%s",
+                (workflow_id,),
+            )
+            children = cur.fetchall()
+        requeued: list[str] = []
+        for child in children:
+            state = TaskState(child["state"])
+            if state not in (TaskState.BLOCKED, TaskState.FAILED):
+                continue
+            if int(child["attempt"]) >= int(child["max_attempts"]):
+                continue
+            try:
+                self.force_transition(child["id"], TaskState.QUEUED)
+                requeued.append(str(child["id"]))
+            except (InvalidTransition, NotFound):
+                pass
+        return {"workflow_id": workflow_id, "requeued": requeued}
+
+    def retry_task(self, task_id: str) -> Task:
+        """Requeue one task, clearing its lease, for an explicit operator retry.
+
+        Unlike the automatic path this does not consult ``max_attempts``: the
+        operator has seen the failure and asked for another run. The counter is
+        not reset, so if the retry fails again the task still advances toward its
+        limit and dead-letters instead of looping forever.
+        """
+        return self.force_transition(task_id, TaskState.QUEUED)
 
     # --------------------------------------------------------------- auth
     def create_session(self, *, token_hash: str, username: str,

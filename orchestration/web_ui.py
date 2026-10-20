@@ -546,6 +546,7 @@ async function openDetail(wfId) {
     const d = await api('/api/workflows/' + encodeURIComponent(wfId));
     $('#dtitle').textContent = d.workflow.goal || 'Задача';
     const w = d.workflow;
+    const terminal = (w.state === 'completed' || w.state === 'cancelled');
     let h = '<dl class="kv">' +
       '<dt>Идентификатор</dt><dd class="mono">' + esc(w.id) + '</dd>' +
       '<dt>Состояние</dt><dd>' + pill(w.state) + '</dd>' +
@@ -557,19 +558,43 @@ async function openDetail(wfId) {
       '</dl>';
     if (w.reason) h += '<div class="banner">Причина остановки: ' + esc(w.reason) + '</div>';
 
+    // Actions. Only what the current state can actually do is shown, so there
+    // are no buttons that would fail. Cancel and resume are mutually exclusive
+    // and neither applies to a terminal workflow.
+    const acts = [];
+    if (!terminal) {
+      acts.push('<button class="ghost" id="wf-cancel" type="button">Остановить задачу</button>');
+    }
+    if (w.state === 'blocked' || w.state === 'failed') {
+      acts.push('<button class="ghost" id="wf-resume" type="button">Возобновить</button>');
+    }
+    if (w.sr_conversation_id && !terminal) {
+      acts.push('<button class="ghost" id="wf-rename" type="button">Переименовать Sr</button>');
+    }
+    if (acts.length) {
+      h += '<div class="actions">' + acts.join('') +
+        '<span class="muted small" id="wf-msg" role="status" aria-live="polite"></span></div>';
+    }
+
     h += '<h4 style="margin-top:18px">Задачи Jr</h4>';
     if (!d.tasks.length) h += '<p class="muted small">Пока нет дочерних задач.</p>';
     else {
       h += '<div class="tablewrap"><table><thead><tr><th>Задача</th><th>Статус</th>' +
-           '<th>Попытка</th><th>Репозиторий</th><th>Результат</th></tr></thead><tbody>';
+           '<th>Попытка</th><th>Репозиторий</th><th>Результат</th><th></th></tr></thead><tbody>';
       for (const t of d.tasks) {
+        // Retry is offered only where the state machine can requeue it, so the
+        // button cannot produce a 409.
+        const canRetry = ['failed', 'blocked', 'dead_letter'].includes(t.state);
         h += '<tr><td>' + esc(t.goal) + '</td><td>' + pill(t.state) + '</td>' +
           '<td class="faint">' + esc(t.attempt) + '/' + esc(t.max_attempts) + '</td>' +
           '<td class="mono faint">' + esc(t.repository || '—') +
             (t.branch ? ' @ ' + esc(t.branch) : '') + '</td>' +
-          '<td class="faint">' + esc((t.result || '—').slice(0, 160)) + '</td></tr>';
+          '<td class="faint">' + esc((t.result || '—').slice(0, 160)) + '</td>' +
+          '<td style="text-align:right">' + (canRetry
+            ? '<button class="link" type="button" data-retry="' + esc(t.id) + '">повторить</button>'
+            : '') + '</td></tr>';
         if (t.evidence && t.evidence.length) {
-          h += '<tr><td colspan="5"><pre>' + esc(JSON.stringify(t.evidence, null, 1)) + '</pre></td></tr>';
+          h += '<tr><td colspan="6"><pre>' + esc(JSON.stringify(t.evidence, null, 1)) + '</pre></td></tr>';
         }
       }
       h += '</tbody></table></div>';
@@ -593,9 +618,11 @@ async function openDetail(wfId) {
       h += '</tbody></table></div>';
     }
 
-    h += '<div class="actions"><input id="msgto" placeholder="Сообщение Sr-агенту…" maxlength="4000">' +
-         '<button id="sendmsg" style="flex:0 0 auto">Отправить</button></div>' +
-         '<div class="field-error" id="msg-err"></div>';
+    if (w.sr_conversation_id && !terminal) {
+      h += '<div class="actions"><input id="msgto" placeholder="Сообщение Sr-агенту…" maxlength="4000">' +
+           '<button id="sendmsg" style="flex:0 0 auto">Отправить</button></div>' +
+           '<div class="field-error" id="msg-err"></div>';
+    }
     $('#dbody').innerHTML = h;
     const send = $('#sendmsg');
     if (send) send.onclick = async () => {
@@ -609,6 +636,52 @@ async function openDetail(wfId) {
       } catch (e) { $('#msg-err').textContent = e.message; }
       finally { send.disabled = false; }
     };
+
+    // Workflow actions. Each one disables its button while in flight, reports
+    // the outcome inline, and re-reads the workflow so the panel always shows
+    // the state the server actually holds rather than an assumed one.
+    const wfMsg = $('#wf-msg');
+    async function wfAction(btn, path, body, okText) {
+      btn.disabled = true;
+      if (wfMsg) { wfMsg.className = 'muted small'; wfMsg.textContent = 'Выполняется…'; }
+      try {
+        await api('/api/workflows/' + encodeURIComponent(wfId) + path,
+                  {method:'POST', body: JSON.stringify(body || {})});
+        if (wfMsg) { wfMsg.className = 'ok small'; wfMsg.textContent = okText; }
+        await openDetail(wfId);
+      } catch (e) {
+        if (wfMsg) { wfMsg.className = 'err small'; wfMsg.textContent = e.message; }
+        btn.disabled = false;
+      }
+    }
+    const cancelBtn = $('#wf-cancel');
+    if (cancelBtn) cancelBtn.onclick = () => {
+      if (!confirm('Остановить задачу? Sr-беседа и её история сохранятся, но работа прекратится.')) return;
+      wfAction(cancelBtn, '/cancel', null, 'Задача остановлена.');
+    };
+    const resumeBtn = $('#wf-resume');
+    if (resumeBtn) resumeBtn.onclick = () =>
+      wfAction(resumeBtn, '/resume', null, 'Задача возобновлена.');
+    const renameBtn = $('#wf-rename');
+    if (renameBtn) renameBtn.onclick = () => {
+      const title = prompt('Новое название Sr-беседы:', (w.goal || '').slice(0, 60));
+      if (title === null) return;
+      if (!title.trim()) { if (wfMsg) { wfMsg.className = 'err small'; wfMsg.textContent = 'Название не может быть пустым.'; } return; }
+      wfAction(renameBtn, '/rename', {title: title.trim()}, 'Sr-беседа переименована.');
+    };
+    $$('#dbody button[data-retry]').forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      const prev = b.textContent;
+      b.textContent = '…';
+      try {
+        await api('/api/tasks/' + encodeURIComponent(b.dataset.retry) + '/retry',
+                  {method:'POST', body: '{}'});
+        await openDetail(wfId);
+      } catch (e) {
+        b.textContent = prev; b.disabled = false;
+        if (wfMsg) { wfMsg.className = 'err small'; wfMsg.textContent = e.message; }
+      }
+    });
     $('#detail').scrollIntoView({behavior:'smooth', block:'nearest'});
   } catch (e) {
     $('#dbody').innerHTML = '<p class="err">Не удалось загрузить задачу: ' + esc(e.message) + '</p>';

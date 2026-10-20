@@ -261,6 +261,48 @@ class App:
         return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id,
                 "reused": not created}
 
+    def cancel_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Stop a workflow for good. Terminal and idempotent.
+
+        The Sr conversation is left alive on purpose: deleting it would destroy
+        the transcript the operator needs to see why they stopped the work. Only
+        the dispatcher's own state becomes terminal, so nothing is dispatched or
+        polled for it again.
+        """
+        return self.store.cancel_workflow(workflow_id)
+
+    def resume_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Reopen a blocked or failed workflow and requeue its retryable tasks."""
+        return self.store.resume_workflow(workflow_id)
+
+    def retry_task(self, task_id: str) -> dict[str, Any]:
+        """Requeue one task for another attempt."""
+        task = self.store.retry_task(task_id)
+        return {"task_id": task.id, "state": task.state.value}
+
+    def rename_sr(self, workflow_id: str, title: str) -> dict[str, Any]:
+        """Rename the workflow's Sr conversation in Cloud.
+
+        The title is applied to the real Cloud conversation (``PATCH``) first and
+        only then recorded locally, so the two never disagree: if Cloud rejects
+        the change, nothing local is written. The goal text is not touched, so a
+        rename cannot change what the work is.
+        """
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("title is required")
+        if len(title) > 200:
+            raise ValueError("title is too long (max 200)")
+        sr = self.store.sr_for(workflow_id)
+        if sr is None:
+            raise NotFound(f"workflow {workflow_id}")
+        conversation_id = sr.get("sr_conversation_id")
+        if not conversation_id:
+            raise ValueError("Sr conversation is not created yet")
+        self.client.update_conversation(conversation_id, title=title)
+        return {"workflow_id": workflow_id, "conversation_id": conversation_id,
+                "title": title}
+
     def sync_github_repositories(self, *, include_archived: bool = False) -> dict[str, Any]:
         """Pull the account's GitHub repositories into the allowlist.
 
@@ -303,6 +345,13 @@ class App:
                 "state": workflows.get(workflow_id, {}).get("state"),
                 "sr_conversation_id": wf.get("sr_conversation_id"),
                 "sr_status": wf.get("sr_status"),
+                # The dashboard URL, derived from the API URL Cloud returns.
+                # Without it the UI's "open in Cloud" link never rendered, so
+                # there was no way to jump to the transcript.
+                "sr_url": (
+                    self.client.web_url(wf["sr_conversation_id"])
+                    if wf.get("sr_conversation_id") else None
+                ),
                 "reason": reason,
             },
             "tasks": [
@@ -688,6 +737,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(409, {"error": "Sr conversation not ready"})
                 ok = self.app.client.send_message(sr["sr_conversation_id"], text)
                 return self._json(200, {"sent": ok})
+            if path.startswith("/api/workflows/") and path.endswith("/cancel"):
+                workflow_id = path.split("/")[3]
+                return self._json(200, self.app.cancel_workflow(workflow_id))
+            if path.startswith("/api/workflows/") and path.endswith("/resume"):
+                workflow_id = path.split("/")[3]
+                return self._json(200, self.app.resume_workflow(workflow_id))
+            if path.startswith("/api/workflows/") and path.endswith("/rename"):
+                workflow_id = path.split("/")[3]
+                return self._json(200, self.app.rename_sr(
+                    workflow_id, body.get("title") or ""
+                ))
+            if path.startswith("/api/tasks/") and path.endswith("/retry"):
+                task_id = path.split("/")[3]
+                return self._json(200, self.app.retry_task(task_id))
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
