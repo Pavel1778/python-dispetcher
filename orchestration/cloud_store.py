@@ -1106,13 +1106,25 @@ class PostgresStore:
                        sr_started_at      = CASE
                            WHEN %s::text IS NOT NULL AND sr_started_at IS NULL
                            THEN now() ELSE sr_started_at END,
-                       sr_start_owner     = NULL,
-                       sr_start_lease_expires = NULL,
+                       -- The start lease is released only once a conversation id
+                       -- is bound. Recording just the start task must keep the
+                       -- lease: the start is two-phase, and between "start task
+                       -- accepted" and "conversation READY" there is no
+                       -- sr_conversation_id -- which is exactly the predicate
+                       -- pending_sr_starts uses to decide the workflow needs an
+                       -- Sr. Clearing the lease there made a slow start look
+                       -- unclaimed, so the next tick started a *second*
+                       -- conversation (the several-sr_bound-events incident).
+                       sr_start_owner     = CASE WHEN %s::text IS NOT NULL
+                                                 THEN NULL ELSE sr_start_owner END,
+                       sr_start_lease_expires = CASE WHEN %s::text IS NOT NULL
+                                                     THEN NULL
+                                                     ELSE sr_start_lease_expires END,
                        updated_at = now()
                  WHERE id = %s
                 """,
                 (conversation_id, start_task_id, status, eager_sandbox_id,
-                 conversation_id, workflow_id),
+                 conversation_id, conversation_id, conversation_id, workflow_id),
             )
             if cur.rowcount == 0:
                 raise NotFound(f"workflow {workflow_id}")
@@ -1549,6 +1561,9 @@ class PostgresStore:
                 raise InvalidTransition(
                     f"workflow {workflow_id} is {row['state']}, cannot resume"
                 )
+            # A resume must also drop a recorded start task that failed
+            # terminally: otherwise the retry would resume the same dead start
+            # task forever. A conversation that exists is kept.
             cur.execute(
                 "UPDATE workflows SET state='queued', sr_attempt=0, "
                 "sr_last_error=NULL, sr_next_attempt_at=NULL, "
@@ -1557,6 +1572,8 @@ class PostgresStore:
                 "                 ELSE sr_status END, "
                 "sr_started_at = CASE WHEN sr_conversation_id IS NULL THEN NULL "
                 "                     ELSE sr_started_at END, "
+                "sr_start_task_id = CASE WHEN sr_conversation_id IS NULL "
+                "                        THEN NULL ELSE sr_start_task_id END, "
                 "updated_at=now() WHERE id=%s",
                 (workflow_id,),
             )

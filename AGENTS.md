@@ -107,6 +107,48 @@ These were found by running against the live server, not from docs:
     accepts `client_tools` on create and emits `ActionEvent`s for them; the
     Cloud V1 app-conversation request has no such field. The Sr tool bridge
     therefore needs the agent-server path, which is what `direct` provides.
+11. **Neither API names a conversation at creation time.** Verified against both
+    live servers, and this is why names were lost:
+    - The local agent-server's `StartConversationRequest` has **no `title`
+      field**: `POST /api/conversations` answers `201` and the conversation keeps
+      `title: null`. A `title` in the body is accepted and silently dropped.
+    - OpenHands Cloud accepts `title` and echoes it inside the start task's
+      `request`, but the conversation that appears carries an auto-generated name
+      derived from the first user message (`autotitle` defaults to true). A Sr
+      conversation was therefore listed as
+      `"You are the senior (Sr) agent for this workflow..."`.
+
+    `PATCH /api/conversations/{id}` with `{"title": ...}` (Cloud:
+    `PATCH /api/v1/app-conversations/{id}`) is the **only** call that sticks, so
+    a name must be applied *after* the conversation exists. Both paths do that
+    now (`SrRuntime._name_sr`, `CloudDispatcher._name_jr`,
+    `Dispatcher._ensure_conversation`) via `orchestration.naming`. Do not
+    "simplify" this back into the create call: it looks redundant and does
+    nothing.
+
+    `conversation_title(kind, goal, ref=...)` takes the **role**, not the path:
+    `"Sr"` for the senior conversation and `"Jr"` for the worker one. The local
+    dispatcher's conversation is the same worker role as the Cloud Jr, so it must
+    pass `"Jr"` too -- passing `"task"` (an earlier mistake) produced
+    `task.<goal>` on one path and `Jr.<goal>` on the other for the identical
+    concept. Tests: `tests/test_dispatcher.py` (naming section) covers the local
+    path; `tests/test_conversation_naming.py` covers the shared helper.
+12. **A slow start must be resumed, not restarted.** The start is two-phase: the
+    conversation id is carried by the start task from the first response but is
+    only *meaningful* at `READY` (before that the sandbox is still provisioning
+    and the conversation is not in the search index). A start that outlives one
+    poll budget therefore reports `SrStartPending`, which is *progress*, not
+    failure: no attempt is spent, and a later tick resumes the **same** recorded
+    `sr_start_task_id`. Treating the poll-budget timeout as an error (the old
+    behaviour) either bound a conversation that was not up yet or fell through to
+    a fresh start and created a second Sr for one workflow. `bind_sr` must keep
+    the start lease until a conversation id is bound, so a slow start does not
+    look unclaimed. Tests: `tests/test_sr_slow_start.py`.
+13. **A test double that is more forgiving than the server hides the bug.** The
+    fakes used to honour `title` on create, so every naming test passed while the
+    real conversations were unnamed. `tests/fake_cloud.py` and
+    `tests/fake_runtime.py` now mirror the live behaviour (ignore `title` on
+    create, honour it on `PATCH`); `tests/test_conversation_naming.py` pins it.
 
 ## Invariants to keep
 

@@ -63,7 +63,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from .cloud_client import CloudError
+from .cloud_client import CloudError, SrStartPending
 from .cloud_direct import build_cloud_client
 from .cloud_dispatcher import CloudDispatcher
 from .cloud_store import (
@@ -414,6 +414,16 @@ class App:
 
         try:
             conversation_id = self.runtime.ensure_sr(workflow_id)
+        except SrStartPending:
+            # The start task exists but its conversation is not READY yet: the
+            # start is progressing, it just outlived this request's poll budget.
+            # Release the lease so the background loop resumes the *same* start
+            # task, and report "starting" rather than an error -- nothing failed,
+            # and the workflow must not look queued with no Sr while one is
+            # already coming up.
+            self.store.release_sr_start(workflow_id)
+            return {"workflow_id": workflow_id, "sr_conversation_id": None,
+                    "reused": not created, "starting": True}
         except CloudError as e:
             # Release the lease so the Sr loop can retry promptly. Keep the
             # workflow so the user can see it failed to start Sr; the loop owns

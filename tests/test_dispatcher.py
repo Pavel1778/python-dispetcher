@@ -23,7 +23,7 @@ from orchestration.openhands_client import (  # noqa: E402
     _origin,
     task_conversation_id,
 )
-from tests.fake_runtime import FakeServer  # noqa: E402
+from tests.fake_runtime import FakeConversation, FakeServer  # noqa: E402
 
 KEY = "test-key"
 
@@ -69,6 +69,75 @@ def test_task_goes_from_sqlite_to_conversation(cp, server):
     assert conv.working_dir.endswith(task.conversation_id)
     assert conv.events == 1
     assert conv.status == "running"
+
+
+# ------------------------------------------------------- naming (local path)
+def test_conversation_is_named_after_it_exists(cp, server):
+    """The name must be applied, because create cannot carry one.
+
+    The stand-in mirrors the live server: it ignores ``title`` on create and
+    only honours ``PATCH``. If the dispatcher stops renaming, the conversation
+    stays untitled and this fails.
+    """
+    cp.submit_task("t1", "audit the parser", max_attempts=3)
+    d = make_dispatcher(cp, server)
+    d.tick()
+
+    conv = server.runtime.conversations[task_conversation_id("t1")]
+    assert conv.title == "Jr.audit the parser [t1]"
+
+
+def test_two_tasks_with_one_goal_are_distinguishable(cp, server):
+    """Identical goals must not produce identical names."""
+    cp.submit_task("t1", "same goal")
+    cp.submit_task("t2", "same goal")
+    d = make_dispatcher(cp, server)
+    d.tick()
+
+    one = server.runtime.conversations[task_conversation_id("t1")].title
+    two = server.runtime.conversations[task_conversation_id("t2")].title
+    assert one != two
+    assert one == "Jr.same goal [t1]"
+    assert two == "Jr.same goal [t2]"
+
+
+def test_adopted_conversation_is_still_named(cp, server):
+    """An adopted conversation may be untitled, so the rename runs on every path.
+
+    Create is idempotent on the derived id, so after a restart the server
+    returns the conversation that already exists instead of making a new one.
+    If the rename only ran when this call created the conversation, that
+    pre-existing one would be adopted and left unnamed.
+    """
+    cid = task_conversation_id("t1")
+    # The conversation survived a restart; the task row did not, so it is queued.
+    server.runtime.conversations[cid] = FakeConversation(
+        id=cid, working_dir=f"/workspace/project/{cid}", title=None
+    )
+    cp.submit_task("t1", "adopt me", max_attempts=3)
+
+    d = make_dispatcher(cp, server)
+    d.tick()
+
+    assert server.runtime.conversations[cid].title == "Jr.adopt me [t1]"
+
+
+def test_rename_failure_does_not_fail_the_task(cp, server, monkeypatch):
+    """Losing a name is cosmetic; the task must still reach RUNNING."""
+    cp.submit_task("t1", "keep going", max_attempts=3)
+    d = make_dispatcher(cp, server)
+
+    def boom(*a, **k):
+        raise ApiUnavailable("rename exploded")
+
+    monkeypatch.setattr(d.client, "rename_conversation", boom)
+    report = d.tick()
+
+    task = cp.get_task("t1")
+    assert task.state is TaskState.RUNNING
+    assert report.dispatched == [
+        {"task": "t1", "conversation_id": task_conversation_id("t1")}
+    ]
 
 
 def test_finished_task_is_verified_and_completed(cp, server):

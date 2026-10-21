@@ -46,6 +46,18 @@ class FakeCloud:
         # Controls: how many polls a start task needs before READY.
         self.start_polls_required = 0
         self.start_fail = False
+        #: When > 0, a start task stays ``WORKING`` (and reports **no**
+        #: ``app_conversation_id``) until this many start-task polls have
+        #: happened. This is the documented two-phase contract: the id is only
+        #: meaningful at ``READY``, so a caller that returns early binds a
+        #: conversation that is not up yet.
+        self.start_ready_after_polls = 0
+        #: start-task id -> the conversation it will produce.
+        self.start_task_cids: dict[str, str] = {}
+        #: Conversations whose start task has not reached READY yet. The real
+        #: search index does not list them, so a tag search cannot be used to
+        #: adopt a conversation that is still starting.
+        self.unready_conversations: set[str] = set()
         #: When > 0, the next N conversation starts fail with this status code
         #: (e.g. 429). Lets a test drive the workflow-level rate-limit path.
         self.start_status = 0
@@ -139,13 +151,24 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/app-conversations":
             ids = self._query("ids")
-            out = [self.cloud.conversations.get(i) for i in ids.split(",") if i]
+            # A conversation that is still starting is not addressable: the id
+            # is only meaningful at READY. Returning it here would let a caller
+            # treat "started" as "usable", which is the bug under test.
+            out = []
+            for i in ids.split(","):
+                if not i:
+                    continue
+                if i in self.cloud.unready_conversations:
+                    out.append(None)
+                else:
+                    out.append(self.cloud.conversations.get(i))
             return self._json(200, out)
 
         if path == "/api/v1/app-conversations/search":
             if self.cloud.search_status:
                 return self._json(self.cloud.search_status, {"detail": "unavailable"})
-            items = list(self.cloud.conversations.values())
+            items = [c for c in self.cloud.conversations.values()
+                     if c["id"] not in self.cloud.unready_conversations]
             # tags__contains is a repeatable key=value filter; all must match.
             for raw in self._query_all("tags__contains"):
                 key, _, value = raw.partition("=")
@@ -177,6 +200,18 @@ class _Handler(BaseHTTPRequestHandler):
                         if st["status"] == "READY":
                             # The id appears only once READY, as on the live API.
                             st["app_conversation_id"] = st.get("_cid")
+                    # The real API only populates ``app_conversation_id`` once the
+                    # start task is READY; before that it is absent. Mirror that
+                    # so a caller cannot mistake "started" for "conversation up".
+                    if (self.cloud.start_ready_after_polls
+                            and st["_polls"] <= self.cloud.start_ready_after_polls
+                            and not self.cloud.start_fail):
+                        st = {**st, "app_conversation_id": None,
+                              "status": "WORKING"}
+                    elif st["_polls"] > self.cloud.start_ready_after_polls:
+                        cid = self.cloud.start_task_cids.get(i)
+                        if cid:
+                            self.cloud.unready_conversations.discard(cid)
                 out.append(st)
             return self._json(200, out)
 
@@ -208,8 +243,28 @@ class _Handler(BaseHTTPRequestHandler):
             text = ""
             for c in (msg.get("content") or []):
                 text += c.get("text", "")
+            if self.cloud.start_fail:
+                # The start request was accepted but the start task terminally
+                # failed: no usable conversation exists. This mirrors an ERROR
+                # start task (a rejected sandbox, a bad repository), and is the
+                # case where a caller must NOT record a conversation id.
+                st_id = str(uuid.uuid4())
+                self.cloud.start_tasks[st_id] = {
+                    "id": st_id,
+                    "status": "ERROR",
+                    "app_conversation_id": None,
+                    "sandbox_id": None,
+                    "agent_server_url": None,
+                    "detail": "sandbox provisioning failed",
+                    "_polls": 0,
+                }
+                return self._json(200, self.cloud.start_tasks[st_id])
             cid = self.cloud.make_conversation(
-                title=body.get("title") or "conversation",
+                # The live server ignores ``title`` on create and derives its own
+                # from the first user message (``autotitle``). Mirroring that is
+                # what lets a test catch a name that is never applied: a fake
+                # that honoured ``title`` here made the defect invisible.
+                title=f"Conversation {uuid.uuid4().hex}",
                 repo=body.get("selected_repository"),
                 branch=body.get("selected_branch"),
                 tags=body.get("tags"),
@@ -222,21 +277,23 @@ class _Handler(BaseHTTPRequestHandler):
                                  "content": [{"type": "text", "text": text}]}}
             )
             st_id = str(uuid.uuid4())
-            # The real API withholds ``app_conversation_id`` until the start
-            # task reaches READY. When a test asks for extra polls, mirror that:
-            # expose the id only once READY, so a caller that ignores the status
-            # and binds early is caught.
-            ready_now = self.cloud.start_polls_required == 0
+            # ``app_conversation_id`` is present from the first response, but it
+            # is only *meaningful* at READY (see the GET handler): the id exists
+            # while the sandbox is still provisioning. A caller that binds it
+            # before READY binds a conversation that is not up yet.
             self.cloud.start_tasks[st_id] = {
                 "id": st_id,
-                "status": "READY" if ready_now else "WORKING",
-                "app_conversation_id": cid if ready_now else None,
+                "status": "WORKING",
+                "app_conversation_id": cid,
                 "_cid": cid,
                 "sandbox_id": self.cloud.conversations[cid]["sandbox_id"],
                 "agent_server_url": None,
                 "detail": None,
                 "_polls": 0,
             }
+            self.cloud.start_task_cids[st_id] = cid
+            if self.cloud.start_ready_after_polls:
+                self.cloud.unready_conversations.add(cid)
             return self._json(200, self.cloud.start_tasks[st_id])
 
         if path.endswith("/send-message"):

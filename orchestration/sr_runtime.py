@@ -41,8 +41,10 @@ from .cloud_client import (
     CloudError,
     CloudNotFound,
     CloudUnavailable,
+    SrStartPending,
 )
 from .cloud_store import NotFound, PostgresStore
+from .naming import conversation_title
 from .sr_tools import SrTools, ToolResult
 
 log = logging.getLogger(__name__)
@@ -81,6 +83,10 @@ class SrTickReport:
     unavailable: list[str] = field(default_factory=list)
     retried: list[dict] = field(default_factory=list)
     retry_blocked: list[str] = field(default_factory=list)
+    #: Workflows whose Sr start is still progressing (start task not READY
+    #: within the poll budget). Not a failure, and not a retry: the same start
+    #: task is resumed by a later tick.
+    pending: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +96,7 @@ class SrTickReport:
             "unavailable": self.unavailable,
             "retried": self.retried,
             "retry_blocked": self.retry_blocked,
+            "pending": self.pending,
         }
 
 
@@ -153,6 +160,11 @@ class SrRuntime:
            conversation that already exists instead of starting another one. This
            is the same recovery the Jr path does with
            ``external_start_task_id``.
+
+           The start is two-phase and can outlive one poll budget, so a start
+           task that is still ``WORKING`` is *progress*, not a failure: it is
+           resumed rather than discarded. Discarding it and falling through to a
+           fresh start is what created a second conversation for one workflow.
         3. Only then is the Cloud searched for a tagged orphan. A failure of that
            search propagates instead of being read as "no orphan": treating a
            search outage as absence is exactly what starts a duplicate Sr.
@@ -167,6 +179,7 @@ class SrRuntime:
 
         orphan = self._find_orphan_sr(workflow_id)
         if orphan is not None:
+            self._name_sr(workflow_id, orphan, goal=(existing or {}).get("goal"))
             self.store.bind_sr(workflow_id, conversation_id=orphan, status="running")
             self._mark_running(workflow_id)
             return orphan
@@ -177,15 +190,21 @@ class SrRuntime:
             initial_message=SR_INSTRUCTION.format(
                 goal=goal, repositories=_repositories_clause(repos)
             ),
-            title=f"Sr.{goal[:40]}",
+            # No title at creation: both APIs ignore one here (see
+            # ``orchestration.naming``). The name is applied once the
+            # conversation is READY.
             tags={"orchestratorsr": workflow_id.replace("-", "")},
             client_tools=SrTools.tool_schemas(),
             agent_profile_id=self.agent_profile_id,
             plugins=self.plugins,
         )
-        # Record the start task before polling so a crash here is recoverable.
+        # Record the start task before polling so a crash here is recoverable,
+        # and so a later attempt resumes this start task instead of starting a
+        # second conversation. The start lease is deliberately kept until the
+        # conversation is bound (``bind_sr`` releases it only on a conversation).
         self.store.bind_sr(workflow_id, start_task_id=start.id, status="starting")
         conversation_id = self._await_start(start)
+        self._name_sr(workflow_id, conversation_id, goal=goal)
         self.store.bind_sr(
             workflow_id, conversation_id=conversation_id, status="running"
         )
@@ -198,33 +217,46 @@ class SrRuntime:
         """Recover the conversation from a start task we already recorded.
 
         Returns the conversation id when the recorded start task is (or becomes)
-        READY. Returns ``None`` when there is no start task to resume, when it
-        failed, or when it disappeared -- the caller then falls back to the
-        tagged-orphan search. A transport error propagates, so a retry backs off
-        instead of starting a second Sr.
+        READY. Returns ``None`` only when there is no start task to resume, when
+        it failed terminally, or when it disappeared from Cloud -- the caller then
+        falls back to the tagged-orphan search. A start that is still progressing
+        raises ``SrStartPending`` so the caller resumes the *same* start task on a
+        later tick instead of starting a second conversation. A transport error
+        propagates, so a retry backs off rather than duplicating.
         """
         start_task_id = existing.get("sr_start_task_id")
         if not start_task_id:
             return None
         start = self.client.get_start_task(start_task_id)
-        if start is None or start.failed:
+        if start is None:
+            # The start task is gone from Cloud and produced no conversation: a
+            # stale id. Drop it and fall through to the orphan search.
             return None
-        if not start.app_conversation_id:
-            # Not READY yet; poll it the same way a fresh start is polled.
-            try:
-                conversation_id = self._await_start(start)
-            except CloudError:
-                return None
-            self.store.bind_sr(
-                workflow_id, conversation_id=conversation_id, status="running"
-            )
-            self._mark_running(workflow_id)
-            return conversation_id
+        if start.failed:
+            # A terminal ERROR start task will never produce a conversation.
+            raise CloudError(f"Sr start failed: {start.detail or start.status}")
+        conversation_id = self._await_start(start)
+        self._name_sr(workflow_id, conversation_id, goal=existing.get("goal"))
         self.store.bind_sr(
-            workflow_id, conversation_id=start.app_conversation_id, status="running"
+            workflow_id, conversation_id=conversation_id, status="running"
         )
         self._mark_running(workflow_id)
-        return start.app_conversation_id
+        return conversation_id
+
+    def _name_sr(self, workflow_id: str, conversation_id: str,
+                 *, goal: str | None) -> None:
+        """Apply the Sr name after the conversation exists.
+
+        A name is not accepted at creation time by either API, so this is the
+        only point where it sticks. A failure here is logged, not raised: the
+        conversation is real and usable, and losing a name must never fail the
+        workflow. ``rename_sr`` re-applies a name on demand.
+        """
+        title = conversation_title("Sr", goal, ref=workflow_id)
+        try:
+            self.client.update_conversation(conversation_id, title=title)
+        except CloudError as e:
+            log.warning("could not name Sr conversation %s: %s", conversation_id, e)
 
     def _mark_running(self, workflow_id: str) -> None:
         """Reflect a started Sr in the workflow state.
@@ -260,20 +292,39 @@ class SrRuntime:
         return None
 
     def _await_start(self, start) -> str:
+        """Poll a start task until its conversation is actually READY.
+
+        The conversation id is carried by the start task from the first
+        response, but it is only meaningful once the status is ``READY`` (see
+        ``CLOUD-INTEGRATION-MAP.md``): before that the sandbox is still being
+        provisioned and the conversation is not in the search index. Returning
+        the id early bound a conversation that was not up yet -- the "first
+        conversation disconnected and could not continue" symptom -- so the id
+        is accepted only at ``READY``. Running out of poll budget raises
+        ``SrStartPending`` so the caller resumes the same start task rather than
+        starting a second one.
+        """
         current = start
         for _ in range(self.start_poll_attempts):
-            if current.app_conversation_id:
+            if current.ready:
+                if not current.app_conversation_id:
+                    raise CloudUnavailable(
+                        "Sr start task is READY but has no conversation id"
+                    )
                 return current.app_conversation_id
             if current.failed:
-                raise CloudError(f"Sr start failed: {current.detail or current.status}")
+                raise CloudError(
+                    f"Sr start failed: {current.detail or current.status}"
+                )
             time.sleep(self.start_poll_interval)
             nxt = self.client.get_start_task(current.id)
             if nxt is None:
                 raise CloudUnavailable("Sr start task disappeared")
             current = nxt
-        if current.app_conversation_id:
-            return current.app_conversation_id
-        raise CloudUnavailable("Sr start task not READY")
+        raise SrStartPending(
+            f"Sr start task not READY after {self.start_poll_attempts} polls "
+            f"(last status: {current.status})"
+        )
 
     def _retry_sr_starts(self, report: SrTickReport) -> None:
         """Start Sr for workflows that have none yet.
@@ -299,6 +350,14 @@ class SrRuntime:
             used = int(row.get("sr_attempt") or 0) + 1
             try:
                 self.ensure_sr(workflow_id)
+            except SrStartPending:
+                # The start task exists and is still progressing; only the poll
+                # budget ran out. Release the lease and let a later tick resume
+                # the *same* start task. No attempt is spent: nothing failed, and
+                # counting this would block a workflow whose sandbox is simply
+                # slow to provision.
+                self.store.release_sr_start(workflow_id)
+                report.pending.append(workflow_id)
             except CloudAuthError as e:
                 # A bad key is permanent: retrying only wastes the quota.
                 self.store.release_sr_start(workflow_id)

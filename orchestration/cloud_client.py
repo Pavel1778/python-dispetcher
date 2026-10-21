@@ -57,6 +57,17 @@ class CloudUnavailable(CloudError):
     """Transport failure or 5xx. Transient: retry with backoff."""
 
 
+class SrStartPending(CloudError):
+    """A start task exists but its conversation is not READY yet.
+
+    This is *progress*, not a failure. The start is two-phase and a start can
+    legitimately take minutes (sandbox provisioning, repository preparation), so
+    a caller that runs out of poll budget must resume the same start task later
+    rather than start a second conversation -- and must not spend an attempt
+    from the failure budget, because nothing has failed.
+    """
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Turn any redirect into an error instead of following it.
 

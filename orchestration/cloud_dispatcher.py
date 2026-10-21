@@ -41,6 +41,7 @@ from .cloud_client import (
     CloudValidationError,
     CloudClient,
     ExecutionStatus,
+    SrStartPending,
 )
 from .cloud_store import (
     InvalidTransition,
@@ -50,6 +51,7 @@ from .cloud_store import (
     Task,
     TaskState,
 )
+from .naming import conversation_title
 
 log = logging.getLogger(__name__)
 
@@ -185,6 +187,11 @@ class CloudDispatcher:
                     evidence=[{"reason": "cloud validation failure", "detail": str(e)}],
                 )
                 report.dead_letter.append(task.id)
+            except SrStartPending as e:
+                # The start task exists and is progressing; the poll budget ran
+                # out. Requeue without burning an attempt: the next tick resumes
+                # the *same* start task, so no second conversation is created.
+                self._requeue(task, report, reason=f"start pending: {e}")
             except CloudUnavailable as e:
                 # Transient: release the task back to the queue without burning
                 # an attempt so the next tick retries it.
@@ -255,7 +262,8 @@ class CloudDispatcher:
             initial_message=task.goal,
             selected_repository=task.selected_repository,
             selected_branch=task.selected_branch,
-            title=(task.goal[:60] or None),
+            # No title at creation: both APIs ignore one here (see
+            # ``orchestration.naming``). The name is applied at READY.
             tags={key: value},
         )
         # Record the start task before polling so a crash here is recoverable.
@@ -265,16 +273,42 @@ class CloudDispatcher:
         report.started.append({"task": task.id, "start_task": start.id})
 
         conversation_id = self._await_start(start)
+        self._name_jr(task, conversation_id)
         self.store.bind_conversation(
             task.id, conversation_id, start_task_id=start.id, status="running"
         )
         self.store.transition(task.id, TaskState.RUNNING, owner=self.worker_id)
 
+    def _name_jr(self, task: Task, conversation_id: str) -> None:
+        """Apply the Jr name once the conversation exists.
+
+        A ``title`` sent at creation is discarded, so every Jr conversation used
+        to be named after its goal text alone -- two tasks with the same goal
+        looked identical. A failure is logged, not raised: the work is real and
+        must not fail because a name did not stick.
+        """
+        title = conversation_title("Jr", task.goal, ref=task.id)
+        try:
+            self.client.update_conversation(conversation_id, title=title)
+        except CloudError as e:
+            log.warning("could not name Jr conversation %s: %s", conversation_id, e)
+
     def _await_start(self, start) -> str:
-        """Poll the start task until it is READY, returning the conversation id."""
+        """Poll the start task until it is READY, returning the conversation id.
+
+        The id is carried from the first response but is only meaningful at
+        ``READY``; returning it earlier bound a conversation whose sandbox was
+        still provisioning. Running out of poll budget is reported as
+        ``SrStartPending`` so the caller resumes the same start task rather than
+        treating progress as failure.
+        """
         current = start
         for _ in range(self.start_poll_attempts):
-            if current.app_conversation_id:
+            if current.ready:
+                if not current.app_conversation_id:
+                    raise CloudUnavailable(
+                        "start task is READY but has no conversation id"
+                    )
                 return current.app_conversation_id
             if current.failed:
                 raise CloudError(f"start task failed: {current.detail or current.status}")
@@ -283,9 +317,10 @@ class CloudDispatcher:
             if nxt is None:
                 raise CloudUnavailable("start task disappeared")
             current = nxt
-        if current.app_conversation_id:
-            return current.app_conversation_id
-        raise CloudUnavailable(f"start task not READY after {self.start_poll_attempts} polls")
+        raise SrStartPending(
+            f"start task not READY after {self.start_poll_attempts} polls "
+            f"(last status: {current.status})"
+        )
 
     # -------------------------------------------------------------- advance
     def _advance_active(self, report: TickReport) -> None:

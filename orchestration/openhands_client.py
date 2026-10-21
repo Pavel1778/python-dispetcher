@@ -275,6 +275,22 @@ class OpenHandsClient:
             raise ApiUnavailable(f"create_conversation -> {status}")
         return self._view(payload), status == 201
 
+    def rename_conversation(self, conversation_id: str, title: str) -> None:
+        """Set a conversation's title (``PATCH /api/conversations/{id}``).
+
+        The live server ignores ``title`` on **create** (``StartConversationRequest``
+        has no such field), so a name sent there is silently dropped and the
+        conversation stays untitled. This is the only call that sticks, which is
+        why the dispatcher applies the name after the conversation exists.
+        """
+        status, _ = self._request(
+            "PATCH", f"/api/conversations/{conversation_id}", {"title": title}
+        )
+        if status == 404:
+            raise ConversationGone(conversation_id)
+        if status not in (200, 201):
+            raise ApiUnavailable(f"rename_conversation -> {status}")
+
     def settings(self) -> dict[str, Any]:
         """Return the server's full settings document (``GET /api/settings``)."""
         status, payload = self._request("GET", "/api/settings")

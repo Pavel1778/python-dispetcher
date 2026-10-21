@@ -209,20 +209,51 @@ def test_missing_conversation_id_is_not_a_successful_start(app, fake):
     """A start task stuck WORKING past the poll budget must not bind a Sr.
 
     The poll budget is shortened; the start task never becomes READY, so the
-    start must fail loudly rather than record a bogus conversation id.
+    start must report *pending* rather than record a bogus conversation id. It
+    is ``SrStartPending`` and not a failure: the same start task is resumed on a
+    later tick, so no attempt is spent and no second conversation is created.
     """
-    from orchestration.cloud_client import CloudUnavailable
+    from orchestration.cloud_client import SrStartPending
 
     app.runtime.start_poll_attempts = 2
     app.runtime.start_poll_interval = 0.0
     fake.cloud.start_polls_required = 99  # never READY
 
     wf = app.store.create_workflow_once("g")[0]
-    with pytest.raises(CloudUnavailable):
+    with pytest.raises(SrStartPending):
         app.runtime.ensure_sr(wf)
     # No conversation was bound, and the workflow has no Sr.
     assert app.store.sr_for(wf)["sr_conversation_id"] is None
     assert len(fake.cloud.conversations) == 1  # the conversation Cloud created
+
+
+def test_recording_a_start_task_keeps_the_start_lease(app, fake):
+    """Binding only a start task must not release the Sr start lease.
+
+    ``bind_sr`` runs twice per start: once with the start task (before polling)
+    and once with the conversation. If the first call released the lease, the
+    workflow would look unclaimed between "start task accepted" and
+    "conversation READY" -- ``pending_sr_starts`` excludes only workflows with a
+    live lease -- and the next tick would start a *second* Sr. This pins the
+    invariant that makes the two-phase start safe when one tick's poll budget
+    cannot cover the whole start.
+    """
+    wf = app.store.create_workflow_once("g")[0]
+    assert app.store.claim_sr_start(wf, "w1", lease_seconds=300.0)
+
+    # The first bind records the start task and nothing else.
+    app.store.bind_sr(wf, start_task_id="st-1", status="starting")
+    row = app.store.sr_for(wf)
+    assert row["sr_start_task_id"] == "st-1"
+    assert row["sr_conversation_id"] is None
+    # Still leased: no other worker may claim it, and it is not "pending".
+    assert app.store.claim_sr_start(wf, "w2") is False
+    assert [r["id"] for r in app.store.pending_sr_starts()] == []
+
+    # Binding the conversation is what releases the lease.
+    app.store.bind_sr(wf, conversation_id="conv-1", status="running")
+    assert app.store.sr_for(wf)["sr_conversation_id"] == "conv-1"
+    assert [r["id"] for r in app.store.pending_sr_starts()] == []
 
 
 def test_cloud_connection_loss_during_start_backs_off_without_duplicate(app, fake):

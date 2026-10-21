@@ -203,7 +203,13 @@ class _Handler(BaseHTTPRequestHandler):
                 c = FakeConversation(
                     id=cid,
                     working_dir=(body.get("workspace") or {}).get("working_dir", ""),
-                    title=body.get("title"),
+                    # The live server ignores ``title`` on create
+                    # (``StartConversationRequest`` has no such field): the
+                    # conversation starts untitled and only ``PATCH`` can name it.
+                    # Mirroring that is what lets a test catch a name that is
+                    # never applied -- a fake that honoured ``title`` here made
+                    # the defect invisible.
+                    title=None,
                 )
                 # Mirror the live server: the conversation inherits exactly the
                 # agent_context and mcp_config the request carried. Nothing is
@@ -299,6 +305,21 @@ class _Handler(BaseHTTPRequestHandler):
                     else:
                         agent[key] = value
                 self._json(200, json.loads(json.dumps(rt.settings)))
+            return
+
+        # PATCH /api/conversations/{id} -> rename (UpdateConversationRequest
+        # carries only ``tags`` and ``title``). Confirmed live: this is the only
+        # call that can name a conversation, because create ignores ``title``.
+        if len(parts) == 3 and parts[:2] == ["api", "conversations"]:
+            rt = self.runtime
+            with rt.lock:
+                c = rt.conversations.get(parts[2])
+                if c is None:
+                    self._json(404, {"detail": "conversation not found"})
+                    return
+                if body.get("title") is not None:
+                    c.title = body["title"]
+                self._json(200, self._info(c))
             return
 
         self._json(404, {"detail": "Not Found"})

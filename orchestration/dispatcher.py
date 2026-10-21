@@ -41,6 +41,7 @@ from .runtime_state import (
     DesiredStateError,
     RuntimeReadiness,
 )
+from .naming import conversation_title
 
 log = logging.getLogger(__name__)
 
@@ -398,9 +399,18 @@ class Dispatcher:
         view, created = self.client.create_conversation(
             conversation_id=conversation_id,
             working_dir=working_dir,
-            title=f"task:{task.id}",
             agent_settings=self._settings(),
         )
+        # The live server drops ``title`` on create, so the name is applied
+        # afterwards -- on every path, not only when this call created the
+        # conversation, because an adopted one may still be untitled. A rename
+        # failure must not fail the task: the conversation exists and works.
+        try:
+            self.client.rename_conversation(
+                conversation_id, conversation_title("Jr", task.goal, ref=task.id)
+            )
+        except (ApiUnavailable, ConversationGone) as e:
+            log.warning("could not name conversation %s: %s", conversation_id, e)
         # Bind before starting: a crash here still leaves the link durable.
         if task.conversation_id != conversation_id:
             self.cp.bind_conversation(task.id, conversation_id)
