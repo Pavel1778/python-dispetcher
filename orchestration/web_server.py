@@ -73,6 +73,7 @@ from .cloud_store import (
     StoreError,
 )
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
+from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
 from .web_auth import (
@@ -273,6 +274,7 @@ class App:
                  plugins: list[dict[str, Any]] | None = None,
                  auth: AuthService | None = None):
         self.store = PostgresStore(dsn)
+        self.projects = ProjectService(self.store)
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -607,6 +609,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
@@ -712,6 +715,23 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _project_principal(self) -> str:
+        # The legacy bearer is an owner-level credential, not a scoped token.
+        # Bind it to the configured login so CLI and browser share projects.
+        session = self._session()
+        if session is not None:
+            return principal_for_session(session.username)
+        return principal_for_session(self.app.auth.username)
+
+    @staticmethod
+    def _project_path(path: str) -> tuple[str, str] | None:
+        parts = path.strip("/").split("/")
+        if len(parts) not in (4, 5) or parts[:3] != ["api", "v1", "projects"]:
+            return None
+        if not UUID_RE.fullmatch(parts[3]):
+            return None
+        return parts[3], parts[4] if len(parts) == 5 else ""
+
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -743,6 +763,21 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_read():
                 return
 
+            if path == "/api/v1/projects":
+                return self._json(200, {"projects": self.app.projects.list(self._project_principal())})
+            if path.startswith("/api/v1/projects/"):
+                parsed = self._project_path(path)
+                if parsed is None:
+                    return self._json(404, {"error": "not found"})
+                project_id, resource = parsed
+                principal = self._project_principal()
+                if not resource:
+                    return self._json(200, {"project": self.app.projects.get(principal, project_id)})
+                if resource == "goals":
+                    return self._json(200, {"goals": self.app.projects.list_goals(principal, project_id)})
+                if resource == "events":
+                    return self._json(200, {"events": self.app.projects.events(principal, project_id)})
+                return self._json(404, {"error": "not found"})
             if path == "/api/session":
                 s = self._session()
                 return self._json(200, {
@@ -833,7 +868,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except Exception as e:  # noqa: BLE001
             log.exception("GET %s failed", path)
-            return self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            error = "internal error" if path.startswith("/api/v1/projects") else f"{type(e).__name__}: {e}"
+            return self._json(500, {"error": error})
 
     # ----------------------------------------------------------------- POST
     def do_POST(self) -> None:
@@ -855,6 +891,19 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_write():
                 return
             body = self._body()
+            if path == "/api/v1/projects" or path.startswith("/api/v1/projects/"):
+                if not isinstance(body, dict):
+                    return self._json(400, {"error": "body must be a JSON object"})
+                principal = self._project_principal()
+                if path == "/api/v1/projects":
+                    project = self.app.projects.create(principal, body.get("name"), body.get("description", ""))
+                    return self._json(201, {"project": project})
+                parsed = self._project_path(path)
+                if parsed is None or parsed[1] != "goals":
+                    return self._json(404, {"error": "not found"})
+                goal, created = self.app.projects.create_goal(
+                    principal, parsed[0], body.get("text"), self.headers.get("Idempotency-Key"))
+                return self._json(201 if created else 200, {"goal": goal, "created": created})
             if path == "/api/repositories":
                 name = (body.get("full_name") or "").strip()
                 if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
@@ -934,6 +983,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except IdempotencyConflict as e:
+            return self._json(409, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except InvalidTransition as e:
@@ -942,7 +993,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(502, {"error": f"cloud: {e}"})
         except Exception as e:  # noqa: BLE001
             log.exception("POST %s failed", path)
-            return self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            error = "internal error" if path.startswith("/api/v1/projects") else f"{type(e).__name__}: {e}"
+            return self._json(500, {"error": error})
+
+    def do_PATCH(self) -> None:
+        path = urlparse(self.path).path
+        try:
+            if not self._require_write():
+                return
+            parsed = self._project_path(path)
+            if parsed is None or parsed[1]:
+                return self._json(404, {"error": "not found"})
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be a JSON object"})
+            project = self.app.projects.update(self._project_principal(), parsed[0], body)
+            return self._json(200, {"project": project})
+        except NotFound:
+            return self._json(404, {"error": "not found"})
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        except Exception:  # noqa: BLE001
+            log.exception("PATCH %s failed", path)
+            return self._json(500, {"error": "internal error"})
 
     # ---------------------------------------------------------------- login
     def _login(self) -> None:

@@ -270,12 +270,46 @@ APP_HTML = r"""<!doctype html>
   </section>
 
   <nav class="tabs" role="tablist" aria-label="Разделы" style="margin-top:24px">
-    <button class="tab" role="tab" id="tab-new" aria-selected="true" aria-controls="panel-new">Новая задача</button>
+    <button class="tab" role="tab" id="tab-projects" aria-selected="true" aria-controls="panel-projects">Проекты NEXUS</button>
+    <button class="tab" role="tab" id="tab-new" aria-selected="false" aria-controls="panel-new">Dispatcher: новая задача</button>
     <button class="tab" role="tab" id="tab-queue" aria-selected="false" aria-controls="panel-queue">Очередь и задачи</button>
     <button class="tab" role="tab" id="tab-system" aria-selected="false" aria-controls="panel-system">Система</button>
   </nav>
 
-  <section id="panel-new" role="tabpanel" aria-labelledby="tab-new">
+  <section id="panel-projects" role="tabpanel" aria-labelledby="tab-projects">
+    <div class="banner info">Проекты и цели сохраняются как черновики. Они пока не запускают агентов и не связаны со старой очередью Dispatcher.</div>
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="card-head"><h3>Проекты NEXUS</h3></div>
+        <p class="muted small">Доступ ограничен текущим пользователем. Существующие задачи Dispatcher остаются отдельно.</p>
+        <form id="project-form">
+          <label for="project-name">Название</label>
+          <input id="project-name" maxlength="120" required placeholder="Название проекта">
+          <label for="project-description">Описание</label>
+          <input id="project-description" maxlength="4000" placeholder="Необязательно">
+          <div class="actions"><button type="submit">Создать проект</button></div>
+        </form>
+        <p id="project-msg" class="small" role="status" aria-live="polite"></p>
+        <div id="projects-list" style="margin-top:16px"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3 id="project-heading">Выберите проект</h3></div>
+        <div id="project-detail" class="hidden">
+          <p id="project-description-view" class="muted small"></p>
+          <form id="project-goal-form">
+            <label for="project-goal">Цель проекта</label>
+            <textarea id="project-goal" maxlength="20000" required placeholder="Опишите цель проекта"></textarea>
+            <div class="actions"><button type="submit">Сохранить черновик</button></div>
+          </form>
+          <p id="project-goal-msg" class="small" role="status" aria-live="polite"></p>
+          <h4 style="margin-top:20px">Черновики целей</h4>
+          <div id="project-goals"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-new" role="tabpanel" aria-labelledby="tab-new" class="hidden">
     <div class="card">
       <div class="card-head"><h3>Поставить задачу</h3></div>
       <p class="muted small" style="margin-bottom:14px">
@@ -413,6 +447,8 @@ let CSRF = '';
 let WORKFLOWS = [];
 let TASKS = [];
 let REPOS = [];
+let PROJECTS = [];
+let SELECTED_PROJECT = null;
 let STATE_LABELS = {
   queued: 'В очереди', assigned: 'Назначена', running: 'Выполняется',
   verifying: 'Проверяется', recovering: 'Восстанавливается',
@@ -825,6 +861,42 @@ async function addRepo() {
   }
 }
 
+/* ------------------------------------------------------- NEXUS projects */
+async function loadProjects() {
+  try {
+    const result = await api('/api/v1/projects');
+    PROJECTS = result.projects || [];
+    const container = $('#projects-list');
+    container.innerHTML = PROJECTS.length ? PROJECTS.map(p =>
+      '<button type="button" class="ghost project-select" data-id="' + esc(p.id) +
+      '" style="width:100%;text-align:left;margin-top:6px">' + esc(p.name) + '</button>'
+    ).join('') : '<p class="muted small">Проектов пока нет.</p>';
+    $$('.project-select', container).forEach(button => button.onclick = () => selectProject(button.dataset.id));
+  } catch (e) { $('#project-msg').textContent = 'Не удалось загрузить проекты: ' + e.message; }
+}
+async function selectProject(id) {
+  const project = PROJECTS.find(p => p.id === id);
+  if (!project) return;
+  SELECTED_PROJECT = id;
+  $('#project-heading').textContent = project.name;
+  $('#project-description-view').textContent = project.description || 'Описание не задано.';
+  $('#project-detail').classList.remove('hidden');
+  $('#project-goal').value = '';
+  delete $('#project-goal-form').dataset.requestId;
+  $('#project-goal-msg').textContent = '';
+  await loadProjectGoals(id);
+}
+async function loadProjectGoals(id) {
+  try {
+    const result = await api('/api/v1/projects/' + encodeURIComponent(id) + '/goals');
+    if (SELECTED_PROJECT !== id) return;
+    $('#project-goals').innerHTML = result.goals.length ? result.goals.map(g =>
+      '<div style="border-bottom:1px solid var(--line);padding:12px 0"><span class="pill queued">Черновик</span>' +
+      '<p style="white-space:pre-wrap;margin-top:8px">' + esc(g.text) + '</p></div>'
+    ).join('') : '<p class="muted small">Целей пока нет.</p>';
+  } catch (e) { if (SELECTED_PROJECT === id) $('#project-goal-msg').textContent = e.message; }
+}
+
 /* --------------------------------------------------------------- refresh */
 async function refresh() {
   clearBanners();
@@ -861,10 +933,49 @@ async function boot() {
   };
   $$('.tab').forEach(tab => tab.onclick = () => {
     $$('.tab').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
-    $$('#panel-new, #panel-queue, #panel-system').forEach(p => p.classList.add('hidden'));
+    $$('#panel-projects, #panel-new, #panel-queue, #panel-system').forEach(p => p.classList.add('hidden'));
     $('#' + tab.getAttribute('aria-controls')).classList.remove('hidden');
     if (tab.id === 'tab-system') loadSystem();
+    if (tab.id === 'tab-projects') loadProjects();
   });
+  $('#project-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const button = $('button[type="submit"]', e.currentTarget);
+    button.disabled = true;
+    try {
+      const result = await api('/api/v1/projects', {method:'POST', body:JSON.stringify({
+        name:$('#project-name').value, description:$('#project-description').value
+      })});
+      $('#project-name').value = ''; $('#project-description').value = '';
+      $('#project-msg').textContent = 'Проект создан.';
+      await loadProjects();
+      await selectProject(result.project.id);
+    } catch (err) { $('#project-msg').textContent = err.message; }
+    finally { button.disabled = false; }
+  };
+  $('#project-goal').oninput = () => { delete $('#project-goal-form').dataset.requestId; };
+  $('#project-goal-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.currentTarget, id = SELECTED_PROJECT;
+    if (!id) return;
+    const button = $('button[type="submit"]', form);
+    button.disabled = true;
+    if (!form.dataset.requestId) form.dataset.requestId =
+      (crypto.randomUUID ? crypto.randomUUID()
+                         : 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+    try {
+      await api('/api/v1/projects/' + encodeURIComponent(id) + '/goals', {
+        method:'POST', headers:{'Idempotency-Key':form.dataset.requestId},
+        body:JSON.stringify({text:$('#project-goal').value})
+      });
+      if (SELECTED_PROJECT === id) {
+        $('#project-goal').value = ''; delete form.dataset.requestId;
+        $('#project-goal-msg').textContent = 'Черновик сохранён; исполнение не запущено.';
+        await loadProjectGoals(id);
+      }
+    } catch (err) { if (SELECTED_PROJECT === id) $('#project-goal-msg').textContent = err.message; }
+    finally { button.disabled = false; }
+  };
   $('#dclose').onclick = () => $('#detail').classList.add('hidden');
   $('#reposync').onclick = syncRepos;
   $('#repoadd').onclick = addRepo;
@@ -908,6 +1019,7 @@ async function boot() {
     } finally { btn.disabled = false; }
   };
 
+  await loadProjects();
   await refresh();
   setInterval(refresh, 5000);
 }
