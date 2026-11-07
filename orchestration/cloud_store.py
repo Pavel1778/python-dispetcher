@@ -709,8 +709,8 @@ class PostgresStore:
                         f"@{task.selected_branch or 'default'} is held by {holder}"
                     )
             else:
-                # Scan candidates in order, skipping any whose workspace is busy,
-                # so one contended repository does not stall the whole queue.
+                # Scan past tasks awaiting dependencies, approval or a workspace.
+                # The explicit-id path above still reports why a claim is refused.
                 tried: list[str] = []
                 while True:
                     cur.execute(
@@ -732,10 +732,9 @@ class PostgresStore:
                     if task.owner is not None and task.lease_live and task.owner != owner:
                         raise LeaseConflict(f"task {task.id} leased by {task.owner}")
                     unmet = self._unmet_dependencies(cur, task)
-                    if unmet:
-                        raise InvalidTransition(f"unmet dependencies: {unmet}")
-                    if task.requires_approval and task.approved is not True:
-                        raise InvalidTransition("approval required")
+                    if unmet or (task.requires_approval and task.approved is not True):
+                        tried.append(task.id)
+                        continue
                     if self._workspace_holder(cur, task) is None:
                         break
                     tried.append(task.id)

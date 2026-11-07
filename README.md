@@ -41,8 +41,8 @@ and its completed tasks are not independently verified QA evidence.
 ## NEXUS project foundation (first increment)
 
 The existing dashboard now has a **Проекты NEXUS** tab for creating projects
-and saving goal drafts. Drafts are stored but **do not** start planning,
-OpenHands, workflows, or QA. Legacy Dispatcher workflows/tasks are deliberately
+and saving goal drafts. Users can also create and approve versioned plans manually.
+Drafts and approvals **do not** start OpenHands, workflows, or QA. Legacy Dispatcher workflows/tasks are deliberately
 not attached to projects and remain accessible through the existing owner-level
 API. Do not treat those legacy endpoints as project-isolated.
 
@@ -70,3 +70,12 @@ running the new version against production. Disable `AUTO_MIGRATE` if schema
 changes are managed separately. No production migration has been applied as
 part of this change. Tests that use `TEST_SUPABASE_DB_URL` delete/truncate data;
 use a disposable PostgreSQL database only.
+
+## NEXUS planning and operations
+
+The current NEXUS increment stores versioned, manually authored DAG plans with
+validated dependencies, criteria and owner approval. Plan approval does not
+dispatch work. See [docs/NEXUS-OPERATIONS.md](docs/NEXUS-OPERATIONS.md) for
+API contracts, UI usage, security limits, testing, and deployment precautions.
+Migration `0010_nexus_plans.sql` is automatically applied on startup unless
+`AUTO_MIGRATE=false`; review and back up the target database before deployment.
