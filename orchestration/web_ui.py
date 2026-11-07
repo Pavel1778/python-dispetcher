@@ -277,7 +277,7 @@ APP_HTML = r"""<!doctype html>
   </nav>
 
   <section id="panel-projects" role="tabpanel" aria-labelledby="tab-projects">
-    <div class="banner info">Проекты и цели сохраняются как черновики. Они пока не запускают агентов и не связаны со старой очередью Dispatcher.</div>
+    <div class="banner info">Цели и планы сохраняются отдельно от очереди Dispatcher. Согласование плана пока не запускает агентов.</div>
     <div class="grid cols-2">
       <div class="card">
         <div class="card-head"><h3>Проекты NEXUS</h3></div>
@@ -306,6 +306,18 @@ APP_HTML = r"""<!doctype html>
           <div id="project-goals"></div>
         </div>
       </div>
+    </div>
+    <div id="plan-panel" class="card hidden" style="margin-top:16px">
+      <div class="card-head"><h3>План цели</h3></div>
+      <p class="muted small">План составляется вручную. Одна задача на строку: ID | название | зависимости через запятую | критерии через точку с запятой. Согласование не запускает выполнение.</p>
+      <form id="plan-form">
+        <label for="plan-tasks">Задачи и зависимости</label>
+        <textarea id="plan-tasks" required maxlength="100000" rows="5" placeholder="audit | Анализ проекта | | Найдены ограничения&#10;api | Разработка API | audit | Тесты написаны; Сборка проходит"></textarea>
+        <div class="actions"><button type="submit">Сохранить версию плана</button></div>
+      </form>
+      <p id="plan-msg" class="small" role="status" aria-live="polite"></p>
+      <div id="plan-list"></div>
+      <div id="plan-detail"></div>
     </div>
   </section>
 
@@ -449,6 +461,7 @@ let TASKS = [];
 let REPOS = [];
 let PROJECTS = [];
 let SELECTED_PROJECT = null;
+let SELECTED_GOAL = null;
 let STATE_LABELS = {
   queued: 'В очереди', assigned: 'Назначена', running: 'Выполняется',
   verifying: 'Проверяется', recovering: 'Восстанавливается',
@@ -878,6 +891,8 @@ async function selectProject(id) {
   const project = PROJECTS.find(p => p.id === id);
   if (!project) return;
   SELECTED_PROJECT = id;
+  SELECTED_GOAL = null;
+  $('#plan-panel').classList.add('hidden');
   $('#project-heading').textContent = project.name;
   $('#project-description-view').textContent = project.description || 'Описание не задано.';
   $('#project-detail').classList.remove('hidden');
@@ -892,9 +907,70 @@ async function loadProjectGoals(id) {
     if (SELECTED_PROJECT !== id) return;
     $('#project-goals').innerHTML = result.goals.length ? result.goals.map(g =>
       '<div style="border-bottom:1px solid var(--line);padding:12px 0"><span class="pill queued">Черновик</span>' +
-      '<p style="white-space:pre-wrap;margin-top:8px">' + esc(g.text) + '</p></div>'
+      '<p style="white-space:pre-wrap;margin-top:8px">' + esc(g.text) + '</p>' +
+      '<button type="button" class="ghost goal-plan" data-id="' + esc(g.id) + '">Планы цели</button></div>'
     ).join('') : '<p class="muted small">Целей пока нет.</p>';
+    $$('.goal-plan', $('#project-goals')).forEach(b => b.onclick = () => selectGoal(b.dataset.id));
   } catch (e) { if (SELECTED_PROJECT === id) $('#project-goal-msg').textContent = e.message; }
+}
+
+
+async function selectGoal(id) {
+  SELECTED_GOAL = id;
+  $('#plan-panel').classList.remove('hidden');
+  $('#plan-tasks').value = '';
+  $('#plan-detail').textContent = '';
+  $('#plan-msg').textContent = '';
+  delete $('#plan-form').dataset.requestId;
+  await loadPlans(SELECTED_PROJECT, id);
+}
+function planBase(project, goal) {
+  return '/api/v1/projects/' + encodeURIComponent(project) + '/goals/' + encodeURIComponent(goal) + '/plans';
+}
+async function loadPlans(project, goal) {
+  try {
+    const result = await api(planBase(project, goal));
+    if (SELECTED_PROJECT !== project || SELECTED_GOAL !== goal) return;
+    $('#plan-list').innerHTML = result.plans.length ? '<h4>Версии</h4>' + result.plans.map(p =>
+      '<button type="button" class="ghost show-plan" data-id="' + esc(p.id) + '" style="margin:8px 6px 0 0">Версия ' +
+      esc(p.version) + ' · ' + esc({draft:'черновик',approved:'согласован',superseded:'заменён'}[p.state] || p.state) + '</button>'
+    ).join('') : '<p class="muted small">Планов пока нет.</p>';
+    $$('.show-plan', $('#plan-list')).forEach(b => b.onclick = () => showPlan(project, goal, b.dataset.id));
+  } catch (e) { if (SELECTED_PROJECT === project && SELECTED_GOAL === goal) $('#plan-msg').textContent = e.message; }
+}
+async function showPlan(project, goal, id) {
+  try {
+    const path = '/api/v1/projects/' + encodeURIComponent(project) + '/plans/' + encodeURIComponent(id);
+    const plan = (await api(path)).plan;
+    if (SELECTED_PROJECT !== project || SELECTED_GOAL !== goal) return;
+    $('#plan-detail').innerHTML = '<h4 style="margin-top:18px">Задачи плана ' + esc(plan.version) + '</h4>' +
+      plan.tasks.map(t => '<div style="border-bottom:1px solid var(--line);padding:12px 0">' +
+        '<strong>' + esc(t.id) + ' · ' + esc(t.title) + '</strong>' +
+        '<p class="muted small">Зависимости: ' + esc(t.dependencies.join(', ') || 'нет') + '</p>' +
+        '<p class="small">Критерии: ' + esc(t.acceptance.join('; ')) + '</p></div>').join('') +
+      (plan.state === 'draft' ? '<button class="ghost" type="button" id="approve-plan" style="margin-top:12px">Согласовать план</button>' : '');
+    const approve = $('#approve-plan');
+    if (approve) approve.onclick = async () => {
+      approve.disabled = true;
+      try {
+        await api(path + '/approve', {method:'POST', body:'{}'});
+        if (SELECTED_PROJECT !== project || SELECTED_GOAL !== goal) return;
+        $('#plan-msg').textContent = 'План согласован. Исполнение не запущено.';
+        await loadPlans(project, goal);
+        await showPlan(project, goal, id);
+      } catch (e) { if (SELECTED_PROJECT === project && SELECTED_GOAL === goal) $('#plan-msg').textContent = e.message; }
+      finally { approve.disabled = false; }
+    };
+  } catch (e) { if (SELECTED_PROJECT === project && SELECTED_GOAL === goal) $('#plan-msg').textContent = e.message; }
+}
+function parsePlanLines(value) {
+  const lines = value.split(/\r?\n/).filter(line => line.trim());
+  return {tasks:lines.map((line, i) => {
+    const cols = line.split('|').map(s => s.trim());
+    if (cols.length !== 4) throw new Error('Строка ' + (i + 1) + ': нужны четыре поля через |');
+    return {id:cols[0], title:cols[1], dependencies:cols[2] ? cols[2].split(',').map(s => s.trim()) : [],
+      acceptance:cols[3].split(';').map(s => s.trim())};
+  })};
 }
 
 /* --------------------------------------------------------------- refresh */
@@ -974,6 +1050,27 @@ async function boot() {
         await loadProjectGoals(id);
       }
     } catch (err) { if (SELECTED_PROJECT === id) $('#project-goal-msg').textContent = err.message; }
+    finally { button.disabled = false; }
+  };
+  $('#plan-tasks').oninput = () => { delete $('#plan-form').dataset.requestId; };
+  $('#plan-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.currentTarget, project = SELECTED_PROJECT, goal = SELECTED_GOAL;
+    if (!project || !goal) return;
+    const button = $('button[type="submit"]', form);
+    button.disabled = true;
+    try {
+      const payload = parsePlanLines($('#plan-tasks').value);
+      if (!form.dataset.requestId) form.dataset.requestId =
+        (crypto.randomUUID ? crypto.randomUUID() : 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+      const result = await api(planBase(project, goal), {method:'POST',
+        headers:{'Idempotency-Key':form.dataset.requestId}, body:JSON.stringify(payload)});
+      if (SELECTED_PROJECT !== project || SELECTED_GOAL !== goal) return;
+      delete form.dataset.requestId;
+      $('#plan-msg').textContent = 'План сохранён как черновик.';
+      await loadPlans(project, goal);
+      await showPlan(project, goal, result.plan.id);
+    } catch (err) { if (SELECTED_PROJECT === project && SELECTED_GOAL === goal) $('#plan-msg').textContent = err.message; }
     finally { button.disabled = false; }
   };
   $('#dclose').onclick = () => $('#detail').classList.add('hidden');

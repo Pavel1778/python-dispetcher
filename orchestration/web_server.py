@@ -74,6 +74,7 @@ from .cloud_store import (
 )
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
+from .nexus_planning import PlanService
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
 from .web_auth import (
@@ -275,6 +276,7 @@ class App:
                  auth: AuthService | None = None):
         self.store = PostgresStore(dsn)
         self.projects = ProjectService(self.store)
+        self.plans = PlanService(self.store)
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -646,13 +648,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _body(self) -> dict[str, Any]:
+    def _body(self, max_bytes: int | None = None) -> dict[str, Any]:
         n = int(self.headers.get("Content-Length", 0))
+        if n < 0 or (max_bytes is not None and n > max_bytes):
+            raise ValueError("invalid or oversized request body")
         if not n:
             return {}
         try:
             return json.loads(self.rfile.read(n))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             raise ValueError("body is not valid JSON")
 
     def _form(self) -> dict[str, str]:
@@ -732,6 +736,21 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return parts[3], parts[4] if len(parts) == 5 else ""
 
+    @staticmethod
+    def _plan_path(path: str) -> tuple[str, str, str] | None:
+        parts = path.strip("/").split("/")
+        if len(parts) not in (6, 7) or parts[:3] != ["api", "v1", "projects"]:
+            return None
+        if not UUID_RE.fullmatch(parts[3]) or not UUID_RE.fullmatch(parts[5]):
+            return None
+        if len(parts) == 7 and parts[4] == "goals" and parts[6] == "plans":
+            return parts[3], "goal-plans", parts[5]
+        if len(parts) == 6 and parts[4] == "plans":
+            return parts[3], "plan", parts[5]
+        if len(parts) == 7 and parts[4] == "plans" and parts[6] == "approve":
+            return parts[3], "approve", parts[5]
+        return None
+
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -763,6 +782,15 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_read():
                 return
 
+            plan_path = self._plan_path(path)
+            if plan_path:
+                project_id, kind, item_id = plan_path
+                principal = self._project_principal()
+                if kind == "goal-plans":
+                    return self._json(200, {"plans": self.app.plans.list(principal, project_id, item_id)})
+                if kind == "plan":
+                    return self._json(200, {"plan": self.app.plans.get(principal, project_id, item_id)})
+                return self._json(404, {"error": "not found"})
             if path == "/api/v1/projects":
                 return self._json(200, {"projects": self.app.projects.list(self._project_principal())})
             if path.startswith("/api/v1/projects/"):
@@ -890,11 +918,23 @@ class Handler(BaseHTTPRequestHandler):
             # --- writes ---
             if not self._require_write():
                 return
-            body = self._body()
+            body = self._body(max_bytes=4 * 1024 * 1024 if path.startswith("/api/v1/projects") else None)
             if path == "/api/v1/projects" or path.startswith("/api/v1/projects/"):
                 if not isinstance(body, dict):
                     return self._json(400, {"error": "body must be a JSON object"})
                 principal = self._project_principal()
+                plan_path = self._plan_path(path)
+                if plan_path:
+                    project_id, kind, item_id = plan_path
+                    if kind == "goal-plans":
+                        plan, created = self.app.plans.create(principal, project_id, item_id, body,
+                                                               self.headers.get("Idempotency-Key"))
+                        return self._json(201 if created else 200, {"plan": plan, "created": created})
+                    if kind == "approve":
+                        if body:
+                            return self._json(400, {"error": "approval body must be empty"})
+                        return self._json(200, {"plan": self.app.plans.approve(principal, project_id, item_id)})
+                    return self._json(404, {"error": "not found"})
                 if path == "/api/v1/projects":
                     project = self.app.projects.create(principal, body.get("name"), body.get("description", ""))
                     return self._json(201, {"project": project})
@@ -1004,7 +1044,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed = self._project_path(path)
             if parsed is None or parsed[1]:
                 return self._json(404, {"error": "not found"})
-            body = self._body()
+            body = self._body(max_bytes=4 * 1024 * 1024)
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
             project = self.app.projects.update(self._project_principal(), parsed[0], body)

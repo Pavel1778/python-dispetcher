@@ -405,3 +405,22 @@ def test_claim_of_a_busy_workspace_by_id_is_refused(store, cloud, dispatcher):
     store.claim_task("w1", task_id=a.id)
     with pytest.raises(InvalidTransition):
         store.claim_task("w2", task_id=b.id)
+
+
+def test_queue_scans_past_unmet_dependencies_and_approval(store):
+    """A waiting high-priority task must not starve independent work."""
+    from orchestration.cloud_store import InvalidTransition
+
+    prerequisite = store.submit_task("prerequisite", priority=-1)
+    blocked = store.submit_task("waiting", priority=100, dependencies=[prerequisite.id])
+    approval = store.submit_task("approval", priority=90, requires_approval=True)
+    independent = store.submit_task("independent", priority=1)
+    with pytest.raises(InvalidTransition, match="unmet dependencies"):
+        store.claim_task("worker", task_id=blocked.id)
+    with pytest.raises(InvalidTransition, match="approval required"):
+        store.claim_task("worker", task_id=approval.id)
+    assert store.claim_task("worker").id == independent.id
+    assert store.get_task(blocked.id).state == TaskState.QUEUED
+    assert store.get_task(approval.id).state == TaskState.QUEUED
+    assert store.claim_task("worker").id == prerequisite.id
+    assert store.claim_task("worker") is None

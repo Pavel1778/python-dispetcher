@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to a d
 def store():
     instance = PostgresStore(DSN)
     with instance._tx() as cur:
-        cur.execute("TRUNCATE nexus_project_events, nexus_goals, nexus_project_members, nexus_projects RESTART IDENTITY")
+        cur.execute("TRUNCATE nexus_plan_dependencies, nexus_plan_tasks, nexus_plans, nexus_project_events, nexus_goals, nexus_project_members, nexus_projects RESTART IDENTITY")
     yield instance
     instance.close()
 
