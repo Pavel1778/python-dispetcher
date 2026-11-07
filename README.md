@@ -30,3 +30,10 @@ python3 tests/e2e_cloud_sr_jr.py         # real Sr→Jr on OpenHands Cloud
 
 The end-to-end scripts are not collected by pytest; they need a live LLM (and,
 for the Cloud one, `OPENHANDS_API_KEY` and `OPENHANDS_DEFAULT_MODEL`).
+
+## NEXUS roadmap
+
+The proposed NEXUS architecture, current-code audit and migration/acceptance
+plan are in [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md). The specification is a
+**draft** pending the second audit; the existing dispatcher is not yet NEXUS
+and its completed tasks are not independently verified QA evidence.
