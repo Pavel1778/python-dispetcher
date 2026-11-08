@@ -407,3 +407,43 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
     duplicate-Sr reproduction and the full one-workflow->one-Sr->one-Jr
     acceptance chain).
 
+
+## Branch topology and the unmerged nexus branch
+
+- `main` is the integration branch and is green: `ruff check .` passes and the
+  full pytest suite passes against a disposable PostgreSQL (`TEST_SUPABASE_DB_URL`).
+  Verified 2026-11-08: `main` 382 passed / 1 skipped; the nexus branch 445 passed
+  / 1 skipped.
+- All five `arena/*` branches are already merged into `main` through PRs #13–#18
+  (`arena/06dcb2d2` docs+NEXUS spec, `arena/22525405` NEXUS projects/goals,
+  `arena/1d4f42a1` versioned DAG plans, `arena/5a479709` installable PWA,
+  `arena/60148d7e` project file uploads + GitHub confirmation). Their tips are
+  ancestors of `main`, so there is nothing left to merge from them.
+- **`nexus/laboratory-files-github` is deliberately not merged.** It is not a
+  fast-forward and not a clean merge: it and `main` implement the *same* feature
+  twice, so a merge is a design choice, not a conflict resolution.
+  - Both add `migrations/0011_*` with an **incompatible** `nexus_files` table
+    (`main`: `name/size integer/sha256/content bytea/created_by`, 5 MiB cap;
+    nexus: `filename/content_type/size bigint/sha256/data bytea/is_archive/
+    uploaded_by`, 32 MiB cap) and both add `nexus_workspaces`/`nexus_workspace_files`
+    on the nexus side. Applying both files would collide on the table name.
+  - Both add a file service (`main` `nexus_files.py` FileService; nexus
+    `file_lab.py` FileLabService) and both wire routes into `web_server.py`
+    (main: `/api/github/prepare|confirm` + `GITHUB_ENABLE_WRITES`; nexus:
+    `GitHubWriter`, `/api/v1/projects/{id}/github/*`, `nexus_actions.py`
+    confirmation handshake).
+  - Merge conflicts: `.env.example`, `AGENTS.md`, `README.md`,
+    `orchestration/github_client.py`, `orchestration/web_server.py`,
+    `orchestration/web_ui.py`, `tests/test_nexus_projects.py`.
+  - The nexus branch is the superset in scope (archive safety with Zip-Slip/bomb
+    rejection, development workspaces, voice notes, multipart parsing, a
+    two-step action confirmation handshake, extra GitHub reads). `main`'s
+    version is smaller and adds a GitHub `GITHUB_ENABLE_WRITES` gate instead.
+  - Do **not** merge it by blindly taking one side: choosing nexus drops main's
+    `github_confirmations.py`, `nexus_files.py`, `0011_nexus_files.sql` and their
+    three test files; choosing main drops the whole nexus laboratory. The safe
+    path is to pick nexus as the base (it is the broader implementation), then
+    port any main-only behaviour and its tests, and renumber the migration.
+    Confirm the choice with the operator before merging.
+- `tools/delete_cloud_sessions.py` and `tools/classify_cloud_sessions.py` are
+  the only guarded Cloud-conversation deletion paths; keep them CLI-only.

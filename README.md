@@ -19,11 +19,34 @@ Cloud transport provisions a sandbox and drives its agent-server directly
 `AGENTS.md` for the repository layout, and `CLOUD-INTEGRATION-MAP.md` for the
 Cloud API surface.
 
+## Repository status
+
+`main` is the integration branch and is green: `ruff check .` passes and the
+full pytest suite passes against a disposable PostgreSQL. Every `arena/*` branch
+has already been merged into `main` (PRs #13–#18).
+
+One branch is **not** merged: `nexus/laboratory-files-github`. It is not
+mergeable as-is, because it and `main` implement the **same** feature twice and
+the two implementations collide (both add `migrations/0011_*` with an
+incompatible `nexus_files` table, both add a file-lab module and service, and
+both add `GitHub` routes). Each side is internally green on its own, but a merge
+would have to choose one implementation and port the other's tests. Until that
+is done, the branch stays out of `main`. Details and the decision are recorded in
+[AGENTS.md](AGENTS.md) ("Branch topology and the unmerged nexus branch").
+
 ## Local development
 
 ```bash
-export SUPABASE_DB_URL="postgresql://postgres@127.0.0.1:5432/ohp_test"
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+
+# The pytest suite reads TEST_SUPABASE_DB_URL (NOT SUPABASE_DB_URL) and skips
+# the DB-backed modules cleanly when it is unset. Use a disposable database.
+export TEST_SUPABASE_DB_URL="postgresql://postgres@127.0.0.1:5432/ohp_test"
 python3 -m pytest -q                     # unit + integration (needs PostgreSQL)
+
+# The end-to-end scripts read SUPABASE_DB_URL and are not collected by pytest.
+export SUPABASE_DB_URL="postgresql://postgres@127.0.0.1:5432/ohp_test"
 python3 tests/e2e_local_sr_jr.py         # real Sr→Jr on a local agent-server
 python3 tests/e2e_cloud_sr_jr.py         # real Sr→Jr on OpenHands Cloud
 ```

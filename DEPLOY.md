@@ -126,6 +126,10 @@ Read from the source, not assumed. Names must match exactly.
 | `LOGIN_MAX_ATTEMPTS_GLOBAL` | no | `web_server.py` | In-memory endpoint-wide login ceiling per minute, independent of the client IP. Default `120`. |
 | `APP_VERSION` / `RENDER_GIT_COMMIT` | no | `web_server.py` | Shown on the System screen. |
 | `TEST_SUPABASE_DB_URL` | tests only | `tests/` | DSN for the test suite. |
+| `GITHUB_API_URL` | no | `github_client.py` | Override the GitHub REST base URL (default `https://api.github.com`). Must be `http(s)` with a host and no embedded credentials, or construction raises. |
+| `LOCAL_AGENT_SERVER_URL` | dev only | `local_runtime.py` | Base URL of a local agent-server for the local end-to-end scripts. Default `http://127.0.0.1:60000`. |
+| `OHP_LOCAL_LLM_MODEL` | dev only | `local_runtime.py` | Model the local runtime asks the local agent-server to use. |
+| `SESSION_API_KEY` | dev only | `openhands_client.py` | Session key for the local agent-server adapter. Not used by the Cloud transports. |
 
 The server **refuses to bind `0.0.0.0`** unless `WEB_AUTH_TOKEN` is set **and**
 the three `AUTH_*` variables are present, so a public deploy can never come up
