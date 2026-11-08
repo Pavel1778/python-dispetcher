@@ -1,5 +1,11 @@
 # Cloud integration map: Sr/Jr dispatcher ↔ OpenHands Cloud V1
 
+> Historical observations below are not a current production verification. In
+> particular the default `direct` transport does not establish that a requested
+> repository/branch was selected, global sandbox reuse is not project-scoped,
+> and workspace claim checks can race across processes. A nonempty result is
+> not independent QA evidence. See [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md).
+
 Every fact below was read from the live OpenAPI document at
 `https://app.all-hands.dev/openapi.json` and confirmed by making real calls,
 not inferred from other versions' docs. Facts that cost a real request to learn

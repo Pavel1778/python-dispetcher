@@ -86,3 +86,11 @@ dispatch work. See [docs/NEXUS-OPERATIONS.md](docs/NEXUS-OPERATIONS.md) for
 API contracts, UI usage, security limits, testing, and deployment precautions.
 Migration `0010_nexus_plans.sql` is automatically applied on startup unless
 `AUTO_MIGRATE=false`; review and back up the target database before deployment.
+
+## Лаборатория разработки: доступные функции
+
+Проектные текстовые цели, ограниченный голосовой ввод в браузере, безопасное
+хранение вложений и GitHub-интеграция с ручным подтверждением описаны в
+[docs/DEVELOPMENT-LAB.md](docs/DEVELOPMENT-LAB.md). Это инкремент, а не полная
+автономная лаборатория: загруженные файлы пока не передаются агентам, проектные
+планы не исполняются, независимая QA и безопасные рабочие пространства не готовы.

@@ -1,8 +1,9 @@
 # Deployment and migrations
 
 This document is the explicit, reproducible procedure for deploying the
-dispatcher and for applying database migrations. The application never applies
-migrations itself; a human or a release step must.
+dispatcher and for applying database migrations. By default the application
+automatically applies migrations at startup; set `AUTO_MIGRATE=false` to manage
+them out of band. Review and back up the database before deployment.
 
 ## What the service is
 
@@ -113,7 +114,8 @@ Read from the source, not assumed. Names must match exactly.
 | `AUTH_PASSWORD_HASH` | yes | `web_auth.py` | PBKDF2 hash of the owner password. |
 | `AUTH_SESSION_SECRET` | yes | `web_auth.py` | Separate secret that signs sessions. |
 | `WEB_AUTH_TOKEN` | yes | `web_server.py` | Bearer token for the machine API. |
-| `GITHUB_TOKEN` | no | `github_client.py` | Read-only GitHub token used to discover repositories for the allowlist. Unset → repositories must be added by hand. Never returned by the API or the UI. |
+| `GITHUB_TOKEN` | no | `github_client.py` | Server-side GitHub token for repository discovery; if write access is separately enabled, its GitHub permissions also bound confirmed writes. Never returned by the API or UI. |
+| `GITHUB_ENABLE_WRITES` | no | `web_server.py` | Default false. Enables the session-only, CSRF-protected, two-step GitHub repository actions; see [docs/DEVELOPMENT-LAB.md](docs/DEVELOPMENT-LAB.md). |
 | `OPENHANDS_CLOUD_URL` | no | `cloud_client.py` | Override for a self-hosted Cloud. Default `https://app.all-hands.dev`. Must be `http(s)`: any other scheme is refused at startup. |
 | `OPENHANDS_TRANSPORT` | no | `cloud_direct.py` | `direct` (default) provisions a sandbox and drives its agent-server; `app` uses the legacy app-conversation endpoint. See "Cloud transport" below. |
 | `OPENHANDS_DEFAULT_MODEL` | no | `cloud_direct.py` | Model forced on every sandbox conversation. Set it when a bare sandbox's default model has no key. |
@@ -288,6 +290,10 @@ psql "$SUPABASE_DB_URL" -f migrations/0004_auth.sql
 psql "$SUPABASE_DB_URL" -f migrations/0005_sr_start_retry.sql
 psql "$SUPABASE_DB_URL" -f migrations/0006_workflow_idempotency.sql
 psql "$SUPABASE_DB_URL" -f migrations/0007_cloud_direct.sql
+psql "$SUPABASE_DB_URL" -f migrations/0008_sr_lifecycle.sql
+psql "$SUPABASE_DB_URL" -f migrations/0009_nexus_projects.sql
+psql "$SUPABASE_DB_URL" -f migrations/0010_nexus_plans.sql
+psql "$SUPABASE_DB_URL" -f migrations/0011_nexus_files.sql
 ```
 
 Do not run migrations against production without authorization. Applying them on
@@ -334,8 +340,8 @@ table is missing, printing the names:
 database is missing tables (apply migrations/): sessions, login_attempts
 ```
 
-This turns a forgotten migration into one clear message at boot instead of a
-failed request later.
+This checks the legacy core tables and columns only, not every NEXUS table or
+column. Verify migrations 0009–0011 separately before enabling these features.
 
 ## Render
 
@@ -366,7 +372,10 @@ conversation on that sandbox's agent-server with the sandbox's own
 **`app` (legacy).** `POST /api/v1/app-conversations`, which provisions a sandbox
 *and* creates the conversation for you, as a two-phase start task.
 
-Use `direct` unless you have a reason not to. The `app` endpoint can fail with
+**Caution:** `direct` currently does not honor `selected_repository` and
+`selected_branch` as a verified workspace; do not rely on repository-scoped
+execution with this transport. Global sandbox reuse also lacks project scoping.
+See [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md). The `app` endpoint can fail with
 `HTTP 500` on the live service when it asks a just-provisioned sandbox to create
 a conversation: the start task reaches `STARTING_CONVERSATION` and then errors,
 and a start without an initial message is `READY` but `send-message` returns
@@ -410,9 +419,10 @@ curl -X POST -H "Authorization: Bearer $WEB_AUTH_TOKEN" \
 
 What the token needs and how it is handled:
 
-* Scope: read access to repositories (`repo` for private repositories, or
-  `public_repo` for public only). The dispatcher never writes to GitHub.
-* The token is read from the environment on each call, sent as a bearer header,
+* For discovery, grant only repository read access. Optional confirmed create/
+  visibility operations require additional GitHub permissions and explicit
+  `GITHUB_ENABLE_WRITES=true`; see [docs/DEVELOPMENT-LAB.md](docs/DEVELOPMENT-LAB.md).
+* The token is read from the environment when the client is constructed, sent as a bearer header,
   and is **never** logged, returned by the API, or written to the database.
   `GET /api/system` and `GET /api/capabilities` report only whether it is set.
 * Archived repositories are skipped: they are read-only on GitHub, so a task
@@ -471,16 +481,15 @@ How each behaves, and why:
   in a state with no route back to `queued` is refused with a `409` rather than
   forced.
 
-### One task per repository and branch at a time
+### Repository and branch contention check
 
-A Jr task holds its workspace (`selected_repository` + `selected_branch`) from
-the moment it is claimed until it reaches a terminal state. While it does, the
-dispatcher will not claim another task for the same repository and branch; the
-second task waits its turn in the queue. Two conversations editing one checkout
-would overwrite each other's commits, and the loser's work would disappear with
-no error.
+The dispatcher checks whether an active task names the same repository and
+branch before claiming a queued task. Two conversations editing one checkout
+can overwrite each other's commits, so this check must not be treated as a
+complete isolation guarantee:
 
-The lock is per **branch**, so work on `main` and work on `dev` in the same
-repository still run in parallel. A task with no repository is analysis-only and
-never takes a lock. The check runs inside the claiming transaction, so it cannot
-go stale between the check and the claim.
+The existing check is per branch and runs in the claiming transaction, but it
+does **not** serialize concurrent claims of different rows for one workspace.
+Do not rely on it as a cross-process lock. The default direct transport also
+does not establish that the requested repository/branch was actually selected.
+See [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md); use caution until fixed and tested.

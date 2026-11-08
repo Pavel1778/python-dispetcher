@@ -34,6 +34,9 @@ node --check orchestration/pwa/service-worker.js
 тот же сайт; для активации нового воркера может потребоваться закрыть старые
 вкладки приложения.
 
+О возможностях и ограничениях диктовки, файлов и GitHub см.
+[DEVELOPMENT-LAB.md](DEVELOPMENT-LAB.md).
+
 ## Не готово к полному релизу
 
 - Нативные Windows/Tauri и Debian пакеты, Android APK/AAB и Rust CLI не
