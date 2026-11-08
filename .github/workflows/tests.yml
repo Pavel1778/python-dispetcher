@@ -36,8 +36,12 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # Matches the PYTHON_VERSION set for the Render service in render.yaml.
-          python-version: "3.12.6"
+          # 3.12.x, not the exact patch. The runner image no longer ships
+          # 3.12.6 (it reported "The version '3.12.6' ... was not found for
+          # Ubuntu 26.04"), and a patch pin buys nothing here: the code targets
+          # >=3.10 and has no patch-level dependency. render.yaml keeps its own
+          # exact PYTHON_VERSION for the deployed service.
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
