@@ -127,6 +127,38 @@ def test_page_is_served(http):
     assert "/static/app.js" in text
 
 
+def test_page_has_the_lab_and_github_tabs(http):
+    st, text = http.get_text("/")
+    assert st == 200
+    # Every button in the UI must target a real element; these ids are what the
+    # new panels and their handlers rely on.
+    for marker in ('id="tab-lab"', 'id="panel-lab"', 'id="tab-github"',
+                   'id="panel-github"', 'id="upload-form"', 'id="rec-start"',
+                   'id="gh-create-form"', 'id="gh-confirm-card"'):
+        assert marker in text, marker
+
+
+def test_client_script_contains_the_new_capabilities(http):
+    st, text = http.get_text("/static/app.js")
+    assert st == 200
+    for fn in ("initLab", "initGithub", "loadFiles", "startRecording",
+               "proposeCreate", "showConfirm", "uploadFile"):
+        assert fn in text, fn
+
+
+def test_static_assets_never_embed_a_secret_value(server, monkeypatch):
+    # A secret *value* must never be served to the browser. Env var *names*
+    # (e.g. GITHUB_TOKEN shown in an operator hint) are fine; values are not.
+    monkeypatch.setenv("OPENHANDS_API_KEY", "sk-super-secret-value")
+    monkeypatch.setenv("WEB_AUTH_TOKEN", "machine-token")
+    client = Client(f"http://127.0.0.1:{server.port}", token="test-token")
+    for path in ("/", "/static/app.js", "/static/app.css", "/login"):
+        st, text = client.get_text(path)
+        assert st == 200
+        assert "sk-super-secret-value" not in text
+        assert "test-key" not in text
+
+
 def _get_with_headers(base: str, path: str, token: str | None = None):
     req = urllib.request.Request(base + path)
     if token:

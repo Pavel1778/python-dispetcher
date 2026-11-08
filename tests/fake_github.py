@@ -1,11 +1,14 @@
 """A real local HTTP server that speaks the GitHub REST surface we consume.
 
-Tests drive :class:`orchestration.github_client.GitHubClient` over real sockets
-against this server, so the client's request building, auth header, pagination
-and error mapping are all exercised for real. It is not a mock of the client.
+Tests drive :class:`orchestration.github_client.GitHubClient` (and the guarded
+:class:`orchestration.github_client.GitHubWriter`) over real sockets against this
+server, so the client's request building, auth header, pagination, error mapping
+and write bodies are all exercised for real. It is not a mock of the client.
 
-Only ``GET /user/repos`` is implemented: the dispatcher reads repositories and
-writes nothing to GitHub.
+Discovery reads ``GET /user/repos``; the detail views add ``branches``,
+``commits``, ``issues`` and ``pulls``; the guarded writes are ``POST
+/user/repos`` and ``PATCH /repos/{owner}/{name}``. Every write is recorded in
+``gh.writes`` so a test can prove an unconfirmed action never reached GitHub.
 """
 
 from __future__ import annotations
@@ -37,6 +40,29 @@ class FakeGitHub:
         self.paths: list[str] = []
         #: Page size used to emulate pagination; 0 disables paging.
         self.page_size = 0
+        #: Every write the fake received, as ``(method, path, body)``.
+        self.writes: list[tuple[str, str, dict]] = []
+        #: Extra read payloads keyed by path suffix, for the detail endpoints.
+        self.branches: list[dict] = [
+            {"name": "main", "commit": {"sha": "abc123"}, "protected": True},
+            {"name": "dev", "commit": {"sha": "def456"}, "protected": False},
+        ]
+        self.commits: list[dict] = [
+            {"sha": "abc123", "commit": {"message": "Initial commit\n\nbody",
+                                         "author": {"name": "Pavel", "date": "2026-01-03T00:00:00Z"}}},
+        ]
+        self.issues: list[dict] = [
+            {"number": 1, "title": "Bug", "state": "open",
+             "user": {"login": "Pavel"}, "created_at": "2026-01-01T00:00:00Z"},
+            {"number": 2, "title": "A pull request", "state": "open",
+             "user": {"login": "Pavel"}, "created_at": "2026-01-01T00:00:00Z",
+             "pull_request": {"url": "x"}},
+        ]
+        self.pulls: list[dict] = [
+            {"number": 3, "title": "Feature", "state": "open",
+             "user": {"login": "Pavel"}, "head": {"ref": "feature"},
+             "base": {"ref": "main"}, "created_at": "2026-01-02T00:00:00Z"},
+        ]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -62,17 +88,96 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if parsed.path != "/user/repos":
-            self._json(404, {"message": "Not Found"})
+        if parsed.path == "/user/repos":
+            query = urllib.parse.parse_qs(parsed.query)
+            page = int((query.get("page") or ["1"])[0])
+            per_page = int((query.get("per_page") or ["100"])[0])
+            if gh.page_size:
+                per_page = gh.page_size
+            start = (page - 1) * per_page
+            self._json(200, gh.repos[start:start + per_page])
             return
 
-        query = urllib.parse.parse_qs(parsed.query)
-        page = int((query.get("page") or ["1"])[0])
-        per_page = int((query.get("per_page") or ["100"])[0])
-        if gh.page_size:
-            per_page = gh.page_size
-        start = (page - 1) * per_page
-        self._json(200, gh.repos[start:start + per_page])
+        # /repos/{owner}/{name}[/section]
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 3 and parts[0] == "repos":
+            full_name = f"{parts[1]}/{parts[2]}"
+            repo = next((r for r in gh.repos if r["full_name"] == full_name), None)
+            if repo is None:
+                self._json(404, {"message": "Not Found"})
+                return
+            if len(parts) == 3:
+                self._json(200, {**repo, "html_url": f"https://github.com/{full_name}"})
+                return
+            section = parts[3]
+            if section == "branches":
+                self._json(200, gh.branches)
+                return
+            if section == "commits":
+                self._json(200, gh.commits)
+                return
+            if section == "issues":
+                self._json(200, gh.issues)
+                return
+            if section == "pulls":
+                self._json(200, gh.pulls)
+                return
+        self._json(404, {"message": "Not Found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        gh: FakeGitHub = self.server.gh  # type: ignore[attr-defined]
+        parsed = urllib.parse.urlparse(self.path)
+        body = self._read_body()
+        gh.writes.append(("POST", parsed.path, body))
+        gh.auth_headers.append(self.headers.get("Authorization"))
+        if gh.force_status:
+            self._json(gh.force_status, {"message": "forced"})
+            return
+        if parsed.path == "/user/repos":
+            name = body.get("name")
+            owner = "Pavel1778"
+            full = f"{owner}/{name}"
+            if any(r["full_name"] == full for r in gh.repos):
+                self._json(422, {"message": "name already exists"})
+                return
+            repo = {"full_name": full, "default_branch": "main",
+                    "private": bool(body.get("private")), "archived": False,
+                    "pushed_at": None, "html_url": f"https://github.com/{full}"}
+            gh.repos.append(repo)
+            self._json(201, repo)
+            return
+        self._json(404, {"message": "Not Found"})
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        gh: FakeGitHub = self.server.gh  # type: ignore[attr-defined]
+        parsed = urllib.parse.urlparse(self.path)
+        body = self._read_body()
+        gh.writes.append(("PATCH", parsed.path, body))
+        gh.auth_headers.append(self.headers.get("Authorization"))
+        if gh.force_status:
+            self._json(gh.force_status, {"message": "forced"})
+            return
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) == 3 and parts[0] == "repos":
+            full = f"{parts[1]}/{parts[2]}"
+            repo = next((r for r in gh.repos if r["full_name"] == full), None)
+            if repo is None:
+                self._json(404, {"message": "Not Found"})
+                return
+            if "private" in body:
+                repo["private"] = bool(body["private"])
+            self._json(200, {**repo, "html_url": f"https://github.com/{full}"})
+            return
+        self._json(404, {"message": "Not Found"})
+
+    def _read_body(self) -> dict:
+        n = int(self.headers.get("Content-Length", 0))
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
 
     def _json(self, code: int, payload) -> None:
         body = json.dumps(payload).encode()

@@ -73,11 +73,22 @@ from .cloud_store import (
     PostgresStore,
     StoreError,
 )
-from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
+from .file_lab import FileLabService, max_upload_bytes
+from .github_client import (
+    GitHubAuthError,
+    GitHubClient,
+    GitHubError,
+    GitHubUnavailable,
+    GitHubWriter,
+    VisibilityError,
+)
+from .multipart import MultipartError, parse_multipart
+from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
+from .voice import VoiceNoteService
 from .web_auth import (
     CSRF_HEADER,
     SESSION_COOKIE,
@@ -291,6 +302,11 @@ class App:
         self.store = PostgresStore(dsn)
         self.projects = ProjectService(self.store)
         self.plans = PlanService(self.store)
+        # File laboratory, development workspaces, voice notes and guarded
+        # actions. All project-scoped; none starts an agent.
+        self.files = FileLabService(self.store)
+        self.voice = VoiceNoteService(self.store)
+        self.actions = PendingActions(self.store)
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -298,6 +314,10 @@ class App:
         # Repository discovery for the allowlist. Reads GITHUB_TOKEN; the value
         # is never exposed through the API or the UI, only its presence.
         self.github = GitHubClient()
+        # The guarded write path. Kept separate from ``self.github`` so nothing
+        # that only needs to read can reach a write, and every call happens
+        # inside a confirmed-action handler (see ``_github_*`` routes).
+        self.github_writer = GitHubWriter(self.github)
         # Bearer token for the machine API. Without one, only read-only requests
         # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
         # stranger to start Cloud conversations. ``None`` means "not set".
@@ -666,6 +686,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    @staticmethod
+    def _content_disposition(filename: str) -> str:
+        """A safe ``Content-Disposition`` value for an arbitrary filename.
+
+        The filename is attacker-controlled, so it is reduced to a conservative
+        ASCII token for ``filename=`` and also offered as ``filename*`` UTF-8,
+        which every current browser prefers. Quoting and dropping path
+        separators/control characters prevents a header-injection or a path hint
+        from reaching the client.
+        """
+        base = (filename or "download").replace("\\", "/").rsplit("/", 1)[-1]
+        ascii_name = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_"
+                             for c in base) or "download"
+        from urllib.parse import quote
+
+        return (f"attachment; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{quote(base)}")
+
+    def _attachment(self, code: int, body: bytes, content_type: str,
+                    filename: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Disposition", self._content_disposition(filename))
+        # Uploaded content is untrusted; never let a browser cache or sniff it.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _body(self, max_bytes: int | None = None) -> dict[str, Any]:
         n = int(self.headers.get("Content-Length", 0))
         if n < 0 or (max_bytes is not None and n > max_bytes):
@@ -676,6 +726,24 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(n))
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise ValueError("body is not valid JSON")
+
+    def _raw_body(self, max_bytes: int) -> bytes:
+        """Read the request body as raw bytes, capped at *max_bytes*.
+
+        Uploads are not JSON, so they cannot go through :meth:`_body`. The cap
+        is enforced against ``Content-Length`` *before* reading, so an oversized
+        upload is rejected without buffering it.
+        """
+        raw_len = self.headers.get("Content-Length", "")
+        try:
+            n = int(raw_len)
+        except (TypeError, ValueError):
+            raise ValueError("missing or invalid Content-Length")
+        if n < 0:
+            raise ValueError("invalid Content-Length")
+        if n > max_bytes:
+            raise ValueError(f"upload exceeds the {max_bytes} byte limit")
+        return self.rfile.read(n) if n else b""
 
     def _form(self) -> dict[str, str]:
         n = int(self.headers.get("Content-Length", 0))
@@ -755,6 +823,317 @@ class Handler(BaseHTTPRequestHandler):
         return parts[3], parts[4] if len(parts) == 5 else ""
 
     @staticmethod
+    def _project_subpath(path: str) -> tuple[str, list[str]] | None:
+        """Split a ``/api/v1/projects/{id}/...`` path into (project_id, rest).
+
+        Unlike :meth:`_project_path` this keeps every trailing segment, so the
+        file-lab, workspace, voice and action routes can dispatch on ``rest``.
+        The project id is validated as a UUID before any query runs, so a
+        malformed id is a 404 rather than a database error.
+        """
+        parts = path.strip("/").split("/")
+        if len(parts) < 4 or parts[:3] != ["api", "v1", "projects"]:
+            return None
+        if not UUID_RE.fullmatch(parts[3]):
+            return None
+        return parts[3], parts[4:]
+
+    def _get_project_resource(self, path: str, project_id: str, principal: str):
+        """Dispatch the deeper project GET routes, or ``None`` if unmatched.
+
+        Returns an HTTP response tuple ``(status, payload, raw)`` where ``raw``
+        is ``(bytes, content_type)`` for a file download, or ``None`` when the
+        payload is JSON. Keeping the raw case explicit avoids base64-inflating a
+        binary file just to send it.
+        """
+        parsed = self._project_subpath(path)
+        if parsed is None:
+            return None
+        _, rest = parsed
+        files = self.app.files
+        # GET /api/v1/projects/{id}/files
+        if rest == ["files"]:
+            return (200, {"files": files.list_files(principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/files/{file_id}
+        if len(rest) == 2 and rest[0] == "files" and UUID_RE.fullmatch(rest[1]):
+            return (200, {"file": files.preview(principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/files/{file_id}/download
+        if (len(rest) == 3 and rest[0] == "files" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "download"):
+            row = files.get_file(principal, project_id, rest[1])
+            return (200, None, (bytes(row["data"]), row["content_type"],
+                                row["filename"]))
+        # GET /api/v1/projects/{id}/workspaces
+        if rest == ["workspaces"]:
+            return (200, {"workspaces": files.list_workspaces(principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/workspaces/{ws}
+        if len(rest) == 2 and rest[0] == "workspaces" and UUID_RE.fullmatch(rest[1]):
+            return (200, {"files": files.list_workspace_files(principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/workspaces/{ws}/diff
+        if (len(rest) == 3 and rest[0] == "workspaces" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "diff"):
+            return (200, {"diff": files.workspace_diff(principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/workspaces/{ws}/files/{path...}
+        if len(rest) >= 4 and rest[0] == "workspaces" and UUID_RE.fullmatch(rest[1]) \
+                and rest[2] == "files":
+            rel = "/".join(rest[3:])
+            return (200, {"file": files.get_workspace_file(principal, project_id, rest[1], rel)}, None)
+        # GET /api/v1/projects/{id}/voice
+        if rest == ["voice"]:
+            return (200, {"voice_notes": self.app.voice.list_notes(principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/voice/{note_id}/audio
+        if (len(rest) == 3 and rest[0] == "voice" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "audio"):
+            row = self.app.voice.get_audio(principal, project_id, rest[1])
+            return (200, None, (bytes(row["data"]), row["content_type"], "audio.webm"))
+        # GET /api/v1/projects/{id}/actions
+        if rest == ["actions"]:
+            # Pending actions are actor-scoped, but the route names a project;
+            # require membership so a foreign project id is a 404 rather than a
+            # window into another user's proposals.
+            try:
+                self.app.projects.get(principal, project_id)
+            except NotFound:
+                return None
+            return (200, {"actions": self.app.actions.list_pending(principal)}, None)
+        # GET /api/v1/projects/{id}/actions/{action_id}
+        if len(rest) == 2 and rest[0] == "actions" and UUID_RE.fullmatch(rest[1]):
+            return (200, {"action": self.app.actions.get(principal, rest[1])}, None)
+        # GET /api/v1/projects/{id}/github/repositories[/{owner}/{name}[/section]]
+        if rest and rest[0] == "github" and len(rest) >= 2 and rest[1] == "repositories":
+            # The GitHub views read no project data, but the route still names a
+            # project, so membership is verified: a foreign project id must not
+            # become a way to probe the account's repositories.
+            try:
+                self.app.projects.get(principal, project_id)
+            except NotFound:
+                return None
+            return self._get_github(principal, rest)
+        return None
+
+    def _get_github(self, principal: str, rest: list[str]):
+        """Read-only GitHub views. Never writes and never returns the token."""
+        try:
+            if len(rest) == 2:
+                repos = self.app.github.list_repositories()
+                return (200, {"repositories": [r.as_dict() for r in repos],
+                              "count": len(repos)}, None)
+            if len(rest) >= 4:
+                full_name = f"{rest[2]}/{rest[3]}"
+                if len(rest) == 4:
+                    return (200, {"repository": self.app.github.get_repository(full_name)}, None)
+                section = rest[4]
+                if section == "branches":
+                    return (200, {"branches": self.app.github.list_branches(full_name)}, None)
+                if section == "commits":
+                    return (200, {"commits": self.app.github.list_commits(full_name)}, None)
+                if section == "issues":
+                    return (200, {"issues": self.app.github.list_issues(full_name)}, None)
+                if section == "pulls":
+                    return (200, {"pulls": self.app.github.list_pulls(full_name)}, None)
+        except GitHubAuthError as e:
+            return (400, {"error": f"github auth: {e}"}, None)
+        except GitHubUnavailable as e:
+            return (503, {"error": f"github unavailable: {e}"}, None)
+        except GitHubError as e:
+            return (502, {"error": f"github: {e}"}, None)
+        return None
+
+    def _post_project_resource(self, path: str, principal: str, body: dict) -> bool:
+        """Dispatch the deeper project POST routes.
+
+        Returns ``True`` when a route matched and its response was written, or
+        ``False`` when nothing matched. ``_json`` itself returns ``None``, so the
+        two are kept separate: treating ``_json``'s return value as the "handled"
+        signal made every POST fall through to a 404 after already sending a 201.
+        """
+        parsed = self._project_subpath(path)
+        if parsed is None:
+            return False
+        project_id, rest = parsed
+        files = self.app.files
+        # POST /api/v1/projects/{id}/workspaces/from-file
+        if rest == ["workspaces", "from-file"]:
+            file_id = body.get("file_id")
+            if not isinstance(file_id, str) or not UUID_RE.fullmatch(file_id):
+                self._json(400, {"error": "file_id must be a uuid"})
+                return True
+            workspace = files.extract_into_workspace(
+                principal, project_id, name=body.get("name"), file_id=file_id)
+            self._json(201, {"workspace": workspace})
+            return True
+        # POST /api/v1/projects/{id}/workspaces
+        if rest == ["workspaces"]:
+            self._json(201, {"workspace": files.create_workspace(
+                principal, project_id, name=body.get("name"))})
+            return True
+        # POST /api/v1/projects/{id}/workspaces/{ws}/files
+        if (len(rest) == 3 and rest[0] == "workspaces" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "files"):
+            self._json(200, {"file": files.put_workspace_file(
+                principal, project_id, rest[1], path=body.get("path"),
+                text=body.get("text"))})
+            return True
+        # POST /api/v1/projects/{id}/actions  (propose)
+        if rest == ["actions"]:
+            action = self.app.actions.propose(
+                principal, body.get("action"), body.get("payload") or {},
+                project_id=project_id)
+            self._json(201, {"action": action})
+            return True
+        # POST /api/v1/projects/{id}/actions/{id}/confirm | cancel
+        if (len(rest) == 3 and rest[0] == "actions" and UUID_RE.fullmatch(rest[1])
+                and rest[2] in ("confirm", "cancel")):
+            action_id = rest[1]
+            if rest[2] == "cancel":
+                self._json(200, {"action": self.app.actions.cancel(principal, action_id)})
+            else:
+                self._confirm_action(principal, project_id, action_id, body)
+            return True
+        # POST /api/v1/projects/{id}/github/repositories  (propose create)
+        if rest == ["github", "repositories"]:
+            name = (body.get("name") or "").strip()
+            private = body.get("private", True)
+            action = self.app.actions.propose(
+                principal, "github.create_repository",
+                {"name": name, "private": bool(private),
+                 "description": (body.get("description") or "")[:350]},
+                project_id=project_id)
+            self._json(201, {"action": action})
+            return True
+        # POST /api/v1/projects/{id}/github/repositories/{owner}/{name}/visibility
+        if (len(rest) == 5 and rest[0] == "github" and rest[1] == "repositories"
+                and rest[4] == "visibility"):
+            full_name = f"{rest[2]}/{rest[3]}"
+            private = body.get("private")
+            if not isinstance(private, bool):
+                self._json(400, {"error": "private must be a boolean"})
+                return True
+            action = self.app.actions.propose(
+                principal, "github.set_visibility",
+                {"full_name": full_name, "private": private},
+                project_id=project_id)
+            self._json(201, {"action": action})
+            return True
+        return False
+
+    def _confirm_action(self, principal: str, project_id: str, action_id: str,
+                        body: dict):
+        """Confirm a proposal and, for a GitHub action, execute it once.
+
+        The confirmation and the side effect are separate steps: the row is
+        marked ``confirmed`` first, so a retried confirm cannot run the action
+        twice (the second confirm is refused as already-confirmed). A failed
+        execution is recorded as the result and surfaced, never retried blindly.
+        """
+        decided = self.app.actions.confirm(principal, action_id, body.get("token") or "")
+        name = decided["action"]
+        payload = decided["payload"] if isinstance(decided["payload"], dict) else {}
+        result: dict[str, Any]
+        if name == "github.create_repository":
+            if not self.app.github_writer.configured:
+                return self._json(400, {"error": "no GitHub token configured"})
+            try:
+                result = self.app.github_writer.create_repository(
+                    name=payload.get("name", ""), private=bool(payload.get("private", True)),
+                    description=payload.get("description", ""))
+            except (GitHubAuthError, GitHubUnavailable, GitHubError, ValueError) as e:
+                return self._json(self._github_status(e), {"error": f"github: {e}",
+                                                           "action": decided})
+        elif name == "github.set_visibility":
+            if not self.app.github_writer.configured:
+                return self._json(400, {"error": "no GitHub token configured"})
+            private = bool(payload.get("private", True))
+            try:
+                result = self.app.github_writer.set_repository_visibility(
+                    full_name=payload.get("full_name", ""), private=private,
+                    # The proposal named the change and a human confirmed it, so
+                    # publishing is acknowledged here and only here.
+                    acknowledge_public=not private)
+            except VisibilityError as e:
+                return self._json(400, {"error": str(e), "action": decided})
+            except (GitHubAuthError, GitHubUnavailable, GitHubError, ValueError) as e:
+                return self._json(self._github_status(e), {"error": f"github: {e}",
+                                                           "action": decided})
+        else:
+            return self._json(400, {"error": f"unknown action: {name}"})
+        recorded = self.app.actions.record_result(principal, action_id, result)
+        return self._json(200, {"action": recorded, "result": result})
+
+    @staticmethod
+    def _github_status(error: Exception) -> int:
+        if isinstance(error, GitHubAuthError):
+            return 400
+        if isinstance(error, GitHubUnavailable):
+            return 503
+        return 502
+
+    def _project_upload(self, path: str) -> None:
+        """Handle a multipart upload into a project (file or voice note).
+
+        Reached only for ``multipart/form-data`` under ``/api/v1/projects/``.
+        The project id and route are validated before the body is read, so a
+        malformed request does not get to consume an upload's worth of bytes.
+        """
+        parsed = self._project_subpath(path)
+        if parsed is None:
+            return self._json(404, {"error": "not found"})
+        project_id, rest = parsed
+        if rest not in (["files"], ["voice"]):
+            return self._json(404, {"error": "not found"})
+        boundary = self._multipart_boundary()
+        if not boundary:
+            return self._json(400, {"error": "multipart boundary is missing"})
+        try:
+            body = self._raw_body(max_upload_bytes())
+        except ValueError as e:
+            return self._json(413 if "limit" in str(e) else 400, {"error": str(e)})
+        try:
+            parts = parse_multipart(body, boundary)
+        except MultipartError as e:
+            return self._json(400, {"error": str(e)})
+        principal = self._project_principal()
+        if rest == ["files"]:
+            part = parts.get("file")
+            if part is None or not part.is_file:
+                return self._json(400, {"error": "a file part is required"})
+            row = self.app.files.upload(
+                principal, project_id,
+                filename=part.filename or parts.get("filename", part).data.decode("utf-8", "replace"),
+                content_type=part.content_type or "application/octet-stream",
+                data=part.data)
+            return self._json(201, {"file": row})
+        # voice note
+        part = parts.get("audio") or parts.get("file")
+        if part is None or not part.is_file:
+            return self._json(400, {"error": "an audio part is required"})
+        duration = parts.get("duration_ms")
+        duration_ms = None
+        if duration is not None and duration.data:
+            try:
+                duration_ms = int(duration.data.decode("ascii").strip())
+            except (ValueError, UnicodeDecodeError):
+                return self._json(400, {"error": "duration_ms must be an integer"})
+        transcript = parts.get("transcript")
+        note = self.app.voice.create(
+            principal, project_id,
+            content_type=part.content_type or "audio/webm",
+            data=part.data, duration_ms=duration_ms,
+            transcript=transcript.data.decode("utf-8", "replace") if transcript else None,
+            # A transcript the browser supplies came from the browser's own
+            # recognizer; label it so it is never mistaken for a server check.
+            engine="browser" if transcript else None)
+        return self._json(201, {"voice_note": note})
+
+    def _multipart_boundary(self) -> str | None:
+        ctype = self.headers.get("Content-Type", "")
+        for token in ctype.split(";")[1:]:
+            key, _, value = token.partition("=")
+            if key.strip().lower() == "boundary":
+                return value.strip().strip('"') or None
+        return None
+
+    @staticmethod
     def _plan_path(path: str) -> tuple[str, str, str] | None:
         parts = path.strip("/").split("/")
         if len(parts) not in (6, 7) or parts[:3] != ["api", "v1", "projects"]:
@@ -818,6 +1197,18 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/v1/projects/"):
                 parsed = self._project_path(path)
                 if parsed is None:
+                    # Deeper routes (files/workspaces/voice/actions/github) have
+                    # more segments than ``_project_path`` accepts; let the
+                    # subpath dispatcher decide, and 404 only if it is unmatched.
+                    sub = self._project_subpath(path)
+                    if sub is not None:
+                        handled = self._get_project_resource(path, sub[0], self._project_principal())
+                        if handled is not None:
+                            status, payload, raw = handled
+                            if raw is not None:
+                                body, content_type, filename = raw
+                                return self._attachment(200, body, content_type, filename)
+                            return self._json(status, payload)
                     return self._json(404, {"error": "not found"})
                 project_id, resource = parsed
                 principal = self._project_principal()
@@ -827,6 +1218,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"goals": self.app.projects.list_goals(principal, project_id)})
                 if resource == "events":
                     return self._json(200, {"events": self.app.projects.events(principal, project_id)})
+                # File lab / workspaces / voice / guarded actions. These use the
+                # deeper path split so the resource id is part of the route.
+                handled = self._get_project_resource(path, project_id, principal)
+                if handled is not None:
+                    status, payload, raw = handled
+                    if raw is not None:
+                        body, content_type, filename = raw
+                        return self._attachment(200, body, content_type, filename)
+                    return self._json(status, payload)
                 return self._json(404, {"error": "not found"})
             if path == "/api/session":
                 s = self._session()
@@ -940,6 +1340,12 @@ class Handler(BaseHTTPRequestHandler):
             # --- writes ---
             if not self._require_write():
                 return
+            # Raw multipart uploads are not JSON, so they are handled before the
+            # JSON body is read. The content type is checked first so a plain
+            # JSON body is never mistaken for an upload.
+            if (path.startswith("/api/v1/projects/")
+                    and self.headers.get("Content-Type", "").startswith("multipart/form-data")):
+                return self._project_upload(path)
             body = self._body(max_bytes=4 * 1024 * 1024 if path.startswith("/api/v1/projects") else None)
             if path == "/api/v1/projects" or path.startswith("/api/v1/projects/"):
                 if not isinstance(body, dict):
@@ -962,6 +1368,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(201, {"project": project})
                 parsed = self._project_path(path)
                 if parsed is None or parsed[1] != "goals":
+                    # Deeper project routes (workspaces, voice, actions).
+                    if self._post_project_resource(path, principal, body):
+                        return
                     return self._json(404, {"error": "not found"})
                 goal, created = self.app.projects.create_goal(
                     principal, parsed[0], body.get("text"), self.headers.get("Idempotency-Key"))
@@ -1045,8 +1454,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except ConfirmationMismatch as e:
+            # A wrong confirmation token is an authorization failure, not a
+            # malformed request; keep it distinct from a 400.
+            return self._json(403, {"error": str(e)})
+        except ActionStateError as e:
+            return self._json(409, {"error": str(e)})
         except IdempotencyConflict as e:
             return self._json(409, {"error": str(e)})
+        except VisibilityError as e:
+            return self._json(400, {"error": str(e)})
+        except GitHubAuthError as e:
+            return self._json(400, {"error": f"github auth: {e}"})
+        except GitHubUnavailable as e:
+            return self._json(503, {"error": f"github unavailable: {e}"})
+        except GitHubError as e:
+            return self._json(502, {"error": f"github: {e}"})
+        except MultipartError as e:
+            return self._json(400, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except InvalidTransition as e:
@@ -1057,6 +1482,44 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("POST %s failed", path)
             error = "internal error" if path.startswith("/api/v1/projects") else f"{type(e).__name__}: {e}"
             return self._json(500, {"error": error})
+
+    # --------------------------------------------------------------- DELETE
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        try:
+            if not self._require_write():
+                return
+            parsed = self._project_subpath(path)
+            if parsed is None:
+                return self._json(404, {"error": "not found"})
+            project_id, rest = parsed
+            principal = self._project_principal()
+            files = self.app.files
+            # DELETE /api/v1/projects/{id}/files/{file_id}
+            if len(rest) == 2 and rest[0] == "files" and UUID_RE.fullmatch(rest[1]):
+                if files.delete_file(principal, project_id, rest[1]):
+                    return self._json(200, {"deleted": rest[1]})
+                return self._json(404, {"error": "not found"})
+            # DELETE /api/v1/projects/{id}/workspaces/{ws}
+            if len(rest) == 2 and rest[0] == "workspaces" and UUID_RE.fullmatch(rest[1]):
+                if files.delete_workspace(principal, project_id, rest[1]):
+                    return self._json(200, {"deleted": rest[1]})
+                return self._json(404, {"error": "not found"})
+            # DELETE /api/v1/projects/{id}/workspaces/{ws}/files/{path...}
+            if (len(rest) >= 4 and rest[0] == "workspaces" and UUID_RE.fullmatch(rest[1])
+                    and rest[2] == "files"):
+                rel = "/".join(rest[3:])
+                if files.delete_workspace_file(principal, project_id, rest[1], rel):
+                    return self._json(200, {"deleted": rel})
+                return self._json(404, {"error": "not found"})
+            return self._json(404, {"error": "not found"})
+        except NotFound:
+            return self._json(404, {"error": "not found"})
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        except Exception:  # noqa: BLE001
+            log.exception("DELETE %s failed", path)
+            return self._json(500, {"error": "internal error"})
 
     def do_PATCH(self) -> None:
         path = urlparse(self.path).path

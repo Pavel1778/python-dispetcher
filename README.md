@@ -86,3 +86,30 @@ dispatch work. See [docs/NEXUS-OPERATIONS.md](docs/NEXUS-OPERATIONS.md) for
 API contracts, UI usage, security limits, testing, and deployment precautions.
 Migration `0010_nexus_plans.sql` is automatically applied on startup unless
 `AUTO_MIGRATE=false`; review and back up the target database before deployment.
+
+## NEXUS laboratory, files and GitHub (second increment)
+
+The dashboard now has a **Лаборатория** tab and a **GitHub** tab:
+
+- **File laboratory** - upload documents, images, source code and archives into
+  a project; preview text and images; download; delete. Bytes are stored in
+  PostgreSQL, never on the server's filesystem.
+- **Development workspaces** - extract an archive into a durable, project-scoped
+  file tree, edit a file and see a unified diff. The workspace is data, not a
+  shell: nothing uploaded is executed.
+- **Archive safety** - Zip Slip, symlinks, device/FIFO entries and archive bombs
+  (by entry count, size and compression ratio) are rejected before a single row
+  is written.
+- **Voice notes** - record in the browser and store the audio. There is no
+  server-side speech recognition; a browser-supplied transcript is labelled
+  `browser` and is not a server-verified result.
+- **GitHub** - read branches, commits, issues and pull requests; create a
+  repository and change its visibility **only after a separate confirmation**.
+  Making a repository public is refused without an explicit acknowledgement.
+
+See [docs/NEXUS-LABORATORY.md](docs/NEXUS-LABORATORY.md) for the API and
+[docs/NEXUS-AUDIT.md](docs/NEXUS-AUDIT.md) for the documentation-vs-code audit.
+Migration `0011_file_lab.sql` is additive and auto-applied unless
+`AUTO_MIGRATE=false`. Still **not** implemented: a sandboxed terminal/test
+runner, server-side speech recognition, agent streaming, independent QA, and
+plan execution. None of these is claimed as done.

@@ -25,7 +25,15 @@ pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to a d
 def store():
     instance = PostgresStore(DSN)
     with instance._tx() as cur:
-        cur.execute("TRUNCATE nexus_plan_dependencies, nexus_plan_tasks, nexus_plans, nexus_project_events, nexus_goals, nexus_project_members, nexus_projects RESTART IDENTITY")
+        # Every NEXUS table that references nexus_projects must be listed, or
+        # TRUNCATE is refused with a foreign-key error. The file-lab tables from
+        # migration 0011 are included for that reason.
+        cur.execute(
+            "TRUNCATE nexus_voice_notes, nexus_pending_actions, nexus_workspace_files, "
+            "nexus_workspaces, nexus_files, nexus_plan_dependencies, nexus_plan_tasks, "
+            "nexus_plans, nexus_project_events, nexus_goals, nexus_project_members, "
+            "nexus_projects RESTART IDENTITY CASCADE"
+        )
     yield instance
     instance.close()
 
