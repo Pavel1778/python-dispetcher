@@ -276,6 +276,7 @@ APP_HTML = r"""<!doctype html>
     <button class="tab" role="tab" id="tab-projects" aria-selected="true" aria-controls="panel-projects">Проекты NEXUS</button>
     <button class="tab" role="tab" id="tab-new" aria-selected="false" aria-controls="panel-new">Dispatcher: новая задача</button>
     <button class="tab" role="tab" id="tab-queue" aria-selected="false" aria-controls="panel-queue">Очередь и задачи</button>
+    <button class="tab" role="tab" id="tab-integrations" aria-selected="false" aria-controls="panel-integrations">Интеграции</button>
     <button class="tab" role="tab" id="tab-system" aria-selected="false" aria-controls="panel-system">Система</button>
   </nav>
 
@@ -302,9 +303,17 @@ APP_HTML = r"""<!doctype html>
           <form id="project-goal-form">
             <label for="project-goal">Цель проекта</label>
             <textarea id="project-goal" maxlength="20000" required placeholder="Опишите цель проекта"></textarea>
-            <div class="actions"><button type="submit">Сохранить черновик</button></div>
+            <div class="actions"><button type="submit">Сохранить черновик</button> <button type="button" class="ghost voice-button" data-target="project-goal">🎙 Диктовать</button></div>
+            <p class="muted small voice-status" role="status">Голос обрабатывается браузером и может передаваться его сервису распознавания.</p>
           </form>
           <p id="project-goal-msg" class="small" role="status" aria-live="polite"></p>
+          <h4 style="margin-top:20px">Файлы проекта</h4>
+          <p class="muted small">Любой формат, включая ZIP: до 5 МиБ на файл, 20 МиБ на проект. Архивы не распаковываются; файлы не передаются агентам автоматически.</p>
+          <form id="files-form"><label for="files-input">Выберите файлы</label>
+            <input id="files-input" type="file" multiple required>
+            <div class="actions"><button type="submit">Загрузить</button></div>
+          </form>
+          <p id="files-msg" class="small" role="status" aria-live="polite"></p><div id="files-list"></div>
           <h4 style="margin-top:20px">Черновики целей</h4>
           <div id="project-goals"></div>
         </div>
@@ -334,6 +343,8 @@ APP_HTML = r"""<!doctype html>
         <label for="goal">Название / суть задачи <span class="faint">(обязательно)</span></label>
         <textarea id="goal" name="goal" required maxlength="4000"
                   placeholder="Например: добавить экспорт отчётов в CSV и покрыть тестами"></textarea>
+        <button type="button" class="ghost voice-button" data-target="goal">🎙 Диктовать</button>
+        <p class="muted small voice-status" role="status">Голос обрабатывается браузером и может передаваться его сервису распознавания.</p>
         <div class="field-error" id="goal-err"></div>
 
         <div class="row">
@@ -383,6 +394,22 @@ APP_HTML = r"""<!doctype html>
           <tbody id="tasks"><tr><td colspan="6" class="empty">Загрузка…</td></tr></tbody>
         </table>
       </div>
+    </div>
+  </section>
+
+  <section id="panel-integrations" role="tabpanel" aria-labelledby="tab-integrations" class="hidden">
+    <div class="card"><div class="card-head"><h3>GitHub</h3></div>
+      <p class="muted small">Токен настраивается администратором на сервере. Это отдельный доступ от GitHub-учётной записи OpenHands. Изменения GitHub доступны только после включения оператором и отдельного подтверждения.</p>
+      <p id="github-status" class="small" role="status"></p>
+      <form id="github-form">
+        <label for="github-action">Действие</label>
+        <select id="github-action"><option value="create">Создать репозиторий в личном аккаунте</option><option value="visibility">Изменить видимость существующего репозитория</option></select>
+        <label for="github-name">Название или owner/name</label><input id="github-name" maxlength="201" required placeholder="name или owner/name" autocapitalize="none">
+        <label for="github-visibility">Видимость</label><select id="github-visibility"><option value="private">Приватный</option><option value="public">Публичный</option></select>
+        <div class="actions"><button type="submit">Проверить и подтвердить</button></div>
+      </form>
+      <p id="github-msg" class="small" role="status" aria-live="polite"></p>
+      <p class="muted small">Публикация может раскрыть содержимое репозитория. После сетевой ошибки проверьте состояние на GitHub перед повтором. Созданный репозиторий не добавляется в список Dispatcher автоматически.</p>
     </div>
   </section>
 
@@ -902,7 +929,7 @@ async function selectProject(id) {
   $('#project-goal').value = '';
   delete $('#project-goal-form').dataset.requestId;
   $('#project-goal-msg').textContent = '';
-  await loadProjectGoals(id);
+  await Promise.all([loadProjectGoals(id), loadProjectFiles(id)]);
 }
 async function loadProjectGoals(id) {
   try {
@@ -917,6 +944,61 @@ async function loadProjectGoals(id) {
   } catch (e) { if (SELECTED_PROJECT === id) $('#project-goal-msg').textContent = e.message; }
 }
 
+
+async function loadProjectFiles(id) {
+  try {
+    const result = await api('/api/v1/projects/' + encodeURIComponent(id) + '/files');
+    if (SELECTED_PROJECT !== id) return;
+    const container = $('#files-list');
+    container.innerHTML = result.files.length ? result.files.map(f =>
+      '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' +
+      '<a href="/api/v1/projects/' + encodeURIComponent(id) + '/files/' + encodeURIComponent(f.id) + '">' + esc(f.name) + '</a>' +
+      ' <span class="muted small">(' + esc(f.size) + ' байт)</span> ' +
+      '<button type="button" class="ghost file-delete" data-id="' + esc(f.id) + '" data-name="' + esc(f.name) + '">Удалить</button></div>'
+    ).join('') : '<p class="muted small">Файлов пока нет.</p>';
+    $$('.file-delete', container).forEach(button => button.onclick = async () => {
+      if (!confirm('Удалить файл «' + button.dataset.name + '» из проекта?')) return;
+      button.disabled = true;
+      try {
+        await api('/api/v1/projects/' + encodeURIComponent(id) + '/files/' + encodeURIComponent(button.dataset.id) + '/delete', {method:'POST'});
+        if (SELECTED_PROJECT === id) await loadProjectFiles(id);
+      } catch (error) { if (SELECTED_PROJECT === id) $('#files-msg').textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+  } catch (error) { if (SELECTED_PROJECT === id) $('#files-msg').textContent = error.message; }
+}
+
+function setupVoice() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  $$('.voice-button').forEach(button => {
+    if (!Recognition || !window.isSecureContext) {
+      button.disabled = true; button.title = 'Голосовой ввод не поддерживается в этом браузере или без HTTPS'; button.textContent = 'Диктовка недоступна'; return;
+    }
+    let active = null;
+    button.onclick = () => {
+      if (active) { active.stop(); return; }
+      const target = $('#' + button.dataset.target);
+      const rec = new Recognition(); active = rec;
+      rec.lang = 'ru-RU'; rec.interimResults = false; rec.continuous = false;
+      button.textContent = 'Остановить диктовку';
+      rec.onresult = event => {
+        let text = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) if (event.results[i].isFinal) text += event.results[i][0].transcript;
+        if (text) { target.value = (target.value + (target.value ? ' ' : '') + text).slice(0, target.maxLength); target.dispatchEvent(new Event('input', {bubbles:true})); }
+      };
+      rec.onerror = () => { button.title = 'Не удалось распознать речь: проверьте разрешение на микрофон.'; const msg = button.closest('form').querySelector('.voice-status'); if (msg) msg.textContent = button.title; };
+      rec.onend = () => { active = null; button.textContent = '🎙 Диктовать'; };
+      try { rec.start(); } catch (_) { active = null; button.textContent = '🎙 Диктовать'; }
+    };
+  });
+}
+
+async function loadGitHubStatus() {
+  try {
+    const s = await api('/api/github/status');
+    $('#github-status').textContent = 'Токен: ' + (s.configured ? 'настроен' : 'не настроен') + '. Запись: ' + (s.writes_enabled ? 'включена оператором' : 'отключена оператором') + '.';
+  } catch (e) { $('#github-status').textContent = e.message; }
+}
 
 async function selectGoal(id) {
   SELECTED_GOAL = id;
@@ -1012,11 +1094,49 @@ async function boot() {
   };
   $$('.tab').forEach(tab => tab.onclick = () => {
     $$('.tab').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
-    $$('#panel-projects, #panel-new, #panel-queue, #panel-system').forEach(p => p.classList.add('hidden'));
+    $$('#panel-projects, #panel-new, #panel-queue, #panel-integrations, #panel-system').forEach(p => p.classList.add('hidden'));
     $('#' + tab.getAttribute('aria-controls')).classList.remove('hidden');
     if (tab.id === 'tab-system') loadSystem();
+    if (tab.id === 'tab-integrations') loadGitHubStatus();
     if (tab.id === 'tab-projects') loadProjects();
   });
+  setupVoice();
+  $('#files-form').onsubmit = async e => {
+    e.preventDefault();
+    const project = SELECTED_PROJECT, files = Array.from($('#files-input').files);
+    if (!project || !files.length) return;
+    const button = $('button[type="submit"]', e.currentTarget); button.disabled = true;
+    try {
+      for (const file of files) {
+        if (file.size > 5 * 1024 * 1024) throw new Error('Файл «' + file.name + '» превышает 5 МиБ.');
+        const response = await fetch('/api/v1/projects/' + encodeURIComponent(project) + '/files', {
+          method:'POST', headers:{'X-CSRF-Token':CSRF, 'X-File-Name':encodeURIComponent(file.name), 'Content-Type':'application/octet-stream'}, body:file
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'HTTP ' + response.status);
+      }
+      if (SELECTED_PROJECT === project) { $('#files-input').value = ''; $('#files-msg').textContent = 'Файлы загружены.'; }
+    } catch (error) { if (SELECTED_PROJECT === project) { $('#files-input').value = ''; $('#files-msg').textContent = 'Загрузка остановлена: ' + error.message + ' Ранее загруженные файлы сохранены; выберите повторно только отсутствующие файлы.'; } }
+    finally { button.disabled = false; if (SELECTED_PROJECT === project) await loadProjectFiles(project); }
+  };
+  $('#github-form').onsubmit = async e => {
+    e.preventDefault();
+    const button = $('button[type="submit"]', e.currentTarget); button.disabled = true;
+    const msg = $('#github-msg'); msg.textContent = 'Проверяем GitHub…';
+    try {
+      const preview = await api('/api/github/prepare', {method:'POST', body:JSON.stringify({
+        action:$('#github-action').value, name:$('#github-name').value.trim(), private:$('#github-visibility').value === 'private'
+      })});
+      const verb = preview.action === 'create' ? 'Создать' : 'Изменить видимость';
+      if (!confirm(verb + ' репозитория ' + preview.full_name + ' как ' + (preview.private ? 'ПРИВАТНЫЙ' : 'ПУБЛИЧНЫЙ') + '?\nАккаунт GitHub: ' + preview.actor + '\nПубличный репозиторий может раскрыть его содержимое.')) {
+        msg.textContent = 'Отменено. GitHub не изменён.'; return;
+      }
+      msg.textContent = 'Отправляем подтверждённое действие в GitHub…';
+      const result = await api('/api/github/confirm', {method:'POST', body:JSON.stringify({confirmation:preview.confirmation})});
+      msg.textContent = 'GitHub подтвердил: ' + result.repository.full_name + (result.repository.private ? ' — приватный.' : ' — публичный.');
+    } catch (error) { msg.textContent = 'Не выполнено или результат неизвестен: ' + error.message + '. Проверьте GitHub перед повтором.'; }
+    finally { button.disabled = false; }
+  };
   $('#project-form').onsubmit = async (e) => {
     e.preventDefault();
     const button = $('button[type="submit"]', e.currentTarget);

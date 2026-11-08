@@ -1,5 +1,9 @@
 # Integration map: control plane ↔ OpenHands runtime
 
+> Historical runtime observations. In the state table below, “verified” means
+> only that the legacy dispatcher received a nonempty response, not that an
+> independent QA runner tested the result or verified a Git commit.
+
 Every fact below was read from the live server at `http://127.0.0.1:60000`
 (`build_git_sha 1e1390a`, tag `v1.50.1`) via `GET /openapi.json` and from the
 installed source, not from other versions' docs.

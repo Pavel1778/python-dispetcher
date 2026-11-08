@@ -2,7 +2,7 @@
 
 ## What this repository is
 
-`/workspace/platform` is the durable control plane for orchestrating OpenHands
+This repository is the durable control plane for orchestrating OpenHands
 agent conversations. It owns task state, leases, assignment and recovery.
 It does not own the runtime: conversations execute in the OpenHands
 agent-server.
@@ -51,11 +51,11 @@ agent-server.
 # Tests (needs the venv that has pytest; the system python does not).
 # Cloud tests need a PostgreSQL DSN; without it they skip cleanly.
 TEST_SUPABASE_DB_URL="postgresql://user:pw@127.0.0.1:5432/db" \
-/workspace/project/4119041ca5254315a7b6e95fdc85ae8a/scratch/sdk-main/.venv/bin/python \
+python \
   -m pytest tests/ -q -p no:cacheprovider
 
 # Lint (same version as CI, pinned in requirements-dev.txt).
-/workspace/project/4119041ca5254315a7b6e95fdc85ae8a/scratch/sdk-main/.venv/bin/python \
+python \
   -m ruff check .
 
 # Apply the Supabase schema (idempotent).
@@ -63,7 +63,7 @@ psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 
 # Manual end-to-end against the live runtime (creates and deletes its own
 # conversation; the three long-lived conversations are never touched)
-/workspace/project/4119041ca5254315a7b6e95fdc85ae8a/scratch/sdk-main/.venv/bin/python \
+python \
   tests/e2e_dispatcher_loop.py
 ```
 
@@ -198,21 +198,23 @@ successful-completion e2e needs a valid key and is not yet exercised.
 - Sessions are stored server-side (`sessions` table, migration `0004_auth.sql`)
   so logout is immediate; only `HMAC(AUTH_SESSION_SECRET, token)` is stored.
   `AUTH_SESSION_SECRET` must be a separate secret from the Cloud API key.
-- Public routes are only `/login`, `/healthz`, `/static/*`. Everything else,
+- Public routes include `/login`, `/healthz`, `/static/*`, `/favicon.svg`,
+  `/manifest.webmanifest` and `/service-worker.js`. Everything else,
   reads included, needs a session or a bearer token. `/healthz` must stay a
   one-line JSON with no configuration.
 - The server refuses to bind `0.0.0.0` unless `WEB_AUTH_TOKEN` and all three
   `AUTH_*` variables are set (`web_server.main`).
 - The UI (`orchestration/web_ui.py`) is static strings: dark theme, Russian,
-  responsive. It must not embed any secret, and every button must call a real
-  endpoint.
+  responsive. It must not embed any secret; actions must be implemented and
+  accurately described (browser-local voice input need not call an endpoint).
 
-## GitHub repository discovery
+## GitHub repository discovery and confirmed writes
 
 - `orchestration/github_client.py` reads `GITHUB_TOKEN` and calls
-  `GET /user/repos`. It is **read-only** against GitHub: nothing there writes to
-  a repository, and the only write on a sync is to the local `repositories`
-  table. `_request` must stay the single place the token is attached.
+  `GET /user/repos`. Discovery is read-only, but optional repository creation and visibility writes
+  exist behind `GITHUB_ENABLE_WRITES` and a session-bound, one-use confirmation.
+  Sync only writes the local allowlist. `_request` must stay the single place
+  the token is attached; redirects must never forward the token.
 - The token value must never be logged, returned by the API or rendered in the
   UI. `GitHubClient.__repr__` is redacted on purpose; keep it that way. Only
   `configured` (a bool) is exposed, and `/api/system` and `/api/capabilities`
@@ -311,7 +313,7 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
   `tests/test_dispatcher.py` (redirect section),
   `tests/test_cloud_integration.py` (base URL / redirect).
 
-## Operator controls and the workspace lock (PR #4)
+## Operator controls and the workspace check (PR #4; historical)
 
 - Workflow lifecycle actions live in `cloud_store` (`cancel_workflow`,
   `resume_workflow`, `retry_task`) with routes in `web_server` and buttons in
@@ -335,12 +337,12 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
   (`.../api/conversations/<id>` -> `<base>/conversations/<id>`). The UI read
   `w.sr_url` for a long time while the server never sent it, so the "open in
   Cloud" link silently never rendered; `workflow_detail` now sends it.
-- **One task per repository+branch at a time.** `claim_task` refuses (by id) or
+- **Workspace check, not a proven cross-process lock.** `claim_task` refuses (by id) or
   skips (when scanning) a candidate whose workspace is occupied. Without it two
   conversations edit one checkout and the loser's commits vanish with no error.
   Occupancy is the states `assigned|running|verifying|blocked|recovering` --
   `queued` must NOT count, or two queued siblings block each other before
-  either starts. The check runs inside the claiming transaction.
+  either starts. The check alone can race for different rows; see NEXUS-SPEC.
 - Live verification (2026-10-20): `PATCH /api/v1/app-conversations/{id}` really
   renames (created a throwaway conversation, renamed it, confirmed the title,
   deleted it). A missing id gives `404 {"detail":"unknown_app_conversation"}`,

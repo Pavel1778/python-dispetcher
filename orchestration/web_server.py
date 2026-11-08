@@ -74,6 +74,8 @@ from .cloud_store import (
     StoreError,
 )
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
+from .github_confirmations import Confirmations
+from .nexus_files import FileService, MAX_FILE_SIZE
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
 from .sr_runtime import SrRuntime
@@ -291,6 +293,9 @@ class App:
         self.store = PostgresStore(dsn)
         self.projects = ProjectService(self.store)
         self.plans = PlanService(self.store)
+        self.files = FileService(self.store)
+        self.github_confirmations = Confirmations()
+        self.github_writes_enabled = os.environ.get("GITHUB_ENABLE_WRITES", "").lower() in ("1", "true", "yes")
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -755,6 +760,38 @@ class Handler(BaseHTTPRequestHandler):
         return parts[3], parts[4] if len(parts) == 5 else ""
 
     @staticmethod
+    def _file_path(path: str) -> tuple[str, str, bool] | None:
+        parts = path.strip("/").split("/")
+        if (len(parts) not in (6, 7) or parts[:3] != ["api", "v1", "projects"]
+                or parts[4] != "files" or not UUID_RE.fullmatch(parts[3])
+                or not UUID_RE.fullmatch(parts[5]) or (len(parts) == 7 and parts[6] != "delete")):
+            return None
+        return parts[3], parts[5], len(parts) == 7
+
+    def _download(self, name: str, content: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", "attachment; filename=download; filename*=UTF-8''" +
+                         urllib.parse.quote(name, safe=""))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _file_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length") is None:
+            raise ValueError("Content-Length required; transfer encoding is not supported")
+        n = int(self.headers["Content-Length"])
+        if n < 0 or n > MAX_FILE_SIZE:
+            raise ValueError("file exceeds 5 MiB")
+        content = self.rfile.read(n)
+        if len(content) != n:
+            raise ValueError("incomplete file")
+        return content
+
+    @staticmethod
     def _plan_path(path: str) -> tuple[str, str, str] | None:
         parts = path.strip("/").split("/")
         if len(parts) not in (6, 7) or parts[:3] != ["api", "v1", "projects"]:
@@ -804,6 +841,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_read():
                 return
 
+            file_path = self._file_path(path)
+            if file_path:
+                project_id, file_id, is_delete = file_path
+                if is_delete:
+                    return self._json(404, {"error": "not found"})
+                file = self.app.files.download(self._project_principal(), project_id, file_id)
+                return self._download(file["name"], bytes(file["content"]))
             plan_path = self._plan_path(path)
             if plan_path:
                 project_id, kind, item_id = plan_path
@@ -825,6 +869,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"project": self.app.projects.get(principal, project_id)})
                 if resource == "goals":
                     return self._json(200, {"goals": self.app.projects.list_goals(principal, project_id)})
+                if resource == "files":
+                    return self._json(200, {"files": self.app.files.list(principal, project_id)})
                 if resource == "events":
                     return self._json(200, {"events": self.app.projects.events(principal, project_id)})
                 return self._json(404, {"error": "not found"})
@@ -847,6 +893,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {
                     "repositories": self.app.store.list_repositories()
                 })
+            if path == "/api/github/status":
+                return self._json(200, {"configured": self.app.github.configured,
+                                        "writes_enabled": self.app.github_writes_enabled})
             if path == "/api/github/repositories":
                 # Preview what a sync would pull, without writing anything. Lets
                 # the UI show the discovered list before the operator commits.
@@ -940,6 +989,39 @@ class Handler(BaseHTTPRequestHandler):
             # --- writes ---
             if not self._require_write():
                 return
+            parsed = self._project_path(path)
+            if parsed and parsed[1] == "files":
+                name = urllib.parse.unquote(self.headers.get("X-File-Name", ""), errors="strict")
+                file = self.app.files.upload(self._project_principal(), parsed[0], name, self._file_body())
+                return self._json(201, {"file": file})
+            file_path = self._file_path(path)
+            if file_path and file_path[2]:
+                if self._body(max_bytes=1024):
+                    raise ValueError("delete body must be empty")
+                self.app.files.delete(self._project_principal(), file_path[0], file_path[1])
+                return self._json(200, {"deleted": True})
+            if path in ("/api/github/prepare", "/api/github/confirm"):
+                # A machine bearer can never approve changes on the owner's behalf.
+                session = self._session()
+                if session is None or not self.app.auth.csrf_ok(session, self.headers.get(CSRF_HEADER)):
+                    return self._json(403, {"error": "human session and CSRF required"})
+                if not self.app.github_writes_enabled:
+                    return self._json(403, {"error": "GitHub writes are disabled"})
+                body = self._body(max_bytes=4096)
+                try:
+                    if path.endswith("/prepare"):
+                        preview = self.app.github_confirmations.prepare(self.app.github, session.token, body)
+                        return self._json(200, preview)
+                    if not isinstance(body, dict) or set(body) != {"confirmation"}:
+                        raise ValueError("confirmation required")
+                    result = self.app.github_confirmations.confirm(self.app.github, session.token, body["confirmation"])
+                    return self._json(200, {"repository": result})
+                except GitHubAuthError as e:
+                    return self._json(403, {"error": str(e)})
+                except GitHubUnavailable as e:
+                    return self._json(503, {"error": str(e) + "; check GitHub before retrying"})
+                except GitHubError as e:
+                    return self._json(502, {"error": str(e) + "; check GitHub before retrying"})
             body = self._body(max_bytes=4 * 1024 * 1024 if path.startswith("/api/v1/projects") else None)
             if path == "/api/v1/projects" or path.startswith("/api/v1/projects/"):
                 if not isinstance(body, dict):

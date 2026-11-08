@@ -5,8 +5,8 @@ allowlist. Typing ``owner/name`` by hand is both tedious and easy to get wrong,
 so this module pulls the list straight from GitHub and feeds the allowlist.
 
 The token is read from ``GITHUB_TOKEN`` and is never logged, returned or
-persisted: only non-secret metadata (full name, default branch, flags) leaves
-this module. Nothing here writes to GitHub.
+persisted: only non-secret metadata leaves this module. Writes are exposed
+only through the separate human-confirmed integration flow.
 """
 
 from __future__ import annotations
@@ -54,6 +54,11 @@ class GitHubRepo:
         }
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class GitHubClient:
     """Minimal, dependency-free GitHub REST client for repository discovery."""
 
@@ -69,6 +74,10 @@ class GitHubClient:
         self.base_url = (
             base_url or os.environ.get("GITHUB_API_URL") or DEFAULT_GITHUB_API_URL
         ).rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("invalid GitHub API URL")
+        self._opener = urllib.request.build_opener(_NoRedirect())
         self._token = (
             token if token is not None else os.environ.get("GITHUB_TOKEN") or ""
         )
@@ -89,19 +98,23 @@ class GitHubClient:
         )
 
     # ------------------------------------------------------------------ http
-    def _request(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _request(self, path: str, params: dict[str, Any] | None = None, *,
+                 method: str = "GET", payload: dict | None = None) -> Any:
         if not self._token:
             raise GitHubAuthError("no GitHub token configured (GITHUB_TOKEN)")
         url = f"{self.base_url}{path}"
         if params:
             url += "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url)
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/vnd.github+json")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
         req.add_header("Authorization", f"Bearer {self._token}")
         req.add_header("User-Agent", "python-dispetcher")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._opener.open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
@@ -118,6 +131,39 @@ class GitHubClient:
             raise GitHubError(f"github -> {e.code}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise GitHubUnavailable(f"github: {type(e).__name__}") from e
+
+    def current_user(self) -> dict:
+        data = self._request("/user")
+        if not isinstance(data, dict) or not isinstance(data.get("login"), str):
+            raise GitHubError("github returned invalid user")
+        return {"login": data["login"]}
+
+    def repository_details(self, full_name: str) -> dict:
+        path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in full_name.split("/"))
+        data = self._request(path)
+        if (not isinstance(data, dict) or not isinstance(data.get("id"), int)
+                or not isinstance(data.get("full_name"), str) or not isinstance(data.get("private"), bool)
+                or data.get("visibility") not in ("public", "private")
+                or not isinstance(data.get("permissions"), dict)):
+            raise GitHubError("github returned incomplete repository metadata")
+        return {"id": data["id"], "full_name": data["full_name"], "private": data["private"],
+                "visibility": data["visibility"], "admin": data["permissions"].get("admin") is True}
+
+    def create_repository(self, name: str, private: bool) -> dict:
+        data = self._request("/user/repos", method="POST", payload={"name": name, "private": private})
+        return self._safe_write_result(data)
+
+    def set_visibility(self, full_name: str, private: bool) -> dict:
+        path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in full_name.split("/"))
+        data = self._request(path, method="PATCH", payload={"private": private})
+        return self._safe_write_result(data)
+
+    @staticmethod
+    def _safe_write_result(data: Any) -> dict:
+        if (not isinstance(data, dict) or not isinstance(data.get("full_name"), str)
+                or not isinstance(data.get("private"), bool)):
+            raise GitHubError("github returned incomplete result; check GitHub before retrying")
+        return {"full_name": data["full_name"], "private": data["private"]}
 
     # ------------------------------------------------------------ discovery
     def list_repositories(self, *, include_archived: bool = False) -> list[GitHubRepo]:
