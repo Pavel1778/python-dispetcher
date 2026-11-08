@@ -36,14 +36,15 @@ Last updated: Phase 0 (2026-11-08).
 |---|---|---|
 | Lint | `python -m ruff check .` | All checks passed |
 | Tests | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | 382 passed, 1 skipped |
-| CI | GitHub Actions on `main` | ❌ failing (python 3.12.6 unavailable) |
+| CI (before fix) | Actions on `main` @ `bd31381` | ❌ `python 3.12.6` unavailable on runner |
+| CI (after fix) | Actions run 42521226852 on `fix/ci-python-version` | ✅ **success** |
 | Migration inventory | `ls migrations/` | `0001`..`0011` (no `0015`) |
 
 ## Defect board
 
 | ID | Defect | Severity | Phase |
 |---|---|---|---|
-| D-01 | CI red on every branch | P0 (programme) | 1 |
+| D-01 | CI red on every branch | P0 (programme) | 1 — **FIXED** (PR #20, CI green) |
 | D-02 | File-lab implemented twice, `nexus_files` schema collides | P0 (architecture) | 1 |
 | D-03 | GitHub confirmation implemented twice | P1 | 1 |
 | D-04 | Workspace claim is not a cross-process lock | P1 | 2 |
@@ -51,6 +52,15 @@ Last updated: Phase 0 (2026-11-08).
 | D-06 | `session_api_key` stored in DB | P2 (security) | 2 |
 | D-07 | Legacy RLS `USING (true)` | P2 (security) | 2 |
 | D-08 | No CLI / MCP / Self-QA / backup / multi-account | Feature gap | 3–6 |
+
+## Open PRs
+
+| PR | Branch | Purpose |
+|---|---|---|
+| #19 | `docs/branch-topology-env-table` | docs (Phase A) |
+| #20 | `fix/ci-python-version` | CI fix (D-01) — CI green |
+| #17 | `nexus/laboratory-files-github` | the pre-existing nexus branch PR |
+| — | `nexus/phase0-recon` | Phase 0 documents (this work) |
 
 ## Blockers
 
