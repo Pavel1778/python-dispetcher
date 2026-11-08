@@ -31,6 +31,13 @@ python3 tests/e2e_cloud_sr_jr.py         # real Sr→Jr on OpenHands Cloud
 The end-to-end scripts are not collected by pytest; they need a live LLM (and,
 for the Cloud one, `OPENHANDS_API_KEY` and `OPENHANDS_DEFAULT_MODEL`).
 
+## Cross-platform web client (preview)
+
+The dashboard can be installed as a PWA on supported Android, Windows and
+Linux browsers after this version is deployed over HTTPS. It is an online web
+client, not an APK or native desktop package. Installation, security and known
+release blockers are documented in [docs/CLIENTS.md](docs/CLIENTS.md).
+
 ## NEXUS roadmap
 
 The proposed NEXUS architecture, current-code audit and migration/acceptance

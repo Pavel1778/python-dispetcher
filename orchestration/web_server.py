@@ -60,6 +60,7 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -104,6 +105,16 @@ def _version() -> str:
 #: Minimal liveness page. Reveals nothing about configuration.
 HEALTHZ = {"status": "ok"}
 
+# Explicit allowlist: do not expose arbitrary files from the package directory.
+_PWA_DIR = Path(__file__).resolve().parent / "pwa"
+PWA_ASSETS = {
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json", "no-cache"),
+    "/service-worker.js": ("service-worker.js", "application/javascript; charset=utf-8", "no-cache"),
+    "/static/pwa/register.js": ("register.js", "application/javascript; charset=utf-8", "public, max-age=300"),
+    "/static/pwa/icon-192.png": ("icon-192.png", "image/png", "public, max-age=300"),
+    "/static/pwa/icon-512.png": ("icon-512.png", "image/png", "public, max-age=300"),
+}
+
 # Ids are UUIDs. ``[0-9a-fA-F-]{36}`` is too weak: 36 hyphens match it and then
 # reach PostgreSQL, which rejects the value and turns a bad request into a 500
 # that echoes the database error. Require the real 8-4-4-4-12 shape so a
@@ -120,6 +131,9 @@ LOGIN_PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Вход — Диспетчер OpenHands</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0b0d12">
+<script defer src="/static/pwa/register.js"></script>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="auth-body">
@@ -624,19 +638,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 
-    def _static(self, code: int, text: str, content_type: str) -> None:
-        body = text.encode()
+    def _static(
+        self, code: int, text: str | bytes, content_type: str, *,
+        cache_control: str = "public, max-age=300",
+    ) -> None:
+        body = text.encode() if isinstance(text, str) else text
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "public, max-age=300")
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(body)
 
@@ -762,6 +780,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(200, LOGIN_PAGE.replace("__ERROR__", ""))
             if path == "/healthz":
                 return self._json(200, HEALTHZ)
+            if path in PWA_ASSETS:
+                name, content_type, cache_control = PWA_ASSETS[path]
+                return self._static(200, (_PWA_DIR / name).read_bytes(), content_type,
+                                    cache_control=cache_control)
             if path == "/static/app.css":
                 return self._static(200, APP_CSS, "text/css; charset=utf-8")
             if path == "/static/app.js":
