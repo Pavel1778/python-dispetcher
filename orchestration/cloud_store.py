@@ -154,6 +154,8 @@ class Task:
     selected_repository: str | None
     selected_branch: str | None
     updated_at: float
+    project_id: str | None = None
+    repository_id: str | None = None
 
     @property
     def lease_live(self) -> bool:
@@ -394,7 +396,8 @@ class PostgresStore:
     # ------------------------------------------------------------ workflows
     def create_workflow(self, goal: str, *, workflow_id: str | None = None,
                         metadata: dict[str, Any] | None = None,
-                        idempotency_key: str | None = None) -> str:
+                        idempotency_key: str | None = None,
+                        project_id: str | None = None) -> str:
         """Create a workflow, or return the one a previous call already made.
 
         When *idempotency_key* is given the insert is guarded by the UNIQUE
@@ -409,13 +412,14 @@ class PostgresStore:
         """
         wid, _ = self.create_workflow_once(
             goal, workflow_id=workflow_id, metadata=metadata,
-            idempotency_key=idempotency_key,
+            idempotency_key=idempotency_key, project_id=project_id,
         )
         return wid
 
     def create_workflow_once(self, goal: str, *, workflow_id: str | None = None,
                              metadata: dict[str, Any] | None = None,
-                             idempotency_key: str | None = None) -> tuple[str, bool]:
+                             idempotency_key: str | None = None,
+                             project_id: str | None = None) -> tuple[str, bool]:
         """Create-or-reuse a workflow, returning ``(workflow_id, created)``.
 
         ``created`` is False when an existing workflow was reused, which is the
@@ -425,11 +429,11 @@ class PostgresStore:
         with self._tx() as cur:
             cur.execute(
                 """
-                INSERT INTO workflows(id, goal, metadata, idempotency_key)
-                VALUES (%s,%s,%s,%s)
+                INSERT INTO workflows(id, goal, metadata, idempotency_key, project_id)
+                VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (wid, goal, json.dumps(metadata or {}), idempotency_key),
+                (wid, goal, json.dumps(metadata or {}), idempotency_key, project_id),
             )
             created = cur.rowcount > 0
             if not created:
@@ -452,7 +456,8 @@ class PostgresStore:
         return row
 
     def create_workflow_idempotent(self, goal: str, key: str, *,
-                                   metadata: dict[str, Any] | None = None
+                                   metadata: dict[str, Any] | None = None,
+                                   project_id: str | None = None
                                    ) -> tuple[str, bool]:
         """Atomically create-or-reuse a workflow for *key*.
 
@@ -466,10 +471,10 @@ class PostgresStore:
             with self._tx() as cur:
                 cur.execute(
                     """
-                    INSERT INTO workflows(id, goal, metadata, idempotency_key)
-                    VALUES (%s,%s,%s,%s)
+                    INSERT INTO workflows(id, goal, metadata, idempotency_key, project_id)
+                    VALUES (%s,%s,%s,%s,%s)
                     """,
-                    (wid, goal, json.dumps(metadata or {}), key),
+                    (wid, goal, json.dumps(metadata or {}), key, project_id),
                 )
                 self._event(cur, "workflow_created", workflow_id=wid,
                             detail={"goal": goal, "idempotency_key": key})
@@ -574,6 +579,7 @@ class PostgresStore:
         requires_approval: bool = False,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
+        project_id: str | None = None,
     ) -> Task:
         tid = task_id or _new_id()
         try:
@@ -583,14 +589,14 @@ class PostgresStore:
                     INSERT INTO tasks(id, workflow_id, parent_task_id, goal, request,
                                       acceptance, state, priority, dependencies,
                                       max_attempts, idempotency_key, requires_approval,
-                                      selected_repository, selected_branch)
-                    VALUES (%s,%s,%s,%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s,%s)
+                                      selected_repository, selected_branch, project_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         tid, workflow_id, parent_task_id, goal, request, acceptance,
                         priority, json.dumps(dependencies or []), max_attempts,
                         idempotency_key, requires_approval,
-                        selected_repository, selected_branch,
+                        selected_repository, selected_branch, project_id,
                     ),
                 )
                 self._event(cur, "task_submitted", task_id=tid,
@@ -647,7 +653,8 @@ class PostgresStore:
     def list_tasks(self, *, workflow_id: str | None = None,
                    parent_task_id: str | None = None,
                    state: TaskState | None = None,
-                   owner: str | None = None) -> list[Task]:
+                   owner: str | None = None,
+                   project_id: str | None = None) -> list[Task]:
         sql = "SELECT * FROM tasks"
         where: list[str] = []
         params: list[Any] = []
@@ -663,6 +670,9 @@ class PostgresStore:
         if owner is not None:
             where.append("owner=%s")
             params.append(owner)
+        if project_id is not None:
+            where.append("project_id=%s")
+            params.append(project_id)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY priority DESC, created_at"
@@ -1275,17 +1285,23 @@ class PostgresStore:
             if cur.rowcount == 0:
                 raise NotFound(f"workflow {workflow_id}")
 
-    def list_workflows(self) -> list[dict[str, Any]]:
+    def list_workflows(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        sql = ("SELECT id, goal, state, sr_conversation_id, sr_status, created_at, "
+               "project_id FROM workflows")
+        params: tuple[Any, ...] = ()
+        if project_id is not None:
+            sql += " WHERE project_id=%s"
+            params = (project_id,)
+        sql += " ORDER BY created_at"
         with self._tx() as cur:
-            cur.execute(
-                "SELECT id, goal, state, sr_conversation_id, sr_status, created_at "
-                "FROM workflows ORDER BY created_at"
-            )
+            cur.execute(sql, params)
             rows = cur.fetchall()
         # ``id`` comes back as a uuid.UUID; callers compare it with string ids
         # (e.g. the workflow-scope check), so normalize it to str here.
         for row in rows:
             row["id"] = str(row["id"])
+            if row.get("project_id") is not None:
+                row["project_id"] = str(row["project_id"])
         return rows
 
     def list_repositories(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
@@ -1725,7 +1741,8 @@ class PostgresStore:
                 SELECT t.id, t.goal, t.state, t.attempt, t.max_attempts,
                        t.selected_repository, t.selected_branch, t.result,
                        t.evidence, t.owner, t.updated_at,
-                       t.workflow_id, w.goal AS workflow_goal,
+                       t.workflow_id, t.project_id, t.repository_id,
+                       w.goal AS workflow_goal,
                        c.external_conversation_id AS conversation_id,
                        c.url AS conversation_url
                   FROM tasks t
@@ -1738,7 +1755,7 @@ class PostgresStore:
             )
             rows = cur.fetchall()
         for r in rows:
-            for key in ("id", "workflow_id"):
+            for key in ("id", "workflow_id", "project_id", "repository_id"):
                 if r.get(key) is not None:
                     r[key] = str(r[key])
             r["updated_at"] = r["updated_at"].timestamp() if r.get("updated_at") else None
@@ -1746,6 +1763,170 @@ class PostgresStore:
 
     def workflow_events(self, workflow_id: str, *, limit: int = 100) -> list[dict]:
         return self.events(workflow_id=workflow_id, limit=limit)
+
+    def workflow_project(self, workflow_id: str) -> str | None:
+        """The project a workflow belongs to, or None for a legacy workflow."""
+        with self._tx() as cur:
+            cur.execute("SELECT project_id FROM workflows WHERE id=%s", (workflow_id,))
+            row = cur.fetchone()
+        if row is None or row["project_id"] is None:
+            return None
+        return str(row["project_id"])
+
+    def project_repository_linked(self, project_id: str, repository_full_name: str) -> bool:
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT 1 FROM nexus_project_repositories pr "
+                "JOIN repositories r ON r.id = pr.repository_id "
+                "WHERE pr.project_id=%s AND r.full_name=%s",
+                (project_id, repository_full_name),
+            )
+            return cur.fetchone() is not None
+
+    # ------------------------------------------------------------- task detail
+    def task_detail(self, task_id: str) -> dict[str, Any]:
+        """One task with its conversation and recent events, or raise NotFound."""
+        task = self.get_task(task_id)
+        conv = self.conversation_for(task_id)
+        events = self.events(task_id=task_id, limit=100)
+        return {
+            "id": task.id,
+            "goal": task.goal,
+            "state": task.state.value,
+            "attempt": task.attempt,
+            "max_attempts": task.max_attempts,
+            "priority": task.priority,
+            "project_id": task.project_id,
+            "workflow_id": task.workflow_id,
+            "parent_task_id": task.parent_task_id,
+            "repository": task.selected_repository,
+            "repository_id": task.repository_id,
+            "branch": task.selected_branch,
+            "result": task.result,
+            "evidence": task.evidence,
+            "owner": task.owner,
+            "conversation": conv,
+            "events": events,
+            "updated_at": task.updated_at,
+        }
+
+    # --------------------------------------------------------------- evidence
+    def evidence_chain_tail(self, project_id: str | None) -> str | None:
+        """The ``entry_hash`` of the newest evidence entry in a project scope.
+
+        ``None`` (no rows, or all legacy) means the next entry starts a chain.
+        A project-scoped chain and the unscoped chain are separate.
+        """
+        with self._tx() as cur:
+            if project_id is None:
+                cur.execute("SELECT entry_hash FROM nexus_evidence "
+                            "WHERE project_id IS NULL ORDER BY seq DESC LIMIT 1")
+            else:
+                cur.execute("SELECT entry_hash FROM nexus_evidence "
+                            "WHERE project_id=%s ORDER BY seq DESC LIMIT 1", (project_id,))
+            row = cur.fetchone()
+        return row["entry_hash"] if row else None
+
+    def insert_evidence(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Append one signed evidence record. Returns the stored row (with seq)."""
+        with self._tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO nexus_evidence(
+                    id, project_id, format_version, repository_id,
+                    repository_full_name, commit_sha, branch, subject_kind,
+                    subject_id, body, signed_payload, key_id, signature, verdict,
+                    verification_detail, verified_at, prev_hash, entry_hash, created_by)
+                VALUES (COALESCE(%s, gen_random_uuid()),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING seq, id, project_id, format_version, repository_id,
+                          repository_full_name, commit_sha, branch, subject_kind,
+                          subject_id, body, signed_payload, key_id, signature,
+                          verdict, verification_detail, verified_at, prev_hash,
+                          entry_hash, created_by, created_at
+                """,
+                (
+                    record.get("id"), record.get("project_id"),
+                    record.get("format_version", 2), record.get("repository_id"),
+                    record.get("repository_full_name"), record.get("commit_sha"),
+                    record.get("branch"), record["subject_kind"],
+                    record.get("subject_id"), json.dumps(record["body"]),
+                    record["signed_payload"], record["key_id"], record["signature"],
+                    record["verdict"], json.dumps(record.get("verification_detail", {})),
+                    record.get("verified_at"), record.get("prev_hash"),
+                    record["entry_hash"], record.get("created_by", "system"),
+                ),
+            )
+            return _evidence_row(cur.fetchone())
+
+    def get_evidence(self, evidence_id: str) -> dict[str, Any]:
+        with self._tx() as cur:
+            cur.execute("SELECT * FROM nexus_evidence WHERE id=%s", (evidence_id,))
+            row = cur.fetchone()
+        if row is None:
+            raise NotFound("evidence not found")
+        return _evidence_row(row)
+
+    def list_evidence(self, *, project_id: str | None = None,
+                      include_unscoped: bool = False,
+                      repository_full_name: str | None = None,
+                      subject_id: str | None = None,
+                      limit: int = 100) -> list[dict[str, Any]]:
+        """List evidence.
+
+        A project-scoped caller passes its ``project_id`` and never sees another
+        project's rows. ``include_unscoped`` is only for the legacy view: a
+        project read never silently includes unscoped rows unless asked.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            if include_unscoped:
+                where.append("(project_id=%s OR project_id IS NULL)")
+            else:
+                where.append("project_id=%s")
+            params.append(project_id)
+        if repository_full_name is not None:
+            where.append("repository_full_name=%s")
+            params.append(repository_full_name)
+        if subject_id is not None:
+            where.append("subject_id=%s")
+            params.append(subject_id)
+        sql = "SELECT * FROM nexus_evidence"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY seq DESC LIMIT %s"
+        params.append(limit)
+        with self._tx() as cur:
+            cur.execute(sql, tuple(params))
+            return [_evidence_row(r) for r in cur.fetchall()]
+
+    def evidence_for_project(self, project_id: str, *, limit: int = 100) -> list[dict]:
+        return self.list_evidence(project_id=project_id, limit=limit)
+
+    def update_evidence_verification(self, evidence_id: str, *, verdict: str,
+                                     detail: dict[str, Any],
+                                     verified_at: Any = None) -> None:
+        """Record a re-verification result. Never changes the signed payload."""
+        with self._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_evidence SET verdict=%s, verification_detail=%s, "
+                "verified_at=COALESCE(%s, now()) WHERE id=%s",
+                (verdict, json.dumps(detail), verified_at, evidence_id),
+            )
+
+
+def _evidence_row(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    for key in ("id", "project_id", "repository_id", "subject_id"):
+        if out.get(key) is not None:
+            out[key] = str(out[key])
+    for key in ("body", "verification_detail"):
+        if isinstance(out.get(key), str):
+            out[key] = json.loads(out[key])
+    for key in ("created_at", "verified_at"):
+        if hasattr(out.get(key), "timestamp"):
+            out[key] = out[key].timestamp()
+    return out
 
 
 def _row_to_task(row: dict[str, Any]) -> Task:
@@ -1776,4 +1957,6 @@ def _row_to_task(row: dict[str, Any]) -> Task:
         selected_repository=row.get("selected_repository"),
         selected_branch=row.get("selected_branch"),
         updated_at=row["updated_at"].timestamp() if hasattr(row["updated_at"], "timestamp") else 0.0,
+        project_id=str(row["project_id"]) if row.get("project_id") else None,
+        repository_id=str(row["repository_id"]) if row.get("repository_id") else None,
     )

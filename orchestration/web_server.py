@@ -163,6 +163,22 @@ LOGIN_PAGE = """<!doctype html>
 """
 
 
+def _task_brief(task: Any) -> dict[str, Any]:
+    """A compact task view for list endpoints (no events or evidence payload)."""
+    return {
+        "id": task.id,
+        "goal": task.goal,
+        "state": task.state.value,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "project_id": task.project_id,
+        "workflow_id": task.workflow_id,
+        "repository": task.selected_repository,
+        "branch": task.selected_branch,
+        "updated_at": task.updated_at,
+    }
+
+
 def _int_env(name: str, default: int) -> int:
     """Read a positive integer from the environment, or *default*."""
     raw = os.environ.get(name)
@@ -294,6 +310,21 @@ class App:
         self.projects = ProjectService(self.store)
         self.plans = PlanService(self.store)
         self.files = FileService(self.store)
+        # D-2 project execution binding and the Evidence Trust Engine.
+        from .nexus_binding import ProjectRepositoryService
+        from .nexus_evidence import EvidenceService
+        from .evidence_trust import (
+            EvidenceTrustEngine,
+            Keyring,
+            signer_from_env,
+        )
+        self.project_repos = ProjectRepositoryService(self.store)
+        self.evidence_keyring = Keyring.from_env()
+        self.evidence_signer = signer_from_env()
+        self.evidence = EvidenceService(
+            self.store,
+            EvidenceTrustEngine(self.evidence_keyring, self.evidence_signer),
+        )
         self.github_confirmations = Confirmations()
         self.github_writes_enabled = os.environ.get("GITHUB_ENABLE_WRITES", "").lower() in ("1", "true", "yes")
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
@@ -390,7 +421,9 @@ class App:
     # ------------------------------------------------------------- actions
     def start_workflow(self, goal: str, repository: str | None = None,
                        branch: str | None = None,
-                       request_id: str | None = None) -> dict[str, Any]:
+                       request_id: str | None = None,
+                       project_id: str | None = None,
+                       principal: str | None = None) -> dict[str, Any]:
         """Create a workflow and start its Sr conversation.
 
         ``request_id`` makes this idempotent: the same logical request (the same
@@ -408,13 +441,22 @@ class App:
             raise ValueError("goal is required")
         if repository is not None and self.store.allowed_repository(repository) is None:
             raise ValueError(f"repository not allowed: {repository}")
+        # Project context is authorized before the workflow exists. A project
+        # workflow may only name a repository that project owns.
+        if project_id is not None:
+            self.projects.get(principal, project_id)  # raises NotFound if not a member
+            if repository is not None and not self.store.project_repository_linked(
+                    project_id, repository):
+                raise ValueError(f"repository not linked to project: {repository}")
 
         if request_id:
             workflow_id, created = self.store.create_workflow_idempotent(
-                goal, request_id
+                goal, request_id, project_id=project_id
             )
         else:
-            workflow_id, created = self.store.create_workflow_once(goal)
+            workflow_id, created = self.store.create_workflow_once(
+                goal, project_id=project_id
+            )
 
         existing = self.store.sr_for(workflow_id)
         if not created and existing and existing.get("sr_conversation_id"):
@@ -540,6 +582,7 @@ class App:
                 "id": workflow_id,
                 "goal": wf["goal"],
                 "state": workflows.get(workflow_id, {}).get("state"),
+                "project_id": workflows.get(workflow_id, {}).get("project_id"),
                 "sr_conversation_id": wf.get("sr_conversation_id"),
                 "sr_status": wf.get("sr_status"),
                 # The dashboard URL, derived from the API URL Cloud returns.
@@ -760,6 +803,26 @@ class Handler(BaseHTTPRequestHandler):
         return parts[3], parts[4] if len(parts) == 5 else ""
 
     @staticmethod
+    def _project_nested(path: str) -> tuple[str, str, str | None] | None:
+        """Parse ``/api/v1/projects/<uuid>/<resource>[/<id>]``.
+
+        Returns ``(project_id, resource, item_id_or_None)``. Only the resources
+        the MVP exposes are accepted; anything else is None (a 404 upstream).
+        """
+        parts = path.strip("/").split("/")
+        if len(parts) not in (5, 6) or parts[:3] != ["api", "v1", "projects"]:
+            return None
+        if not UUID_RE.fullmatch(parts[3]):
+            return None
+        resource = parts[4]
+        if resource not in ("repositories", "tasks", "workflows", "evidence"):
+            return None
+        item = parts[5] if len(parts) == 6 else None
+        if item is not None and not UUID_RE.fullmatch(item):
+            return None
+        return parts[3], resource, item
+
+    @staticmethod
     def _file_path(path: str) -> tuple[str, str, bool] | None:
         parts = path.strip("/").split("/")
         if (len(parts) not in (6, 7) or parts[:3] != ["api", "v1", "projects"]
@@ -805,6 +868,112 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 7 and parts[4] == "plans" and parts[6] == "approve":
             return parts[3], "approve", parts[5]
         return None
+
+    # -------------------------------------------------- nested project routes
+    def _project_nested_get(self, project_id: str, resource: str,
+                            item_id: str | None) -> None:
+        """Read a project-scoped resource. Membership is enforced by the service
+        layer (a non-member gets 404), so no cross-project read is possible."""
+        principal = self._project_principal()
+        self.app.projects.get(principal, project_id)  # membership check
+        if resource == "repositories":
+            return self._json(200, {"repositories": self.app.project_repos.list(principal, project_id)})
+        if resource == "tasks":
+            if item_id is None:
+                tasks = self.app.store.list_tasks(project_id=project_id)
+                return self._json(200, {"tasks": [_task_brief(t) for t in tasks]})
+            detail = self.app.store.task_detail(item_id)
+            if detail["project_id"] != project_id:
+                return self._json(404, {"error": "not found"})
+            return self._json(200, {"task": detail})
+        if resource == "workflows":
+            if item_id is None:
+                return self._json(200, {"workflows": self.app.store.list_workflows(project_id=project_id)})
+            detail = self.app.workflow_detail(item_id)
+            if detail.get("project_id") != project_id:
+                return self._json(404, {"error": "not found"})
+            return self._json(200, detail)
+        if resource == "evidence":
+            if item_id is None:
+                return self._json(200, {"evidence": self.app.evidence.list(project_id=project_id)})
+            rec = self.app.evidence.get(item_id, project_id=project_id)
+            return self._json(200, {"evidence": rec})
+        return self._json(404, {"error": "not found"})
+
+    def _project_nested_post(self, project_id: str, resource: str,
+                             item_id: str | None, body: Any) -> None:
+        """Write a project-scoped resource (repositories, tasks, evidence)."""
+        principal = self._project_principal()
+        if resource == "repositories" and item_id is None:
+            full_name = (body.get("full_name") or "").strip() if isinstance(body, dict) else ""
+            if not re.fullmatch(r"[\w.-]+/[\w.-]+", full_name):
+                return self._json(400, {"error": "full_name must be owner/name"})
+            link = self.app.project_repos.link(principal, project_id, full_name)
+            return self._json(201, {"repository": link})
+        if resource == "tasks" and item_id is None:
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be a JSON object"})
+            return self._create_project_task(principal, project_id, body)
+        if resource == "evidence" and item_id is None:
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be a JSON object"})
+            rec = self.app.evidence.record(
+                subject_kind=body.get("subject_kind") or "manual",
+                subject_id=body.get("subject_id"),
+                project_id=project_id,
+                repository_full_name=body.get("repository"),
+                commit_sha=body.get("commit_sha"),
+                branch=body.get("branch"),
+                summary=body.get("summary") or "",
+                detail=body.get("detail") or {},
+                created_by=principal,
+            )
+            return self._json(201, {"evidence": rec})
+        return self._json(404, {"error": "not found"})
+
+    @staticmethod
+    def _project_evidence_verify(path: str) -> tuple[str, str] | None:
+        """Parse ``/api/v1/projects/<uuid>/evidence/<uuid>/verify``."""
+        parts = path.strip("/").split("/")
+        if (len(parts) == 7 and parts[:3] == ["api", "v1", "projects"]
+                and parts[4] == "evidence" and parts[6] == "verify"
+                and UUID_RE.fullmatch(parts[3]) and UUID_RE.fullmatch(parts[5])):
+            return parts[3], parts[5]
+        return None
+
+    def _create_project_task(self, principal: str, project_id: str, body: dict) -> None:
+        """Create a task inside a project and start its workflow (Sr).
+
+        This is the MVP path: the project, the repository link, the branch and
+        the goal are all bound here, and the workflow inherits the project so the
+        Sr-created child tasks do too.
+        """
+        goal = (body.get("goal") or "").strip()
+        if not goal:
+            return self._json(400, {"error": "goal is required"})
+        repository = body.get("repository")
+        branch = body.get("branch")
+        if repository is not None:
+            if not isinstance(repository, str) or not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+                return self._json(400, {"error": "repository must be owner/name"})
+            if not self.app.store.project_repository_linked(project_id, repository):
+                return self._json(409, {"error": "repository is not linked to this project"})
+            repo = self.app.store.allowed_repository(repository)
+            if repo is None:
+                return self._json(409, {"error": "repository is not enabled"})
+            allowed = repo.get("allowed_branches") or []
+            if branch:
+                if (allowed and branch not in allowed) or (
+                        not allowed and branch != repo["default_branch"]):
+                    return self._json(409, {"error": "branch is not allowed"})
+        request_id = (self.headers.get("Idempotency-Key")
+                      or (body.get("request_id") or "").strip() or None)
+        out = self.app.start_workflow(
+            goal, repository, branch, request_id=request_id,
+            project_id=project_id, principal=principal,
+        )
+        return self._json(200, out)
+
 
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
@@ -859,6 +1028,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"error": "not found"})
             if path == "/api/v1/projects":
                 return self._json(200, {"projects": self.app.projects.list(self._project_principal())})
+            nested = self._project_nested(path)
+            if nested is not None:
+                return self._project_nested_get(*nested)
             if path.startswith("/api/v1/projects/"):
                 parsed = self._project_path(path)
                 if parsed is None:
@@ -1042,6 +1214,16 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/v1/projects":
                     project = self.app.projects.create(principal, body.get("name"), body.get("description", ""))
                     return self._json(201, {"project": project})
+                verify = self._project_evidence_verify(path)
+                if verify is not None:
+                    project_id, evidence_id = verify
+                    rec = self.app.evidence.reverify(
+                        evidence_id, project_id=project_id,
+                        expected_commit=body.get("expected_commit"))
+                    return self._json(200, {"evidence": rec})
+                nested = self._project_nested(path)
+                if nested is not None:
+                    return self._project_nested_post(*nested, body)
                 parsed = self._project_path(path)
                 if parsed is None or parsed[1] != "goals":
                     return self._json(404, {"error": "not found"})
