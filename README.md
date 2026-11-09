@@ -30,6 +30,8 @@ Start here:
 
 - [docs/MVP_RELEASE_REPORT.md](docs/MVP_RELEASE_REPORT.md) — what is
   implemented, tested and verified, and what still needs a live OpenHands key.
+- [docs/AUTONOMOUS-LAB.md](docs/AUTONOMOUS-LAB.md) — honest per-stage status
+  (implemented / tested / live verified / blocked / not implemented).
 - [AGENTS.md](AGENTS.md) — repository layout and hard-won runtime facts.
 - [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md) — the target architecture.
 - [CLOUD-INTEGRATION-MAP.md](CLOUD-INTEGRATION-MAP.md) — the Cloud API surface.

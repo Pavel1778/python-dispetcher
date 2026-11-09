@@ -572,6 +572,34 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
 - **`tests/test_backup_restore.py` is the restore drill.** A real
   `pg_dump`/`pg_restore` into a fresh database; keep it passing — it is the
   automated proof that a dump restores.
-- **Migrations are now `0001`–`0011`, `0014`, `0015`, `0016`.** `0012`/`0013`
-  stay reserved for the deferred File Lab. The runner applies `*.sql` in lexical
-  order; a gap is fine.
+- **Migrations are `0001`–`0011`, `0014`, `0015`, `0016`.** The runner applies
+  `*.sql` in lexical order; a gap (`0012`/`0013`) is fine. File Lab's tables
+  were folded into `0011_nexus_files.sql` when that branch was integrated, so
+  the gap is intentional and permanent.
+
+## LLM orchestrator cascade (provider failover)
+
+- `orchestration/providers.py` holds ordered orchestrator adapters: Gemini
+  (default), Groq, OpenRouter, then OpenHands. `ProviderCascade.plan` returns
+  the first provider that answers with a valid plan. Only configured providers
+  are tried; an unconfigured one is skipped, not failed.
+- **Failover is for provider/transport problems only.** 401/403, 400/422 and a
+  malformed body fail that provider immediately (retrying a bad key only burns
+  quota); transport errors, 5xx and 429 are retried with bounded exponential
+  backoff and honour `Retry-After`. A *coding* result is never a failover
+  reason -- that decision belongs to the executor/verifier path.
+- **Orchestrator ≠ executor.** These adapters only *propose* a plan as JSON;
+  OpenHands remains the executor. `OpenHandsOrchestratorProvider.executor` is
+  `False` and it posts a conversation, not a chat completion -- never let it
+  execute a plan it produced.
+- Keys are read from the environment (`GEMINI_API_KEY`, `GROQ_API_KEY`,
+  `OPENROUTER_API_KEY`, `OPENHANDS_API_KEY`), never logged, returned, or put in
+  an exception message; `Provider.__repr__` is redacted. `/api/system` reports
+  provider *presence* only.
+- The cascade is reachable at `POST /api/v1/projects/{id}/goals/{gid}/plan-draft`
+  and via the **«Черновик через ИИ»** button on the plan panel. It **stores
+  nothing and dispatches nothing**; the draft must be saved and approved as
+  before. A provider outage is a `503` with the per-provider reasons, never a
+  fabricated plan.
+- Tests: `tests/test_providers.py` (real local HTTP server per provider shape),
+  `tests/test_plan_draft.py` (real web server + PostgreSQL).
