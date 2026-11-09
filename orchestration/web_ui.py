@@ -1079,8 +1079,25 @@ async function loadProjectWorkflows(id) {
     const workflows = result.workflows || [];
     $('#project-workflows').innerHTML = workflows.length ? workflows.map(w =>
       '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' + pill(w.state) +
-      ' <span class="muted small">' + esc(w.goal.slice(0, 80)) + '</span></div>'
+      ' <span class="muted small">' + esc(w.goal.slice(0, 80)) + '</span> ' +
+      '<button type="button" class="ghost wf-open" data-id="' + esc(w.id) + '">Детали</button>' +
+      '<div class="muted small wf-detail hidden" data-id="' + esc(w.id) + '"></div></div>'
     ).join('') : '<p class="muted small">Workflow пока нет.</p>';
+    $$('.wf-open', $('#project-workflows')).forEach(button => button.onclick = async () => {
+      try {
+        const detail = await api('/api/v1/projects/' + encodeURIComponent(id) + '/workflows/' + encodeURIComponent(button.dataset.id));
+        const box = $('#project-workflows').querySelector('.wf-detail[data-id="' + button.dataset.id + '"]');
+        if (!box) return;
+        box.classList.toggle('hidden');
+        const wf = detail.workflow || {};
+        const tasks = (detail.tasks || []).map(t =>
+          '<li>' + pill(t.state) + ' ' + esc((t.goal || '').slice(0, 70)) + ' <span class="muted small">' + esc(t.repository || '—') + '@' + esc(t.branch || 'default') + '</span></li>').join('');
+        box.innerHTML = '<p>Sr: ' + esc(wf.sr_status || '—') +
+          (wf.sr_url ? ' — <a href="' + esc(wf.sr_url) + '" target="_blank" rel="noopener">открыть в Cloud</a>' : '') +
+          '</p><p class="muted small">Причина: ' + esc(wf.reason || '—') + '</p>' +
+          '<ul>' + (tasks || '<li class="muted small">Задач нет</li>') + '</ul>';
+      } catch (e) { $('#project-workflows').querySelector('.wf-detail[data-id="' + button.dataset.id + '"]').textContent = e.message; }
+    });
   } catch (e) { if (SELECTED_PROJECT === id) $('#project-workflows').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
 }
 
@@ -1092,8 +1109,26 @@ async function loadProjectTasks(id) {
     $('#project-tasks').innerHTML = tasks.length ? tasks.map(t =>
       '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' + pill(t.state) +
       ' <span class="muted small">' + esc(t.goal.slice(0, 80)) + '</span> ' +
-      '<span class="muted small">' + esc(t.repository || '—') + '@' + esc(t.branch || 'default') + '</span></div>'
+      '<span class="muted small">' + esc(t.repository || '—') + '@' + esc(t.branch || 'default') + '</span> ' +
+      '<button type="button" class="ghost task-open" data-id="' + esc(t.id) + '">Детали</button>' +
+      '<div class="muted small task-detail hidden" data-id="' + esc(t.id) + '"></div></div>'
     ).join('') : '<p class="muted small">Задач пока нет.</p>';
+    $$('.task-open', $('#project-tasks')).forEach(button => button.onclick = async () => {
+      try {
+        const detail = await api('/api/v1/projects/' + encodeURIComponent(id) + '/tasks/' + encodeURIComponent(button.dataset.id));
+        const task = detail.task || {};
+        const box = $('#project-tasks').querySelector('.task-detail[data-id="' + button.dataset.id + '"]');
+        if (!box) return;
+        box.classList.toggle('hidden');
+        const events = (task.events || []).slice(0, 10).map(e =>
+          '<li><span class="mono small">' + esc(e.kind) + '</span> <span class="muted small">' + esc(JSON.stringify(e.detail || {}).slice(0, 120)) + '</span></li>').join('');
+        const conv = task.conversation || {};
+        box.innerHTML = '<p>Попытка ' + esc(task.attempt) + '/' + esc(task.max_attempts) + ' · владелец ' + esc(task.owner || '—') + '</p>' +
+          '<p class="muted small">Conversation: ' + esc(conv.external_conversation_id || '—') + '</p>' +
+          (task.result ? '<p style="white-space:pre-wrap">' + esc(task.result.slice(0, 500)) + '</p>' : '') +
+          '<ul>' + (events || '<li class="muted small">Событий нет</li>') + '</ul>';
+      } catch (e) { $('#project-tasks').querySelector('.task-detail[data-id="' + button.dataset.id + '"]').textContent = e.message; }
+    });
   } catch (e) { if (SELECTED_PROJECT === id) $('#project-tasks').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
 }
 

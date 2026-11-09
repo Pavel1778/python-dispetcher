@@ -180,6 +180,13 @@ def test_full_user_journey(base, app, page):
     workflows_text = page.inner_text("#project-workflows")
     assert "Implement the widget API" in workflows_text
 
+    # Workflow detail opens and shows the Sr state and the child task list.
+    page.click(".wf-open")
+    page.wait_for_function(
+        "() => document.querySelector('.wf-detail:not(.hidden)') !== null",
+        timeout=20000,
+    )
+
     # 9. Record evidence (a real, signed record) and re-verify it in the UI.
     page.fill("#project-evidence-summary", "browser evidence")
     page.fill("#project-evidence-commit", "abc123def")
