@@ -825,6 +825,12 @@ async function initShell() {
     if (b) openConversation(b.getAttribute('data-conv'));
   });
 
+  // IDE file tree: open the clicked file.
+  document.addEventListener('click', (e) => {
+    const item = e.target.closest && e.target.closest('#ide-tree [data-path]');
+    if (item) openIdeFile(item.getAttribute('data-path'));
+  });
+
   // Repository picker.
   on('#repo-refresh', 'onclick', () => loadAccountRepositories($('#repo-account').value));
   on('#repo-account', 'onchange', (e) => loadAccountRepositories(e.target.value));
