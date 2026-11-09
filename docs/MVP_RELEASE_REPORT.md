@@ -109,6 +109,7 @@ All commands run in this sandbox on PostgreSQL 17.
 | Browser E2E | `tests/test_browser_e2e.py` (Chromium) | **passed** — full journey + mobile overflow |
 | Security negative | `tests/test_project_binding.py`, `test_evidence_trust.py`, `test_route_auth.py`, `test_cli_mcp.py`, `test_dispatch_authorization.py` | **passed** |
 | Clean startup | server start + `GET /healthz` / `GET /readyz` | **200 / ready** |
+| Docker Compose | `docker compose up --build` then `/readyz`, `/login`, CLI | **ready / 200 / works** |
 
 New test files (62 new tests over the 382 baseline):
 

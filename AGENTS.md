@@ -447,3 +447,52 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
     Confirm the choice with the operator before merging.
 - `tools/delete_cloud_sessions.py` and `tools/classify_cloud_sessions.py` are
   the only guarded Cloud-conversation deletion paths; keep them CLI-only.
+
+## D-2 project execution binding and the Evidence Trust Engine (MVP)
+
+Added on `nexus/mvp-integration`. These are the invariants to keep.
+
+- **Migration `0014_nexus_project_binding.sql` is additive.** It adds
+  `nexus_project_repositories` (project↔repo many-to-many), nullable
+  `project_id` on `tasks`/`workflows`, the canonical repository-identity trigger,
+  and `nexus_evidence`. `0012`/`0013` are intentionally reserved for the
+  deferred File Lab (D-1). The runner applies every `*.sql` in lexical order and
+  does not require a contiguous sequence, so the gap is safe. **Never backfill
+  legacy rows**: a task/workflow/evidence with no project stays unscoped.
+- **`tasks.repository_id` is canonical.** A `BEFORE INSERT/UPDATE` trigger
+  (`nexus_tasks_check_binding`) derives `selected_repository` from it, resolves
+  it from the allowlist when only `selected_repository` is given, refuses a
+  conflict, refuses a cross-project repository, and refuses a task whose
+  workflow is in a different project. Do not "simplify" this to a Python check:
+  a direct insert must be refused too.
+- **`authorize_dispatch` is the single dispatch gate** (`nexus_binding.py`). It
+  is re-run immediately before a conversation is created and before a task is
+  queued, for the dispatcher, the web API, the CLI and MCP. The global allowlist
+  is necessary but never sufficient for a project-scoped task. A failing check
+  dead-letters the task with the reason as evidence — never a silent skip.
+- **The Evidence Trust Engine is real crypto** (`evidence_trust.py`). Ed25519
+  over a canonical encoding; a trusted keyring by `key_id`; revoked keys never
+  verify. **Only a trusted asymmetric signature yields `VERIFIED`; HMAC can
+  never produce it.** `UNVERIFIED` for unsigned/legacy/unknown-key/expected-
+  commit-mismatch; `FAILED` for a tampered signed field; `BLOCKED` without the
+  crypto library.
+- **Project-scoped evidence signs `project_id`** (format v2). The exact signed
+  bytes are stored in `signed_payload` and verification reads them verbatim, so
+  editing the `project_id` column afterwards fails verification. Legacy records
+  are format v1 and unscoped; never give them a fabricated project.
+- **Project isolation is a 404, not a 403.** A non-member reading another
+  project's resource gets "not found". `tests/test_route_auth.py` fails if a
+  protected endpoint is added without `_require_read`/`_require_write`.
+- **The CLI and MCP are thin clients.** `orchestration/cli.py` calls the HTTP
+  API and never prints a secret; `orchestration/mcp_server.py` speaks MCP over
+  stdio with no shell/SQL/eval tool and re-checks membership on every write.
+  Streamable-HTTP MCP is not implemented; do not claim it is.
+- **`/readyz` checks the database**; `/healthz` stays a one-line liveness probe.
+  Both are public and expose no configuration.
+- **Docker Compose doubles `$` in `.env`.** Compose interpolates `$` in an
+  `env_file`, so `AUTH_PASSWORD_HASH` (which contains `$`) must be written with
+  `$$` or the server refuses to boot with a clear "N separators" message.
+- Tests: `test_project_binding.py`, `test_evidence_trust.py`,
+  `test_dispatch_authorization.py`, `test_route_auth.py`, `test_cli_mcp.py`,
+  `test_browser_e2e.py`, `test_migration_d2.py`. `docs/MVP_RELEASE_REPORT.md`
+  states what is verified and what still needs a live OpenHands key.
