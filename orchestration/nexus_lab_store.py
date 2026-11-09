@@ -112,20 +112,42 @@ class LabStore:
             raise ValueError("invalid run state")
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
-            cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
-                        "updated_at=now() WHERE id=%s AND project_id=%s RETURNING *",
-                        (state, last_error, run_id, project_id))
+            return self._apply_run_state(cur, project_id, run_id, state, last_error)
+
+    def set_run_state_internal(self, run_id: str, state: str,
+                               *, last_error: str | None = None) -> dict:
+        """State transition by the scheduler itself, not a user request.
+
+        The worker is not a project member, so it cannot pass the membership
+        check a user request must. It is still not a bypass of *authorization*:
+        the run must exist, and only the scheduler calls this.
+        """
+        if state not in ("running", "paused", "waiting_for_approval", "blocked",
+                         "completed", "failed", "cancelled"):
+            raise ValueError("invalid run state")
+        with self.store._tx() as cur:
+            cur.execute("SELECT project_id FROM nexus_runs WHERE id=%s", (run_id,))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("run not found")
-            run = dict(row)
-            # Mirror terminal states onto the goal so the goal is not left
-            # "running" after its only run finished.
-            if state in ("completed", "failed", "cancelled"):
-                cur.execute("UPDATE nexus_goals SET state=%s, updated_at=now() WHERE id=%s",
-                            (state, run["goal_id"]))
-                self._notify(cur, project_id, f"goal_{state}", f"Цель: {state}", run_id)
-            return run
+            return self._apply_run_state(cur, str(row["project_id"]), run_id, state, last_error)
+
+    def _apply_run_state(self, cur: Any, project_id: str, run_id: str, state: str,
+                         last_error: str | None) -> dict:
+        cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
+                    "updated_at=now() WHERE id=%s AND project_id=%s RETURNING *",
+                    (state, last_error, run_id, project_id))
+        row = cur.fetchone()
+        if row is None:
+            raise NotFound("run not found")
+        run = dict(row)
+        # Mirror terminal states onto the goal so the goal is not left
+        # "running" after its only run finished.
+        if state in ("completed", "failed", "cancelled"):
+            cur.execute("UPDATE nexus_goals SET state=%s, updated_at=now() WHERE id=%s",
+                        (state, run["goal_id"]))
+            self._notify(cur, project_id, f"goal_{state}", f"Цель: {state}", run_id)
+        return run
 
     def bump_iteration(self, run_id: str) -> int:
         with self.store._tx() as cur:
@@ -312,6 +334,35 @@ class LabStore:
         with self.store._tx() as cur:
             cur.execute("SELECT count(*) AS n FROM nexus_run_tasks WHERE run_id=%s "
                         "AND state IN ('pending','dispatched','running','verifying')", (run_id,))
+            return cur.fetchone()["n"] > 0
+
+    def has_in_flight(self, run_id: str) -> bool:
+        """Whether any task is dispatched/running/verifying right now."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT count(*) AS n FROM nexus_run_tasks WHERE run_id=%s "
+                        "AND state IN ('dispatched','running','verifying')", (run_id,))
+            return cur.fetchone()["n"] > 0
+
+    def has_claimable(self, run_id: str) -> bool:
+        """Whether any pending task could be claimed right now.
+
+        Same predicate as ``claim_task`` (attempts left, no live lease, every
+        dependency completed_verified), without taking a lock. Used to tell a
+        run that is *waiting* from one that is *deadlocked*: a pending task
+        whose dependency ended `completed_unverified`/`failed`/`blocked` can
+        never become claimable.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM nexus_run_tasks t "
+                "WHERE t.run_id=%s AND t.state='pending' AND t.attempt < t.max_attempts "
+                "AND (t.lease_expires IS NULL OR t.lease_expires < now()) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM jsonb_array_elements_text(t.dependencies) AS d(dep) "
+                "  WHERE NOT EXISTS ("
+                "    SELECT 1 FROM nexus_run_tasks dep "
+                "    WHERE dep.run_id = t.run_id AND dep.task_key = d.dep "
+                "      AND dep.state = 'completed_verified'))", (run_id,))
             return cur.fetchone()["n"] > 0
 
     # ----------------------------------------------------------- notifications
