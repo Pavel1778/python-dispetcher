@@ -19,37 +19,16 @@ Security rules, each enforced in code:
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import os
 from typing import Any
 
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubAuthError, GitHubClient, GitHubUnavailable
 from .nexus_projects import ProjectService, _text
-
-_ENV_SECRET = "NEXUS_SECRET_KEY"
-
-
-class SecretsError(RuntimeError):
-    """The encryption key is missing or unusable."""
-
-
-def _fernet():
-    """A Fernet built from ``NEXUS_SECRET_KEY``. Refuses to run without one."""
-    raw = os.environ.get(_ENV_SECRET, "").strip()
-    if not raw:
-        raise SecretsError(f"{_ENV_SECRET} is not set; refusing to store a GitHub PAT")
-    try:
-        from cryptography.fernet import Fernet
-    except ImportError as e:  # pragma: no cover - cryptography is a declared dep
-        raise SecretsError("cryptography is not installed") from e
-    # Accept either a real Fernet key or an arbitrary passphrase (derive a key).
-    try:
-        return Fernet(raw.encode())
-    except (ValueError, TypeError):
-        digest = hashlib.sha256(raw.encode()).digest()
-        return Fernet(base64.urlsafe_b64encode(digest))
+from .secrets import (  # noqa: F401 - SecretsError is re-exported for callers
+    SecretsError,
+    decrypt as _decrypt_secret,
+    encrypt as _encrypt_secret,
+)
 
 
 class GitHubAccountService:
@@ -80,7 +59,7 @@ class GitHubAccountService:
         except GitHubUnavailable as e:
             raise ValueError(f"GitHub is unavailable: {e}") from e
         login = identity["login"]
-        ciphertext = _fernet().encrypt(token.encode())
+        ciphertext = _encrypt_secret(token)
         with self.store._tx() as cur:
             cur.execute(
                 "INSERT INTO nexus_github_accounts(principal, label, login, token_encrypted) "
@@ -114,7 +93,7 @@ class GitHubAccountService:
             login = self._client(token).current_user()["login"]
         except (GitHubAuthError, GitHubUnavailable) as e:
             raise ValueError(f"new token was rejected: {e}") from e
-        ciphertext = _fernet().encrypt(token.encode())
+        ciphertext = _encrypt_secret(token)
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_github_accounts SET token_encrypted=%s, login=%s, "
@@ -189,6 +168,21 @@ class GitHubAccountService:
         token = self._decrypt(principal, str(account_id))
         return self._client(token)
 
+    def client_for_account(self, principal: str, account_id: str) -> GitHubClient:
+        """A client for one named account, or raise.
+
+        Used by the visual repository picker: the list of repositories comes from
+        *this* account's token, so a multi-account lab sees the right set. The
+        token is decrypted here and never returned to the caller.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_github_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("account not found")
+        token = self._decrypt(principal, account_id)
+        return self._client(token)
+
     def _decrypt(self, principal: str, account_id: str) -> str:
         with self.store._tx() as cur:
             cur.execute("SELECT token_encrypted, state FROM nexus_github_accounts "
@@ -198,7 +192,7 @@ class GitHubAccountService:
                 raise NotFound("account not found")
             if row["state"] != "active":
                 raise ValueError(f"account is {row['state']}")
-            return _fernet().decrypt(bytes(row["token_encrypted"])).decode()
+            return _decrypt_secret(row["token_encrypted"])
 
     @staticmethod
     def _view(row: Any) -> dict:

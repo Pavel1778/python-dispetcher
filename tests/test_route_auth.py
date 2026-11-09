@@ -50,6 +50,12 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/tasks", f"/api/v1/projects/{UUID}/workflows",
     f"/api/v1/projects/{UUID}/evidence", f"/api/v1/projects/{UUID}/goals",
     f"/api/v1/projects/{UUID}/events", f"/api/v1/projects/{UUID}/files",
+    f"/api/v1/projects/{UUID}/conversations",
+    f"/api/v1/projects/{UUID}/conversations/{UUID}",
+    f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
+    f"/api/v1/projects/{UUID}/agents", f"/api/v1/projects/{UUID}/binding",
+    "/api/openhands/accounts", f"/api/openhands/accounts/{UUID}",
+    f"/api/github/accounts/{UUID}/repositories",
 ]
 PROTECTED_POST = [
     "/mcp",
@@ -61,6 +67,13 @@ PROTECTED_POST = [
     f"/api/v1/projects/{UUID}/tasks",
     f"/api/v1/projects/{UUID}/evidence",
     f"/api/v1/projects/{UUID}/evidence/{UUID}/verify",
+    f"/api/v1/projects/{UUID}/conversations",
+    f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
+    f"/api/v1/projects/{UUID}/binding", f"/api/v1/projects/{UUID}/binding/branch",
+    f"/api/v1/projects/{UUID}/openhands-account",
+    "/api/openhands/accounts",
+    f"/api/openhands/accounts/{UUID}/verify",
+    f"/api/github/accounts/{UUID}/verify",
 ]
 
 

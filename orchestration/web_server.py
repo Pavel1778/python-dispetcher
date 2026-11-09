@@ -86,6 +86,8 @@ from .github_client import (
 from .github_confirmations import Confirmations
 from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
+from .nexus_binding import ProjectBindingError
+from .nexus_chat import ChatError
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
@@ -333,7 +335,7 @@ class App:
         self.voice = VoiceNoteService(self.store)
         self.actions = PendingActions(self.store)
         # D-2 project execution binding and the Evidence Trust Engine.
-        from .nexus_binding import ProjectRepositoryService
+        from .nexus_binding import ProjectBindingService, ProjectRepositoryService
         from .nexus_evidence import EvidenceService
         from .evidence_trust import (
             EvidenceTrustEngine,
@@ -341,6 +343,8 @@ class App:
             signer_from_env,
         )
         self.project_repos = ProjectRepositoryService(self.store)
+        # The explicit project execution binding (repository + branch + account).
+        self.project_binding = ProjectBindingService(self.store)
         self.evidence_keyring = Keyring.from_env()
         self.evidence_signer = signer_from_env()
         self.evidence = EvidenceService(
@@ -359,12 +363,26 @@ class App:
         from .nexus_context import ContextService, MemoryService
         from .nexus_github_accounts import GitHubAccountService
         from .nexus_lab_store import LabStore
+        from .nexus_openhands_accounts import OpenHandsAccountService
         from .nexus_planner import Planner
         self.lab = LabStore(self.store)
         self.context = ContextService(self.store)
         self.memory = MemoryService(self.store)
         self.planner = Planner(self.providers)
         self.github_accounts = GitHubAccountService(self.store)
+        # OpenHands multi-account: an account is one row, the API key encrypted
+        # with NEXUS_SECRET_KEY and never returned. A project may bind one.
+        self.openhands_accounts = OpenHandsAccountService(self.store)
+        # The persistent conversational surface. The responder needs the provider
+        # cascade for ask/plan and the dispatch hooks for code/autonomous.
+        from .nexus_chat import ChatResponder
+        from .nexus_conversations import ConversationService
+        self.conversations = ConversationService(self.store)
+        self.chat = ChatResponder(
+            self.providers,
+            dispatch_code=self._chat_dispatch_code,
+            start_autonomous=self._chat_start_autonomous,
+        )
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -533,6 +551,43 @@ class App:
             raise
         return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id,
                 "reused": not created}
+
+    def _chat_dispatch_code(self, request: dict) -> dict[str, Any]:
+        """Chat "Code" mode: start a real OpenHands workflow for the request.
+
+        The project's bound account executes it (when one is bound), and the
+        workflow is scoped to the project so the dispatcher's authorization gate
+        re-checks the repository link before any conversation is created.
+        """
+        return self.start_workflow(
+            request["goal"], request.get("repository"), request.get("branch"),
+            project_id=request.get("project_id"),
+            principal=request.get("principal"),
+        )
+
+    def _chat_start_autonomous(self, request: dict) -> dict[str, Any]:
+        """Chat "Autonomous" mode: plan the goal and start a real Lab run.
+
+        The plan comes from the provider cascade and is validated before it is
+        stored; a provider outage raises, so the chat records a failure instead
+        of a fabricated plan. The durable worker advances the run.
+        """
+        from .nexus_planner import store_plan
+
+        principal = request["principal"]
+        project_id = request["project_id"]
+        project = self.projects.get(principal, project_id)
+        goal, _created = self.projects.create_goal(principal, project_id, request["goal"])
+        context = self.context.current(principal, project_id)
+        memory = self.memory.retrieve(principal, project_id, limit=30)
+        tasks, _meta = self.planner.plan(
+            goal=goal["text"], project_name=project["name"],
+            context=(context or {}).get("summary") or {}, memory=memory)
+        run = self.lab.start_run(principal, project_id, str(goal["id"]))
+        stored = store_plan(self.lab, principal, project_id, str(run["id"]),
+                            tasks=tasks, repository=request.get("repository") or "",
+                            branch=request.get("branch") or "")
+        return {"run_id": str(run["id"]), "tasks": stored}
 
     def cancel_workflow(self, workflow_id: str) -> dict[str, Any]:
         """Stop a workflow for good. Terminal and idempotent.
@@ -1060,6 +1115,32 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/v1/projects/{id}/notifications
         if rest == ["notifications"]:
             return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/conversations[?q=&archived=1]
+        if rest and rest[0] == "conversations" and len(rest) == 1:
+            # The query lives on the raw request target, not the stripped path.
+            from urllib.parse import parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            query = (params.get("q") or [None])[0]
+            include_archived = (params.get("archived") or ["0"])[0] in ("1", "true")
+            return (200, {"conversations": self.app.conversations.list(
+                principal, project_id, include_archived=include_archived,
+                query=query)}, None)
+        # GET /api/v1/projects/{id}/conversations/{cid}
+        if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
+            return (200, {"conversation": self.app.conversations.get(
+                principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/conversations/{cid}/messages
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "messages"):
+            return (200, {"messages": self.app.conversations.list_messages(
+                principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/agents  (agent sessions)
+        if rest == ["agents"]:
+            return (200, {"sessions": self.app.conversations.list_agent_sessions(
+                principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/binding  (repository/branch/account binding)
+        if rest == ["binding"]:
+            return (200, {"binding": self.app.project_binding.get(principal, project_id)}, None)
         # GET /api/v1/projects/{id}/github/repositories[/{owner}/{name}[/section]]
         if rest and rest[0] == "github" and len(rest) >= 2 and rest[1] == "repositories":
             # The GitHub views read no project data, but the route still names a
@@ -1071,6 +1152,118 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             return self._get_github(principal, rest)
         return None
+
+    def _github_account_get(self, path: str):
+        """GET a GitHub account's repositories using *that account's* token.
+
+        This is what makes the visual repository picker multi-account: the list
+        comes from the named account, never from the process-wide token. The PAT
+        never leaves the server.
+        """
+        parts = path.strip("/").split("/")
+        principal = self._project_principal()
+        if len(parts) == 4:  # /api/github/accounts/{id}
+            account = self._find_account(self.app.github_accounts.list_accounts(principal),
+                                         parts[3])
+            return self._json(200, {"account": account})
+        if len(parts) == 5 and parts[4] == "repositories":
+            try:
+                client = self.app.github_accounts.client_for_account(principal, parts[3])
+                repos = client.list_repositories()
+            except NotFound:
+                return self._json(404, {"error": "account not found"})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except GitHubAuthError as e:
+                return self._json(400, {"error": f"github auth: {e}"})
+            except GitHubUnavailable as e:
+                return self._json(503, {"error": f"github unavailable: {e}"})
+            except GitHubError as e:
+                return self._json(502, {"error": f"github: {e}"})
+            return self._json(200, {"repositories": [r.as_dict() for r in repos],
+                                    "count": len(repos)})
+        return self._json(404, {"error": "not found"})
+
+    def _openhands_account_get(self, path: str):
+        """GET one OpenHands account, or its discovered capabilities.
+
+        Capabilities come from the named account's own key, read-only, and never
+        include a secret. The API key never leaves the server.
+        """
+        parts = path.strip("/").split("/")
+        principal = self._project_principal()
+        account = self._find_account(self.app.openhands_accounts.list_accounts(principal),
+                                     parts[3])
+        if len(parts) == 4:
+            return self._json(200, {"account": account})
+        if len(parts) == 5 and parts[4] == "capabilities":
+            try:
+                client = self.app.openhands_accounts.client_for_account(principal, parts[3])
+                caps = client.account_capabilities()
+            except NotFound:
+                return self._json(404, {"error": "account not found"})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except CloudError as e:
+                return self._json(502, {"error": f"cloud: {e}"})
+            return self._json(200, {"capabilities": caps})
+        return self._json(404, {"error": "not found"})
+
+    @staticmethod
+    def _find_account(accounts: list[dict], account_id: str) -> dict:
+        for account in accounts:
+            if str(account.get("id")) == account_id:
+                return account
+        raise NotFound("account not found")
+
+    def _github_account_post(self, path: str, body: dict):
+        """Actions on a GitHub account: verify / rotate / revoke / default."""
+        parts = path.strip("/").split("/")
+        principal = self._project_principal()
+        account_id, action = parts[3], (parts[4] if len(parts) > 4 else "")
+        if not UUID_RE.fullmatch(account_id):
+            return self._json(404, {"error": "not found"})
+        try:
+            if action == "verify":
+                return self._json(200, {"account": self.app.github_accounts.verify(
+                    principal, account_id)})
+            if action == "rotate":
+                return self._json(200, {"account": self.app.github_accounts.rotate(
+                    principal, account_id, token=body.get("token"))})
+            if action == "revoke":
+                return self._json(200, {"account": self.app.github_accounts.revoke(
+                    principal, account_id)})
+        except NotFound:
+            return self._json(404, {"error": "account not found"})
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        return self._json(404, {"error": "not found"})
+
+    def _openhands_account_post(self, path: str, body: dict):
+        """Actions on an OpenHands account: verify / rotate / revoke / default."""
+        parts = path.strip("/").split("/")
+        principal = self._project_principal()
+        account_id, action = parts[3], (parts[4] if len(parts) > 4 else "")
+        if not UUID_RE.fullmatch(account_id):
+            return self._json(404, {"error": "not found"})
+        try:
+            if action == "verify":
+                return self._json(200, {"account": self.app.openhands_accounts.verify(
+                    principal, account_id)})
+            if action == "rotate":
+                return self._json(200, {"account": self.app.openhands_accounts.rotate(
+                    principal, account_id, api_key=body.get("api_key"))})
+            if action == "revoke":
+                return self._json(200, {"account": self.app.openhands_accounts.revoke(
+                    principal, account_id)})
+            if action == "default":
+                return self._json(200, {"account": self.app.openhands_accounts.set_default(
+                    principal, account_id)})
+        except NotFound:
+            return self._json(404, {"error": "account not found"})
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        return self._json(404, {"error": "not found"})
 
     def _get_github(self, principal: str, rest: list[str]):
         """Read-only GitHub views. Never writes and never returns the token."""
@@ -1192,6 +1385,54 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"run": self.app.lab.set_run_state(
                 principal, project_id, rest[1], state)})
             return True
+        # POST /api/v1/projects/{id}/conversations   (create)
+        if rest == ["conversations"]:
+            self._json(201, {"conversation": self.app.conversations.create(
+                principal, project_id, title=body.get("title") or "",
+                mode=body.get("mode") or "ask")})
+            return True
+        # POST /api/v1/projects/{id}/conversations/{cid}/messages   (a chat turn)
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "messages"):
+            self._chat_turn(principal, project_id, rest[1], body)
+            return True
+        # POST /api/v1/projects/{id}/binding   (bind repository + branch)
+        if rest == ["binding"]:
+            try:
+                binding = self.app.project_binding.set_repository(
+                    principal, project_id,
+                    repository_id=body.get("repository_id"),
+                    full_name=body.get("full_name"),
+                    branch=body.get("branch"))
+            except ProjectBindingError as e:
+                self._json(400, {"error": str(e)})
+                return True
+            self._json(200, {"binding": binding})
+            return True
+        # POST /api/v1/projects/{id}/binding/branch   (change only the branch)
+        if rest == ["binding", "branch"]:
+            try:
+                binding = self.app.project_binding.set_branch(
+                    principal, project_id, body.get("branch"))
+            except ProjectBindingError as e:
+                self._json(400, {"error": str(e)})
+                return True
+            self._json(200, {"binding": binding})
+            return True
+        # POST /api/v1/projects/{id}/openhands-account   (bind an OpenHands account)
+        if rest == ["openhands-account"]:
+            account_id = body.get("account_id")
+            if account_id is not None and not UUID_RE.fullmatch(str(account_id)):
+                self._json(400, {"error": "account_id must be a uuid or null"})
+                return True
+            try:
+                project = self.app.openhands_accounts.bind_project(
+                    principal, project_id, str(account_id) if account_id else None)
+            except NotFound:
+                self._json(404, {"error": "account not found or not active"})
+                return True
+            self._json(200, {"project": project})
+            return True
         # POST /api/v1/projects/{id}/github/account  (bind one account)
         if rest == ["github", "account"]:
             account_id = body.get("account_id")
@@ -1285,6 +1526,87 @@ class Handler(BaseHTTPRequestHandler):
         stored = store_plan(self.app.lab, principal, project_id, str(run["id"]),
                             tasks=tasks, repository=repository, branch=branch)
         self._json(201, {"run": run, "tasks": stored, "plan": meta})
+
+    def _chat_turn(self, principal: str, project_id: str, conversation_id: str,
+                   body: dict) -> None:
+        """Store the user turn, produce the assistant turn, return the new messages.
+
+        The user message is persisted first, so it survives even if the assistant
+        fails. The assistant reply is produced by :mod:`orchestration.nexus_chat`
+        (real provider cascade or real dispatch), never fabricated; a failure is
+        recorded as an ``error`` system message and the conversation state becomes
+        ``error``. The response is the list of messages appended this turn, which
+        the client appends to the transcript (a single JSON body, not a stream —
+        the transport here is a stdlib HTTP server; the client renders a typing
+        indicator until the body arrives).
+        """
+        text = (body.get("text") or "").strip()
+        if not text:
+            self._json(400, {"error": "text is required"})
+            return
+        mode = body.get("mode")
+        conversation = self.app.conversations.get(principal, project_id, conversation_id)
+        if mode:
+            self.app.conversations.set_mode(principal, project_id, conversation_id, mode)
+            # Re-read so the joined repository/branch fields are present; set_mode
+            # returns only the conversation row itself.
+            conversation = self.app.conversations.get(principal, project_id, conversation_id)
+        # Persist the user turn first: it must not be lost to an assistant failure.
+        user_msg = self.app.conversations.add_message(
+            principal, project_id, conversation_id, role="user", content=text)
+        history = self.app.conversations.list_messages(principal, project_id, conversation_id)
+        appended: list[dict] = [user_msg]
+        self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
+        context = self.app.context.current(principal, project_id)
+        memory = self.app.memory.retrieve(principal, project_id, limit=30)
+        try:
+            produced = self.app.chat.respond(
+                mode=conversation["mode"], goal=text, context=context, memory=memory,
+                repository=conversation.get("repository") or "",
+                branch=conversation.get("selected_branch") or "",
+                history=history)
+        except ChatError as e:
+            self.app.conversations.set_state(principal, project_id, conversation_id, "error")
+            err = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role="system",
+                content=f"Не удалось получить ответ: {e}", meta={"error": True})
+            self._json(502, {"error": str(e), "messages": appended + [err]})
+            return
+        # Persist each produced message, attaching any run/task ids to the
+        # conversation so the agent panel can follow it.
+        for msg in produced:
+            stored = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role=msg["role"],
+                content=msg["content"], meta=msg.get("meta"))
+            appended.append(stored)
+            meta = msg.get("meta") or {}
+            if meta.get("workflow_id") and msg["role"] == "assistant":
+                self._record_agent_session(principal, project_id, conversation_id,
+                                           meta, msg)
+        self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+        self._json(200, {"messages": appended})
+
+    def _record_agent_session(self, principal: str, project_id: str,
+                              conversation_id: str, meta: dict, msg: dict) -> None:
+        """Record the mapping between this NEXUS chat and the OpenHands work.
+
+        A NEXUS task/conversation is not an OpenHands conversation; this keeps the
+        two distinct and durable so the agent panel can show the real session.
+        """
+        try:
+            binding = self.app.project_binding.get(principal, project_id)
+            session = self.app.conversations.start_agent_session(
+                principal, project_id, conversation_id=conversation_id,
+                openhands_account_id=(str(binding["openhands_account_id"])
+                                      if binding.get("openhands_account_id") else None),
+                external_conversation_id=meta.get("sr_conversation_id"),
+                repository=meta.get("repository") or binding.get("full_name") or "",
+                branch=meta.get("branch") or binding.get("selected_branch") or "")
+            self.app.conversations.update_agent_session(
+                session["id"], state="running",
+                current_activity=(msg.get("content") or "")[:500])
+        except (NotFound, ValueError):
+            pass
 
     def _confirm_action(self, principal: str, project_id: str, action_id: str,
                         body: dict):
@@ -1724,6 +2046,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Token-free views only; the PAT never leaves the server.
                 return self._json(200, {"accounts": self.app.github_accounts.list_accounts(
                     self._project_principal())})
+            if path == "/api/openhands/accounts":
+                # API-key-free views only; the key never leaves the server.
+                return self._json(200, {"accounts": self.app.openhands_accounts.list_accounts(
+                    self._project_principal())})
             if path == "/api/config":
                 return self._json(200, {
                     "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
@@ -1931,6 +2257,22 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(201, {"account": account})
+            if path == "/api/openhands/accounts":
+                try:
+                    account = self.app.openhands_accounts.add(
+                        self._project_principal(),
+                        label=body.get("label"), api_key=body.get("api_key"),
+                        base_url=(body.get("base_url") or None),
+                        transport=(body.get("transport") or "direct"),
+                        default_model=(body.get("default_model") or None),
+                        make_default=bool(body.get("make_default")))
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(201, {"account": account})
+            if path.startswith("/api/github/accounts/"):
+                return self._github_account_post(path, body)
+            if path.startswith("/api/openhands/accounts/"):
+                return self._openhands_account_post(path, body)
             if path == "/api/repositories":
                 name = (body.get("full_name") or "").strip()
                 if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
@@ -2068,6 +2410,10 @@ class Handler(BaseHTTPRequestHandler):
                 if files.delete_workspace_file(principal, project_id, rest[1], rel):
                     return self._json(200, {"deleted": rel})
                 return self._json(404, {"error": "not found"})
+            # DELETE /api/v1/projects/{id}/conversations/{cid}
+            if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
+                self.app.conversations.set_archived(principal, project_id, rest[1], True)
+                return self._json(200, {"archived": rest[1]})
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
@@ -2082,6 +2428,25 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._require_write():
                 return
+            # PATCH /api/v1/projects/{id}/conversations/{cid}  (rename / mode)
+            sub = self._project_subpath(path)
+            if sub is not None:
+                project_id, rest = sub
+                if (len(rest) == 2 and rest[0] == "conversations"
+                        and UUID_RE.fullmatch(rest[1])):
+                    body = self._body(max_bytes=64 * 1024)
+                    if not isinstance(body, dict):
+                        return self._json(400, {"error": "body must be a JSON object"})
+                    principal = self._project_principal()
+                    conversation = self.app.conversations.get(principal, project_id, rest[1])
+                    if "title" in body:
+                        conversation = self.app.conversations.rename(
+                            principal, project_id, rest[1], body["title"])
+                    if "mode" in body:
+                        conversation = self.app.conversations.set_mode(
+                            principal, project_id, rest[1], body["mode"])
+                    return self._json(200, {"conversation": conversation})
+                return self._json(404, {"error": "not found"})
             parsed = self._project_path(path)
             if parsed is None or parsed[1]:
                 return self._json(404, {"error": "not found"})

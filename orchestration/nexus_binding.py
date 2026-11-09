@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from .cloud_store import NotFound, PostgresStore, StoreError, Task
+from .nexus_projects import _text
 
 
 class AuthorizationError(StoreError):
@@ -235,3 +236,121 @@ def authorize_dispatch(store: PostgresStore, *, task: Task,
 
         return {"project_id": project_id, "repository": repo_full,
                 "branch": task.selected_branch}
+
+
+class ProjectBindingError(StoreError):
+    """A project binding change was refused."""
+
+
+class ProjectBindingService:
+    """The project's explicit execution binding: repository, branch, account.
+
+    A binding is changed only through :meth:`set_repository`, never as a side
+    effect of another action, so a project cannot silently switch the repository
+    or branch work runs against. The repository is resolved from the allowlist by
+    stable id (or by full name for the advanced manual path) and must be
+    linkable; the branch must be one the repository actually has (checked by the
+    caller that holds a GitHub client) or the default.
+    """
+
+    def __init__(self, store: PostgresStore):
+        self.store = store
+
+    def get(self, principal: str, project_id: str) -> dict:
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT p.id, p.name, p.repository_id, p.selected_branch, "
+                "       p.openhands_account_id, p.github_account_id, "
+                "       r.full_name, r.provider, r.default_branch, r.allowed_branches, "
+                "       r.enabled "
+                "FROM nexus_projects p "
+                "LEFT JOIN repositories r ON r.id = p.repository_id "
+                "JOIN nexus_project_members m ON m.project_id = p.id "
+                "WHERE p.id=%s AND m.principal=%s",
+                (project_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project not found")
+            return dict(row)
+
+    def set_repository(self, principal: str, project_id: str, *,
+                       repository_id: str | None = None,
+                       full_name: str | None = None,
+                       branch: str | None = None) -> dict:
+        """Bind a repository (and branch) to a project. Explicit, never implicit.
+
+        Exactly one of *repository_id* / *full_name* selects the repository; a
+        ``None`` repository_id with no full_name unbinds. When a repository is
+        given it is also linked to the project (the link is what authorizes
+        dispatch), so binding and authorizing cannot drift apart.
+        """
+        if (repository_id is None) == (full_name is None):
+            raise ValueError("provide exactly one of repository_id or full_name")
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_project_members "
+                        "WHERE project_id=%s AND principal=%s AND role='owner'",
+                        (project_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("project not found")
+            repo = None
+            if repository_id is not None:
+                cur.execute("SELECT id, full_name, default_branch, allowed_branches, enabled "
+                            "FROM repositories WHERE id=%s", (repository_id,))
+                repo = cur.fetchone()
+            elif full_name is not None:
+                cur.execute("SELECT id, full_name, default_branch, allowed_branches, enabled "
+                            "FROM repositories WHERE full_name=%s", (full_name.strip(),))
+                repo = cur.fetchone()
+            if repo is None:
+                raise NotFound("repository not in the allowlist")
+            if not repo["enabled"]:
+                raise ProjectBindingError("repository is disabled")
+            chosen = (branch or repo["default_branch"]).strip()
+            if not chosen:
+                raise ProjectBindingError("branch is required")
+            allowed = repo["allowed_branches"] or []
+            if allowed and chosen not in allowed:
+                raise ProjectBindingError(
+                    f"branch {chosen} is not in the repository's allowed branches")
+            cur.execute(
+                "INSERT INTO nexus_project_repositories(project_id, repository_id, created_by) "
+                "VALUES (%s,%s,%s) ON CONFLICT (project_id, repository_id) DO NOTHING",
+                (project_id, repo["id"], principal))
+            cur.execute(
+                "UPDATE nexus_projects SET repository_id=%s, selected_branch=%s, "
+                "updated_at=now() WHERE id=%s "
+                "RETURNING id, name, repository_id, selected_branch",
+                (repo["id"], chosen, project_id))
+            out = dict(cur.fetchone())
+            out["full_name"] = repo["full_name"]
+            out["default_branch"] = repo["default_branch"]
+            cur.execute("INSERT INTO nexus_project_events(project_id, actor, kind, resource_id) "
+                        "VALUES (%s,%s,'project.repository_bound',%s)",
+                        (project_id, principal, repo["id"]))
+            return out
+
+    def set_branch(self, principal: str, project_id: str, branch: str) -> dict:
+        """Change only the selected branch of an already-bound repository."""
+        branch = _text(branch, "branch", maximum=255)
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT p.repository_id, r.allowed_branches, r.default_branch "
+                "FROM nexus_projects p JOIN repositories r ON r.id = p.repository_id "
+                "JOIN nexus_project_members m ON m.project_id = p.id "
+                "WHERE p.id=%s AND m.principal=%s AND m.role='owner'",
+                (project_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project has no repository bound")
+            allowed = row["allowed_branches"] or []
+            if allowed and branch not in allowed:
+                raise ProjectBindingError(
+                    f"branch {branch} is not in the repository's allowed branches")
+            cur.execute("UPDATE nexus_projects SET selected_branch=%s, updated_at=now() "
+                        "WHERE id=%s RETURNING id, repository_id, selected_branch",
+                        (branch, project_id))
+            out = dict(cur.fetchone())
+            cur.execute("INSERT INTO nexus_project_events(project_id, actor, kind, resource_id) "
+                        "VALUES (%s,%s,'project.branch_changed',%s)",
+                        (project_id, principal, row["repository_id"]))
+            return out

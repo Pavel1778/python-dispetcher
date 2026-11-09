@@ -177,6 +177,25 @@ class Provider:
 
     def complete(self, prompt: str, system: str = "") -> ProviderResponse:
         """Call the provider, retrying only transient failures, bounded."""
+        text = self._text_with_retry(prompt, system)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ProviderRejected(f"{self.name}: completion was not JSON") from e
+        if not isinstance(parsed, dict):
+            raise ProviderRejected(f"{self.name}: completion was not a JSON object")
+        return ProviderResponse(provider=self.name, model=self.model,
+                                data=parsed, attempts=1)
+
+    def complete_text(self, prompt: str, system: str = "") -> str:
+        """Call the provider and return the raw text of its answer.
+
+        Used by the chat surface, which needs prose, not a plan. The retry
+        policy is identical: only a transient failure is retried, bounded.
+        """
+        return self._text_with_retry(prompt, system)
+
+    def _text_with_retry(self, prompt: str, system: str) -> str:
         if not self.configured:
             raise ProviderAuthError(f"{self.name}: no API key configured")
         attempts = 0
@@ -194,14 +213,7 @@ class Provider:
             text = self._extract_text(body)
             if not text:
                 raise ProviderRejected(f"{self.name}: empty completion")
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise ProviderRejected(f"{self.name}: completion was not JSON") from e
-            if not isinstance(parsed, dict):
-                raise ProviderRejected(f"{self.name}: completion was not a JSON object")
-            return ProviderResponse(provider=self.name, model=self.model,
-                                    data=parsed, attempts=attempts)
+            return text
         raise last or ProviderUnavailable(f"{self.name}: exhausted retries")
 
 
@@ -407,4 +419,29 @@ class ProviderCascade:
                 failures.append((provider.name, f"invalid plan: {e}"))
                 continue
             return CascadeResult(response=response, plan=plan, failovers=list(failures))
+        raise AllProvidersFailed(failures)
+
+    def text(self, prompt: str, system: str = "") -> ProviderResponse:
+        """Ask each configured provider for prose until one answers.
+
+        The chat surface needs a natural-language answer, not a plan. Failover
+        is identical to :meth:`plan`: only provider/transport problems move to
+        the next provider. The answer is returned as a
+        :class:`ProviderResponse` whose ``data`` is ``{"text": ...}``, so the
+        caller records the same provenance either way.
+        """
+        failures: list[tuple[str, str]] = []
+        for provider in self.providers:
+            if not provider.configured:
+                continue
+            try:
+                text = provider.complete_text(prompt, system)
+            except ProviderError as e:
+                failures.append((provider.name, str(e)))
+                continue
+            if not text.strip():
+                failures.append((provider.name, "empty completion"))
+                continue
+            return ProviderResponse(provider=provider.name, model=provider.model,
+                                    data={"text": text})
         raise AllProvidersFailed(failures)

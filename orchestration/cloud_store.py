@@ -323,6 +323,18 @@ class PostgresStore:
                                   "status", "expires_at"),
         "nexus_voice_notes": ("id", "project_id", "content_type", "size", "data",
                               "transcript"),
+        "nexus_openhands_accounts": ("id", "principal", "label", "base_url",
+                                     "transport", "api_key_encrypted", "state",
+                                     "is_default"),
+        "nexus_conversations": ("id", "project_id", "title", "mode", "state",
+                                "archived"),
+        "nexus_conversation_messages": ("id", "conversation_id", "role", "content",
+                                        "meta"),
+        "nexus_conversation_attachments": ("id", "conversation_id", "file_id",
+                                           "kind", "filename"),
+        "nexus_agent_sessions": ("id", "project_id", "conversation_id",
+                                 "openhands_account_id", "external_conversation_id",
+                                 "state"),
     }
 
     def verify_schema(self) -> list[str]:

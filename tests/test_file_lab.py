@@ -78,9 +78,12 @@ def store():
     instance = PostgresStore(DSN)
     with instance._tx() as cur:
         cur.execute(
-            "TRUNCATE nexus_voice_notes, nexus_pending_actions, nexus_workspace_files, "
-            "nexus_workspaces, nexus_files, nexus_plan_dependencies, nexus_plan_tasks, "
-            "nexus_plans, nexus_project_events, nexus_goals, nexus_project_members, "
+            "TRUNCATE nexus_agent_sessions, nexus_conversation_attachments, "
+            "nexus_conversation_messages, nexus_conversations, "
+            "nexus_openhands_accounts, nexus_voice_notes, nexus_pending_actions, "
+            "nexus_workspace_files, nexus_workspaces, nexus_files, "
+            "nexus_plan_dependencies, nexus_plan_tasks, nexus_plans, "
+            "nexus_project_events, nexus_goals, nexus_project_members, "
             "nexus_projects RESTART IDENTITY CASCADE"
         )
     yield instance
