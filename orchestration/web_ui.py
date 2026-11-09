@@ -727,8 +727,47 @@ APP_HTML = r"""<!doctype html>
   </section>
 
   <section id="panel-integrations" role="tabpanel" aria-labelledby="tab-integrations" class="hidden">
-    <div class="card"><div class="card-head"><h3>GitHub</h3></div>
-      <p class="muted small">Токен настраивается администратором на сервере. Это отдельный доступ от GitHub-учётной записи OpenHands. Изменения GitHub доступны только после включения оператором и отдельного подтверждения.</p>
+    <div class="card"><div class="card-head"><h3>Аккаунты GitHub</h3></div>
+      <p class="muted small">Каждый аккаунт хранит свой токен, зашифрованный на сервере.
+        Токен никогда не показывается и не возвращается API. Аккаунтов может быть
+        сколько угодно — ограничения на два нет.</p>
+      <div id="gh-accounts-list"><p class="muted small">Загрузка…</p></div>
+      <form id="gh-account-form">
+        <div class="row">
+          <div><label for="gh-account-label">Название аккаунта</label>
+            <input id="gh-account-label" maxlength="120" placeholder="Например: личный" required></div>
+          <div><label for="gh-account-token">Personal access token</label>
+            <input id="gh-account-token" type="password" autocomplete="off" placeholder="ghp_…" required></div>
+        </div>
+        <div class="actions"><button type="submit">Добавить аккаунт</button>
+          <span class="muted small" id="gh-account-msg" role="status" aria-live="polite"></span></div>
+      </form>
+    </div>
+    <div class="card" style="margin-top:16px"><div class="card-head"><h3>Аккаунты OpenHands</h3></div>
+      <p class="muted small">Несколько аккаунтов OpenHands: свой ключ, свой базовый URL,
+        свой транспорт. Ключ шифруется и никогда не возвращается. Проект может
+        выполняться отдельным аккаунтом.</p>
+      <div id="oh-accounts-list"><p class="muted small">Загрузка…</p></div>
+      <form id="oh-account-form">
+        <div class="row">
+          <div><label for="oh-account-label">Название</label>
+            <input id="oh-account-label" maxlength="120" placeholder="Например: основной" required></div>
+          <div><label for="oh-account-key">API key</label>
+            <input id="oh-account-key" type="password" autocomplete="off" placeholder="sk-…" required></div>
+        </div>
+        <div class="row">
+          <div><label for="oh-account-url">Base URL</label>
+            <input id="oh-account-url" placeholder="https://app.all-hands.dev" autocapitalize="none"></div>
+          <div><label for="oh-account-transport">Транспорт</label>
+            <select id="oh-account-transport"><option value="direct">direct (sandbox + agent-server)</option><option value="app">app (app-conversations)</option></select></div>
+        </div>
+        <div class="actions"><button type="submit">Добавить аккаунт</button>
+          <label class="small" style="margin:0 0 0 12px"><input type="checkbox" id="oh-account-default" style="width:auto"> сделать по умолчанию</label>
+          <span class="muted small" id="oh-account-msg" role="status" aria-live="polite"></span></div>
+      </form>
+    </div>
+    <div class="card" style="margin-top:16px"><div class="card-head"><h3>GitHub: подтверждённые записи</h3></div>
+      <p class="muted small">Токен по умолчанию (GITHUB_TOKEN) — отдельный доступ от аккаунта OpenHands. Изменения GitHub доступны только после включения оператором и отдельного подтверждения.</p>
       <p id="github-status" class="small" role="status"></p>
       <form id="github-form">
         <label for="github-action">Действие</label>
@@ -2155,7 +2194,7 @@ async function boot() {
       .forEach(p => p.classList.add('hidden'));
     $('#' + tab.getAttribute('aria-controls')).classList.remove('hidden');
     if (tab.id === 'tab-system') loadSystem();
-    if (tab.id === 'tab-integrations') loadGitHubStatus();
+    if (tab.id === 'tab-integrations') { loadGitHubStatus(); if (typeof initAccounts === 'function') initAccounts(); }
     if (tab.id === 'tab-projects') loadProjects();
     if (tab.id === 'tab-autolab') initAutoLab();
     if (tab.id === 'tab-lab') initLab();

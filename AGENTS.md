@@ -690,3 +690,60 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
 - **Supabase**: the only project (`xwooledhoyuaaxkccnjd`) is **INACTIVE**; the
   access token is valid but the database is not serving. Tests use a local
   PostgreSQL, not this project.
+
+## NEXUS AI IDE transformation (branch `nexus/ai-ide-transformation`)
+
+Turns the dispatcher dashboard into an AI development workspace. The old panels
+are **not removed** — they are secondary tabs behind the sidebar — so nothing
+was lost; the first screen is now chat/IDE.
+
+- **`orchestration/secrets.py` is the single credential cipher.** Every stored
+  secret (a GitHub PAT, an OpenHands API key) is Fernet-encrypted with
+  `NEXUS_SECRET_KEY`. A missing key is a hard refusal (`SecretsError`), never a
+  plaintext write. `nexus_github_accounts` and `nexus_openhands_accounts` both
+  use it; do not add a second crypto path.
+- **`orchestration/nexus_openhands_accounts.py`** — one OpenHands account per
+  row: label, base URL, transport (`direct`/`app`), optional default model,
+  encrypted key, verified identity, discovered capabilities. At most one
+  `is_default` per principal (partial unique index). `client_for_project` never
+  falls back to another account or the process-wide key.
+- **`nexus_github_accounts.client_for_account`** is what makes the repository
+  picker multi-account: the repository list comes from the named account's own
+  token. There is no cap on the number of accounts.
+- **`orchestration/nexus_binding.py` — `ProjectBindingService`** is the project's
+  explicit repository+branch binding. `set_repository` also writes the
+  project↔repo link (the thing `authorize_dispatch` checks), so binding and
+  authorization cannot drift. Changing a binding is always an explicit action,
+  never a side effect.
+- **`orchestration/nexus_conversations.py`** — persistent conversations,
+  messages, attachments and agent sessions, all project-isolated (a non-member
+  gets 404, not 403). A NEXUS conversation is **not** an OpenHands conversation;
+  `nexus_agent_sessions` keeps that mapping durable.
+- **`orchestration/nexus_chat.py`** — the chat brain. `ask`/`plan` use the
+  provider cascade's text path; `code`/`autonomous` start real OpenHands work.
+  A provider outage is an `error` message, **never** a fabricated answer; the
+  user turn is persisted first so it survives an assistant failure.
+- **`providers.py`** gained `complete_text`/`text` for prose. `complete` still
+  reports the real `attempts` count (the retry loop returns `(text, attempts)`).
+- **Migration `0020_nexus_ai_ide.sql`** is additive: `nexus_openhands_accounts`,
+  `nexus_conversations`, `nexus_conversation_messages`,
+  `nexus_conversation_attachments`, `nexus_agent_sessions`, and nullable
+  `repository_id`/`selected_branch`/`openhands_account_id` on `nexus_projects`.
+  No backfill. `REQUIRED_COLUMNS` in `cloud_store.py` names the new tables.
+- **`orchestration/web_ui_ide.py`** holds the shell's CSS and JS, concatenated
+  into `APP_CSS`/`APP_JS` by `web_ui.py`. The shell binds every control through
+  the `on(sel, event, handler)` helper so **one missing element cannot abort the
+  whole shell** — a plain `$('#x').onclick` on a missing id did exactly that.
+- **The Unicode fix.** `github_client.repo_path` percent-encodes every path
+  segment as UTF-8; the raw form raised `UnicodeEncodeError: 'latin-1' codec`
+  from `http.client`. The fake GitHub decodes percent-encoded segments the way
+  GitHub does, so the regression tests are real. `multipart._decode_header_value`
+  decodes a part header as UTF-8 first (falling back to latin-1).
+- Tests: `test_github_multi_account.py`, `test_openhands_multi_account.py`,
+  `test_conversations.py`, the IDE-shell block in `test_web_server.py`, and the
+  chat journey in `test_browser_e2e.py`. Route-auth coverage was extended to
+  every new endpoint.
+- **Not delivered / limitations.** The IDE editor is read-only (files are read
+  through the GitHub API at the bound ref); there is no local terminal because
+  execution happens in OpenHands Cloud; the live multi-account and chat paths
+  were not exercised against a real OpenHands key in this sandbox.

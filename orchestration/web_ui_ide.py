@@ -682,6 +682,86 @@ function toast(text, kind) {
   setTimeout(() => el.remove(), 5000);
 }
 
+/* ----------------------------------------------------------------- accounts */
+async function renderAccountLists() {
+  await loadAccounts();
+  const gh = $('#gh-accounts-list');
+  if (gh) {
+    gh.innerHTML = WS_ACCOUNTS.length ? WS_ACCOUNTS.map(a =>
+      '<div class="agent-card"><dl class="kv">' +
+      '<dt>Название</dt><dd>' + esc(a.label) + '</dd>' +
+      '<dt>GitHub</dt><dd class="mono">' + esc(a.login) + '</dd>' +
+      '<dt>Статус</dt><dd>' + pill(a.state === 'active' ? 'running' : 'failed') + '</dd>' +
+      '<dt>Токен</dt><dd>скрыт (зашифрован)</dd>' +
+      (a.last_error ? '<dt>Ошибка</dt><dd class="err">' + esc(a.last_error) + '</dd>' : '') +
+      '</dl><div class="actions">' +
+      '<button class="ghost" data-gh-act="verify" data-id="' + esc(a.id) + '">Проверить</button>' +
+      '<button class="ghost" data-gh-act="revoke" data-id="' + esc(a.id) + '">Отключить</button>' +
+      '</div></div>').join('') : '<p class="muted small">Аккаунтов нет.</p>';
+  }
+  const oh = $('#oh-accounts-list');
+  if (oh) {
+    oh.innerHTML = WS_OH_ACCOUNTS.length ? WS_OH_ACCOUNTS.map(a =>
+      '<div class="agent-card"><dl class="kv">' +
+      '<dt>Название</dt><dd>' + esc(a.label) + (a.is_default ? ' · по умолчанию' : '') + '</dd>' +
+      '<dt>Base URL</dt><dd class="mono">' + esc(a.base_url) + '</dd>' +
+      '<dt>Транспорт</dt><dd class="mono">' + esc(a.transport) + '</dd>' +
+      '<dt>Статус</dt><dd>' + pill(a.state === 'active' ? 'running' : 'failed') + '</dd>' +
+      '<dt>Ключ</dt><dd>скрыт (зашифрован)</dd>' +
+      '</dl><div class="actions">' +
+      '<button class="ghost" data-oh-act="verify" data-id="' + esc(a.id) + '">Проверить</button>' +
+      '<button class="ghost" data-oh-act="default" data-id="' + esc(a.id) + '">Сделать по умолчанию</button>' +
+      '<button class="ghost" data-oh-act="revoke" data-id="' + esc(a.id) + '">Отключить</button>' +
+      '</div></div>').join('') : '<p class="muted small">Аккаунтов нет.</p>';
+  }
+}
+document.addEventListener('click', async (e) => {
+  const gh = e.target.closest && e.target.closest('[data-gh-act]');
+  if (gh) {
+    const act = gh.getAttribute('data-gh-act'), id = gh.getAttribute('data-id');
+    try { await api('/api/github/accounts/' + encodeURIComponent(id) + '/' + act, {method:'POST', body:'{}'});
+      toast('Готово.'); await renderAccountLists(); }
+    catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  const oh = e.target.closest && e.target.closest('[data-oh-act]');
+  if (oh) {
+    const act = oh.getAttribute('data-oh-act'), id = oh.getAttribute('data-id');
+    try { await api('/api/openhands/accounts/' + encodeURIComponent(id) + '/' + act, {method:'POST', body:'{}'});
+      toast('Готово.'); await renderAccountLists(); }
+    catch (err) { toast(err.message, 'bad'); }
+  }
+});
+
+async function initAccounts() {
+  on('#gh-account-form', 'onsubmit', async (e) => {
+    e.preventDefault();
+    const msg = $('#gh-account-msg'); msg.textContent = 'Проверяем токен в GitHub…';
+    try {
+      await api('/api/github/accounts', {method:'POST', body: JSON.stringify({
+        label: $('#gh-account-label').value.trim(), token: $('#gh-account-token').value})});
+      $('#gh-account-label').value = ''; $('#gh-account-token').value = '';
+      msg.textContent = 'Аккаунт добавлен.';
+      await renderAccountLists();
+    } catch (err) { msg.textContent = 'Не добавлено: ' + err.message; }
+  });
+  on('#oh-account-form', 'onsubmit', async (e) => {
+    e.preventDefault();
+    const msg = $('#oh-account-msg'); msg.textContent = 'Проверяем ключ в OpenHands…';
+    try {
+      await api('/api/openhands/accounts', {method:'POST', body: JSON.stringify({
+        label: $('#oh-account-label').value.trim(), api_key: $('#oh-account-key').value,
+        base_url: $('#oh-account-url').value.trim() || null,
+        transport: $('#oh-account-transport').value,
+        make_default: $('#oh-account-default').checked})});
+      $('#oh-account-label').value = ''; $('#oh-account-key').value = '';
+      msg.textContent = 'Аккаунт добавлен.';
+      await renderAccountLists();
+    } catch (err) { msg.textContent = 'Не добавлено: ' + err.message; }
+  });
+  await renderAccountLists();
+}
+
 /* ------------------------------------------------------------------- wiring */
 // Bind an element's event only if it exists, so one missing element can never
 // abort the whole shell (the pattern that silently left the workspace unloaded).
