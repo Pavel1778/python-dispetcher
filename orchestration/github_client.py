@@ -313,6 +313,74 @@ class GitHubClient:
             })
         return out[:limit]
 
+    # ------------------------------------------------------------- tree/contents
+    def default_branch_sha(self, full_name: str, branch: str | None = None) -> str | None:
+        """The commit SHA a branch points at, or ``None`` if it cannot be read."""
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        path = f"/repos/{full_name}/commits"
+        params = {"sha": branch, "per_page": 1} if branch else {"per_page": 1}
+        batch = self._request(path, params)
+        if isinstance(batch, list) and batch and isinstance(batch[0], dict):
+            return batch[0].get("sha")
+        return None
+
+    def list_tree(self, full_name: str, *, branch: str | None = None,
+                  recursive: bool = True, limit: int = 500) -> list[dict[str, Any]]:
+        """The repository tree at a branch. Read-only; used for context.
+
+        Returns ``[{path, type, size}]``. ``truncated`` trees are returned as-is
+        up to ``limit`` entries; the caller must not treat a short list as the
+        whole repository.
+        """
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        ref = branch or self._default_branch(full_name)
+        params: dict[str, Any] = {"recursive": "1"} if recursive else {}
+        data = self._request(f"/repos/{full_name}/git/trees/{ref}", params)
+        tree = data.get("tree") if isinstance(data, dict) else None
+        out: list[dict[str, Any]] = []
+        for item in tree if isinstance(tree, list) else []:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            out.append({"path": item["path"], "type": item.get("type"),
+                        "size": item.get("size")})
+            if len(out) >= limit:
+                break
+        return out
+
+    def read_file(self, full_name: str, path: str, *, branch: str | None = None,
+                  max_bytes: int = 200_000) -> str | None:
+        """The decoded text of one file, or ``None`` if it is missing/binary."""
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        data = self._request(f"/repos/{full_name}/contents/{path}",
+                             {"ref": branch} if branch else None)
+        if not isinstance(data, dict):
+            return None
+        if data.get("encoding") == "base64" and isinstance(data.get("content"), str):
+            import base64
+            try:
+                raw = base64.b64decode(data["content"])
+            except (ValueError, TypeError):
+                return None
+            if len(raw) > max_bytes:
+                raw = raw[:max_bytes]
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        if isinstance(data.get("content"), str):
+            return data["content"]
+        return None
+
+    def _default_branch(self, full_name: str) -> str:
+        repo = self.get_repository(full_name)
+        return repo.get("default_branch") or "main"
+
 
 def _repo_from_payload(item: Any) -> GitHubRepo | None:
     """Map one API object to :class:`GitHubRepo`, or ``None`` if unusable."""

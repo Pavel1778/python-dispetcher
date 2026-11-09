@@ -63,6 +63,21 @@ class FakeGitHub:
              "user": {"login": "Pavel"}, "head": {"ref": "feature"},
              "base": {"ref": "main"}, "created_at": "2026-01-02T00:00:00Z"},
         ]
+        #: The repository tree, as GitHub's git/trees returns it.
+        self.tree: list[dict] = [
+            {"path": "README.md", "type": "blob", "size": 120},
+            {"path": "src", "type": "tree", "size": None},
+            {"path": "src/app.py", "type": "blob", "size": 340},
+            {"path": "tests/test_app.py", "type": "blob", "size": 210},
+            {"path": "requirements.txt", "type": "blob", "size": 30},
+        ]
+        #: File contents, keyed by path, returned base64 from /contents/{path}.
+        self.contents: dict[str, str] = {
+            "README.md": "# Demo project\n\nA tiny service used by tests.\n",
+            "requirements.txt": "pytest\n",
+            "src/app.py": "def add(a, b):\n    return a + b\n",
+            "tests/test_app.py": "from src.app import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+        }
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -121,6 +136,23 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if section == "pulls":
                 self._json(200, gh.pulls)
+                return
+            # /repos/{owner}/{name}/git/trees/{ref}
+            if len(parts) == 6 and section == "git" and parts[4] == "trees":
+                self._json(200, {"tree": gh.tree, "truncated": False})
+                return
+            # /repos/{owner}/{name}/contents/{path...}
+            if section == "contents" and len(parts) >= 5:
+                rel = "/".join(parts[4:])
+                content = gh.contents.get(rel)
+                if content is None:
+                    self._json(404, {"message": "Not Found"})
+                    return
+                import base64
+                self._json(200, {
+                    "path": rel, "encoding": "base64",
+                    "content": base64.b64encode(content.encode()).decode(),
+                })
                 return
         self._json(404, {"message": "Not Found"})
 
