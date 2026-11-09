@@ -40,6 +40,21 @@ class Part:
         return self.filename is not None
 
 
+def _decode_header_value(raw: bytes) -> str:
+    """Decode a part header value as UTF-8, falling back to latin-1.
+
+    Browsers put the raw UTF-8 bytes of a filename into the plain
+    ``filename="..."`` form, so decoding with latin-1 alone turns a Cyrillic
+    name into mojibake. Decoding as UTF-8 first recovers the real text; a value
+    that is not valid UTF-8 (a legacy client) still decodes, byte-for-byte, as
+    latin-1 rather than raising.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
 def _parse_headers(raw: bytes) -> tuple[str | None, str | None, str | None]:
     """Return ``(name, filename, content_type)`` from a part's header block."""
     name = filename = content_type = None
@@ -48,7 +63,7 @@ def _parse_headers(raw: bytes) -> tuple[str | None, str | None, str | None]:
             continue
         key, _, value = line.partition(b":")
         key_l = key.strip().lower()
-        value_s = value.strip().decode("latin-1")
+        value_s = _decode_header_value(value.strip())
         if key_l == b"content-disposition":
             m = _DISPOSITION_NAME.search(value_s)
             if m:

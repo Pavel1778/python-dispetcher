@@ -70,6 +70,36 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def quote_path_segment(segment: str) -> str:
+    """Percent-encode one path segment as UTF-8, keeping ``/`` structural.
+
+    Repository owners, names, refs and file paths are user-controlled and may
+    contain non-ASCII characters (a Cyrillic owner or filename is legal on
+    GitHub). A raw non-ASCII byte reaching the request line is encoded with
+    ``latin-1`` by ``http.client``, which raises
+    ``UnicodeEncodeError: 'latin-1' codec can't encode character``. Encoding
+    here -- with ``safe=""`` so a segment cannot introduce a path separator --
+    is the correct boundary: the wire path is always ASCII and GitHub decodes
+    it back to UTF-8.
+    """
+    return urllib.parse.quote(segment, safe="")
+
+
+def repo_path(full_name: str, *extra: str) -> str:
+    """``/repos/{owner}/{name}[/{extra...}]`` with every segment encoded.
+
+    ``full_name`` is split on ``/`` and each half is encoded independently, so
+    a Cyrillic owner or name is transmitted correctly while the separator stays
+    structural. Extra segments (``branches``, a ref, a file path) are encoded
+    the same way; a file path may itself contain ``/``, which is preserved.
+    """
+    owner, _, name = full_name.partition("/")
+    path = "/repos/" + quote_path_segment(owner) + "/" + quote_path_segment(name)
+    for part in extra:
+        path += "/" + "/".join(quote_path_segment(seg) for seg in part.split("/"))
+    return path
+
+
 class GitHubClient:
     """Minimal, dependency-free GitHub REST client for repository discovery."""
 
@@ -157,8 +187,7 @@ class GitHubClient:
         return {"login": data["login"]}
 
     def repository_details(self, full_name: str) -> dict:
-        path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in full_name.split("/"))
-        data = self._request(path)
+        data = self._request(repo_path(full_name))
         if (not isinstance(data, dict) or not isinstance(data.get("id"), int)
                 or not isinstance(data.get("full_name"), str) or not isinstance(data.get("private"), bool)
                 or data.get("visibility") not in ("public", "private")
@@ -172,8 +201,7 @@ class GitHubClient:
         return self._safe_write_result(data)
 
     def set_visibility(self, full_name: str, private: bool) -> dict:
-        path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in full_name.split("/"))
-        data = self._request(path, method="PATCH", payload={"private": private})
+        data = self._request(repo_path(full_name), method="PATCH", payload={"private": private})
         return self._safe_write_result(data)
 
     @staticmethod
@@ -224,13 +252,13 @@ class GitHubClient:
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:
             raise ValueError("full_name must be owner/name")
-        return _repo_dict(self._request(f"/repos/{full_name}"))
+        return _repo_dict(self._request(repo_path(full_name)))
 
     def list_branches(self, full_name: str, *, limit: int = 100) -> list[dict[str, Any]]:
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:
             raise ValueError("full_name must be owner/name")
-        batch = self._request(f"/repos/{full_name}/branches",
+        batch = self._request(repo_path(full_name, "branches"),
                               {"per_page": min(limit, 100)})
         out = []
         for item in batch if isinstance(batch, list) else []:
@@ -248,7 +276,7 @@ class GitHubClient:
         params: dict[str, Any] = {"per_page": min(limit, 100)}
         if branch:
             params["sha"] = branch
-        batch = self._request(f"/repos/{full_name}/commits", params)
+        batch = self._request(repo_path(full_name, "commits"), params)
         out = []
         for item in batch if isinstance(batch, list) else []:
             if not isinstance(item, dict):
@@ -270,7 +298,7 @@ class GitHubClient:
             raise ValueError("full_name must be owner/name")
         if state not in ("open", "closed", "all"):
             raise ValueError("state must be open, closed or all")
-        batch = self._request(f"/repos/{full_name}/issues",
+        batch = self._request(repo_path(full_name, "issues"),
                               {"state": state, "per_page": min(limit, 100)})
         out = []
         for item in batch if isinstance(batch, list) else []:
@@ -296,7 +324,7 @@ class GitHubClient:
             raise ValueError("full_name must be owner/name")
         if state not in ("open", "closed", "all"):
             raise ValueError("state must be open, closed or all")
-        batch = self._request(f"/repos/{full_name}/pulls",
+        batch = self._request(repo_path(full_name, "pulls"),
                               {"state": state, "per_page": min(limit, 100)})
         out = []
         for item in batch if isinstance(batch, list) else []:
@@ -319,9 +347,8 @@ class GitHubClient:
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:
             raise ValueError("full_name must be owner/name")
-        path = f"/repos/{full_name}/commits"
         params = {"sha": branch, "per_page": 1} if branch else {"per_page": 1}
-        batch = self._request(path, params)
+        batch = self._request(repo_path(full_name, "commits"), params)
         if isinstance(batch, list) and batch and isinstance(batch[0], dict):
             return batch[0].get("sha")
         return None
@@ -339,7 +366,7 @@ class GitHubClient:
             raise ValueError("full_name must be owner/name")
         ref = branch or self._default_branch(full_name)
         params: dict[str, Any] = {"recursive": "1"} if recursive else {}
-        data = self._request(f"/repos/{full_name}/git/trees/{ref}", params)
+        data = self._request(repo_path(full_name, "git", "trees", ref), params)
         tree = data.get("tree") if isinstance(data, dict) else None
         out: list[dict[str, Any]] = []
         for item in tree if isinstance(tree, list) else []:
@@ -357,7 +384,7 @@ class GitHubClient:
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:
             raise ValueError("full_name must be owner/name")
-        data = self._request(f"/repos/{full_name}/contents/{path}",
+        data = self._request(repo_path(full_name, "contents", path),
                              {"ref": branch} if branch else None)
         if not isinstance(data, dict):
             return None
@@ -471,6 +498,6 @@ class GitHubWriter:
                 "making a repository public requires explicit acknowledgement"
             )
         result = self._client._request(
-            f"/repos/{full_name}", method="PATCH", body={"private": bool(private)},
+            repo_path(full_name), method="PATCH", body={"private": bool(private)},
         )
         return _repo_dict(result)

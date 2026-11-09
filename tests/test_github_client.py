@@ -226,3 +226,63 @@ def test_writer_repr_never_exposes_the_token(gh_server):
     writer = GitHubWriter(client_for(gh_server))
     assert TOKEN not in repr(writer)
     assert "configured=True" in repr(writer)
+
+
+# --------------------------------------------------------------- unicode paths
+# Regression for the reported "UnicodeEncodeError: 'latin-1' codec can't encode
+# character '\u0418'" in the GitHub integration. The cause was an unencoded
+# non-ASCII path segment reaching http.client, which encodes the request line
+# with latin-1. Every repository-scoped call must now percent-encode its
+# segments as UTF-8 and never raise.
+def test_repository_detail_handles_a_cyrillic_name(gh_server):
+    gh_server.gh.repos.append({
+        "full_name": "Павел/Имя-проекта", "default_branch": "main",
+        "private": True, "archived": False, "pushed_at": None})
+    detail = client_for(gh_server).get_repository("Павел/Имя-проекта")
+    assert detail["full_name"] == "Павел/Имя-проекта"
+    # The wire path was percent-encoded ASCII, not raw bytes.
+    assert gh_server.gh.paths[-1].startswith("/repos/%D0%9F%D0%B0%D0%B2%D0%B5%D0%BB/")
+
+
+def test_branches_commits_and_pulls_handle_a_cyrillic_name(gh_server):
+    gh_server.gh.repos.append({
+        "full_name": "Павел/Имя", "default_branch": "main",
+        "private": False, "archived": False, "pushed_at": None})
+    client = client_for(gh_server)
+    assert client.list_branches("Павел/Имя")[0]["name"] == "main"
+    assert client.list_commits("Павел/Имя")
+    assert client.list_pulls("Павел/Имя")
+    for path in gh_server.gh.paths:
+        path.encode("ascii")  # every wire path is ASCII
+
+
+def test_file_and_tree_reads_handle_cyrillic_paths(gh_server):
+    gh_server.gh.contents["src/имя.py"] = "print('привет')\n"
+    client = client_for(gh_server)
+    text = client.read_file("Pavel1778/python-dispetcher", "src/имя.py")
+    assert text == "print('привет')\n"
+    # The tree read never raises for a Cyrillic ref either.
+    assert client.list_tree("Pavel1778/python-dispetcher", branch="ветка")
+
+
+def test_write_paths_encode_a_cyrillic_repository(gh_server):
+    from orchestration.github_client import GitHubWriter
+
+    gh_server.gh.repos.append({
+        "full_name": "Павел/Имя", "default_branch": "main",
+        "private": True, "archived": False, "pushed_at": None})
+    writer = GitHubWriter(client_for(gh_server))
+    writer.set_repository_visibility(full_name="Павел/Имя", private=True)
+    method, path, body = gh_server.gh.writes[-1]
+    assert method == "PATCH" and body == {"private": True}
+    path.encode("ascii")  # encoded, never latin-1-mangled
+
+
+def test_a_cyrillic_name_never_reaches_the_wire_unencoded(gh_server):
+    """The exact failure mode: a raw non-ASCII byte in the request line."""
+    gh_server.gh.repos.append({
+        "full_name": "Павел/Имя", "default_branch": "main",
+        "private": False, "archived": False, "pushed_at": None})
+    # Would raise UnicodeEncodeError before the fix.
+    client_for(gh_server).get_repository("Павел/Имя")
+    assert all(p.isascii() for p in gh_server.gh.paths)

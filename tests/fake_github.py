@@ -120,7 +120,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         # /repos/{owner}/{name}[/section]
-        parts = parsed.path.strip("/").split("/")
+        # GitHub decodes percent-encoded path segments back to UTF-8, so the
+        # fake does too: a Cyrillic owner/name/path must reach the same repo the
+        # client encoded. Without this the regression test would pass only
+        # because the client never encoded.
+        parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/")]
         if len(parts) >= 3 and parts[0] == "repos":
             full_name = f"{parts[1]}/{parts[2]}"
             repo = next((r for r in gh.repos if r["full_name"] == full_name), None)
@@ -195,7 +199,7 @@ class _Handler(BaseHTTPRequestHandler):
         if gh.force_status:
             self._json(gh.force_status, {"message": "forced"})
             return
-        parts = parsed.path.strip("/").split("/")
+        parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/")]
         if len(parts) == 3 and parts[0] == "repos":
             full = f"{parts[1]}/{parts[2]}"
             repo = next((r for r in gh.repos if r["full_name"] == full), None)
