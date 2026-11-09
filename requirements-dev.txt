@@ -4,3 +4,7 @@
 # CI and a local run agree. The runtime dependencies live in requirements.txt.
 pytest==9.0.3
 ruff==0.13.1
+# Browser end-to-end (tests/test_browser_e2e.py). The test skips cleanly when
+# Playwright or Chromium is absent, so this is optional; install the browser
+# with `python -m playwright install --with-deps chromium`.
+playwright>=1.40,<2
