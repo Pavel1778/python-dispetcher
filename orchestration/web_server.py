@@ -90,6 +90,7 @@ from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
+from .providers import ProviderCascade
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
 from .web_auth import (
@@ -347,6 +348,10 @@ class App:
         )
         self.github_confirmations = Confirmations()
         self.github_writes_enabled = os.environ.get("GITHUB_ENABLE_WRITES", "").lower() in ("1", "true", "yes")
+        # The LLM orchestrator cascade (Gemini -> Groq -> OpenRouter ->
+        # OpenHands). It only proposes plans; it never executes them. Only
+        # configured providers are used, and only their presence is reported.
+        self.providers = ProviderCascade()
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -664,6 +669,9 @@ class App:
             "evidence": {"ok": bool(self.evidence_keyring) and self.evidence_signer is not None,
                          "detail": "signer and keyring" if self.evidence_signer
                          else "no signer configured (NEXUS_EVIDENCE_PRIVATE_KEY unset)"},
+            "providers": {"ok": bool(self.providers.configured()),
+                          "detail": ", ".join(self.providers.configured()) or
+                          "no orchestrator provider configured"},
         }
         return {
             "store": {"ok": store_ok, "error": store_err},
@@ -1265,7 +1273,47 @@ class Handler(BaseHTTPRequestHandler):
             return parts[3], "plan", parts[5]
         if len(parts) == 7 and parts[4] == "plans" and parts[6] == "approve":
             return parts[3], "approve", parts[5]
+        if len(parts) == 7 and parts[4] == "goals" and parts[6] == "plan-draft":
+            return parts[3], "goal-plan-draft", parts[5]
         return None
+
+    def _plan_draft(self, principal: str, project_id: str, goal_id: str) -> None:
+        """Ask the provider cascade to draft a plan for a goal. Nothing runs.
+
+        The goal text is read (membership enforced), sent to the first working
+        orchestrator provider, validated, and returned as a *draft*. It is not
+        stored and nothing is dispatched: approving and dispatching stay
+        explicit, separate steps. A provider outage is a ``503``, never a
+        fabricated plan.
+        """
+        from .providers import AllProvidersFailed, ProviderError
+
+        try:
+            goal = self.app.projects.get(principal, project_id)  # membership check
+            goals = self.app.projects.list_goals(principal, project_id)
+        except NotFound:
+            return self._json(404, {"error": "not found"})
+        match = next((g for g in goals if str(g["id"]) == goal_id), None)
+        if match is None:
+            return self._json(404, {"error": "goal not found"})
+        prompt = (
+            "Return a JSON object {\"tasks\": [{\"id\", \"title\", \"description\", "
+            "\"dependencies\"}]} that decomposes this goal. Keep it minimal.\n\n"
+            f"Project: {goal['name']}\nGoal: {match['text']}"
+        )
+        try:
+            result = self.app.providers.plan(prompt)
+        except AllProvidersFailed as e:
+            return self._json(503, {"error": "no orchestrator provider succeeded",
+                                    "failures": e.failures})
+        except ProviderError as e:
+            return self._json(503, {"error": str(e)})
+        return self._json(200, {
+            "draft": {"tasks": result.plan},
+            "provider": result.provider,
+            "failovers": result.failovers,
+            "stored": False,
+        })
 
     # -------------------------------------------------- nested project routes
     def _project_nested_get(self, project_id: str, resource: str,
@@ -1703,6 +1751,8 @@ class Handler(BaseHTTPRequestHandler):
                         if body:
                             return self._json(400, {"error": "approval body must be empty"})
                         return self._json(200, {"plan": self.app.plans.approve(principal, project_id, item_id)})
+                    if kind == "goal-plan-draft":
+                        return self._plan_draft(principal, project_id, item_id)
                     return self._json(404, {"error": "not found"})
                 if path == "/api/v1/projects":
                     project = self.app.projects.create(principal, body.get("name"), body.get("description", ""))

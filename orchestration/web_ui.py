@@ -377,6 +377,10 @@ APP_HTML = r"""<!doctype html>
     <div id="plan-panel" class="card hidden" style="margin-top:16px">
       <div class="card-head"><h3>План цели</h3></div>
       <p class="muted small">План составляется вручную. Одна задача на строку: ID | название | зависимости через запятую | критерии через точку с запятой. Согласование не запускает выполнение.</p>
+      <div class="actions" style="margin-bottom:8px">
+        <button type="button" class="ghost" id="plan-draft">Черновик через ИИ</button>
+      </div>
+      <p class="muted small">Черновик через ИИ спрашивает настроенный провайдер-оркестратор (Gemini → Groq → OpenRouter → OpenHands). Он только предлагает план: ничего не сохраняется и не запускается, пока вы не сохраните и не согласуете его.</p>
       <form id="plan-form">
         <label for="plan-tasks">Задачи и зависимости</label>
         <textarea id="plan-tasks" required maxlength="100000" rows="5" placeholder="audit | Анализ проекта | | Найдены ограничения&#10;api | Разработка API | audit | Тесты написаны; Сборка проходит"></textarea>
@@ -1948,6 +1952,27 @@ async function boot() {
     finally { button.disabled = false; }
   };
   $('#plan-tasks').oninput = () => { delete $('#plan-form').dataset.requestId; };
+  $('#plan-draft').onclick = async () => {
+    const project = SELECTED_PROJECT, goal = SELECTED_GOAL;
+    if (!project || !goal) return;
+    const button = $('#plan-draft');
+    button.disabled = true;
+    $('#plan-msg').textContent = 'Запрашиваем черновик у провайдера…';
+    try {
+      const url = '/api/v1/projects/' + encodeURIComponent(project) +
+        '/goals/' + encodeURIComponent(goal) + '/plan-draft';
+      const result = await api(url, {method:'POST', body:JSON.stringify({})});
+      if (SELECTED_PROJECT !== project || SELECTED_GOAL !== goal) return;
+      const lines = result.draft.tasks.map(t =>
+        [t.id, t.title, (t.dependencies || []).join(','), t.description || ''].join(' | '));
+      $('#plan-tasks').value = lines.join('\n');
+      delete $('#plan-form').dataset.requestId;
+      const via = result.provider + (result.failovers && result.failovers.length
+        ? ' (после: ' + result.failovers.map(f => f[0]).join(', ') + ')' : '');
+      $('#plan-msg').textContent = 'Черновик от ' + via + '. Проверьте и сохраните вручную.';
+    } catch (err) { $('#plan-msg').textContent = err.message; }
+    finally { button.disabled = false; }
+  };
   $('#plan-form').onsubmit = async (e) => {
     e.preventDefault();
     const form = e.currentTarget, project = SELECTED_PROJECT, goal = SELECTED_GOAL;

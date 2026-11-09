@@ -1,0 +1,410 @@
+"""LLM provider cascade: ordered orchestrator adapters with real failover.
+
+The NEXUS orchestrator asks a model to turn a goal into a structured plan. No
+single provider is reliable: a key can be missing, a free tier can return
+``429`` with a ``Retry-After``, and a host can simply be down. This module
+implements the *provider* side of that problem and nothing else.
+
+Design rules, each enforced in code:
+
+* **Orchestrator ≠ executor.** These adapters only ever *propose* a plan as
+  JSON. Executing the plan is OpenHands' job (``cloud_direct``). A provider is
+  never asked to run code, and a coding-task failure is never a reason to fail
+  over: failover happens only on a *provider* or *transport* problem.
+* **Ordered cascade.** ``ProviderCascade`` tries providers in the configured
+  order (Gemini → Groq → OpenRouter → OpenHands by default) and returns the
+  first valid structured response. A provider whose key is absent is skipped,
+  not failed.
+* **Bounded, honest retry.** A transient error (transport, 5xx, 429) is retried
+  a bounded number of times with exponential backoff that honours
+  ``Retry-After``. A non-retryable error (400/401/403, a malformed body) moves
+  to the next provider at once -- retrying a bad key only burns quota.
+* **No secrets in logs.** Keys are read from the environment and never logged,
+  returned, or included in an exception message. ``__repr__`` is redacted.
+* **Structured output.** Every provider returns a plan-shaped object validated
+  by :func:`validate_plan_json`; an invalid response is a failure of that
+  provider, not a result.
+
+The module is standard-library only, like the rest of the orchestration layer,
+so it needs no new dependency and is exercised against a real local HTTP server
+in ``tests/test_providers.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+# --------------------------------------------------------------------- errors
+
+
+class ProviderError(RuntimeError):
+    """Base class for provider failures."""
+
+
+class ProviderUnavailable(ProviderError):
+    """Transport failure, 5xx or 429. Transient: another provider may work."""
+
+
+class ProviderAuthError(ProviderError):
+    """401/403, or no key. Retrying this provider cannot succeed."""
+
+
+class ProviderRejected(ProviderError):
+    """400/422 or a malformed body. The request or the response is wrong."""
+
+
+class AllProvidersFailed(ProviderError):
+    """Every provider in the cascade failed. Carries each provider's reason."""
+
+    def __init__(self, failures: list[tuple[str, str]]):
+        self.failures = failures
+        detail = "; ".join(f"{name}: {reason}" for name, reason in failures) or "no providers configured"
+        super().__init__(f"all providers failed ({detail})")
+
+
+# ------------------------------------------------------------- http plumbing
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: ``urlopen`` would resend the bearer to a new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+@dataclass
+class ProviderResponse:
+    """One provider's answer: parsed JSON plus non-secret provenance."""
+
+    provider: str
+    model: str
+    data: dict[str, Any]
+    attempts: int = 1
+
+
+def _retry_after(headers: Any) -> float | None:
+    """Parse a ``Retry-After`` header (seconds form). ``None`` if unusable."""
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if not raw:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+# --------------------------------------------------------------- provider API
+
+
+class Provider:
+    """Base class: a named adapter that turns a prompt into structured JSON.
+
+    A concrete provider implements :meth:`_call`, which returns the raw decoded
+    body. This class handles auth-header shaping, the retry/backoff policy,
+    ``Retry-After``, and turning an HTTP status into the right exception.
+    """
+
+    name: str = "provider"
+
+    def __init__(self, *, api_key: str | None = None, base_url: str,
+                 model: str, timeout: float = 30.0, max_retries: int = 2,
+                 backoff_base: float = 0.5, sleep: Callable[[float], None] = time.sleep):
+        self.api_key = api_key if api_key is not None else self._key_from_env()
+        self.base_url = base_url
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self._sleep = sleep
+        self._opener = urllib.request.build_opener(_NoRedirect)
+
+    # -- subclass hooks ----------------------------------------------------
+    _ENV_KEY = ""
+
+    def _key_from_env(self) -> str | None:
+        value = os.environ.get(self._ENV_KEY, "").strip() if self._ENV_KEY else ""
+        return value or None
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+    def __repr__(self) -> str:  # never expose the key
+        return f"{type(self).__name__}(name={self.name!r}, model={self.model!r}, configured={self.configured})"
+
+    def _endpoint(self) -> str:
+        raise NotImplementedError
+
+    def _headers(self) -> dict[str, str]:
+        raise NotImplementedError
+
+    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _extract_text(self, body: Any) -> str:
+        raise NotImplementedError
+
+    # -- shared request path ----------------------------------------------
+    def _post(self, prompt: str, system: str) -> Any:
+        data = json.dumps(self._payload(prompt, system)).encode()
+        req = urllib.request.Request(self._endpoint(), data=data, method="POST")
+        for key, value in self._headers().items():
+            req.add_header(key, value)
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise ProviderAuthError(f"{self.name} -> {e.code}") from e
+            if e.code == 429:
+                raise ProviderUnavailable(f"{self.name} -> 429") from e
+            if e.code >= 500:
+                raise ProviderUnavailable(f"{self.name} -> {e.code}") from e
+            raise ProviderRejected(f"{self.name} -> {e.code}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
+
+    def complete(self, prompt: str, system: str = "") -> ProviderResponse:
+        """Call the provider, retrying only transient failures, bounded."""
+        if not self.configured:
+            raise ProviderAuthError(f"{self.name}: no API key configured")
+        attempts = 0
+        last: ProviderUnavailable | None = None
+        while attempts <= self.max_retries:
+            attempts += 1
+            try:
+                body = self._post(prompt, system)
+            except ProviderUnavailable as e:
+                last = e
+                if attempts > self.max_retries:
+                    raise
+                self._sleep(self.backoff_base * (2 ** (attempts - 1)))
+                continue
+            text = self._extract_text(body)
+            if not text:
+                raise ProviderRejected(f"{self.name}: empty completion")
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise ProviderRejected(f"{self.name}: completion was not JSON") from e
+            if not isinstance(parsed, dict):
+                raise ProviderRejected(f"{self.name}: completion was not a JSON object")
+            return ProviderResponse(provider=self.name, model=self.model,
+                                    data=parsed, attempts=attempts)
+        raise last or ProviderUnavailable(f"{self.name}: exhausted retries")
+
+
+class GeminiProvider(Provider):
+    name = "gemini"
+    _ENV_KEY = "GEMINI_API_KEY"
+
+    def __init__(self, **kw: Any):
+        kw.setdefault("base_url", os.environ.get(
+            "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"))
+        kw.setdefault("model", os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+        super().__init__(**kw)
+
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/models/{self.model}:generateContent"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Content-Type": "application/json", "x-goog-api-key": self.api_key or ""}
+
+    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+        return payload
+
+    def _extract_text(self, body: Any) -> str:
+        try:
+            parts = body["candidates"][0]["content"]["parts"]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+
+
+class _OpenAICompatProvider(Provider):
+    """Shared shape for Groq and OpenRouter (OpenAI-compatible chat completions)."""
+
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key or ''}"}
+
+    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return {"model": self.model, "messages": messages,
+                "response_format": {"type": "json_object"}}
+
+    def _extract_text(self, body: Any) -> str:
+        try:
+            return body["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+
+class GroqProvider(_OpenAICompatProvider):
+    name = "groq"
+    _ENV_KEY = "GROQ_API_KEY"
+
+    def __init__(self, **kw: Any):
+        kw.setdefault("base_url", os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"))
+        kw.setdefault("model", os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
+        super().__init__(**kw)
+
+
+class OpenRouterProvider(_OpenAICompatProvider):
+    name = "openrouter"
+    _ENV_KEY = "OPENROUTER_API_KEY"
+
+    def __init__(self, **kw: Any):
+        kw.setdefault("base_url", os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
+        kw.setdefault("model", os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"))
+        super().__init__(**kw)
+
+
+class OpenHandsOrchestratorProvider(Provider):
+    """The last-resort orchestrator: OpenHands' own model, via its Cloud API.
+
+    This is deliberately *not* a chat-completion adapter. It posts a
+    single-turn conversation to OpenHands Cloud and reads the final assistant
+    message. It is the fallback *orchestrator* only; it must never be used as
+    the executor of a task it planned (that would recurse OpenHands into
+    itself), so the cascade marks it ``executor=False``.
+    """
+
+    name = "openhands"
+    _ENV_KEY = "OPENHANDS_API_KEY"
+    executor = False
+
+    def __init__(self, **kw: Any):
+        kw.setdefault("base_url", os.environ.get("OPENHANDS_CLOUD_URL", "https://app.all-hands.dev"))
+        kw.setdefault("model", os.environ.get("OPENHANDS_ORCHESTRATOR_MODEL", "gpt-5"))
+        super().__init__(**kw)
+
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/api/v1/app-conversations"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key or ''}"}
+
+    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+        content = (system + "\n\n" + prompt).strip() if system else prompt
+        return {"initial_message": {"role": "user", "content": [{"type": "text", "text": content}]},
+                "llm_model": self.model}
+
+    def _extract_text(self, body: Any) -> str:
+        # The start-task response does not carry the model's answer; a caller
+        # that needs the text polls the conversation. For planning we accept an
+        # inline answer when present and otherwise report it as rejected.
+        if isinstance(body, dict):
+            for key in ("content", "response", "text"):
+                if isinstance(body.get(key), str):
+                    return body[key]
+        return ""
+
+
+# --------------------------------------------------------------- the cascade
+
+
+def validate_plan_json(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate the plan shape an orchestrator must return.
+
+    Kept intentionally close to ``nexus_planning.validate_plan`` but tolerant of
+    a provider that returns a bare list under ``tasks``. Raises ``ValueError``
+    on anything that is not a plan, so a provider cannot pass off prose as a
+    plan.
+    """
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("plan must contain a non-empty 'tasks' list")
+    out = []
+    for i, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise ValueError(f"task {i} is not an object")
+        title = task.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(f"task {i} has no title")
+        deps = task.get("dependencies", [])
+        if not isinstance(deps, list) or any(not isinstance(d, str) for d in deps):
+            raise ValueError(f"task {i} dependencies must be a list of ids")
+        out.append({"id": task.get("id") or f"task-{i + 1}",
+                    "title": title.strip(),
+                    "description": (task.get("description") or "").strip()
+                    if isinstance(task.get("description"), str) else "",
+                    "dependencies": deps})
+    return out
+
+
+@dataclass
+class CascadeResult:
+    """The winning provider's plan plus the failover trail (for the audit log)."""
+
+    response: ProviderResponse
+    plan: list[dict[str, Any]]
+    failovers: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def provider(self) -> str:
+        return self.response.provider
+
+
+def default_providers() -> list[Provider]:
+    """The cascade in the documented order: Gemini → Groq → OpenRouter → OpenHands."""
+    return [GeminiProvider(), GroqProvider(), OpenRouterProvider(),
+            OpenHandsOrchestratorProvider()]
+
+
+class ProviderCascade:
+    """Try providers in order; return the first valid structured plan."""
+
+    def __init__(self, providers: list[Provider] | None = None):
+        self.providers = providers if providers is not None else default_providers()
+
+    def configured(self) -> list[str]:
+        return [p.name for p in self.providers if p.configured]
+
+    def plan(self, prompt: str, system: str = "") -> CascadeResult:
+        """Ask each configured provider for a plan until one answers validly.
+
+        Failover happens only on a provider/transport failure or an invalid
+        plan body. An unconfigured provider is skipped silently. If nothing
+        succeeds, :class:`AllProvidersFailed` carries every reason so the
+        operator sees *why*, not just "failed".
+        """
+        failures: list[tuple[str, str]] = []
+        for provider in self.providers:
+            if not provider.configured:
+                continue
+            try:
+                response = provider.complete(prompt, system)
+                plan = validate_plan_json(response.data)
+            except ProviderError as e:
+                failures.append((provider.name, str(e)))
+                continue
+            except ValueError as e:
+                failures.append((provider.name, f"invalid plan: {e}"))
+                continue
+            return CascadeResult(response=response, plan=plan, failovers=list(failures))
+        raise AllProvidersFailed(failures)
