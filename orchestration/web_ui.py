@@ -824,11 +824,15 @@ async function openDetail(wfId) {
 async function loadSystem() {
   try {
     const s = await api('/api/system');
+    let cfg = {};
+    try { cfg = await api('/api/config'); } catch (e) { cfg = {}; }
     const rows = [
       ['База данных', s.store.ok ? 'доступна' : ('недоступна: ' + (s.store.error || ''))],
       ['OpenHands Cloud', s.cloud.ok ? 'доступен' : ('недоступен: ' + (s.cloud.error || ''))],
       ['URL Cloud', s.cloud.url || '—'],
       ['Ключ Cloud настроен', s.config.cloud_key ? 'да' : 'нет'],
+      ['Транспорт', cfg.transport || '—'],
+      ['Выбор репозитория транспортом', cfg.supports_repository_selection ? 'поддерживается' : ('через инструкцию (' + (cfg.repository_mode || 'prompt') + ')')],
       ['Токен GitHub', s.config.github_token ? 'настроен' : 'нет'],
       ['Запись требует токен', s.config.writes_require_auth ? 'да' : 'нет'],
       ['Версия приложения', s.build.version || 'неизвестно'],

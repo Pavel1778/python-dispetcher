@@ -147,6 +147,12 @@ class CloudConversation:
 class CloudClient:
     """Minimal, dependency-free client for the OpenHands Cloud V1 API."""
 
+    #: The app-conversation start request carries ``selected_repository`` /
+    #: ``selected_branch`` as documented fields, so this transport can select a
+    #: repository natively. (It still depends on the account having a GitHub
+    #: provider connected; see CLOUD-INTEGRATION-MAP.md.)
+    supports_repository_selection = True
+
     def __init__(
         self,
         base_url: str | None = None,

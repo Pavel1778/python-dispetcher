@@ -1094,6 +1094,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {
                     "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
                     "cloud_url": self.app.client.base_url,
+                    "transport": os.environ.get("OPENHANDS_TRANSPORT", "direct"),
+                    # Whether this transport can select a repository natively.
+                    # The UI and the operator need to know: a False here with a
+                    # repository task means the direct transport's clone-by-
+                    # instruction mode (or refusal) applies.
+                    "supports_repository_selection": getattr(
+                        self.app.client, "supports_repository_selection", False),
+                    "repository_mode": os.environ.get(
+                        "OPENHANDS_DIRECT_REPO_MODE", "prompt"),
                 })
             if path == "/api/repositories":
                 return self._json(200, {
