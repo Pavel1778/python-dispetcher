@@ -114,3 +114,25 @@ def test_dump_and_restore_into_a_fresh_database():
         source.close()
         if os.path.exists(dump_path):
             os.unlink(dump_path)
+
+
+def test_secret_tables_are_rls_protected():
+    """conversation_routes/cloud_sandboxes hold a session key; they must be locked.
+
+    RLS enabled with no client policy, and no PUBLIC grant, so a Supabase
+    anon/authenticated role cannot read a sandbox session key through PostgREST.
+    """
+    _reset_schema()
+    store = PostgresStore(DSN)
+    try:
+        with store._tx() as cur:
+            for table in ("conversation_routes", "cloud_sandboxes"):
+                cur.execute("SELECT relrowsecurity FROM pg_class WHERE oid=%s::regclass",
+                            (table,))
+                assert cur.fetchone()["relrowsecurity"], table
+                cur.execute(
+                    "SELECT count(*) AS n FROM pg_class c, aclexplode(c.relacl) a "
+                    "WHERE c.oid=%s::regclass AND a.grantee=0", (table,))
+                assert cur.fetchone()["n"] == 0, table
+    finally:
+        store.close()
