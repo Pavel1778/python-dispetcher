@@ -72,6 +72,8 @@ p { margin: 0 0 8px; }
 .faint { color: var(--fg-faint); }
 .small { font-size: 12.5px; }
 .mono { font-family: var(--mono); font-size: 12.5px; }
+.badge { display: inline-block; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px;
+         font-size: 12px; color: var(--fg-dim); white-space: nowrap; }
 .err { color: var(--bad); }
 .ok { color: var(--ok); }
 .warn { color: var(--warn); }
@@ -274,6 +276,7 @@ APP_HTML = r"""<!doctype html>
 
   <nav class="tabs" role="tablist" aria-label="Разделы" style="margin-top:24px">
     <button class="tab" role="tab" id="tab-projects" aria-selected="true" aria-controls="panel-projects">Проекты NEXUS</button>
+    <button class="tab" role="tab" id="tab-autolab" aria-selected="false" aria-controls="panel-autolab">Автономная лаборатория</button>
     <button class="tab" role="tab" id="tab-lab" aria-selected="false" aria-controls="panel-lab">Лаборатория</button>
     <button class="tab" role="tab" id="tab-github" aria-selected="false" aria-controls="panel-github">GitHub</button>
     <button class="tab" role="tab" id="tab-new" aria-selected="false" aria-controls="panel-new">Dispatcher: новая задача</button>
@@ -389,6 +392,57 @@ APP_HTML = r"""<!doctype html>
       <p id="plan-msg" class="small" role="status" aria-live="polite"></p>
       <div id="plan-list"></div>
       <div id="plan-detail"></div>
+    </div>
+  </section>
+
+  <section id="panel-autolab" role="tabpanel" aria-labelledby="tab-autolab" class="hidden">
+    <div class="banner info">
+      Автономная лаборатория: введите цель, выберите проект и запустите. Планирование
+      выполняет провайдер-оркестратор (Gemini → Groq → OpenRouter → OpenHands), а
+      исполнение ведёт отдельный worker-процесс — закрытие браузера не останавливает работу.
+      Задача становится <b>завершённой</b> только после независимой проверки.
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Новая цель</h3></div>
+      <label for="al-project">Проект</label>
+      <select id="al-project"><option value="">— выберите проект —</option></select>
+      <div class="row">
+        <div><label for="al-repo">Репозиторий (owner/name)</label>
+          <input id="al-repo" placeholder="owner/name" autocapitalize="none" maxlength="200"></div>
+        <div><label for="al-branch">Ветка</label>
+          <input id="al-branch" placeholder="main" autocapitalize="none" maxlength="200"></div>
+      </div>
+      <label for="al-goal">Цель (обычным языком)</label>
+      <textarea id="al-goal" rows="4" maxlength="20000"
+        placeholder="Например: добавь детерминированную функцию, регрессионные тесты и обнови документацию"></textarea>
+      <div class="row">
+        <div><label for="al-maxiter">Максимум итераций</label>
+          <input id="al-maxiter" type="number" min="1" max="500" value="50"></div>
+        <div><label for="al-maxatt">Попыток на задачу</label>
+          <input id="al-maxatt" type="number" min="1" max="10" value="3"></div>
+      </div>
+      <div class="actions">
+        <button type="button" class="ghost" id="al-analyze">1. Анализ репозитория</button>
+        <button type="button" id="al-start">2. Запустить автономно</button>
+      </div>
+      <p id="al-msg" class="small" role="status" aria-live="polite"></p>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Контекст проекта</h3></div>
+      <div id="al-context"><p class="muted small">Ещё не собран.</p></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Память проекта</h3></div>
+      <div id="al-memory"><p class="muted small">Пусто.</p></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Запуски</h3></div>
+      <div id="al-runs"><p class="muted small">Запусков нет.</p></div>
+      <div id="al-run-detail"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Уведомления</h3></div>
+      <div id="al-notifications"><p class="muted small">Пусто.</p></div>
     </div>
   </section>
 
@@ -1604,6 +1658,147 @@ async function stopRecording() {
 
 /* -------------------------------------------------------------- lab boot */
 let LAB_READY = false;
+let AUTOLAB_READY = false;
+async function initAutoLab() {
+  if (!PROJECTS.length) { try { await loadProjects(); } catch (e) { /* ignore */ } }
+  fillAutoLabProjects();
+  if (AUTOLAB_READY) { await refreshAutoLab(); return; }
+  AUTOLAB_READY = true;
+  $('#al-project').onchange = () => refreshAutoLab();
+  $('#al-analyze').onclick = async () => {
+    const pid = $('#al-project').value, repo = $('#al-repo').value.trim();
+    if (!pid) { $('#al-msg').textContent = 'Выберите проект.'; return; }
+    if (!repo) { $('#al-msg').textContent = 'Укажите репозиторий owner/name.'; return; }
+    const btn = $('#al-analyze'); btn.disabled = true;
+    $('#al-msg').textContent = 'Читаем репозиторий…';
+    try {
+      await api('/api/v1/projects/' + encodeURIComponent(pid) + '/context/refresh',
+        {method:'POST', body: JSON.stringify({repository: repo, branch: $('#al-branch').value.trim()})});
+      $('#al-msg').textContent = 'Контекст собран.';
+      await refreshAutoLab();
+    } catch (e) { $('#al-msg').textContent = e.message; }
+    finally { btn.disabled = false; }
+  };
+  $('#al-start').onclick = async () => {
+    const pid = $('#al-project').value, goal = $('#al-goal').value.trim();
+    if (!pid) { $('#al-msg').textContent = 'Выберите проект.'; return; }
+    if (!goal) { $('#al-msg').textContent = 'Введите цель.'; return; }
+    const btn = $('#al-start'); btn.disabled = true;
+    $('#al-msg').textContent = 'Планируем и запускаем…';
+    try {
+      const g = await api('/api/v1/projects/' + encodeURIComponent(pid) + '/goals',
+        {method:'POST', body: JSON.stringify({text: goal})});
+      const body = {repository: $('#al-repo').value.trim(), branch: $('#al-branch').value.trim(),
+        max_iterations: Number($('#al-maxiter').value) || 50,
+        max_attempts_per_task: Number($('#al-maxatt').value) || 3};
+      const r = await api('/api/v1/projects/' + encodeURIComponent(pid) +
+        '/goals/' + encodeURIComponent(g.goal.id) + '/run',
+        {method:'POST', body: JSON.stringify(body)});
+      $('#al-msg').textContent = 'Запуск создан: ' + r.tasks.length + ' задач(и), провайдер ' +
+        (r.plan && r.plan.provider || '?') + '. Worker продолжит выполнение.';
+      await refreshAutoLab();
+    } catch (e) { $('#al-msg').textContent = e.message; }
+    finally { btn.disabled = false; }
+  };
+}
+
+function fillAutoLabProjects() {
+  const sel = $('#al-project');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">— выберите проект —</option>' +
+    PROJECTS.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('');
+  if (current) sel.value = current;
+}
+
+async function refreshAutoLab() {
+  const pid = $('#al-project').value;
+  if (!pid) return;
+  const base = '/api/v1/projects/' + encodeURIComponent(pid);
+  try {
+    const ctx = await api(base + '/context');
+    $('#al-context').innerHTML = ctx.context
+      ? renderContext(ctx.context) : '<p class="muted small">Контекст ещё не собран.</p>';
+  } catch (e) { $('#al-context').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+  try {
+    const mem = await api(base + '/memory');
+    $('#al-memory').innerHTML = mem.memory.length
+      ? '<div class="tablewrap"><table><thead><tr><th>Тип</th><th>Содержание</th><th>Происхождение</th></tr></thead><tbody>' +
+        mem.memory.map(m => '<tr><td>' + esc(m.kind) + '</td><td>' + esc(m.content) +
+          '</td><td>' + esc(m.provenance) + '</td></tr>').join('') + '</tbody></table></div>'
+      : '<p class="muted small">Пусто.</p>';
+  } catch (e) { $('#al-memory').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+  try {
+    const runs = await api(base + '/runs');
+    $('#al-runs').innerHTML = runs.runs.length
+      ? '<div class="tablewrap"><table><thead><tr><th>Запуск</th><th>Состояние</th><th>Итерация</th><th></th></tr></thead><tbody>' +
+        runs.runs.map(r => '<tr><td class="mono">' + esc(String(r.id).slice(0, 8)) + '</td><td>' +
+          runBadge(r.state) + '</td><td>' + esc(String(r.iteration)) + '</td><td>' +
+          '<button class="ghost" data-run="' + esc(r.id) + '">Детали</button> ' +
+          '<button class="ghost" data-runpause="' + esc(r.id) + '">Пауза</button> ' +
+          '<button class="ghost" data-runresume="' + esc(r.id) + '">Продолжить</button> ' +
+          '<button class="ghost" data-runcancel="' + esc(r.id) + '">Отмена</button>' +
+          '</td></tr>').join('') + '</tbody></table></div>'
+      : '<p class="muted small">Запусков нет.</p>';
+    $$('#al-runs button[data-run]').forEach(b => b.onclick = () => showRun(pid, b.dataset.run));
+    $$('#al-runs button[data-runpause]').forEach(b => b.onclick = () => runAction(pid, b.dataset.runpause, 'pause'));
+    $$('#al-runs button[data-runresume]').forEach(b => b.onclick = () => runAction(pid, b.dataset.runresume, 'resume'));
+    $$('#al-runs button[data-runcancel]').forEach(b => b.onclick = () => runAction(pid, b.dataset.runcancel, 'cancel'));
+  } catch (e) { $('#al-runs').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+  try {
+    const notes = await api(base + '/notifications');
+    $('#al-notifications').innerHTML = notes.notifications.length
+      ? '<ul class="small">' + notes.notifications.slice(0, 20).map(n =>
+          '<li>' + esc(n.title) + ' <span class="muted">(' + esc(n.kind) + ')</span></li>').join('') + '</ul>'
+      : '<p class="muted small">Пусто.</p>';
+  } catch (e) { $('#al-notifications').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+}
+
+function renderContext(ctx) {
+  const s = ctx.summary || {};
+  const langs = Object.entries(s.languages || {}).map(([k, v]) => k + ' (' + v + ')').join(', ');
+  return '<dl class="kv">' +
+    '<dt>Репозиторий</dt><dd>' + esc(ctx.repository || '—') + '</dd>' +
+    '<dt>Ревизия</dt><dd class="mono">' + esc(String(ctx.revision || '—').slice(0, 12)) + '</dd>' +
+    '<dt>Языки</dt><dd>' + esc(langs || '—') + '</dd>' +
+    '<dt>Сборочные команды</dt><dd>' + esc((s.build_commands || []).join('; ') || '—') + '</dd>' +
+    '<dt>Тестовых файлов</dt><dd>' + esc(String(s.test_file_count || 0)) + '</dd>' +
+    '<dt>CI</dt><dd>' + (s.has_ci ? 'есть' : 'нет') + '</dd>' +
+    '</dl>';
+}
+
+function runBadge(state) {
+  const map = {running:'выполняется', paused:'пауза', waiting_for_approval:'ждёт подтверждения',
+    blocked:'заблокирован', completed:'завершён', failed:'ошибка', cancelled:'отменён'};
+  return '<span class="badge">' + esc(map[state] || state) + '</span>';
+}
+
+async function runAction(pid, runId, action) {
+  try {
+    await api('/api/v1/projects/' + encodeURIComponent(pid) + '/runs/' +
+      encodeURIComponent(runId) + '/' + action, {method:'POST', body: JSON.stringify({})});
+    await refreshAutoLab();
+  } catch (e) { $('#al-msg').textContent = e.message; }
+}
+
+async function showRun(pid, runId) {
+  try {
+    const d = await api('/api/v1/projects/' + encodeURIComponent(pid) + '/runs/' + encodeURIComponent(runId));
+    const rows = d.tasks.map(t => '<tr><td class="mono">' + esc(t.task_key) + '</td><td>' + esc(t.title) +
+      '</td><td>' + taskBadge(t.state) + '</td><td>' + esc((t.dependencies || []).join(', ') || '—') +
+      '</td><td>' + esc(t.attempt + '/' + t.max_attempts) + '</td></tr>').join('');
+    $('#al-run-detail').innerHTML = '<h4 style="margin-top:16px">Задачи запуска</h4>' +
+      '<div class="tablewrap"><table><thead><tr><th>ID</th><th>Задача</th><th>Состояние</th>' +
+      '<th>Зависимости</th><th>Попытки</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  } catch (e) { $('#al-run-detail').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+}
+
+function taskBadge(state) {
+  const map = {pending:'ожидает', dispatched:'отправлена', running:'выполняется', verifying:'проверяется',
+    completed_verified:'проверено ✓', completed_unverified:'без проверки', partial:'частично',
+    failed:'ошибка', blocked:'заблокирована'};
+  return '<span class="badge">' + esc(map[state] || state) + '</span>';
+}
+
 async function initLab() {
   if (!PROJECTS.length) { try { await loadProjects(); } catch (e) { /* ignore */ } }
   fillLabProjectSelect();
@@ -1815,12 +2010,13 @@ async function boot() {
   };
   $$('.tab').forEach(tab => tab.onclick = () => {
     $$('.tab').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
-    $$('#panel-projects, #panel-lab, #panel-github, #panel-new, #panel-queue, #panel-integrations, #panel-system')
+    $$('#panel-projects, #panel-autolab, #panel-lab, #panel-github, #panel-new, #panel-queue, #panel-integrations, #panel-system')
       .forEach(p => p.classList.add('hidden'));
     $('#' + tab.getAttribute('aria-controls')).classList.remove('hidden');
     if (tab.id === 'tab-system') loadSystem();
     if (tab.id === 'tab-integrations') loadGitHubStatus();
     if (tab.id === 'tab-projects') loadProjects();
+    if (tab.id === 'tab-autolab') initAutoLab();
     if (tab.id === 'tab-lab') initLab();
     if (tab.id === 'tab-github') initGithub();
   });

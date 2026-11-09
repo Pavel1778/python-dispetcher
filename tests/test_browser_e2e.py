@@ -222,3 +222,90 @@ def test_no_horizontal_overflow_on_mobile(base, app, page):
         "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
     )
     assert overflow <= 2, f"horizontal overflow of {overflow}px"
+
+
+def test_autonomous_lab_tab_renders_and_starts_a_run(base, app, page):
+    """The Autonomous Lab tab is real: it analyzes, plans and starts a run.
+
+    The provider is pointed at a local fake HTTP server so the plan is produced
+    over a real socket; the run is then driven by the scheduler with a fake
+    executor/verifier, and the UI reflects the persisted state.
+    """
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from orchestration.nexus_lab import LabScheduler, TaskReport, Verification
+    from orchestration.providers import GroqProvider, ProviderCascade
+    from tests.test_providers import FakeProvider, chat_body
+
+    plan = {"tasks": [
+        {"id": "audit", "title": "Audit", "acceptance": ["summary"]},
+        {"id": "impl", "title": "Implement", "dependencies": ["audit"], "acceptance": ["tests"]},
+    ]}
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+    srv.script = [{"payload": chat_body(plan)}]
+    srv.calls = []
+    srv.index = 0
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    app.providers = ProviderCascade([
+        GroqProvider(base_url=f"http://127.0.0.1:{srv.server_port}",
+                     api_key="k", model="m", sleep=lambda _s: None)])
+    from orchestration.nexus_planner import Planner
+    app.planner = Planner(app.providers)
+    try:
+        _login(page, base)
+        # Create a project through the UI.
+        page.click("#tab-projects")
+        page.wait_for_selector("#project-form")
+        page.fill("#project-name", "Lab Project")
+        page.click("#project-form button[type=submit]")
+        page.wait_for_selector(".project-select")
+
+        # Open the Autonomous Lab tab.
+        page.click("#tab-autolab")
+        page.wait_for_selector("#panel-autolab:not(.hidden)")
+        page.wait_for_function("() => document.querySelectorAll('#al-project option').length >= 2")
+
+        # Select the project, enter a goal and start.
+        page.select_option("#al-project", index=1)
+        page.fill("#al-goal", "Add a deterministic feature and tests")
+        page.click("#al-start")
+        page.wait_for_function(
+            "() => document.getElementById('al-msg').textContent.includes('Запуск создан')",
+            timeout=15000)
+
+        # The run exists in the backend and the task graph is intact.
+        status = page.evaluate(
+            "async () => { const r = await fetch('/api/v1/projects/' + "
+            "document.getElementById('al-project').value + '/runs', {headers:{'X-CSRF-Token': CSRF}}); "
+            "return (await r.json()).runs.length; }")
+        assert status == 1
+
+        # Drive the loop with the fake executor/verifier, then re-open the tab.
+        run_id = page.evaluate(
+            "async () => { const r = await fetch('/api/v1/projects/' + "
+            "document.getElementById('al-project').value + '/runs', {headers:{'X-CSRF-Token': CSRF}}); "
+            "return (await r.json()).runs[0].id; }")
+
+        class _Exec:
+            def dispatch(self, task):
+                return "c-" + task["task_key"]
+
+            def poll(self, task, conv):
+                return TaskReport(state="finished", final_text="ok", conversation_id=conv)
+
+        class _Ver:
+            def verify(self, task, report):
+                return Verification("completed_verified", "test", {})
+
+        LabScheduler(app.lab, _Exec(), _Ver()).run_until_done(run_id)
+        page.click("#tab-lab")
+        page.click("#tab-autolab")
+        page.wait_for_function(
+            "() => document.getElementById('al-runs').textContent.includes('завершён')",
+            timeout=10000)
+    finally:
+        srv.shutdown()
+        t.join()
+        srv.server_close()
