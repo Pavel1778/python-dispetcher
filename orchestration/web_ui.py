@@ -1117,15 +1117,17 @@ async function loadProjectEvidence(id) {
         const out = await api('/api/v1/projects/' + encodeURIComponent(id) + '/evidence/' +
                               encodeURIComponent(button.dataset.id) + '/verify', {method:'POST', body: '{}'});
         const rec = out.evidence || {};
-        const detail = container.querySelector('.evidence-detail[data-id="' + button.dataset.id + '"]');
-        if (detail) {
-          detail.classList.remove('hidden');
+        // Re-render first (which recreates the detail node), then fill it in, so
+        // the explanation survives the refresh.
+        await loadProjectEvidence(id);
+        const fresh = $('#project-evidence').querySelector('.evidence-detail[data-id="' + button.dataset.id + '"]');
+        if (fresh) {
+          fresh.classList.remove('hidden');
           const checks = (rec.verification_detail && rec.verification_detail.checks) || {};
-          detail.textContent = 'Verdict: ' + rec.verdict + ' — ' + ((rec.verification_detail||{}).reason || '') +
+          fresh.textContent = 'Verdict: ' + rec.verdict + ' — ' + ((rec.verification_detail||{}).reason || '') +
             ' | commit ' + (rec.commit_sha || '—') + ' | ключ ' + (rec.key_id || '—') +
             ' | подпись ' + (checks.signature_valid ? 'ок' : 'нет');
         }
-        await loadProjectEvidence(id);
       } catch (e) { $('#project-evidence-msg').textContent = e.message; }
     });
   } catch (e) { if (SELECTED_PROJECT === id) $('#project-evidence').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
