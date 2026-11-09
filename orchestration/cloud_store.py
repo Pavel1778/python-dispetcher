@@ -718,9 +718,21 @@ class PostgresStore:
                         f"workspace {task.selected_repository}"
                         f"@{task.selected_branch or 'default'} is held by {holder}"
                     )
+                try:
+                    self._claim_row(cur, task, owner, lease_seconds)
+                except psycopg.errors.UniqueViolation:
+                    # The partial unique index refused it: another dispatcher
+                    # claimed the same workspace in the same instant.
+                    raise InvalidTransition(
+                        f"workspace {task.selected_repository}"
+                        f"@{task.selected_branch or 'default'} was just taken"
+                    ) from None
             else:
                 # Scan past tasks awaiting dependencies, approval or a workspace.
                 # The explicit-id path above still reports why a claim is refused.
+                # The workspace check here is the fast path; the partial unique
+                # index ``uq_tasks_workspace_active`` is the real cross-process
+                # lock, so a losing race is caught below and the scan continues.
                 tried: list[str] = []
                 while True:
                     cur.execute(
@@ -745,18 +757,34 @@ class PostgresStore:
                     if unmet or (task.requires_approval and task.approved is not True):
                         tried.append(task.id)
                         continue
-                    if self._workspace_holder(cur, task) is None:
-                        break
-                    tried.append(task.id)
-            cur.execute(
-                "UPDATE tasks SET state='assigned', owner=%s, "
-                "lease_expires=now() + make_interval(secs => %s), updated_at=now() "
-                "WHERE id=%s",
-                (owner, lease_seconds, task.id),
-            )
-            self._event(cur, "task_claimed", task_id=task.id, session_id=owner,
-                        detail={"lease_seconds": lease_seconds})
+                    if self._workspace_holder(cur, task) is not None:
+                        tried.append(task.id)
+                        continue
+                    # Claim inside a savepoint: if another dispatcher took this
+                    # workspace between the check and the update, the unique
+                    # index refuses it, the savepoint rolls back, and the scan
+                    # moves on instead of aborting the whole transaction.
+                    cur.execute("SAVEPOINT claim_try")
+                    try:
+                        self._claim_row(cur, task, owner, lease_seconds)
+                    except psycopg.errors.UniqueViolation:
+                        cur.execute("ROLLBACK TO SAVEPOINT claim_try")
+                        tried.append(task.id)
+                        continue
+                    cur.execute("RELEASE SAVEPOINT claim_try")
+                    break
         return self.get_task(task.id)
+
+    def _claim_row(self, cur: Any, task: Task, owner: str, lease_seconds: float) -> None:
+        """Mark *task* assigned to *owner*. May raise UniqueViolation on a race."""
+        cur.execute(
+            "UPDATE tasks SET state='assigned', owner=%s, "
+            "lease_expires=now() + make_interval(secs => %s), updated_at=now() "
+            "WHERE id=%s",
+            (owner, lease_seconds, task.id),
+        )
+        self._event(cur, "task_claimed", task_id=task.id, session_id=owner,
+                    detail={"lease_seconds": lease_seconds})
 
     def _workspace_holder(self, cur: Any, task: Task) -> str | None:
         """The id of a task already occupying *task*'s workspace.
@@ -768,6 +796,12 @@ class PostgresStore:
         Only states that mean "a conversation may be editing this checkout right
         now" count: a merely ``queued`` sibling holds nothing, so two queued
         tasks on one repository do not block each other before either starts.
+
+        This is the fast path; it is **not** the lock. Two dispatchers can still
+        pass it for different rows in the same instant, so the partial unique
+        index ``uq_tasks_workspace_active`` (migration 0015) is the real,
+        database-enforced cross-process lock. ``claim_task`` claims inside a
+        savepoint and treats a ``UniqueViolation`` as "workspace taken".
         """
         if not task.selected_repository:
             return None
