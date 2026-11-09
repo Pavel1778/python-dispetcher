@@ -11,3 +11,5 @@ state/
 .audit-baseline/
 dist/
 *.deb
+*.keystore
+nexus-*.apk

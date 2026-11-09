@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NEXUS</string>
+    <string name="backend_hint">Backend URL (https://…)</string>
+    <string name="connect">Connect</string>
+    <string name="offline">No connection to the NEXUS backend.</string>
+    <string name="retry">Retry</string>
+    <string name="settings">Backend</string>
+    <string name="save">Save</string>
+</resources>
