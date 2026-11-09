@@ -1267,6 +1267,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get_github(self, principal: str, rest: list[str]):
         """Read-only GitHub views. Never writes and never returns the token."""
+        from urllib.parse import parse_qs, unquote
+
+        # The path segments arrive percent-encoded; decode each so a Cyrillic
+        # owner, name, branch or file path reaches the client as real text.
+        rest = [unquote(part) for part in rest]
+        query = parse_qs(urlparse(self.path).query)
+        ref = (query.get("ref") or [None])[0]
         try:
             if len(rest) == 2:
                 repos = self.app.github.list_repositories()
@@ -1280,17 +1287,29 @@ class Handler(BaseHTTPRequestHandler):
                 if section == "branches":
                     return (200, {"branches": self.app.github.list_branches(full_name)}, None)
                 if section == "commits":
-                    return (200, {"commits": self.app.github.list_commits(full_name)}, None)
+                    return (200, {"commits": self.app.github.list_commits(
+                        full_name, branch=ref)}, None)
                 if section == "issues":
                     return (200, {"issues": self.app.github.list_issues(full_name)}, None)
                 if section == "pulls":
                     return (200, {"pulls": self.app.github.list_pulls(full_name)}, None)
+                # The IDE view: the file tree and one file's text, at a ref.
+                if section == "tree":
+                    return (200, {"tree": self.app.github.list_tree(full_name, branch=ref)}, None)
+                if section == "contents" and len(rest) >= 5:
+                    path = "/".join(rest[5:])
+                    text = self.app.github.read_file(full_name, path, branch=ref)
+                    if text is None:
+                        return (404, {"error": "file not found or binary"}, None)
+                    return (200, {"path": path, "content": text, "ref": ref}, None)
         except GitHubAuthError as e:
             return (400, {"error": f"github auth: {e}"}, None)
         except GitHubUnavailable as e:
             return (503, {"error": f"github unavailable: {e}"}, None)
         except GitHubError as e:
             return (502, {"error": f"github: {e}"}, None)
+        except ValueError as e:
+            return (400, {"error": str(e)}, None)
         return None
 
     def _post_project_resource(self, path: str, principal: str, body: dict) -> bool:

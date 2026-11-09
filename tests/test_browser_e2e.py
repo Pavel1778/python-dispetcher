@@ -309,3 +309,72 @@ def test_autonomous_lab_tab_renders_and_starts_a_run(base, app, page):
         srv.shutdown()
         t.join()
         srv.server_close()
+
+
+def test_chat_journey_is_real(base, app, page):
+    """The primary product experience: a project, a persistent chat, a real answer.
+
+    The provider is a local fake HTTP server, so the assistant reply is produced
+    over a real socket by the real cascade. The conversation persists: reloading
+    the page restores it.
+    """
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from orchestration.providers import GroqProvider, ProviderCascade
+    from orchestration.nexus_chat import ChatResponder
+    from tests.test_providers import FakeProvider
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+    srv.script = [{"payload": {"choices": [{"message": {"content": "Привет из NEXUS!"}}]}}]
+    srv.calls = []
+    srv.index = 0
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    app.providers = ProviderCascade([
+        GroqProvider(base_url=f"http://127.0.0.1:{srv.server_port}",
+                     api_key="k", model="m", sleep=lambda _s: None)])
+    app.chat = ChatResponder(app.providers, dispatch_code=app._chat_dispatch_code,
+                             start_autonomous=app._chat_start_autonomous)
+    try:
+        _login(page, base)
+        # Create a project through the UI, then it becomes the workspace project.
+        page.click("#tab-projects")
+        page.wait_for_selector("#project-form")
+        page.fill("#project-name", "Chat Project")
+        page.click("#project-form button[type=submit]")
+        page.wait_for_selector(".project-select")
+        page.click(".project-select")
+        page.wait_for_selector("#project-exec:not(.hidden)")
+
+        # The chat is the primary view and the project is selected in the sidebar.
+        page.click("#tab-chat")
+        page.wait_for_selector("#panel-chat:not(.hidden)")
+        page.wait_for_function("() => document.querySelector('#ws-project').value.length > 0")
+
+        # New chat, then a real message.
+        page.click("#new-chat")
+        page.wait_for_function(
+            "() => { const r = document.querySelector('#ws-recent'); return r && r.textContent.indexOf('Без названия') >= 0; }",
+            timeout=10000)
+        page.fill("#chat-input", "Привет, что ты умеешь?")
+        page.click("#chat-send")
+        page.wait_for_function(
+            "() => document.querySelector('#chat-log').textContent.includes('Привет из NEXUS!')",
+            timeout=15000)
+        assert srv.calls, "the provider was really called"
+
+        # The conversation persists across a reload.
+        page.reload()
+        page.wait_for_selector("#chat-log")
+        page.wait_for_function(
+            "() => document.querySelector('#ws-recent') && document.querySelector('#ws-recent').children.length >= 1",
+            timeout=10000)
+        page.click("#ws-recent .recent-item")
+        page.wait_for_function(
+            "() => document.querySelector('#chat-log').textContent.includes('Привет из NEXUS!')",
+            timeout=10000)
+    finally:
+        srv.shutdown()
+        t.join()
+        srv.server_close()

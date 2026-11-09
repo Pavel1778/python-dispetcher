@@ -123,7 +123,7 @@ def http(server):
 def test_page_is_served(http):
     st, text = http.get_text("/")
     assert st == 200
-    assert "Диспетчер OpenHands" in text
+    assert "NEXUS" in text
     assert "/static/app.js" in text
 
 
@@ -136,6 +136,21 @@ def test_page_has_the_lab_and_github_tabs(http):
                    'id="panel-github"', 'id="upload-form"', 'id="rec-start"',
                    'id="gh-create-form"', 'id="gh-confirm-card"'):
         assert marker in text, marker
+
+
+def test_page_is_the_ai_ide_shell(http):
+    """The first screen is the AI IDE workspace, not the old dashboard."""
+    st, text = http.get_text("/")
+    assert st == 200
+    for marker in ('id="sidebar"', 'id="chat-log"', 'id="chat-input"', 'id="chat-send"',
+                   'id="panel-chat"', 'id="panel-ide"', 'id="panel-agents"',
+                   'id="ws-project"', 'id="repo-picker"', 'id="repo-list"',
+                   'id="repo-account"', 'id="branch-list"', 'id="repo-bind"',
+                   'id="rightpanel"', 'id="rp-toggle"', 'id="new-chat"',
+                   'id="menu-toggle"', 'class="mode-chip"'):
+        assert marker in text, marker
+    # The dashboard metric strip is no longer the first thing a user sees.
+    assert 'id="metrics"' not in text
 
 
 def test_client_script_contains_the_new_capabilities(http):

@@ -249,7 +249,7 @@ APP_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Диспетчер OpenHands</title>
+<title>NEXUS — AI Development Environment</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#0b0d12">
@@ -258,34 +258,117 @@ APP_HTML = r"""<!doctype html>
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="dot" aria-hidden="true"></span><h1>Диспетчер OpenHands</h1></div>
+  <button class="ghost menu-btn" id="menu-toggle" type="button"
+          aria-expanded="false" aria-controls="sidebar" aria-label="Меню">☰</button>
+  <div class="brand"><span class="dot" aria-hidden="true"></span><h1>NEXUS</h1></div>
   <div class="spacer"></div>
   <span class="muted small" id="whoami"></span>
+  <button class="ghost" id="rp-toggle" type="button" aria-pressed="true">Панель агента</button>
   <button class="ghost" id="logout" type="button">Выйти</button>
 </header>
 
-<div class="wrap">
+<div class="app-shell right-open">
+  <aside id="sidebar" aria-label="Навигация">
+    <div class="side-brand"><span class="logo" aria-hidden="true">N</span>
+      <span class="side-title">NEXUS</span></div>
+    <label class="side-label" for="ws-project">Проект</label>
+    <select id="ws-project" class="block" aria-label="Выбор проекта"></select>
+    <div id="ws-binding" class="side-binding muted small">Проект не выбран.</div>
+    <button class="ghost block" id="ws-manage" type="button">Управление проектом</button>
+    <button class="ghost block" id="new-chat" type="button">＋ Новый чат</button>
+    <div class="side-recent">
+      <h4>Недавние чаты</h4>
+      <div id="ws-recent"></div>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Разделы">
+      <button class="tab" role="tab" id="tab-chat" aria-selected="true" aria-controls="panel-chat">Чат</button>
+      <button class="tab" role="tab" id="tab-ide" aria-selected="false" aria-controls="panel-ide">IDE / Workspace</button>
+      <button class="tab" role="tab" id="tab-agents" aria-selected="false" aria-controls="panel-agents">Агенты</button>
+      <button class="tab" role="tab" id="tab-projects" aria-selected="false" aria-controls="panel-projects">Проекты</button>
+      <button class="tab" role="tab" id="tab-autolab" aria-selected="false" aria-controls="panel-autolab">Автономная лаборатория</button>
+      <button class="tab" role="tab" id="tab-lab" aria-selected="false" aria-controls="panel-lab">Лаборатория</button>
+      <button class="tab" role="tab" id="tab-github" aria-selected="false" aria-controls="panel-github">GitHub</button>
+      <button class="tab" role="tab" id="tab-new" aria-selected="false" aria-controls="panel-new">Диспетчер: задача</button>
+      <button class="tab" role="tab" id="tab-queue" aria-selected="false" aria-controls="panel-queue">Очередь и задачи</button>
+      <button class="tab" role="tab" id="tab-integrations" aria-selected="false" aria-controls="panel-integrations">Интеграции</button>
+      <button class="tab" role="tab" id="tab-system" aria-selected="false" aria-controls="panel-system">Система</button>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <div class="ws-header">
+      <div class="crumbs">
+        <span id="ws-project-name">NEXUS</span>
+        <span class="faint">/</span>
+        <span class="repo" id="ws-repo">—</span>
+        <span class="faint">@</span>
+        <span class="repo" id="ws-branch">—</span>
+      </div>
+      <div class="grow"></div>
+      <button class="ghost" id="open-picker" type="button">Сменить репозиторий</button>
+    </div>
+    <div class="wrap">
   <div id="banners"></div>
 
-  <section class="grid cols-4" id="metrics" aria-label="Сводка">
-    <div class="card metric"><span class="value skeleton" style="width:60%"></span><span class="name">Загрузка…</span></div>
-    <div class="card metric"><span class="value skeleton" style="width:60%"></span><span class="name">Загрузка…</span></div>
-    <div class="card metric"><span class="value skeleton" style="width:60%"></span><span class="name">Загрузка…</span></div>
-    <div class="card metric"><span class="value skeleton" style="width:60%"></span><span class="name">Загрузка…</span></div>
+  <section id="panel-chat" role="tabpanel" aria-labelledby="tab-chat">
+    <div class="chat">
+      <div class="chat-modes" role="group" aria-label="Режим чата">
+        <button class="mode-chip" type="button" data-mode="ask" aria-pressed="true">Ask — вопрос и объяснение</button>
+        <button class="mode-chip" type="button" data-mode="code" aria-pressed="false">Code — изменения в репозитории</button>
+        <button class="mode-chip" type="button" data-mode="plan" aria-pressed="false">Plan — план работы</button>
+        <button class="mode-chip" type="button" data-mode="autonomous" aria-pressed="false">Autonomous — автономная цель</button>
+      </div>
+      <div class="chat-log" id="chat-log" role="log" aria-live="polite">
+        <div class="empty">Выберите проект слева, затем откройте чат.</div>
+      </div>
+      <div class="composer">
+        <div class="attach-row" id="chat-attachments"></div>
+        <textarea id="chat-input" rows="2" maxlength="20000" aria-label="Сообщение"
+          placeholder="Опишите цель на естественном языке. Например: изучи проект, найди архитектурные проблемы и предложи план."></textarea>
+        <div class="row2">
+          <button type="button" class="ghost" id="chat-attach">📎 Вложить</button>
+          <input id="chat-file" type="file" class="hidden" aria-hidden="true" tabindex="-1">
+          <span id="chat-status" class="muted small" role="status" aria-live="polite"></span>
+          <div class="spacer" style="flex:1"></div>
+          <button type="button" id="chat-send">Отправить</button>
+        </div>
+      </div>
+    </div>
   </section>
 
-  <nav class="tabs" role="tablist" aria-label="Разделы" style="margin-top:24px">
-    <button class="tab" role="tab" id="tab-projects" aria-selected="true" aria-controls="panel-projects">Проекты NEXUS</button>
-    <button class="tab" role="tab" id="tab-autolab" aria-selected="false" aria-controls="panel-autolab">Автономная лаборатория</button>
-    <button class="tab" role="tab" id="tab-lab" aria-selected="false" aria-controls="panel-lab">Лаборатория</button>
-    <button class="tab" role="tab" id="tab-github" aria-selected="false" aria-controls="panel-github">GitHub</button>
-    <button class="tab" role="tab" id="tab-new" aria-selected="false" aria-controls="panel-new">Dispatcher: новая задача</button>
-    <button class="tab" role="tab" id="tab-queue" aria-selected="false" aria-controls="panel-queue">Очередь и задачи</button>
-    <button class="tab" role="tab" id="tab-integrations" aria-selected="false" aria-controls="panel-integrations">Интеграции</button>
-    <button class="tab" role="tab" id="tab-system" aria-selected="false" aria-controls="panel-system">Система</button>
-  </nav>
+  <section id="panel-ide" role="tabpanel" aria-labelledby="tab-ide" class="hidden">
+    <div class="ide">
+      <div class="ide-tree" id="ide-tree" aria-label="Файлы проекта">
+        <p class="muted small">Выберите проект и привяжите репозиторий.</p>
+      </div>
+      <div class="ide-main">
+        <div class="ide-editor" id="ide-editor">
+          <div class="empty">Выберите файл слева, чтобы открыть его.<br>
+            Файлы читаются через GitHub API привязанного аккаунта (только чтение).</div>
+        </div>
+        <div class="ide-bottom">
+          <h4>Терминал / логи / тесты</h4>
+          <p class="muted small" id="ide-terminal-note">
+            Исполнение происходит в OpenHands Cloud, а не на этом сервере. Локального
+            терминала здесь нет; ниже показано состояние агента и изменения. Откройте
+            панель агента справа для подробностей.
+          </p>
+          <div id="ide-changes"></div>
+        </div>
+      </div>
+    </div>
+  </section>
 
-  <section id="panel-projects" role="tabpanel" aria-labelledby="tab-projects">
+  <section id="panel-agents" role="tabpanel" aria-labelledby="tab-agents" class="hidden">
+    <div class="banner info">Сессия агента — это запуск OpenHands для проекта. Она не является чатом
+      NEXUS: чат остаётся диалогом, сессия — исполнением. Откройте сессию в чате, чтобы продолжить диалог.</div>
+    <div class="card">
+      <div class="card-head"><h3>Сессии агента</h3></div>
+      <div id="agents-body"><p class="muted small">Выберите проект.</p></div>
+    </div>
+  </section>
+
+  <section id="panel-projects" role="tabpanel" aria-labelledby="tab-projects" class="hidden">
     <div class="banner info">Цели и планы сохраняются отдельно от очереди Dispatcher. Согласование плана пока не запускает агентов.</div>
     <div class="grid cols-2">
       <div class="card">
@@ -325,18 +408,51 @@ APP_HTML = r"""<!doctype html>
       </div>
     </div>
 
+    <div id="repo-picker" class="card hidden" style="margin-top:16px">
+      <div class="card-head"><h3>Репозиторий и ветка</h3>
+        <div class="spacer" style="flex:1"></div>
+        <button class="ghost" id="repo-refresh" type="button">Обновить список</button>
+      </div>
+      <p class="muted small">Выберите аккаунт GitHub, затем репозиторий и ветку. Список приходит
+        из GitHub API выбранного аккаунта — вводить owner/name вручную не нужно.</p>
+      <div class="picker">
+        <div>
+          <label for="repo-account">Аккаунт GitHub</label>
+          <select id="repo-account"><option value="">— аккаунт GitHub —</option></select>
+        </div>
+        <div>
+          <label for="repo-search">Поиск по репозиториям</label>
+          <input id="repo-search" type="search" placeholder="Начните вводить имя…" autocomplete="off">
+        </div>
+        <div id="repo-list" class="picker-list"><p class="muted small" style="padding:10px">Загружаем…</p></div>
+        <div id="branch-list"></div>
+        <div class="actions">
+          <span class="muted small">Выбрано: <span class="mono" id="repo-selected">—</span></span>
+          <button type="button" id="repo-bind" data-repo="">Привязать к проекту</button>
+        </div>
+        <div style="border-top:1px dashed var(--line);margin-top:10px;padding-top:10px">
+          <p class="muted small">Дополнительно: ввести owner/name вручную.</p>
+          <form id="project-repo-form">
+            <label for="project-repo-name">Репозиторий (owner/name)</label>
+            <input id="project-repo-name" placeholder="owner/name" maxlength="200" autocapitalize="none" required>
+            <div class="actions"><button class="ghost" type="submit">Привязать вручную</button></div>
+          </form>
+          <p id="project-repo-msg" class="small" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+    </div>
+
     <div id="project-exec" class="card hidden" style="margin-top:16px">
       <div class="card-head"><h3>Контекст выполнения проекта</h3></div>
       <p class="muted small">Здесь показано, с каким проектом, репозиторием и веткой будет запущена работа. Задача не может использовать репозиторий, не привязанный к проекту.</p>
 
-      <h4>Репозитории проекта</h4>
+      <h4>Аккаунт OpenHands для проекта</h4>
+      <label for="project-oh-account">Исполнитель</label>
+      <select id="project-oh-account"><option value="">— наследовать аккаунт —</option></select>
+      <p class="muted small">Проект может выполняться отдельным аккаунтом OpenHands. Если не выбран — используется аккаунт по умолчанию.</p>
+
+      <h4 style="margin-top:20px">Репозитории проекта</h4>
       <div id="project-repos"><p class="muted small">Загрузка…</p></div>
-      <form id="project-repo-form">
-        <label for="project-repo-name">Привязать репозиторий (owner/name)</label>
-        <input id="project-repo-name" placeholder="owner/name" maxlength="200" autocapitalize="none" required>
-        <div class="actions"><button type="submit">Привязать</button></div>
-      </form>
-      <p id="project-repo-msg" class="small" role="status" aria-live="polite"></p>
 
       <h4 style="margin-top:20px">Новая задача в проекте</h4>
       <form id="project-task-form">
@@ -684,6 +800,17 @@ APP_HTML = r"""<!doctype html>
       <div id="dbody"></div>
     </div>
   </section>
+    </div>
+  </div>
+
+  <aside class="rightpanel" id="rightpanel" aria-label="Активность агента">
+    <div class="card-head">
+      <h3>Активность агента</h3>
+      <div class="spacer" style="flex:1"></div>
+      <button class="ghost" id="rp-close" type="button" aria-label="Свернуть панель">×</button>
+    </div>
+    <div id="rp-body"><p class="muted small">Выберите проект.</p></div>
+  </aside>
 </div>
 
 <script src="/static/app.js"></script>
@@ -756,6 +883,8 @@ function clearBanners() { $('#banners').innerHTML = ''; }
 
 /* ------------------------------------------------------------- metrics */
 function renderMetrics(d, health) {
+  const box = $('#metrics');
+  if (!box) return;  // the IDE shell has no dashboard metric strip
   const items = [
     {n:'Всего задач', v:d.tasks},
     {n:'В очереди', v:d.queued},
@@ -1141,6 +1270,13 @@ async function selectProject(id) {
   if (!project) return;
   SELECTED_PROJECT = id;
   SELECTED_GOAL = null;
+  // Keep the IDE shell in step: refresh its project picker (a project created
+  // after the last refresh is not in the dropdown yet) and load its binding and
+  // conversations. The shell owns the sidebar; this panel owns the detail view.
+  if (typeof openWorkspaceProject === 'function') {
+    await loadWorkspace();
+    await openWorkspaceProject(id);
+  }
   $('#plan-panel').classList.add('hidden');
   $('#project-heading').textContent = project.name;
   $('#project-description-view').textContent = project.description || 'Описание не задано.';
@@ -1192,7 +1328,12 @@ let PROJECT_REPOS = [];
 
 async function loadProjectExec(id) {
   $('#project-exec').classList.remove('hidden');
+  $('#repo-picker').classList.remove('hidden');
   await Promise.all([loadProjectRepos(id), loadProjectWorkflows(id), loadProjectTasks(id), loadProjectEvidence(id)]);
+  if (typeof loadAccountRepositories === 'function') {
+    const sel = $('#repo-account');
+    loadAccountRepositories(sel ? sel.value : '');
+  }
 }
 
 async function loadProjectRepos(id) {
@@ -2010,7 +2151,7 @@ async function boot() {
   };
   $$('.tab').forEach(tab => tab.onclick = () => {
     $$('.tab').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
-    $$('#panel-projects, #panel-autolab, #panel-lab, #panel-github, #panel-new, #panel-queue, #panel-integrations, #panel-system')
+    $$('#panel-projects, #panel-autolab, #panel-lab, #panel-github, #panel-new, #panel-queue, #panel-integrations, #panel-system, #panel-chat, #panel-ide, #panel-agents')
       .forEach(p => p.classList.add('hidden'));
     $('#' + tab.getAttribute('aria-controls')).classList.remove('hidden');
     if (tab.id === 'tab-system') loadSystem();
@@ -2019,6 +2160,9 @@ async function boot() {
     if (tab.id === 'tab-autolab') initAutoLab();
     if (tab.id === 'tab-lab') initLab();
     if (tab.id === 'tab-github') initGithub();
+    if (tab.id === 'tab-ide' && typeof loadIdeTree === 'function') loadIdeTree();
+    if (tab.id === 'tab-agents' && typeof refreshAgentPanel === 'function') refreshAgentPanel();
+    toggleSidebar(false);
   });
   setupVoice();
   $('#files-form').onsubmit = async e => {
@@ -2238,3 +2382,12 @@ async function boot() {
 }
 document.addEventListener('DOMContentLoaded', boot);
 """
+
+# The AI IDE shell (sidebar, chat, IDE, agent panel) is a separate module so this
+# file stays a readable set of static strings. Concatenated so the browser gets a
+# single stylesheet and a single script, and the shell's helpers can use the ones
+# defined above.
+from .web_ui_ide import IDE_CSS, IDE_JS  # noqa: E402
+
+APP_CSS = APP_CSS + IDE_CSS
+APP_JS = APP_JS + IDE_JS
