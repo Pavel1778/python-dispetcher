@@ -27,6 +27,7 @@ Public endpoints (no session):
     GET  /login                  the login page
     POST /login                  authenticate (rate limited)
     GET  /healthz                minimal liveness probe for Render
+    GET  /readyz                 readiness probe (liveness + DB round-trip)
     GET  /static/app.css         stylesheet
 
 Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
@@ -1009,6 +1010,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(200, LOGIN_PAGE.replace("__ERROR__", ""))
             if path == "/healthz":
                 return self._json(200, HEALTHZ)
+            if path == "/readyz":
+                # Readiness: liveness plus a real database round-trip. A process
+                # that is up but cannot reach PostgreSQL is not ready to serve.
+                # Public on purpose (a load balancer must not need a credential),
+                # and it exposes no configuration.
+                try:
+                    self.app.store.dashboard_counts()
+                    return self._json(200, {"status": "ready", "database": True})
+                except Exception:  # noqa: BLE001 - readiness must not raise
+                    return self._json(503, {"status": "not_ready", "database": False})
             if path in PWA_ASSETS:
                 name, content_type, cache_control = PWA_ASSETS[path]
                 return self._static(200, (_PWA_DIR / name).read_bytes(), content_type,

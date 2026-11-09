@@ -37,7 +37,7 @@ TOKEN = "machine-token"
 UUID = "11111111-1111-1111-1111-111111111111"
 
 # Endpoints that must be reachable with no credentials at all.
-PUBLIC_GET = {"/login", "/healthz", "/static/app.css", "/static/app.js",
+PUBLIC_GET = {"/login", "/healthz", "/readyz", "/static/app.css", "/static/app.js",
               "/favicon.svg", "/manifest.webmanifest", "/service-worker.js"}
 
 # Endpoints that must require a session or bearer. Method + path.
