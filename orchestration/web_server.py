@@ -629,9 +629,22 @@ class App:
         except Exception as e:  # noqa: BLE001
             cloud_err = type(e).__name__
         last = self.last_tick or {}
+        components = {
+            "database": {"ok": store_ok, "error": store_err},
+            "openhands": {"ok": cloud_ok, "error": cloud_err},
+            "github": {"ok": self.github.configured,
+                       "detail": "token configured" if self.github.configured else "no token"},
+            "auth": {"ok": self.auth.configured,
+                     "detail": "configured" if self.auth.configured
+                     else "missing: " + ", ".join(self.auth.missing_settings())},
+            "evidence": {"ok": bool(self.evidence_keyring) and self.evidence_signer is not None,
+                         "detail": "signer and keyring" if self.evidence_signer
+                         else "no signer configured (NEXUS_EVIDENCE_PRIVATE_KEY unset)"},
+        }
         return {
             "store": {"ok": store_ok, "error": store_err},
             "cloud": {"ok": cloud_ok, "error": cloud_err, "url": self.client.base_url},
+            "components": components,
             "config": {
                 "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
                 "writes_require_auth": bool(self.token),
@@ -819,7 +832,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
         item = parts[5] if len(parts) == 6 else None
         if item is not None and not UUID_RE.fullmatch(item):
-            return None
+            # Only the repositories collection accepts a non-uuid action segment.
+            if not (resource == "repositories" and item == "remove"):
+                return None
         return parts[3], resource, item
 
     @staticmethod
@@ -890,7 +905,7 @@ class Handler(BaseHTTPRequestHandler):
             if item_id is None:
                 return self._json(200, {"workflows": self.app.store.list_workflows(project_id=project_id)})
             detail = self.app.workflow_detail(item_id)
-            if detail.get("project_id") != project_id:
+            if (detail.get("workflow") or {}).get("project_id") != project_id:
                 return self._json(404, {"error": "not found"})
             return self._json(200, detail)
         if resource == "evidence":
@@ -910,6 +925,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "full_name must be owner/name"})
             link = self.app.project_repos.link(principal, project_id, full_name)
             return self._json(201, {"repository": link})
+        if resource == "repositories" and item_id == "remove":
+            full_name = (body.get("full_name") or "").strip() if isinstance(body, dict) else ""
+            if not full_name:
+                return self._json(400, {"error": "full_name is required"})
+            removed = self.app.project_repos.unlink(principal, project_id, full_name)
+            if not removed:
+                return self._json(404, {"error": "repository not linked to this project"})
+            return self._json(200, {"unlinked": full_name})
         if resource == "tasks" and item_id is None:
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
