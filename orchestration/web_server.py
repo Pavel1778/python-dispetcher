@@ -965,6 +965,35 @@ class Handler(BaseHTTPRequestHandler):
             return parts[3], parts[5]
         return None
 
+    def _mcp_http(self) -> None:
+        """Serve one MCP Streamable-HTTP request at ``POST /mcp``.
+
+        Authentication is the server's own: a session with CSRF, or the machine
+        bearer. The MCP caller therefore has exactly the caller's authority, and
+        the tool surface re-checks project membership. A JSON-RPC notification
+        returns 202 with no body; a parse error is a 400.
+        """
+        from .mcp_server import McpServer, handle_http
+
+        n = int(self.headers.get("Content-Length", 0))
+        if n < 0 or n > 1024 * 1024:
+            return self._json(400, {"jsonrpc": "2.0", "id": None,
+                                    "error": {"code": -32600, "message": "invalid request"}})
+        raw = self.rfile.read(n) if n else b""
+        try:
+            message = json.loads(raw) if raw else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self._json(400, {"jsonrpc": "2.0", "id": None,
+                                    "error": {"code": -32700, "message": "parse error"}})
+        server = McpServer(self.app.store, self._project_principal())
+        status, payload = handle_http(server, message)
+        if status == 202:
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        return self._json(status, payload)
+
     def _create_project_task(self, principal: str, project_id: str, body: dict) -> None:
         """Create a task inside a project and start its workflow (Sr).
 
@@ -1204,6 +1233,8 @@ class Handler(BaseHTTPRequestHandler):
             # --- writes ---
             if not self._require_write():
                 return
+            if path == "/mcp":
+                return self._mcp_http()
             parsed = self._project_path(path)
             if parsed and parsed[1] == "files":
                 name = urllib.parse.unquote(self.headers.get("X-File-Name", ""), errors="strict")

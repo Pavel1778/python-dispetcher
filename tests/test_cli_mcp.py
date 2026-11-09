@@ -213,3 +213,64 @@ def test_mcp_parse_error_is_reported(app):
     serve(server, stdin=stdin, stdout=stdout)
     error = json.loads(stdout.getvalue().strip())
     assert error["error"]["code"] == -32700
+
+
+# ------------------------------------------------------------ MCP over HTTP
+def _mcp_post(base, message, token=TOKEN):
+    req = urllib.request.Request(base + "/mcp", data=json.dumps(message).encode(),
+                                 method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        return e.code, (json.loads(body) if body else None)
+
+
+def test_mcp_http_requires_auth(base):
+    status, _ = _mcp_post(base, {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                          token="wrong")
+    assert status == 401
+
+
+def test_mcp_http_initialize_and_tools(base):
+    status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 1,
+                                    "method": "initialize", "params": {}})
+    assert status == 200
+    assert body["result"]["serverInfo"]["name"] == "nexus"
+    status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert len(body["result"]["tools"]) == 10
+
+
+def test_mcp_http_project_isolation(base, app):
+    other = app.projects.create("user:someone-else", "Theirs")["id"]
+    status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                    "params": {"name": "get_project",
+                                               "arguments": {"project_id": str(other)}}})
+    assert status == 200
+    assert "error" in body and body["error"]["code"] == -32004
+
+
+def test_mcp_http_parse_error_is_400(base):
+    req = urllib.request.Request(base + "/mcp", data=b"not json", method="POST")
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_mcp_http_notification_is_202(base):
+    req = urllib.request.Request(base + "/mcp",
+                                 data=json.dumps({"jsonrpc": "2.0",
+                                                  "method": "tools/list"}).encode(),
+                                 method="POST")
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        assert r.status == 202

@@ -52,6 +52,7 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/events", f"/api/v1/projects/{UUID}/files",
 ]
 PROTECTED_POST = [
+    "/mcp",
     "/api/repositories", "/api/repositories/sync", "/api/repositories/remove",
     "/api/workflows", f"/api/workflows/{UUID}/cancel",
     f"/api/workflows/{UUID}/resume", f"/api/tasks/{UUID}/retry",

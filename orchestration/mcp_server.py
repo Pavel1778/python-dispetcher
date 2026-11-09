@@ -13,12 +13,11 @@ deliberately not a general-purpose executor:
 * Secrets are never returned: ``get_execution_status`` reports presence of
   configuration, never a key.
 
-Transport: stdio only. Streamable HTTP is not implemented in this MVP; the
-server refuses to start in HTTP mode rather than pretending to support it.
-
-Run::
-
-    NEXUS_DB_URL=... NEXUS_MCP_PRINCIPAL=user:owner python -m orchestration.mcp_server
+Transport: stdio (``python -m orchestration.mcp_server``) and, when mounted on
+the web server, Streamable HTTP at ``POST /mcp`` (JSON-RPC 2.0 over HTTP). The
+HTTP mount reuses the server's own session/bearer authentication and CSRF, so an
+MCP caller has exactly the authority of an authenticated NEXUS user -- it cannot
+reach a project the caller is not a member of.
 """
 
 from __future__ import annotations
@@ -272,6 +271,37 @@ def serve(server: McpServer, stdin: Any = None, stdout: Any = None) -> None:
 def _write(stdout: Any, payload: dict) -> None:
     stdout.write(json.dumps(payload) + "\n")
     stdout.flush()
+
+
+def handle_http(server: McpServer, message: dict) -> tuple[int, dict]:
+    """Handle one JSON-RPC message over HTTP. Returns ``(http_status, body)``.
+
+    MCP Streamable HTTP sends a single JSON-RPC object (or a batch) and expects
+    a JSON-RPC response. A notification (no id) is acknowledged with 202 and no
+    body, per the spec. A malformed message is a JSON-RPC error, still HTTP 200
+    (the transport succeeded; the message was bad) except a true parse error,
+    which the web server maps to 400 before calling this.
+    """
+    if not isinstance(message, dict):
+        return 400, {"jsonrpc": "2.0", "id": None,
+                     "error": {"code": -32600, "message": "invalid request"}}
+    msg_id = message.get("id")
+    method = message.get("method")
+    params = message.get("params") or {}
+    if msg_id is None:
+        # A notification: no response body.
+        return 202, {}
+    try:
+        result = server.handle(method, params)
+        return 200, {"jsonrpc": "2.0", "id": msg_id, "result": result}
+    except McpError as e:
+        return 200, {"jsonrpc": "2.0", "id": msg_id,
+                     "error": {"code": e.code, "message": str(e)}}
+    except Exception as e:  # noqa: BLE001 - never crash the transport
+        log.exception("mcp http handler failed")
+        return 200, {"jsonrpc": "2.0", "id": msg_id,
+                     "error": {"code": -32603,
+                               "message": f"internal error: {type(e).__name__}"}}
 
 
 def main(argv: list[str] | None = None) -> int:
