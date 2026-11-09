@@ -84,9 +84,11 @@ class OpenHandsExecutor:
     executor does **not** treat the reply as proof; that is the verifier's job.
     """
 
-    def __init__(self, client: Any, *, poll_interval: float = 2.0):
+    def __init__(self, client: Any, *, poll_interval: float = 2.0,
+                 start_poll_attempts: int = 40):
         self.client = client
         self.poll_interval = poll_interval
+        self.start_poll_attempts = start_poll_attempts
 
     @staticmethod
     def instructions(task: dict) -> str:
@@ -120,10 +122,28 @@ class OpenHandsExecutor:
             title=f"lab:{task['task_key']}",
             tags={"nexusrun": str(task["run_id"])[:40], "nexustask": task["task_key"][:40]},
         )
-        # The two-phase start: the conversation id appears when READY. We record
-        # the start-task id as the conversation id until it is bound, so a
-        # restart can reattach rather than start a second conversation.
-        return getattr(start, "app_conversation_id", None) or getattr(start, "id", "")
+        # Two-phase start: the conversation id appears only at READY. Wait for
+        # it (bounded) so the returned id is a real conversation, not a start
+        # task that a later poll would report as "missing". If the client has no
+        # start-task API (e.g. a local agent-server), fall back to its id.
+        conv_id = getattr(start, "app_conversation_id", None)
+        if conv_id:
+            return conv_id
+        if hasattr(self.client, "get_start_task") and getattr(start, "id", None):
+            current = start
+            for _ in range(self.start_poll_attempts):
+                conv_id = getattr(current, "app_conversation_id", None)
+                if conv_id:
+                    return conv_id
+                if getattr(current, "failed", False):
+                    raise CloudError(f"start task failed: {getattr(current, 'detail', '')}")
+                time.sleep(self.poll_interval)
+                nxt = self.client.get_start_task(current.id)
+                if nxt is None:
+                    raise CloudError("start task disappeared")
+                current = nxt
+            raise CloudError("start task not READY within the poll budget")
+        return getattr(start, "id", "")
 
     def poll(self, task: dict, conversation_id: str) -> TaskReport:
         try:
