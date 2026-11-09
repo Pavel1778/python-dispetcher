@@ -35,6 +35,38 @@ Start here:
 - [CLOUD-INTEGRATION-MAP.md](CLOUD-INTEGRATION-MAP.md) — the Cloud API surface.
 - [DEPLOY.md](DEPLOY.md) — deployment guide.
 
+## What is ready today
+
+Working and covered by tests (the suite passes against a disposable
+PostgreSQL; the browser E2E needs Chromium, and the end-to-end Cloud scripts
+are manual and need a live LLM):
+
+- The **Dispatcher**: durable workflows/tasks, atomic claim with leases,
+  idempotent submission and Sr start, bounded retry, recovery, and operator
+  actions (cancel / resume / retry / rename) with a web UI.
+- The **Sr→Jr bridge**: Sr runs on Cloud with `client_tools` and delegates to
+  Jr tasks, which the dispatcher runs and feeds back.
+- **Authentication**: browser session (PBKDF2 + server-side sessions + CSRF)
+  and a machine bearer token, plus login rate limiting and proxy-aware client
+  IP handling.
+- **Project execution binding (D-2)** and the **Ed25519 Evidence Trust
+  Engine**: a result is `VERIFIED` only from a trusted, valid signature.
+- **GitHub discovery** (read-only) with an allowlist, and **optional
+  confirmed writes** (create / change visibility) behind a session + CSRF +
+  one-use confirmation and `GITHUB_ENABLE_WRITES`.
+- **NEXUS foundation**: projects and goals, manually authored versioned DAG
+  plans (validated, owner-approved), and bounded project file uploads with a
+  file laboratory (workspaces, archive safety, voice notes).
+- A **CLI** (`nexus`), an **MCP** surface (stdio + Streamable HTTP) and an
+  installable **PWA** shell of the same dashboard.
+
+Not ready (see `docs/NEXUS-SPEC.md` and `docs/DEVELOPMENT-LAB.md`): the NEXUS
+plans do **not** dispatch work; there is no LLM planner/gateway or provider
+cascade, no autonomous goal loop, no multi-account OpenHands routing, no
+server-side speech recognition, and no native Desktop/Android/iOS packages. A
+legacy `completed` status means the Dispatcher's own rules were met — it is
+**not** verified QA evidence. Uploaded files are not yet delivered to agents.
+
 ## Quick start (clean environment)
 
 ```bash
