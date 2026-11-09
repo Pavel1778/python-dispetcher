@@ -386,6 +386,27 @@ column. Verify migrations 0009–0011 separately before enabling these features.
 
 ## Render
 
+### Autonomous lab worker (run a second process)
+
+The web server only *starts* autonomous runs; a separate worker advances them.
+On Render, add a second service (same image, different start command) so a run
+survives a browser close and a web-server restart:
+
+```
+python -m orchestration.lab_worker --worker-id lab-1 --poll-interval 5
+```
+
+Both services share `SUPABASE_DB_URL`. The worker holds no per-run state, so it
+can be restarted or scaled to N workers at any time: claims are leases, and a
+dead worker's task is reclaimed by the next tick. `--once` runs a single pass
+(useful for a cron-style deployment).
+
+Client packages (`packaging/`): a `.deb` (Debian/Linux), a signed `.apk`
+(Android) and a `.exe` (Windows). All three are thin clients that open the same
+backend URL and store no credential; build them with the scripts in
+`packaging/*/build-*.sh`.
+
+
 `render.yaml` describes the web service. It does not contain secret values; the
 required variables are marked `sync: false` and must be set in the dashboard.
 The health check path is `/healthz`, which returns `{"status": "ok"}` and

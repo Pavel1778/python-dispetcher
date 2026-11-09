@@ -1,129 +1,111 @@
-# NEXUS Autonomous Lab — integration status
+# NEXUS Autonomous Lab — delivery report
 
-This document states what is actually implemented, tested and verified in
-`main`, and what is not. It is written after the integration of PR #17 and the
-addition of the provider cascade. Status labels follow the request's vocabulary:
+This report states what is implemented, tested, live-verified and *not* done in
+the `nexus/autonomous-completion` line. Status labels are used precisely:
 
-**IMPLEMENTED** · **TESTED** · **LIVE VERIFIED** · **PARTIALLY VERIFIED** ·
-**BLOCKED** · **NOT IMPLEMENTED**
+**IMPLEMENTED** · **UNIT-TESTED** · **INTEGRATION-TESTED** · **LIVE-VERIFIED** ·
+**BUILT (not runtime-tested)** · **NOT IMPLEMENTED** · **BLOCKED**
 
-An agent's own text is never evidence here. "TESTED" means a test in this
-repository exercises the real code path (a real HTTP server and, where relevant,
-a real PostgreSQL). "LIVE VERIFIED" is reserved for a check against a real
-external service and is only used where that was actually run.
+An agent's own text is never evidence. "LIVE-VERIFIED" means a real request to a
+real external service was made and its result observed.
 
 ---
 
-## 1. Single-main delivery (Git)
+## Git
 
-| Item | Status | Evidence |
+- Starting commit (verified): `556734732eddeb6029c394aeabf28480092ac744` (`main`).
+- Working branch: `nexus/autonomous-completion`.
+- Preservation tags kept (13). No history rewritten, no force-push.
+
+## Autonomous Lab
+
+| Component | Status | Where |
 |---|---|---|
-| One working branch `main` | **LIVE VERIFIED** | GitHub API `branches` returns `["main"]`; local `main == origin/main`. |
-| PR #17 integrated | **LIVE VERIFIED** | `origin/nexus/laboratory-files-github` was an ancestor of `main`; its files are present; branch deleted after confirmation. |
-| User doc changes preserved | **LIVE VERIFIED** | Stashed edits re-applied onto merged `main`; the "What is ready today" section is present. |
-| Preservation tags kept | **LIVE VERIFIED** | 13 `preservation/*` tags still present. |
-| `main` pushed | **LIVE VERIFIED** | `git push` fast-forwarded `c36c828..24bdb53`. |
+| Goal lifecycle (draft…cancelled) | **INTEGRATION-TESTED** | `migrations/0018`, `nexus_lab_store.py` |
+| Run + run-task store, one active run per goal | **INTEGRATION-TESTED** | `nexus_lab_store.py`, `tests/test_lab_store.py` |
+| Atomic claim with lease + lease recovery | **INTEGRATION-TESTED** | same (concurrency test caught a real lock bug) |
+| Dependency gating on `completed_verified` | **INTEGRATION-TESTED** | `tests/test_lab_loop.py` |
+| Planner (validated DAG from the cascade) | **INTEGRATION-TESTED** | `nexus_planner.py`, `tests/test_planner_worker.py` |
+| OpenHands dispatch + poll | **LIVE-VERIFIED** | `nexus_lab.py` (real conversation ran to `finished`) |
+| Independent Git verification | **LIVE-VERIFIED** | `GitVerifier` against the real repo |
+| Replanning decision (complete/block/deadlock) | **INTEGRATION-TESTED** | `LabScheduler.tick` |
+| Durable worker, separate process | **INTEGRATION-TESTED** | `lab_worker.py`, restart/recovery tests |
+| Project context (versioned, observed) | **INTEGRATION-TESTED** + **LIVE-VERIFIED** analysis | `nexus_context.py`, `nexus_analysis.py` |
+| Unified memory with provenance | **INTEGRATION-TESTED** | `nexus_context.py` |
+| Notifications | **INTEGRATION-TESTED** | `nexus_lab_store.py`, UI |
+| Autonomous Lab web UI | **LIVE-VERIFIED** (Chromium journey) | `web_ui.py`, `tests/test_browser_e2e.py` |
 
-## 2. File laboratory (PR #17)
+**Not implemented in the loop:** an LLM-driven *replanner* that authors new tasks
+after a failed verification (today a failed/deadlocked dependency blocks the run
+for a human); cost/token budgets (iteration/attempt/deadline budgets exist); and
+multi-run concurrency within one goal (one active run per goal by design).
 
-| Feature | Status | Evidence |
+## Integrations
+
+| Integration | Secret | Auth | Real request | Notes |
+|---|---|---|---|---|
+| OpenHands (executor + last-resort orchestrator) | present | **passed** | **passed** | `health()` true; a conversation ran to `finished`. No GitHub provider token on the account, so it cannot clone a repo itself. |
+| GitHub (PAT) | present | **passed** | **passed** | `GET /user`, tree/contents reads, multi-account add/verify. |
+| Supabase | present | **passed** (token) | **project INACTIVE** | The only project is not serving; tests use a local PostgreSQL. |
+| Gemini | **absent** | not tested | not tested | cascade falls through |
+| Groq | **absent** | not tested | not tested | cascade falls through |
+| OpenRouter | **absent** | not tested | not tested | cascade falls through |
+| Figma | present | passed | read-only | unused by NEXUS |
+| `FROM_API_KEY` | absent | — | — | no intended use found in the repository |
+
+The provider cascade is exercised against a real local HTTP server per provider
+shape; **no live LLM-provider call was made** because no provider key is set.
+
+## Clients
+
+| Artifact | Path | Status |
 |---|---|---|
-| Opaque project uploads (raw body + `X-File-Name`) | **TESTED** | `tests/test_lab_files.py` over real HTTP. |
-| File lab uploads (multipart), preview, download, delete | **TESTED** | `tests/test_file_lab.py` (25 cases). |
-| Development workspaces + unified diff | **TESTED** | `tests/test_file_lab.py`. |
-| Archive safety (Zip Slip, symlinks, bombs) | **TESTED** | `tests/test_archive_safety.py` (no DB; each rejection named). |
-| Voice notes (honest: no server recognizer) | **TESTED** | `tests/test_file_lab.py`. |
-| Guarded GitHub actions (propose → confirm) | **TESTED** | `tests/test_file_lab.py`, `tests/test_github_client.py`. |
-| Unified `nexus_files` schema (two designs) | **TESTED** | `migrations/0011_nexus_files.sql`; both suites green. |
+| Web + E2E | `orchestration/web_ui.py` | **LIVE-VERIFIED** (Chromium) |
+| Debian `.deb` | `dist/nexus-client_2.0.0_all.deb` | **BUILT + install/uninstall verified** |
+| Android `.apk` | `dist/nexus-2.0.0.apk` | **BUILT + signature/manifest verified**; **BLOCKED** runtime (no `/dev/kvm`) |
+| Windows `.exe` | `dist/nexus-client.exe` | **BUILT + PE/version verified**; **BLOCKED** runtime (no Windows host) |
 
-## 3. LLM orchestrator cascade (new)
+## Tests
 
-| Feature | Status | Evidence |
-|---|---|---|
-| Ordered adapters Gemini → Groq → OpenRouter → OpenHands | **TESTED** | `tests/test_providers.py`. |
-| Real auth, structured JSON, size/timeout limits | **TESTED** | same. |
-| Bounded exponential backoff, `Retry-After`, 429/5xx/transport | **TESTED** | same. |
-| Failover only on provider/transport failure | **TESTED** | same (401 is not retried; a bad body fails over). |
-| Orchestrator ≠ executor (OpenHands last, never executes its own plan) | **IMPLEMENTED** | `OpenHandsOrchestratorProvider.executor=False`. |
-| Plan-draft route + UI button (stores/dispatches nothing) | **TESTED** | `tests/test_plan_draft.py`. |
-| Live provider keys exercised end to end | **BLOCKED** | No `GEMINI_API_KEY`/`GROQ_API_KEY`/`OPENROUTER_API_KEY` in this environment; only the local fake-provider server was used. |
+- `ruff check .` → **All checks passed**
+- `pytest tests/ -q` → **625 passed, 1 skipped** (was 557 before this work)
 
-## 4. Project execution, evidence, CLI, MCP, PWA (pre-existing MVP)
+## Remaining blockers (genuine, distinguished)
 
-| Feature | Status | Evidence |
-|---|---|---|
-| D-2 project execution binding | **TESTED** | `tests/test_project_binding.py`, `tests/test_dispatch_authorization.py`. |
-| Ed25519 Evidence Trust Engine | **TESTED** | `tests/test_evidence_trust.py`. |
-| CLI (`nexus`) | **TESTED** | `tests/test_cli_mcp.py`. |
-| MCP stdio + Streamable HTTP | **TESTED** | `tests/test_cli_mcp.py`, `tests/test_route_auth.py`. |
-| Backup/restore drill | **TESTED** | `tests/test_backup_restore.py` (real `pg_dump`/`pg_restore`). |
-| Responsive web + PWA | **TESTED** | `tests/test_browser_e2e.py` (Playwright, Chromium), `tests/test_pwa.py`. |
-| Live OpenHands execution | **BLOCKED** | No working OpenHands key in this environment; the Cloud boundary is exercised against `tests/fake_cloud.py`. |
+- **Missing credentials:** no `GEMINI_API_KEY` / `GROQ_API_KEY` /
+  `OPENROUTER_API_KEY` → the cascade cannot be live-verified.
+- **Unavailable infrastructure:** no `/dev/kvm` (no Android emulator), no Windows
+  host (no `.exe` run), Supabase project `INACTIVE` (no live DB).
+- **Account limitation:** the OpenHands account has no GitHub provider token, so
+  it cannot clone a repository; a full live code-change acceptance needs that
+  token (or the `direct` transport with an authenticated sandbox).
+- **Unfinished implementation:** the autonomous *replanner* (auto-authoring
+  corrective tasks) and push notifications.
 
-## 5. Autonomous goal loop (the headline request)
-
-| Capability | Status | Why |
-|---|---|---|
-| One big goal → auto plan → auto tasks → auto conversations → verify → memory → next action | **NOT IMPLEMENTED** | Today a plan is authored (manually or via the AI draft) and **approved explicitly**; approval does not dispatch. There is no scheduler that turns an approved plan into tasks, creates conversations, verifies them and continues unattended. |
-| Project context collection (languages, modules, schema, deps, CI) | **NOT IMPLEMENTED** | No context collector exists. |
-| Project memory (goals, decisions, attempts, evidence, failover reasons) | **PARTIALLY VERIFIED** | Durable records exist (`nexus_*`, `task_events`, `nexus_evidence`), but there is no unified memory model with `VERIFIED/INFERRED/UNKNOWN/OUTDATED` provenance. |
-| Independent verification of task results | **PARTIALLY VERIFIED** | The verifier decides workflow state from durable signals and the Evidence Trust Engine signs results, but there is no independent test/build runner producing evidence of its own. |
-| Supervisor states (PENDING…CANCELLED) and recovery | **PARTIALLY VERIFIED** | The dispatcher has leases, idempotency, bounded retry and reconciliation; the full NEXUS lifecycle (`planned→ready→…→completed|rework|blocked|failed`) is not implemented. |
-| Multi-account GitHub / OpenHands routing | **NOT IMPLEMENTED** | One `GITHUB_TOKEN`, one `OPENHANDS_API_KEY`. |
-
-## 6. Mobile application (Android / iOS)
-
-| Item | Status | Why |
-|---|---|---|
-| Native Android/iOS app | **NOT IMPLEMENTED** | The PWA is the mobile-capable client today. No native project, no signing credentials, no store submission. The backend already serves the same auth/permissions over HTTPS, so a native client is a client-side effort, not a backend blocker. |
-| Push notifications | **NOT IMPLEMENTED** | In-app status is polled; no push transport. |
-
-## 7. Safety
-
-| Item | Status | Evidence |
-|---|---|---|
-| Critical actions require a one-use, session-bound confirmation | **TESTED** | GitHub writes via `nexus_actions.py` (SHA-256 token, TTL, single use) and `github_confirmations.py`. |
-| Production deploy/migrations not automatic | **IMPLEMENTED** | `AUTO_MIGRATE=false` opt-out; no deploy hook in this environment. |
-
----
-
-## How to run
+## Installation
 
 ```bash
-# 1. Dependencies
-pip install -r requirements.txt -r requirements-dev.txt
-
-# 2. A PostgreSQL database; migrations apply on start by default.
-export SUPABASE_DB_URL="postgresql://user:pw@host:5432/db"
-
-# 3. Owner login + machine token + evidence key (see DEPLOY.md)
-export WEB_AUTH_TOKEN=... AUTH_USERNAME=owner AUTH_PASSWORD_HASH=... AUTH_SESSION_SECRET=...
-
-# 4. Optional: orchestrator providers (only configured ones are used)
-export GEMINI_API_KEY=...   # default orchestrator
-export GROQ_API_KEY=...     # fallback 1
-export OPENROUTER_API_KEY=... # fallback 2
-export OPENHANDS_API_KEY=...  # executor, and last-resort orchestrator
-
-# 5. Run one instance
+# Server + worker
+pip install -r requirements.txt
+export SUPABASE_DB_URL=... WEB_AUTH_TOKEN=... AUTH_USERNAME=... AUTH_PASSWORD_HASH=... AUTH_SESSION_SECRET=... NEXUS_SECRET_KEY=...
 python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN
+python -m orchestration.lab_worker --worker-id lab-1
+
+# Debian client
+sudo dpkg -i dist/nexus-client_2.0.0_all.deb && NEXUS_URL=https://nexus.example.com nexus-client
+
+# Android
+adb install dist/nexus-2.0.0.apk
+
+# Windows
+nexus-client.exe https://nexus.example.com
 ```
 
-## Credentials needed for the parts that are BLOCKED
+## Truthfulness summary
 
-- `OPENHANDS_API_KEY` — a live OpenHands Cloud key (executor + last-resort
-  orchestrator). Without it, execution stops at the Cloud boundary.
-- `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` — at least one, to
-  exercise the cascade against a real provider.
-- `GITHUB_TOKEN` — repository discovery; `GITHUB_ENABLE_WRITES=true` plus
-  admin rights for the optional confirmed writes.
-
-## What this document does not claim
-
-The NEXUS product described in the request — enter one goal and the system
-plans, dispatches, verifies, remembers and continues by itself — is **not**
-built. What is built is a durable, tested control plane with a working Sr/Jr
-delegation, a project/plan/file foundation, signed evidence, a CLI/MCP surface,
-a responsive PWA and a real provider cascade with honest failover. Closing the
-gap to the autonomous loop is the next, clearly-scoped piece of work, not
-something this document presents as done.
+Implemented + tested + live-verified: the OpenHands dispatch/verify path, GitHub
+reads and multi-account, project context analysis. Implemented + integration-
+tested (not live): the scheduler, planner, worker, memory, notifications, UI,
+cascade. Built but not runtime-tested: the APK and the `.exe`. Not implemented:
+the autonomous replanner, push notifications, multi-account OpenHands routing,
+and a native iOS app (excluded by the brief).

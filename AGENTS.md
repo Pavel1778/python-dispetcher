@@ -603,3 +603,90 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
   fabricated plan.
 - Tests: `tests/test_providers.py` (real local HTTP server per provider shape),
   `tests/test_plan_draft.py` (real web server + PostgreSQL).
+
+## Autonomous lab (context, memory, runs, worker)
+
+- `orchestration/nexus_context.py` — versioned project-context snapshots and the
+  unified memory. `analyze_tree` is a pure function (no I/O); memory carries a
+  `provenance` label and only `test_verified`/`independently_verified` count as
+  verified. A repeat memory update only strengthens provenance; an agent cannot
+  downgrade a verified fact by re-asserting it. Migrations `0017`.
+- `orchestration/nexus_analysis.py` — reads a repository tree + a few files
+  through the read-only GitHub client to build a context summary. It never asks
+  a model and never writes. `0019` adds the tree/contents reads the client uses.
+- `orchestration/nexus_lab_store.py` — runs, run tasks and notifications. The
+  invariants live here: one active run per goal (partial unique index), atomic
+  claim with a lease, **a task is claimable only when every dependency is
+  `completed_verified`** (computed in SQL, one row locked at a time — locking the
+  whole pending queue was a real bug the concurrency test caught), lease
+  recovery, and `set_run_state_internal` for the worker (which is not a project
+  member). Migration `0018`.
+- `orchestration/nexus_planner.py` — validates a provider plan (ids, deps,
+  cycles, unknown refs) before storing it. `PLANNER_SYSTEM` asks for JSON only.
+- `orchestration/nexus_lab.py` — `OpenHandsExecutor` (dispatch + poll; **never**
+  decides completion), `GitVerifier` (checks the *real* remote branch/commit; a
+  finished conversation with no observable commit is `completed_unverified`) and
+  `LabScheduler` (reclaim → claim → dispatch → poll → verify → record → decide).
+  A run completes only when every task is `completed_verified`; an unverified
+  dependency deadlocks the graph and the run is `blocked`, not left spinning.
+- `orchestration/lab_worker.py` — the durable worker, a **separate process**
+  (`python -m orchestration.lab_worker`). It holds no per-run state, so a restart
+  is a non-event: it re-reads the active runs and continues. Run it alongside the
+  web server; the web server only *starts* runs.
+- **Two-phase OpenHands start is awaited.** `POST /api/v1/app-conversations`
+  returns a start task; the conversation id appears only at `READY`.
+  `OpenHandsExecutor.dispatch` polls until READY and returns the real
+  `app_conversation_id`. A live dispatch proved the earlier version returned the
+  start-task id and then polled it as a conversation ("missing"). Do not remove
+  the wait.
+- Routes: `POST …/context/refresh`, `POST …/goals/{gid}/run`,
+  `POST …/runs/{id}/{pause,resume,cancel}`, `GET …/runs|runs/{id}|context|memory|notifications`,
+  plus `GET/POST /api/github/accounts` and `POST …/github/account`.
+- UI: the **Автономная лаборатория** tab drives the whole loop and shows
+  run/task state, context, memory and notifications. Status badges distinguish
+  running/waiting/blocked/failed/completed/verified; the UI never fakes progress.
+- Tests: `tests/test_context_memory.py`, `tests/test_lab_store.py`,
+  `tests/test_lab_loop.py`, `tests/test_planner_worker.py`,
+  `tests/test_lab_http.py`, and the autonomous journey in
+  `tests/test_browser_e2e.py`.
+
+## GitHub multi-account
+
+- `orchestration/nexus_github_accounts.py` — one account per row, the PAT
+  **Fernet-encrypted** with `NEXUS_SECRET_KEY` and never returned by any method.
+  Identity is verified via `GET /user` before the account is trusted; a rejected
+  token marks the account `invalid`. A project binds to exactly one account and
+  `client_for_project` **never falls back** to another. Migration `0019`.
+- Without `NEXUS_SECRET_KEY` the service refuses to store an account rather than
+  write a plaintext token.
+- Tests: `tests/test_github_accounts.py` (includes the never-leak-the-token
+  assertion and the HTTP routes).
+
+## Client packages
+
+- `packaging/debian/build-deb.sh` — real `.deb` via `dpkg-deb` (launcher,
+  desktop entry, icons, postinst/postrm). Verified by `dpkg-deb --info/--contents`
+  and a real `dpkg -i`/`dpkg -r`. `tests/test_deb_package.py`.
+- `packaging/android/build-apk.sh` — real signed APK via the SDK tools
+  (aapt2 → d8 → zipalign → apksigner), no Gradle. `MainActivity` is a native
+  WebView around the same dashboard; it stores only the backend URL. **Use
+  build-tools 35**: 34's d8 crashes on the inner `WebViewClient` class. Verified
+  by `apksigner verify`, `aapt2 dump badging` and `apkanalyzer dex packages`;
+  **not runtime-verified** (no `/dev/kvm`, so no emulator). `tests/test_android_apk.py`.
+- `packaging/windows/build-exe.sh` — real PE32+ GUI `.exe` cross-compiled with
+  mingw-w64, with an embedded `VERSIONINFO` resource. Verified by reading the PE
+  headers and `.rsrc`; **not runtime-verified** (no Windows host).
+  `tests/test_windows_exe.py`.
+
+## Live verification (2026-11-09)
+
+- **OpenHands**: `CloudClient.health()` is `True`; a real conversation ran
+  `running → finished` through `OpenHandsExecutor` and returned its report. The
+  account has an LLM key but **no GitHub provider token**, so OpenHands cannot
+  clone a repository on its own.
+- **GitHub**: `GET /user` and repository analysis work against the real API; the
+  real repo's head was read as `556734732edd`. Multi-account add/verify worked
+  with the real PAT and did not leak it.
+- **Supabase**: the only project (`xwooledhoyuaaxkccnjd`) is **INACTIVE**; the
+  access token is valid but the database is not serving. Tests use a local
+  PostgreSQL, not this project.

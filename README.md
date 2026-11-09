@@ -59,15 +59,22 @@ are manual and need a live LLM):
 - **NEXUS foundation**: projects and goals, manually authored versioned DAG
   plans (validated, owner-approved), and bounded project file uploads with a
   file laboratory (workspaces, archive safety, voice notes).
-- A **CLI** (`nexus`), an **MCP** surface (stdio + Streamable HTTP) and an
-  installable **PWA** shell of the same dashboard.
+- The **Autonomous Lab**: enter a goal, analyze the repository, plan via the
+  provider cascade, and let a **separate durable worker** dispatch tasks to
+  OpenHands, verify the real Git result, record evidence and decide the next
+  step. A task is completed only when independently verified.
+- **GitHub multi-account**: several accounts with encrypted PATs and an explicit
+  per-project binding.
+- A **CLI** (`nexus`), an **MCP** surface (stdio + Streamable HTTP), an
+  installable **PWA**, and native client packages: Debian `.deb`, Android
+  `.apk`, Windows `.exe`.
 
-Not ready (see `docs/NEXUS-SPEC.md` and `docs/DEVELOPMENT-LAB.md`): the NEXUS
-plans do **not** dispatch work; there is no LLM planner/gateway or provider
-cascade, no autonomous goal loop, no multi-account OpenHands routing, no
-server-side speech recognition, and no native Desktop/Android/iOS packages. A
-legacy `completed` status means the Dispatcher's own rules were met — it is
-**not** verified QA evidence. Uploaded files are not yet delivered to agents.
+Not ready (see `docs/AUTONOMOUS-LAB.md` for the per-item status): there is no
+LLM-driven *replanner* that authors corrective tasks after a failed verification
+(a failed dependency blocks the run for a human), no push notifications, no
+multi-account OpenHands routing, and no native iOS app. A legacy `completed`
+status means the Dispatcher's own rules were met — it is **not** verified QA
+evidence.
 
 ## Quick start (clean environment)
 
