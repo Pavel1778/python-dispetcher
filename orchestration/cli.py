@@ -1,0 +1,484 @@
+"""``nexus`` CLI: a thin client over the running NEXUS HTTP API.
+
+Design rules (from docs/CLI_REFERENCE.md):
+
+* **Thin client.** It calls the same HTTP endpoints the browser does; it never
+  reaches into the store directly and never duplicates business logic. Every
+  authorization check the server performs therefore applies to the CLI too.
+* **Machine-readable.** Every command supports ``--json`` and returns a stable
+  exit code (see :data:`EXIT`). Scripts can branch on the code, not on prose.
+* **No secret leakage.** The token is read from ``NEXUS_TOKEN`` /
+  ``WEB_AUTH_TOKEN`` and attached as a header; it is never printed, logged, or
+  included in ``--json`` output. Diagnostics report presence only.
+* **Works without a TTY.** No interactive prompt except a destructive action
+  without ``--yes``, which is refused (exit 8) rather than guessed.
+
+Usage::
+
+    NEXUS_URL=https://nexus.example NEXUS_TOKEN=... nexus project list --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from typing import Any
+
+#: Stable, machine-readable exit codes. Do not renumber: scripts depend on them.
+EXIT = {
+    "ok": 0,
+    "error": 1,
+    "usage": 2,
+    "config": 3,
+    "not_found": 4,
+    "conflict": 5,
+    "unavailable": 6,
+    "timeout": 7,
+    "refused": 8,
+}
+
+
+class CliError(RuntimeError):
+    def __init__(self, message: str, code: int = EXIT["error"]):
+        super().__init__(message)
+        self.code = code
+
+
+class Client:
+    """Minimal bearer-authenticated JSON client for the NEXUS API."""
+
+    def __init__(self, base_url: str, token: str | None, *, timeout: float = 30.0):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    def _request(self, method: str, path: str, body: dict | None = None,
+                 *, idempotency_key: str | None = None) -> tuple[int, Any]:
+        url = f"{self.base_url}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Accept", "application/json")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        if idempotency_key:
+            req.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                payload = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                payload = {"error": raw.decode(errors="replace")[:200]}
+            return e.code, payload
+        except urllib.error.URLError as e:
+            raise CliError(f"cannot reach {self.base_url}: {e.reason}",
+                           EXIT["unavailable"]) from e
+        except TimeoutError as e:
+            raise CliError("request timed out", EXIT["timeout"]) from e
+
+    def get(self, path: str) -> Any:
+        status, payload = self._request("GET", path)
+        return self._ok(status, payload)
+
+    def post(self, path: str, body: dict | None = None,
+             *, idempotency_key: str | None = None) -> Any:
+        status, payload = self._request("POST", path, body, idempotency_key=idempotency_key)
+        return self._ok(status, payload)
+
+    @staticmethod
+    def _ok(status: int, payload: Any) -> Any:
+        if 200 <= status < 300:
+            return payload
+        message = (payload or {}).get("error") if isinstance(payload, dict) else str(payload)
+        if status == 404:
+            raise CliError(message or "not found", EXIT["not_found"])
+        if status in (401, 403):
+            raise CliError(message or "unauthorized", EXIT["config"])
+        if status == 409:
+            raise CliError(message or "conflict", EXIT["conflict"])
+        if status in (502, 503):
+            raise CliError(message or "dependency unavailable", EXIT["unavailable"])
+        raise CliError(message or f"HTTP {status}", EXIT["error"])
+
+
+def _emit(args: argparse.Namespace, data: Any, *, human: str | None = None) -> None:
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    elif human is not None:
+        print(human)
+    else:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _client(args: argparse.Namespace) -> Client:
+    url = args.url or os.environ.get("NEXUS_URL") or os.environ.get("NEXUS_BASE_URL")
+    if not url:
+        raise CliError("set NEXUS_URL (or pass --url)", EXIT["config"])
+    token = os.environ.get("NEXUS_TOKEN") or os.environ.get("WEB_AUTH_TOKEN")
+    if not token:
+        raise CliError("set NEXUS_TOKEN (a bearer token); the CLI never prompts",
+                       EXIT["config"])
+    return Client(url, token, timeout=args.timeout)
+
+
+# --------------------------------------------------------------------- commands
+def cmd_version(args: argparse.Namespace) -> int:
+    from . import __version__ as v
+    _emit(args, {"version": v}, human=v)
+    return EXIT["ok"]
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Diagnose connectivity and configuration without printing any secret."""
+    report: dict[str, Any] = {
+        "nexus_url": args.url or os.environ.get("NEXUS_URL"),
+        "token_present": bool(os.environ.get("NEXUS_TOKEN") or os.environ.get("WEB_AUTH_TOKEN")),
+        "evidence_signer_present": bool(os.environ.get("NEXUS_EVIDENCE_PRIVATE_KEY")),
+        "evidence_keyring_entries": len(
+            [p for p in (os.environ.get("NEXUS_EVIDENCE_KEYRING") or "").split(",") if p.strip()]
+        ),
+        "checks": {},
+    }
+    code = EXIT["ok"]
+    try:
+        client = _client(args)
+    except CliError as e:
+        report["checks"]["client"] = {"ok": False, "detail": str(e)}
+        _emit(args, report, human=f"doctor: {e}")
+        return e.code
+    try:
+        report["checks"]["healthz"] = client.get("/healthz")
+    except CliError as e:
+        report["checks"]["healthz"] = {"ok": False, "detail": str(e)}
+        code = max(code, EXIT["unavailable"])
+    try:
+        system = client.get("/api/system")
+        report["checks"]["system"] = system
+        # Surface the exact reason a subsystem is unavailable, without values.
+        for name, entry in (system.get("components") or {}).items():
+            report["checks"][name] = entry
+    except CliError as e:
+        report["checks"]["system"] = {"ok": False, "detail": str(e)}
+        code = max(code, EXIT["unavailable"])
+    human = "\n".join(
+        f"{name}: {'ok' if (v is True or (isinstance(v, dict) and v.get('ok')) ) else v}"
+        for name, v in report["checks"].items()
+    )
+    _emit(args, report, human=human)
+    return code
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    client = _client(args)
+    dash = client.get("/api/dashboard")
+    health = client.get("/api/health")
+    data = {"counts": dash.get("counts"), "health": health}
+    counts = dash.get("counts") or {}
+    human = "\n".join(f"{k}: {v}" for k, v in counts.items())
+    _emit(args, data, human=human)
+    return EXIT["ok"]
+
+
+def cmd_project_list(args: argparse.Namespace) -> int:
+    client = _client(args)
+    projects = client.get("/api/v1/projects").get("projects", [])
+    human = "\n".join(f"{p['id']}  {p['name']}" for p in projects) or "(no projects)"
+    _emit(args, {"projects": projects}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_project_create(args: argparse.Namespace) -> int:
+    client = _client(args)
+    body = {"name": args.name, "description": args.description or ""}
+    out = client.post("/api/v1/projects", body, idempotency_key=args.idempotency_key)
+    project = out.get("project", {})
+    _emit(args, out, human=f"created {project.get('id')}  {project.get('name')}")
+    return EXIT["ok"]
+
+
+def cmd_project_show(args: argparse.Namespace) -> int:
+    client = _client(args)
+    project = client.get(f"/api/v1/projects/{args.project_id}").get("project", {})
+    repos = client.get(f"/api/v1/projects/{args.project_id}/repositories").get("repositories", [])
+    tasks = client.get(f"/api/v1/projects/{args.project_id}/tasks").get("tasks", [])
+    data = {"project": project, "repositories": repos, "tasks": tasks}
+    human = f"{project.get('name')} ({project.get('id')})\n" \
+            f"repositories: {len(repos)}  tasks: {len(tasks)}"
+    _emit(args, data, human=human)
+    return EXIT["ok"]
+
+
+def cmd_project_repo_add(args: argparse.Namespace) -> int:
+    client = _client(args)
+    out = client.post(f"/api/v1/projects/{args.project_id}/repositories",
+                      {"full_name": args.full_name})
+    _emit(args, out, human=f"linked {args.full_name} to {args.project_id}")
+    return EXIT["ok"]
+
+
+def cmd_project_repo_remove(args: argparse.Namespace) -> int:
+    client = _client(args)
+    out = client.post(f"/api/v1/projects/{args.project_id}/repositories/remove",
+                      {"full_name": args.full_name})
+    _emit(args, out, human=f"unlinked {args.full_name}")
+    return EXIT["ok"]
+
+
+def cmd_task_list(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if args.project_id:
+        tasks = client.get(f"/api/v1/projects/{args.project_id}/tasks").get("tasks", [])
+    else:
+        tasks = client.get("/api/tasks").get("tasks", [])
+    human = "\n".join(f"{t['id']}  {t['state']:<12} {t.get('goal','')[:60]}" for t in tasks) or "(no tasks)"
+    _emit(args, {"tasks": tasks}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_task_create(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if not args.project_id:
+        raise CliError("--project is required (a task must have project context)",
+                       EXIT["usage"])
+    body = {"goal": args.goal, "repository": args.repository, "branch": args.branch}
+    out = client.post(f"/api/v1/projects/{args.project_id}/tasks", body,
+                      idempotency_key=args.idempotency_key)
+    _emit(args, out, human=f"workflow {out.get('workflow_id')} started")
+    return EXIT["ok"]
+
+
+def cmd_task_show(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if not args.project_id:
+        raise CliError("--project is required", EXIT["usage"])
+    detail = client.get(f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}").get("task", {})
+    _emit(args, detail, human=f"{detail.get('id')}  {detail.get('state')}")
+    return EXIT["ok"]
+
+
+def cmd_task_dispatch(args: argparse.Namespace) -> int:
+    """Requeue a task for another attempt (the dispatcher picks it up)."""
+    client = _client(args)
+    out = client.post(f"/api/tasks/{args.task_id}/retry")
+    _emit(args, out, human=f"task {args.task_id} requeued")
+    return EXIT["ok"]
+
+
+def cmd_workflow_list(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if args.project_id:
+        workflows = client.get(f"/api/v1/projects/{args.project_id}/workflows").get("workflows", [])
+    else:
+        workflows = client.get("/api/workflows").get("workflows", [])
+    human = "\n".join(f"{w['id']}  {w['state']:<12} {w.get('goal','')[:60]}" for w in workflows) or "(no workflows)"
+    _emit(args, {"workflows": workflows}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_workflow_show(args: argparse.Namespace) -> int:
+    client = _client(args)
+    detail = client.get(f"/api/workflows/{args.workflow_id}")
+    _emit(args, detail, human=f"{args.workflow_id}  {detail.get('workflow',{}).get('state')}")
+    return EXIT["ok"]
+
+
+def cmd_evidence_list(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if not args.project_id:
+        raise CliError("--project is required (evidence is project-scoped)",
+                       EXIT["usage"])
+    evidence = client.get(f"/api/v1/projects/{args.project_id}/evidence").get("evidence", [])
+    human = "\n".join(
+        f"{e['id']}  {e['verdict']:<10} {e.get('commit_sha') or '-'}  {e.get('summary','')[:40]}"
+        for e in evidence
+    ) or "(no evidence)"
+    _emit(args, {"evidence": evidence}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_evidence_verify(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if not args.project_id:
+        raise CliError("--project is required", EXIT["usage"])
+    body = {"expected_commit": args.expected_commit} if args.expected_commit else {}
+    out = client.post(
+        f"/api/v1/projects/{args.project_id}/evidence/{args.evidence_id}/verify", body)
+    rec = out.get("evidence", {})
+    verdict = rec.get("verdict")
+    _emit(args, out, human=f"{args.evidence_id}: {verdict}")
+    return EXIT["ok"]
+
+
+def cmd_agent_status(args: argparse.Namespace) -> int:
+    client = _client(args)
+    caps = client.get("/api/capabilities")
+    health = client.get("/api/health")
+    data = {"capabilities": caps, "health": health}
+    cloud = health.get("cloud")
+    _emit(args, data, human=f"cloud: {cloud}")
+    return EXIT["ok"]
+
+
+def cmd_qa_report(args: argparse.Namespace) -> int:
+    """Summarize real system state: counts, health and integration status."""
+    client = _client(args)
+    dash = client.get("/api/dashboard").get("counts", {})
+    system = client.get("/api/system")
+    report = {"counts": dash, "components": system.get("components"),
+              "build": system.get("build")}
+    human = "\n".join(f"{k}: {v}" for k, v in (dash or {}).items())
+    _emit(args, report, human=human)
+    return EXIT["ok"]
+
+
+def cmd_qa_verify(args: argparse.Namespace) -> int:
+    """Verify the evidence hash chain for a project."""
+    client = _client(args)
+    if not args.project_id:
+        raise CliError("--project is required", EXIT["usage"])
+    evidence = client.get(f"/api/v1/projects/{args.project_id}/evidence").get("evidence", [])
+    verdicts: dict[str, int] = {}
+    for e in evidence:
+        verdicts[e["verdict"]] = verdicts.get(e["verdict"], 0) + 1
+    ok = verdicts.get("FAILED", 0) == 0
+    data = {"count": len(evidence), "verdicts": verdicts, "ok": ok}
+    _emit(args, data, human=f"{len(evidence)} record(s): {verdicts}")
+    return EXIT["ok"] if ok else EXIT["conflict"]
+
+
+# ----------------------------------------------------------------------- parser
+def _add_global_flags(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
+    """Add the global options to *parser*.
+
+    ``suppress`` is used on the shared parent given to every subparser: with
+    ``SUPPRESS`` a subparser only writes the value when the flag was actually
+    given, so ``nexus doctor --json`` works without clobbering the top-level
+    default parsed from ``nexus --json doctor``.
+    """
+    default = argparse.SUPPRESS if suppress else None
+    parser.add_argument("--url", default=default, help="base URL of the NEXUS server (or NEXUS_URL)")
+    parser.add_argument("--json", action="store_true",
+                        default=(argparse.SUPPRESS if suppress else False),
+                        help="machine-readable output")
+    parser.add_argument("--no-color", action="store_true",
+                        default=(argparse.SUPPRESS if suppress else False),
+                        help="disable colour")
+    parser.add_argument("--timeout", type=float,
+                        default=(argparse.SUPPRESS if suppress else 30.0),
+                        help="request timeout (seconds)")
+    parser.add_argument("--yes", action="store_true",
+                        default=(argparse.SUPPRESS if suppress else False),
+                        help="confirm a destructive action")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    _add_global_flags(common, suppress=True)
+
+    parser = argparse.ArgumentParser(
+        prog="nexus",
+        description="NEXUS command-line client (thin client over the HTTP API).",
+    )
+    _add_global_flags(parser, suppress=False)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("version", parents=[common], help="print the version").set_defaults(func=cmd_version)
+    sub.add_parser("doctor", parents=[common], help="diagnose connectivity and configuration").set_defaults(func=cmd_doctor)
+    sub.add_parser("status", parents=[common], help="dashboard counts and health").set_defaults(func=cmd_status)
+
+    project = sub.add_parser("project", parents=[common], help="manage projects").add_subparsers(dest="sub", required=True)
+    project.add_parser("list", parents=[common], help="list projects").set_defaults(func=cmd_project_list)
+    pc = project.add_parser("create", parents=[common], help="create a project")
+    pc.add_argument("name")
+    pc.add_argument("--description", default="")
+    pc.add_argument("--idempotency-key", default=None)
+    pc.set_defaults(func=cmd_project_create)
+    ps = project.add_parser("show", parents=[common], help="show a project with repositories and tasks")
+    ps.add_argument("project_id")
+    ps.set_defaults(func=cmd_project_show)
+    repo = project.add_parser("repo", parents=[common], help="manage project repositories").add_subparsers(dest="action", required=True)
+    ra = repo.add_parser("add", parents=[common], help="link an allowlisted repository to a project")
+    ra.add_argument("project_id")
+    ra.add_argument("full_name")
+    ra.set_defaults(func=cmd_project_repo_add)
+    rr = repo.add_parser("remove", parents=[common], help="unlink a repository from a project")
+    rr.add_argument("project_id")
+    rr.add_argument("full_name")
+    rr.set_defaults(func=cmd_project_repo_remove)
+
+    task = sub.add_parser("task", parents=[common], help="manage tasks").add_subparsers(dest="sub", required=True)
+    tl = task.add_parser("list", parents=[common], help="list tasks")
+    tl.add_argument("--project", dest="project_id", default=None)
+    tl.set_defaults(func=cmd_task_list)
+    tc = task.add_parser("create", parents=[common], help="create a task in a project (starts its workflow)")
+    tc.add_argument("goal")
+    tc.add_argument("--project", dest="project_id", required=True)
+    tc.add_argument("--repository", default=None)
+    tc.add_argument("--branch", default=None)
+    tc.add_argument("--idempotency-key", default=None)
+    tc.set_defaults(func=cmd_task_create)
+    ts = task.add_parser("show", parents=[common], help="show a task with its events")
+    ts.add_argument("task_id")
+    ts.add_argument("--project", dest="project_id", required=True)
+    ts.set_defaults(func=cmd_task_show)
+    td = task.add_parser("dispatch", parents=[common], help="requeue a task for another attempt")
+    td.add_argument("task_id")
+    td.set_defaults(func=cmd_task_dispatch)
+
+    workflow = sub.add_parser("workflow", parents=[common], help="manage workflows").add_subparsers(dest="sub", required=True)
+    wl = workflow.add_parser("list", parents=[common], help="list workflows")
+    wl.add_argument("--project", dest="project_id", default=None)
+    wl.set_defaults(func=cmd_workflow_list)
+    ws = workflow.add_parser("show", parents=[common], help="show a workflow")
+    ws.add_argument("workflow_id")
+    ws.set_defaults(func=cmd_workflow_show)
+
+    evidence = sub.add_parser("evidence", parents=[common], help="manage evidence").add_subparsers(dest="sub", required=True)
+    el = evidence.add_parser("list", parents=[common], help="list project evidence")
+    el.add_argument("--project", dest="project_id", required=True)
+    el.set_defaults(func=cmd_evidence_list)
+    ev = evidence.add_parser("verify", parents=[common], help="re-verify one evidence record")
+    ev.add_argument("evidence_id")
+    ev.add_argument("--project", dest="project_id", required=True)
+    ev.add_argument("--expected-commit", default=None)
+    ev.set_defaults(func=cmd_evidence_verify)
+
+    agent = sub.add_parser("agent", parents=[common], help="agent/account status").add_subparsers(dest="sub", required=True)
+    agent.add_parser("status", parents=[common], help="account capability and health").set_defaults(func=cmd_agent_status)
+
+    qa = sub.add_parser("qa", parents=[common], help="QA and evidence reports").add_subparsers(dest="sub", required=True)
+    qa.add_parser("report", parents=[common], help="real system report").set_defaults(func=cmd_qa_report)
+    qv = qa.add_parser("verify", parents=[common], help="verify project evidence chain")
+    qv.add_argument("--project", dest="project_id", required=True)
+    qv.set_defaults(func=cmd_qa_verify)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except CliError as e:
+        payload = {"error": str(e)}
+        if getattr(args, "json", False):
+            print(json.dumps(payload))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return e.code
+    except BrokenPipeError:
+        return EXIT["ok"]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

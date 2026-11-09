@@ -90,6 +90,12 @@ class SrTools:
                 False, {},
                 f"workflow child-task limit reached ({self.MAX_CHILD_TASKS})",
             )
+        # Inherit the workflow's project. A project-scoped workflow may only use
+        # repositories linked to that project; a legacy workflow (no project)
+        # keeps the old allowlist-only behaviour. This is the second half of the
+        # dispatch authorization: even if the model names a repository that is in
+        # the global allowlist, it is refused here unless the project owns it.
+        project_id = self.store.workflow_project(workflow_id)
         if repository is not None:
             repo = self.store.allowed_repository(repository)
             if repo is None:
@@ -102,6 +108,12 @@ class SrTools:
                     return ToolResult(
                         False, {}, f"branch not allowed (default only): {branch}"
                     )
+            if project_id is not None and not self.store.project_repository_linked(
+                    project_id, repository):
+                return ToolResult(
+                    False, {},
+                    f"repository not linked to this project: {repository}",
+                )
         task = self.store.submit_task(
             goal,
             workflow_id=workflow_id,
@@ -114,6 +126,7 @@ class SrTools:
             idempotency_key=idempotency_key,
             selected_repository=repository,
             selected_branch=branch,
+            project_id=project_id,
         )
         return ToolResult(True, {"task_id": task.id, "state": task.state.value})
 

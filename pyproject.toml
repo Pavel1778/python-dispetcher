@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-dispetcher"
+version = "2.0.0"
+description = "NEXUS: durable control plane orchestrating OpenHands agent conversations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "psycopg[binary]>=3.2,<4",
+    "cryptography>=42,<46",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "ruff==0.13.1",
+]
+
+[project.scripts]
+nexus = "orchestration.cli:main"
+
+[tool.setuptools]
+packages = ["orchestration"]
+
+[tool.setuptools.package-data]
+orchestration = ["pwa/*"]

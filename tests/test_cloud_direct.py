@@ -55,6 +55,8 @@ def _reset_schema() -> None:
 
 
 @pytest.fixture(autouse=True)
+
+
 def _schema():
     _reset_schema()
     yield
@@ -257,5 +259,88 @@ def test_build_cloud_client_selects_transport(monkeypatch):
         assert isinstance(build_cloud_client(store, transport="app"), CloudClient)
         with pytest.raises(ValueError):
             build_cloud_client(store, transport="nonsense")
+    finally:
+        store.close()
+
+
+# ------------------------------------------------- repository selection mode
+
+
+def test_direct_transport_reports_no_native_repository_selection():
+    assert CloudDirectClient.supports_repository_selection is False
+    assert CloudClient.supports_repository_selection is True
+
+
+def test_repository_task_default_mode_injects_a_clone_instruction(monkeypatch):
+    """The workspace is empty, so the agent must be told to clone first.
+
+    Asserts through the real call path: the message the agent-server receives
+    (recorded by the fake) carries the clone instruction.
+    """
+    store = PostgresStore(DSN)
+    try:
+        monkeypatch.delenv("OPENHANDS_DIRECT_REPO_MODE", raising=False)
+        account = FakeCloudAccount()
+        client, server = _client(store, account)
+        captured: dict = {}
+        inner = client._send
+
+        def recording(route, method, path, body=None):
+            if method == "POST" and path == "/api/conversations":
+                captured["body"] = body
+            return inner(route, method, path, body)
+
+        client._send = recording  # type: ignore[method-assign]
+        client.start_conversation(
+            initial_message="fix the bug",
+            selected_repository="acme/repo",
+            selected_branch="dev",
+            title="repo task",
+        )
+        text = captured["body"]["initial_message"]["content"][0]["text"]
+        assert "acme/repo" in text and "dev" in text
+        assert text.endswith("fix the bug")
+        assert "clone" in text.lower()
+    finally:
+        store.close()
+
+
+def test_repository_task_refuse_mode_raises(monkeypatch):
+    from orchestration.cloud_client import CloudError
+
+    store = PostgresStore(DSN)
+    try:
+        monkeypatch.setenv("OPENHANDS_DIRECT_REPO_MODE", "refuse")
+        account = FakeCloudAccount()
+        client, _ = _client(store, account)
+        with pytest.raises(CloudError):
+            client.start_conversation(
+                initial_message="fix",
+                selected_repository="acme/repo",
+                selected_branch="main",
+            )
+    finally:
+        store.close()
+
+
+def test_repository_task_allow_mode_is_unchanged(monkeypatch):
+    store = PostgresStore(DSN)
+    try:
+        monkeypatch.setenv("OPENHANDS_DIRECT_REPO_MODE", "allow")
+        account = FakeCloudAccount()
+        client, _ = _client(store, account)
+        assert client._apply_repository_mode("fix", "acme/repo", "main") == "fix"
+    finally:
+        store.close()
+
+
+def test_repository_less_task_is_never_prefixed(monkeypatch):
+    store = PostgresStore(DSN)
+    try:
+        monkeypatch.setenv("OPENHANDS_DIRECT_REPO_MODE", "refuse")
+        account = FakeCloudAccount()
+        client, _ = _client(store, account)
+        # No repository: even refuse mode must not raise.
+        assert client._apply_repository_mode("analyze", None, None) == "analyze"
     finally:
         store.close()

@@ -7,3 +7,5 @@
 # The [binary] extra ships prebuilt wheels, so no libpq/compiler is needed on
 # the build image. psycopg 3.3.x requires Python >= 3.10.
 psycopg[binary]>=3.2,<4
+# Ed25519 signatures for the Evidence Trust Engine (orchestration/evidence_trust.py).
+cryptography>=42,<46

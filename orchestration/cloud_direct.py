@@ -47,6 +47,7 @@ so :class:`~orchestration.cloud_dispatcher.CloudDispatcher`,
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -210,12 +211,31 @@ class CloudDirectClient:
         shared dispatcher's ``_await_start`` returns immediately and the
         two-phase Cloud start task is not needed.
 
+        **Repository selection is not native here.** A sandbox conversation
+        starts in an empty ``LocalWorkspace``; there is no
+        ``selected_repository`` field on the agent-server create call. Silently
+        ignoring it would run a repository task against the wrong (empty)
+        checkout with no error, so the behavior is explicit and controlled by
+        ``OPENHANDS_DIRECT_REPO_MODE``:
+
+        * ``prompt`` (default) — prepend a deterministic instruction telling the
+          agent to clone ``owner/name`` at the branch and work there. The task is
+          functionally correct; the selection is via instruction, not a native
+          field, and ``supports_repository_selection`` reports ``False``.
+        * ``refuse`` — raise ``CloudError`` so the task is dead-lettered with a
+          clear reason. Use this when a repository task must never run without
+          native selection.
+        * ``allow`` — the legacy behavior: ignore the fields. Only for
+          repository-less analysis or a transport that has been verified to
+          select the repository itself.
+
         The account-selection fields (``agent_profile_id``, ``agent_type``,
-        ``plugins``) and the repository fields are accepted for interface parity.
-        The sandbox agent-server uses its own account settings, so these are not
-        forwarded; ``selected_repository`` would require a repository provider on
-        the sandbox, which is a roadmap item.
+        ``plugins``) are accepted for interface parity and not forwarded; the
+        sandbox uses its own account settings.
         """
+        initial_message = self._apply_repository_mode(
+            initial_message, selected_repository, selected_branch
+        )
         route = self._new_sandbox(
             force_new=client_tools is not None,  # an Sr gets its own sandbox
         )
@@ -270,6 +290,44 @@ class CloudDirectClient:
         # (the agent-server returns the existing conversation for the same id).
         seed = f"cloud-direct:{title or ''}\x00{initial_message or ''}"
         return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+    #: The direct transport has no native repository-selection field on the
+    #: agent-server create call. Callers (and the UI diagnostics) read this.
+    supports_repository_selection = False
+
+    def _apply_repository_mode(self, message: str, repository: str | None,
+                               branch: str | None) -> str:
+        """Handle repository selection for a sandbox conversation.
+
+        See :meth:`start_conversation` for the modes. Returns the (possibly
+        prefixed) initial message.
+        """
+        if not repository:
+            return message
+        mode = (os.environ.get("OPENHANDS_DIRECT_REPO_MODE") or "prompt").strip().lower()
+        if mode == "refuse":
+            raise CloudError(
+                "the direct transport cannot select a repository natively; "
+                f"task asked for {repository}@{branch or 'default'}. Set "
+                "OPENHANDS_DIRECT_REPO_MODE=prompt to clone-by-instruction, or use "
+                "OPENHANDS_TRANSPORT=app which carries selected_repository."
+            )
+        if mode == "allow":
+            return message
+        # Default: prompt. The workspace starts empty, so instruct the agent to
+        # clone the repository and branch first. This is a real, deterministic
+        # instruction, not a silent no-op.
+        ref = f"{repository}@{branch}" if branch else repository
+        prefix = (
+            f"Work in the repository {repository}"
+            + (f" on branch {branch}" if branch else "")
+            + ". The workspace is empty: clone it first (e.g. "
+            f"`git clone https://github.com/{repository}.git .`"
+            + (f" && `git checkout {branch}`" if branch else "")
+            + ") and do all work there.\n\n"
+        )
+        log.info("direct transport: repository task for %s via instruction", ref)
+        return prefix + message
 
     def _sandbox_agent_settings(self, route: SandboxRoute) -> dict[str, Any]:
         """The agent-settings document from the sandbox's own ``/api/settings``.

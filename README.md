@@ -1,96 +1,145 @@
-# Multi-agent orchestration platform
+# NEXUS — AI development control plane
 
-Durable control-plane state for coordinating multiple OpenHands agents.
+Durable control-plane state for orchestrating OpenHands agent conversations,
+with project-scoped execution, a CLI, an MCP surface and an Ed25519 Evidence
+Trust Engine.
 
-A **workflow** holds a goal. A **Sr** (senior) OpenHands conversation plans it and
+A **project** owns repositories (many-to-many), tasks and workflows. A
+**workflow** holds a goal. A **Sr** (senior) OpenHands conversation plans it and
 delegates each unit of work to **Jr** tasks through client tools. A dispatcher
 runs each Jr to completion, records the result, and feeds it back to the Sr.
+Every result can be captured as **signed evidence** whose verdict is earned,
+not granted.
 
 ```
-workflow ──▶ Sr conversation ──sr_create_task──▶ task ──▶ Jr conversation
-                     ▲                                        │
-                     └────────────── result ──────────────────┘
+project ──▶ repositories (explicit links)
+   │
+   └─▶ workflow ──▶ Sr conversation ──sr_create_task──▶ task ──▶ Jr conversation
+                          ▲                                     │
+                          └────────────── result ───────────────┘
+   task/workflow result ──▶ Evidence Trust Engine (Ed25519)
+                            ──▶ VERIFIED / UNVERIFIED / FAILED / BLOCKED
 ```
 
 State lives in PostgreSQL; conversations run on OpenHands Cloud. The default
 Cloud transport provisions a sandbox and drives its agent-server directly
 (the `direct` transport); the legacy app-conversation endpoint is kept behind
-`OPENHANDS_TRANSPORT=app`. See `DEPLOY.md` for the deployment guide,
-`AGENTS.md` for the repository layout, and `CLOUD-INTEGRATION-MAP.md` for the
-Cloud API surface.
+`OPENHANDS_TRANSPORT=app`.
+
+Start here:
+
+- [docs/MVP_RELEASE_REPORT.md](docs/MVP_RELEASE_REPORT.md) — what is
+  implemented, tested and verified, and what still needs a live OpenHands key.
+- [AGENTS.md](AGENTS.md) — repository layout and hard-won runtime facts.
+- [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md) — the target architecture.
+- [CLOUD-INTEGRATION-MAP.md](CLOUD-INTEGRATION-MAP.md) — the Cloud API surface.
+- [DEPLOY.md](DEPLOY.md) — deployment guide.
+
+## Quick start (clean environment)
+
+```bash
+# 1. Dependencies (psycopg[binary], cryptography)
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+
+# 2. A PostgreSQL database (any 14+). Migrations apply on start by default.
+export SUPABASE_DB_URL="postgresql://user:pw@127.0.0.1:5432/nexus"
+
+# 3. Owner login, machine token, evidence key
+python -m orchestration.web_auth hash       # -> AUTH_PASSWORD_HASH
+python -m orchestration.web_auth secret     # -> AUTH_SESSION_SECRET
+python -m orchestration.evidence_keygen     # -> NEXUS_EVIDENCE_* values
+export AUTH_USERNAME=owner
+export AUTH_PASSWORD_HASH='pbkdf2_sha256$...'
+export AUTH_SESSION_SECRET='...'
+export NEXUS_EVIDENCE_KEY_ID=nexus-lab
+export NEXUS_EVIDENCE_PRIVATE_KEY='...'
+export NEXUS_EVIDENCE_KEYRING='nexus-lab:...'
+export WEB_AUTH_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+# Optional, for real execution: export OPENHANDS_API_KEY=...
+
+# 4. Run the single instance (web UI + dispatcher loop)
+python -m orchestration.web_server --host 0.0.0.0 --port 8000 --token "$WEB_AUTH_TOKEN"
+```
+
+Open `http://localhost:8000`, sign in, create a project, link a repository,
+create a task, and watch the execution state. `GET /healthz` is liveness;
+`GET /readyz` adds a real database round-trip.
+
+The CLI is a thin client over the same API:
+
+```bash
+export NEXUS_URL=http://localhost:8000 NEXUS_TOKEN="$WEB_AUTH_TOKEN"
+python -m orchestration.cli doctor
+python -m orchestration.cli project create "My project"
+python -m orchestration.cli project repo add <project_id> owner/name
+python -m orchestration.cli task create "Implement X" --project <project_id> \
+  --repository owner/name --branch main
+python -m orchestration.cli evidence list --project <project_id>
+python -m orchestration.cli qa verify --project <project_id>
+```
 
 ## Local development
 
 ```bash
-export SUPABASE_DB_URL="postgresql://postgres@127.0.0.1:5432/ohp_test"
-python3 -m pytest -q                     # unit + integration (needs PostgreSQL)
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+
+# The pytest suite reads TEST_SUPABASE_DB_URL and skips the DB-backed modules
+# cleanly when it is unset. Use a disposable database.
+export TEST_SUPABASE_DB_URL="postgresql://postgres@127.0.0.1:5432/ohp_test"
+python3 -m pytest -q                     # unit + integration + browser E2E
+python3 -m ruff check .
+
+# The end-to-end Cloud scripts read SUPABASE_DB_URL, are not collected by
+# pytest, and need a live LLM.
 python3 tests/e2e_local_sr_jr.py         # real Sr→Jr on a local agent-server
 python3 tests/e2e_cloud_sr_jr.py         # real Sr→Jr on OpenHands Cloud
 ```
 
-The end-to-end scripts are not collected by pytest; they need a live LLM (and,
-for the Cloud one, `OPENHANDS_API_KEY` and `OPENHANDS_DEFAULT_MODEL`).
+The browser E2E (`tests/test_browser_e2e.py`) drives Chromium through the real
+user journey and is skipped when Playwright/Chromium is absent.
 
-## Cross-platform web client (preview)
+## Project execution binding (D-2)
 
-The dashboard can be installed as a PWA on supported Android, Windows and
-Linux browsers after this version is deployed over HTTPS. It is an online web
-client, not an APK or native desktop package. Installation, security and known
-release blockers are documented in [docs/CLIENTS.md](docs/CLIENTS.md).
+`tasks.project_id` and `workflows.project_id` are nullable and are **not**
+backfilled: legacy rows stay unscoped. A project's repositories are an explicit
+many-to-many link (`nexus_project_repositories`); a repository can be shared by
+several projects. `tasks.repository_id` is canonical and is kept in agreement
+with `tasks.selected_repository` by a database trigger that refuses a conflict
+rather than guessing. Before any dispatch, `authorize_dispatch` re-checks that
+the project exists, the task and workflow share it, the repository is linked,
+enabled and on an allowed branch, and the caller is a member. The same gate
+protects the web API, the CLI, MCP and the background dispatcher.
 
-## NEXUS roadmap
+## Evidence Trust Engine
 
-The proposed NEXUS architecture, current-code audit and migration/acceptance
-plan are in [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md). The specification is a
-**draft** pending the second audit; the existing dispatcher is not yet NEXUS
-and its completed tasks are not independently verified QA evidence.
+Evidence is signed with Ed25519 over a canonical byte encoding. A verdict is
+earned: `VERIFIED` requires a trusted, non-revoked key and a valid signature; a
+record that merely exists is `UNVERIFIED`; tampering with a signed field is
+`FAILED`. Project-scoped records sign `project_id` (format v2), so editing the
+column afterwards breaks the signature; legacy records stay unscoped. HMAC
+alone can never produce `VERIFIED`. The hash chain detects reordering by an
+honest reader; the signature is the real integrity boundary.
 
-## NEXUS project foundation (first increment)
+## MCP
 
-The existing dashboard now has a **Проекты NEXUS** tab for creating projects
-and saving goal drafts. Users can also create and approve versioned plans manually.
-Drafts and approvals **do not** start OpenHands, workflows, or QA. Legacy Dispatcher workflows/tasks are deliberately
-not attached to projects and remain accessible through the existing owner-level
-API. Do not treat those legacy endpoints as project-isolated.
+`python -m orchestration.mcp_server` speaks MCP over stdio and exposes a limited
+tool set (`list_projects`, `get_project`, `list_repositories`, `list_tasks`,
+`get_task`, `create_task`, `dispatch_task`, `get_execution_status`,
+`list_evidence`, `verify_evidence`). There is no arbitrary shell, SQL or eval
+tool. Every tool re-checks project membership through the same services the HTTP
+API uses. Streamable HTTP is not implemented in this MVP.
 
-The new API supports `GET/POST /api/v1/projects`,
-`GET/PATCH /api/v1/projects/{id}`, and `GET/POST
-/api/v1/projects/{id}/goals` plus `GET /api/v1/projects/{id}/events`. All use
-existing session/CSRF or bearer authentication. Project and goal reads/writes
-are filtered by membership; another principal gets 404. Goals optionally accept
-an `Idempotency-Key`; reusing it with different content returns 409.
+## Cross-platform web client (PWA)
 
-This is still the existing single-owner authentication system, not a complete
-multi-user IAM system. The legacy machine bearer acts as the configured
-`AUTH_USERNAME` owner (or `machine:default` when no username is configured),
-so it has that owner's project access. Keep this token secret. Membership is
-created for the owner and there is no membership-management UI yet. Switching
-`AUTH_USERNAME` changes the principal; there is no automatic data transfer.
-New NEXUS tables have RLS enabled without client policies, and browser clients
-must use the backend, not Supabase direct access. The legacy Supabase RLS
-policies are not changed by this increment.
+The dashboard installs as a PWA on supported Android, Windows and Linux browsers
+after deployment over HTTPS. It is an online web client, not an APK. Install,
+security and known blockers are in [docs/CLIENTS.md](docs/CLIENTS.md).
 
-**Deployment:** `migrations/0009_nexus_projects.sql` is additive and leaves
-legacy data untouched. This repository auto-applies migrations on startup by
-default; review the target's existing migration history and back up before
-running the new version against production. Disable `AUTO_MIGRATE` if schema
-changes are managed separately. No production migration has been applied as
-part of this change. Tests that use `TEST_SUPABASE_DB_URL` delete/truncate data;
-use a disposable PostgreSQL database only.
+## Deployment
 
-## NEXUS planning and operations
-
-The current NEXUS increment stores versioned, manually authored DAG plans with
-validated dependencies, criteria and owner approval. Plan approval does not
-dispatch work. See [docs/NEXUS-OPERATIONS.md](docs/NEXUS-OPERATIONS.md) for
-API contracts, UI usage, security limits, testing, and deployment precautions.
-Migration `0010_nexus_plans.sql` is automatically applied on startup unless
-`AUTO_MIGRATE=false`; review and back up the target database before deployment.
-
-## Лаборатория разработки: доступные функции
-
-Проектные текстовые цели, ограниченный голосовой ввод в браузере, безопасное
-хранение вложений и GitHub-интеграция с ручным подтверждением описаны в
-[docs/DEVELOPMENT-LAB.md](docs/DEVELOPMENT-LAB.md). Это инкремент, а не полная
-автономная лаборатория: загруженные файлы пока не передаются агентам, проектные
-планы не исполняются, независимая QA и безопасные рабочие пространства не готовы.
+`requirements.txt`, `render.yaml`, `DEPLOY.md`. Start exactly one instance:
+`python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN`.
+Migrations are idempotent and applied on first connect unless `AUTO_MIGRATE=false`.
+Back up before applying a new migration to a database with real data.

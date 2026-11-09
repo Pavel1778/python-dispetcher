@@ -407,3 +407,122 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
     duplicate-Sr reproduction and the full one-workflow->one-Sr->one-Jr
     acceptance chain).
 
+
+## Branch topology and the unmerged nexus branch
+
+- `main` is the integration branch and is green: `ruff check .` passes and the
+  full pytest suite passes against a disposable PostgreSQL (`TEST_SUPABASE_DB_URL`).
+  Verified 2026-11-08: `main` 382 passed / 1 skipped; the nexus branch 445 passed
+  / 1 skipped.
+- All five `arena/*` branches are already merged into `main` through PRs #13–#18
+  (`arena/06dcb2d2` docs+NEXUS spec, `arena/22525405` NEXUS projects/goals,
+  `arena/1d4f42a1` versioned DAG plans, `arena/5a479709` installable PWA,
+  `arena/60148d7e` project file uploads + GitHub confirmation). Their tips are
+  ancestors of `main`, so there is nothing left to merge from them.
+- **`nexus/laboratory-files-github` is deliberately not merged.** It is not a
+  fast-forward and not a clean merge: it and `main` implement the *same* feature
+  twice, so a merge is a design choice, not a conflict resolution.
+  - Both add `migrations/0011_*` with an **incompatible** `nexus_files` table
+    (`main`: `name/size integer/sha256/content bytea/created_by`, 5 MiB cap;
+    nexus: `filename/content_type/size bigint/sha256/data bytea/is_archive/
+    uploaded_by`, 32 MiB cap) and both add `nexus_workspaces`/`nexus_workspace_files`
+    on the nexus side. Applying both files would collide on the table name.
+  - Both add a file service (`main` `nexus_files.py` FileService; nexus
+    `file_lab.py` FileLabService) and both wire routes into `web_server.py`
+    (main: `/api/github/prepare|confirm` + `GITHUB_ENABLE_WRITES`; nexus:
+    `GitHubWriter`, `/api/v1/projects/{id}/github/*`, `nexus_actions.py`
+    confirmation handshake).
+  - Merge conflicts: `.env.example`, `AGENTS.md`, `README.md`,
+    `orchestration/github_client.py`, `orchestration/web_server.py`,
+    `orchestration/web_ui.py`, `tests/test_nexus_projects.py`.
+  - The nexus branch is the superset in scope (archive safety with Zip-Slip/bomb
+    rejection, development workspaces, voice notes, multipart parsing, a
+    two-step action confirmation handshake, extra GitHub reads). `main`'s
+    version is smaller and adds a GitHub `GITHUB_ENABLE_WRITES` gate instead.
+  - Do **not** merge it by blindly taking one side: choosing nexus drops main's
+    `github_confirmations.py`, `nexus_files.py`, `0011_nexus_files.sql` and their
+    three test files; choosing main drops the whole nexus laboratory. The safe
+    path is to pick nexus as the base (it is the broader implementation), then
+    port any main-only behaviour and its tests, and renumber the migration.
+    Confirm the choice with the operator before merging.
+- `tools/delete_cloud_sessions.py` and `tools/classify_cloud_sessions.py` are
+  the only guarded Cloud-conversation deletion paths; keep them CLI-only.
+
+## D-2 project execution binding and the Evidence Trust Engine (MVP)
+
+Added on `nexus/mvp-integration`. These are the invariants to keep.
+
+- **Migration `0014_nexus_project_binding.sql` is additive.** It adds
+  `nexus_project_repositories` (project↔repo many-to-many), nullable
+  `project_id` on `tasks`/`workflows`, the canonical repository-identity trigger,
+  and `nexus_evidence`. `0012`/`0013` are intentionally reserved for the
+  deferred File Lab (D-1). The runner applies every `*.sql` in lexical order and
+  does not require a contiguous sequence, so the gap is safe. **Never backfill
+  legacy rows**: a task/workflow/evidence with no project stays unscoped.
+- **`tasks.repository_id` is canonical.** A `BEFORE INSERT/UPDATE` trigger
+  (`nexus_tasks_check_binding`) derives `selected_repository` from it, resolves
+  it from the allowlist when only `selected_repository` is given, refuses a
+  conflict, refuses a cross-project repository, and refuses a task whose
+  workflow is in a different project. Do not "simplify" this to a Python check:
+  a direct insert must be refused too.
+- **`authorize_dispatch` is the single dispatch gate** (`nexus_binding.py`). It
+  is re-run immediately before a conversation is created and before a task is
+  queued, for the dispatcher, the web API, the CLI and MCP. The global allowlist
+  is necessary but never sufficient for a project-scoped task. A failing check
+  dead-letters the task with the reason as evidence — never a silent skip.
+- **The Evidence Trust Engine is real crypto** (`evidence_trust.py`). Ed25519
+  over a canonical encoding; a trusted keyring by `key_id`; revoked keys never
+  verify. **Only a trusted asymmetric signature yields `VERIFIED`; HMAC can
+  never produce it.** `UNVERIFIED` for unsigned/legacy/unknown-key/expected-
+  commit-mismatch; `FAILED` for a tampered signed field; `BLOCKED` without the
+  crypto library.
+- **Project-scoped evidence signs `project_id`** (format v2). The exact signed
+  bytes are stored in `signed_payload` and verification reads them verbatim, so
+  editing the `project_id` column afterwards fails verification. Legacy records
+  are format v1 and unscoped; never give them a fabricated project.
+- **Project isolation is a 404, not a 403.** A non-member reading another
+  project's resource gets "not found". `tests/test_route_auth.py` fails if a
+  protected endpoint is added without `_require_read`/`_require_write`.
+- **The CLI and MCP are thin clients.** `orchestration/cli.py` calls the HTTP
+  API and never prints a secret; `orchestration/mcp_server.py` speaks MCP over
+  stdio with no shell/SQL/eval tool and re-checks membership on every write.
+  Streamable-HTTP MCP is not implemented; do not claim it is.
+- **`/readyz` checks the database**; `/healthz` stays a one-line liveness probe.
+  Both are public and expose no configuration.
+- **Docker Compose doubles `$` in `.env`.** Compose interpolates `$` in an
+  `env_file`, so `AUTH_PASSWORD_HASH` (which contains `$`) must be written with
+  `$$` or the server refuses to boot with a clear "N separators" message.
+- Tests: `test_project_binding.py`, `test_evidence_trust.py`,
+  `test_dispatch_authorization.py`, `test_route_auth.py`, `test_cli_mcp.py`,
+  `test_browser_e2e.py`, `test_migration_d2.py`. `docs/MVP_RELEASE_REPORT.md`
+  states what is verified and what still needs a live OpenHands key.
+
+## Additional MVP invariants (round two)
+
+- **`OPENHANDS_DIRECT_REPO_MODE` governs repository selection on the direct
+  transport.** The sandbox agent-server create call has no `selected_repository`
+  field; the workspace starts empty. `prompt` (default) prepends a deterministic
+  clone instruction, `refuse` raises so the task dead-letters, `allow` is the old
+  silent-ignore behavior. `CloudClient.supports_repository_selection` is `True`,
+  `CloudDirectClient`'s is `False`; both are surfaced in `/api/config` and the
+  System screen. Never go back to silently ignoring the field.
+- **The workspace lock is the database index, not the check.** Migration `0015`
+  adds `uq_tasks_workspace_active` (partial unique on
+  `(selected_repository, COALESCE(selected_branch,''))` over the active states).
+  `claim_task` claims inside a `SAVEPOINT` and treats a `UniqueViolation` as
+  "workspace taken". The `_workspace_holder` read is only the fast path.
+  Repository-less tasks never contend (NULL is distinct in a unique index).
+- **The sandbox session-key tables have RLS.** Migration `0016` enables RLS and
+  revokes PUBLIC/anon/authenticated grants on `conversation_routes` and
+  `cloud_sandboxes`. They hold a live `session_api_key`; do not add a client
+  policy. The app connects as the owner and bypasses RLS.
+- **MCP has two transports.** stdio (`python -m orchestration.mcp_server`) and
+  Streamable HTTP at `POST /mcp`, which reuses the web server's session/CSRF or
+  bearer auth. A notification returns 202, a parse error 400. The tool surface
+  re-checks project membership either way.
+- **`tests/test_backup_restore.py` is the restore drill.** A real
+  `pg_dump`/`pg_restore` into a fresh database; keep it passing — it is the
+  automated proof that a dump restores.
+- **Migrations are now `0001`–`0011`, `0014`, `0015`, `0016`.** `0012`/`0013`
+  stay reserved for the deferred File Lab. The runner applies `*.sql` in lexical
+  order; a gap is fine.

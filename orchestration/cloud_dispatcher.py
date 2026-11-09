@@ -50,6 +50,7 @@ from .cloud_store import (
     Task,
     TaskState,
 )
+from .nexus_binding import AuthorizationError, authorize_dispatch
 
 log = logging.getLogger(__name__)
 
@@ -110,7 +111,13 @@ class CloudDispatcher:
     # --------------------------------------------------------------- helpers
     def _allowed(self, task: Task) -> bool:
         """A task with a repository must match the allowlist; else it may run
-        repository-less (analysis-only work)."""
+        repository-less (analysis-only work).
+
+        For a project-scoped task the allowlist alone is not enough: the
+        repository must be linked to the task's project. That stronger check is
+        :func:`authorize_dispatch`, called in ``_start_task`` right before the
+        conversation is created.
+        """
         if not task.selected_repository:
             return True
         repo = self.store.allowed_repository(task.selected_repository)
@@ -216,6 +223,15 @@ class CloudDispatcher:
             raise RepoNotAllowed(
                 f"{task.selected_repository}@{task.selected_branch or 'default'}"
             )
+        # Re-check the full project/repository authorization immediately before
+        # the conversation is created. The allowlist above is necessary but not
+        # sufficient for a project-scoped task: the repository must be linked to
+        # the task's project, the workflow must share the project, and the task
+        # must still belong to the project it was queued under.
+        try:
+            authorize_dispatch(self.store, task=task)
+        except AuthorizationError as e:
+            raise RepoNotAllowed(str(e)) from e
         existing = self.store.conversation_for(task.id)
         if existing and existing.get("external_conversation_id"):
             # Already started on a previous attempt: just move to running.

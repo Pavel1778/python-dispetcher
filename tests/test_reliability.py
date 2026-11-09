@@ -54,12 +54,16 @@ def _reset_schema() -> None:
 
 
 @pytest.fixture(autouse=True)
+
+
 def _schema():
     _reset_schema()
     yield
 
 
 @pytest.fixture
+
+
 def store():
     s = PostgresStore(DSN)
     yield s
@@ -67,22 +71,30 @@ def store():
 
 
 @pytest.fixture
+
+
 def cloud():
     with FakeCloudServer() as server:
         yield server
 
 
 @pytest.fixture
+
+
 def client(cloud):
     return CloudClient(cloud.base_url, api_key="test-key", timeout=5.0)
 
 
 @pytest.fixture
+
+
 def dispatcher(store, client):
     return CloudDispatcher(store, client, worker_id="w1", start_poll_interval=0.01)
 
 
 @pytest.fixture
+
+
 def runtime(store, client, dispatcher):
     return SrRuntime(store, client, SrTools(store, dispatcher),
                      start_poll_interval=0.01)
@@ -94,6 +106,8 @@ def _repo(store, name="acme/repo"):
 
 
 # ---------------------------------------------------------- Sr call recovery
+
+
 def test_claimed_but_unfinished_call_is_reexecuted(store, cloud, runtime):
     """Crash between claim and finish must not lose the call forever.
 
@@ -172,6 +186,8 @@ def test_reexecuted_create_task_does_not_duplicate(store, cloud, runtime):
 
 
 # ------------------------------------------------------ Jr orphan recovery
+
+
 def test_orphan_sr_conversation_is_reused(store, cloud, runtime):
     """A crash after starting Sr, before recording it, must not start a second."""
     wf = store.create_workflow("wf")
@@ -203,6 +219,8 @@ def test_orphan_conversation_is_reused_not_duplicated(store, cloud, dispatcher):
 
 
 # ------------------------------------------------------------ 429 handling
+
+
 def test_rate_limit_is_transient_not_dead_letter(store, dispatcher):
     """429 (quota) must not burn an attempt or dead-letter the task."""
     wf = store.create_workflow("wf")
@@ -222,6 +240,8 @@ def test_rate_limit_is_transient_not_dead_letter(store, dispatcher):
 
 
 # ---------------------------------------------------------- event pagination
+
+
 def test_action_event_beyond_first_page_is_handled(store, cloud, runtime):
     """A tool call older than the first 100 events must still be seen."""
     repo = _repo(store)
@@ -243,6 +263,8 @@ def test_action_event_beyond_first_page_is_handled(store, cloud, runtime):
 
 
 # ------------------------------------------------------------ workflow scope
+
+
 def test_task_tool_rejects_other_workflows_task(store, cloud, runtime):
     """A Sr conversation cannot touch a task from a different workflow."""
     repo = _repo(store)
@@ -272,6 +294,8 @@ def test_child_task_limit_is_enforced(store, cloud, runtime):
 
 
 # --------------------------------------------------------- workflow verifier
+
+
 def _finish_all(store, wf, n=1):
     ids = []
     for i in range(n):
@@ -329,6 +353,8 @@ def test_verifier_waits_on_pending_tool_call(store, cloud, client):
 
 
 # ------------------------------------------------------- workspace conflicts
+
+
 def test_two_tasks_on_one_workspace_do_not_run_together(store, cloud, dispatcher):
     """Two conversations editing one checkout would clobber each other.
 
@@ -424,3 +450,91 @@ def test_queue_scans_past_unmet_dependencies_and_approval(store):
     assert store.get_task(approval.id).state == TaskState.QUEUED
     assert store.claim_task("worker").id == prerequisite.id
     assert store.claim_task("worker") is None
+
+
+def test_concurrent_claims_of_one_workspace_serialize_in_the_database(store):
+    """The workspace lock is the database index, not a read-then-write check.
+
+    Two independent connections (as two dispatcher processes would use) try to
+    claim two different queued tasks for the same repository+branch at the same
+    time. The partial unique index ``uq_tasks_workspace_active`` must let exactly
+    one succeed and refuse the other, so two conversations can never edit one
+    checkout.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import psycopg
+
+    from orchestration.cloud_store import InvalidTransition
+
+    repo = _repo(store)
+
+    def seed() -> None:
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO workflows(goal) VALUES ('wf') RETURNING id")
+                wf = str(cur.fetchone()[0])
+                for goal in ("first", "second"):
+                    cur.execute(
+                        "INSERT INTO tasks(goal, workflow_id, selected_repository, "
+                        "selected_branch) VALUES (%s,%s,%s,'main')",
+                        (goal, wf, repo),
+                    )
+
+    seed()
+
+    def claim(owner: str) -> str:
+        s = PostgresStore(DSN)
+        try:
+            try:
+                task = s.claim_task(owner, task_id=None)
+            except InvalidTransition:
+                return "refused"
+            return task.id if task else "none"
+        finally:
+            s.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, ["w1", "w2"]))
+
+    claimed = [r for r in results if r not in ("refused", "none")]
+    assert len(claimed) == 1, results
+    # Exactly one task is in an active workspace state.
+    with psycopg.connect(DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM tasks WHERE selected_repository=%s "
+                "AND state IN ('assigned','running','verifying','blocked','recovering')",
+                (repo,),
+            )
+            assert cur.fetchone()[0] == 1
+
+
+def test_workspace_index_refuses_a_second_active_claim(store):
+    """Deterministic proof the index bites, independent of thread timing.
+
+    Mark one task active for a workspace, then have a fresh connection claim a
+    second task for the same workspace. The partial unique index must refuse it.
+    """
+    import psycopg
+
+    from orchestration.cloud_store import InvalidTransition
+
+    repo = _repo(store)
+    wf = store.create_workflow("wf")
+    a = store.submit_task("first", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    b = store.submit_task("second", workflow_id=wf, selected_repository=repo,
+                          selected_branch="main")
+    store.claim_task("w1", task_id=a.id)
+    # Force the second row directly to 'assigned' for the same workspace: the
+    # index, not application logic, must reject it. The failed transaction rolls
+    # back, so b stays queued.
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with store._tx() as cur:
+            cur.execute(
+                "UPDATE tasks SET state='assigned', owner='w2' WHERE id=%s", (b.id,)
+            )
+    # And the store's own claim path reports it as a refusal, not a crash.
+    with pytest.raises(InvalidTransition):
+        store.claim_task("w2", task_id=b.id)

@@ -319,6 +319,59 @@ APP_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
+
+    <div id="project-exec" class="card hidden" style="margin-top:16px">
+      <div class="card-head"><h3>Контекст выполнения проекта</h3></div>
+      <p class="muted small">Здесь показано, с каким проектом, репозиторием и веткой будет запущена работа. Задача не может использовать репозиторий, не привязанный к проекту.</p>
+
+      <h4>Репозитории проекта</h4>
+      <div id="project-repos"><p class="muted small">Загрузка…</p></div>
+      <form id="project-repo-form">
+        <label for="project-repo-name">Привязать репозиторий (owner/name)</label>
+        <input id="project-repo-name" placeholder="owner/name" maxlength="200" autocapitalize="none" required>
+        <div class="actions"><button type="submit">Привязать</button></div>
+      </form>
+      <p id="project-repo-msg" class="small" role="status" aria-live="polite"></p>
+
+      <h4 style="margin-top:20px">Новая задача в проекте</h4>
+      <form id="project-task-form">
+        <label for="project-task-goal">Цель задачи</label>
+        <textarea id="project-task-goal" maxlength="4000" required placeholder="Что должен сделать агент"></textarea>
+        <div class="row">
+          <div>
+            <label for="project-task-repo">Репозиторий</label>
+            <select id="project-task-repo"><option value="">— без репозитория (только анализ) —</option></select>
+          </div>
+          <div>
+            <label for="project-task-branch">Ветка</label>
+            <input id="project-task-branch" placeholder="main" maxlength="200" autocapitalize="none">
+          </div>
+        </div>
+        <p class="muted small" id="project-task-context" role="status"></p>
+        <div class="actions"><button type="submit" id="project-task-go">Запустить задачу</button></div>
+      </form>
+      <p id="project-task-msg" class="small" role="status" aria-live="polite"></p>
+
+      <h4 style="margin-top:20px">Workflows проекта</h4>
+      <div id="project-workflows"><p class="muted small">Загрузка…</p></div>
+      <h4 style="margin-top:20px">Задачи проекта</h4>
+      <div id="project-tasks"><p class="muted small">Загрузка…</p></div>
+
+      <h4 style="margin-top:20px">Evidence проекта</h4>
+      <div id="project-evidence"><p class="muted small">Загрузка…</p></div>
+      <form id="project-evidence-form">
+        <label for="project-evidence-summary">Записать evidence вручную (для демонстрации)</label>
+        <input id="project-evidence-summary" maxlength="400" placeholder="Краткое описание" required>
+        <div class="row">
+          <div><label for="project-evidence-commit">Commit SHA</label>
+            <input id="project-evidence-commit" maxlength="64" placeholder="abc123" autocapitalize="none"></div>
+          <div><label for="project-evidence-branch">Ветка</label>
+            <input id="project-evidence-branch" maxlength="200" placeholder="main" autocapitalize="none"></div>
+        </div>
+        <div class="actions"><button type="submit">Записать и подписать</button></div>
+      </form>
+      <p id="project-evidence-msg" class="small" role="status" aria-live="polite"></p>
+    </div>
     <div id="plan-panel" class="card hidden" style="margin-top:16px">
       <div class="card-head"><h3>План цели</h3></div>
       <p class="muted small">План составляется вручную. Одна задача на строку: ID | название | зависимости через запятую | критерии через точку с запятой. Согласование не запускает выполнение.</p>
@@ -771,11 +824,15 @@ async function openDetail(wfId) {
 async function loadSystem() {
   try {
     const s = await api('/api/system');
+    let cfg = {};
+    try { cfg = await api('/api/config'); } catch (e) { cfg = {}; }
     const rows = [
       ['База данных', s.store.ok ? 'доступна' : ('недоступна: ' + (s.store.error || ''))],
       ['OpenHands Cloud', s.cloud.ok ? 'доступен' : ('недоступен: ' + (s.cloud.error || ''))],
       ['URL Cloud', s.cloud.url || '—'],
       ['Ключ Cloud настроен', s.config.cloud_key ? 'да' : 'нет'],
+      ['Транспорт', cfg.transport || '—'],
+      ['Выбор репозитория транспортом', cfg.supports_repository_selection ? 'поддерживается' : ('через инструкцию (' + (cfg.repository_mode || 'prompt') + ')')],
       ['Токен GitHub', s.config.github_token ? 'настроен' : 'нет'],
       ['Запись требует токен', s.config.writes_require_auth ? 'да' : 'нет'],
       ['Версия приложения', s.build.version || 'неизвестно'],
@@ -929,7 +986,7 @@ async function selectProject(id) {
   $('#project-goal').value = '';
   delete $('#project-goal-form').dataset.requestId;
   $('#project-goal-msg').textContent = '';
-  await Promise.all([loadProjectGoals(id), loadProjectFiles(id)]);
+  await Promise.all([loadProjectGoals(id), loadProjectFiles(id), loadProjectExec(id)]);
 }
 async function loadProjectGoals(id) {
   try {
@@ -967,6 +1024,155 @@ async function loadProjectFiles(id) {
     });
   } catch (error) { if (SELECTED_PROJECT === id) $('#files-msg').textContent = error.message; }
 }
+
+/* ------------------------------------------- project execution context */
+let PROJECT_REPOS = [];
+
+async function loadProjectExec(id) {
+  $('#project-exec').classList.remove('hidden');
+  await Promise.all([loadProjectRepos(id), loadProjectWorkflows(id), loadProjectTasks(id), loadProjectEvidence(id)]);
+}
+
+async function loadProjectRepos(id) {
+  try {
+    const result = await api('/api/v1/projects/' + encodeURIComponent(id) + '/repositories');
+    if (SELECTED_PROJECT !== id) return;
+    PROJECT_REPOS = result.repositories || [];
+    const container = $('#project-repos');
+    container.innerHTML = PROJECT_REPOS.length ? PROJECT_REPOS.map(r =>
+      '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' +
+      '<strong>' + esc(r.full_name) + '</strong> <span class="muted small">ветки: ' +
+      esc((r.allowed_branches || []).join(', ') || ('только ' + r.default_branch)) + '</span> ' +
+      (r.enabled ? '<span class="pill completed">включён</span>' : '<span class="pill failed">выключен</span>') + ' ' +
+      '<button type="button" class="ghost repo-unlink" data-name="' + esc(r.full_name) + '">Отвязать</button></div>'
+    ).join('') : '<p class="muted small">Репозитории не привязаны. Задача сможет работать только без репозитория.</p>';
+    $$('.repo-unlink', container).forEach(button => button.onclick = async () => {
+      if (!confirm('Отвязать репозиторий «' + button.dataset.name + '» от проекта?')) return;
+      try {
+        await api('/api/v1/projects/' + encodeURIComponent(id) + '/repositories/remove',
+                  {method:'POST', body: JSON.stringify({full_name: button.dataset.name})});
+        await loadProjectRepos(id);
+      } catch (e) { $('#project-repo-msg').textContent = e.message; }
+    });
+    // Reflect the linked repositories in the task form and its context hint.
+    const sel = $('#project-task-repo');
+    sel.innerHTML = '<option value="">— без репозитория (только анализ) —</option>' +
+      PROJECT_REPOS.filter(r => r.enabled).map(r =>
+        '<option value="' + esc(r.full_name) + '">' + esc(r.full_name) + '</option>').join('');
+    updateTaskContext();
+  } catch (e) { if (SELECTED_PROJECT === id) $('#project-repo-msg').textContent = e.message; }
+}
+
+function updateTaskContext() {
+  const repo = $('#project-task-repo').value;
+  const branch = $('#project-task-branch').value.trim() || 'ветка по умолчанию';
+  const project = PROJECTS.find(p => p.id === SELECTED_PROJECT);
+  $('#project-task-context').textContent =
+    'Будет использовано: проект «' + (project ? project.name : '—') + '», репозиторий ' +
+    (repo || 'без репозитория') + ', ' + branch + '.';
+}
+
+async function loadProjectWorkflows(id) {
+  try {
+    const result = await api('/api/v1/projects/' + encodeURIComponent(id) + '/workflows');
+    if (SELECTED_PROJECT !== id) return;
+    const workflows = result.workflows || [];
+    $('#project-workflows').innerHTML = workflows.length ? workflows.map(w =>
+      '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' + pill(w.state) +
+      ' <span class="muted small">' + esc(w.goal.slice(0, 80)) + '</span> ' +
+      '<button type="button" class="ghost wf-open" data-id="' + esc(w.id) + '">Детали</button>' +
+      '<div class="muted small wf-detail hidden" data-id="' + esc(w.id) + '"></div></div>'
+    ).join('') : '<p class="muted small">Workflow пока нет.</p>';
+    $$('.wf-open', $('#project-workflows')).forEach(button => button.onclick = async () => {
+      try {
+        const detail = await api('/api/v1/projects/' + encodeURIComponent(id) + '/workflows/' + encodeURIComponent(button.dataset.id));
+        const box = $('#project-workflows').querySelector('.wf-detail[data-id="' + button.dataset.id + '"]');
+        if (!box) return;
+        box.classList.toggle('hidden');
+        const wf = detail.workflow || {};
+        const tasks = (detail.tasks || []).map(t =>
+          '<li>' + pill(t.state) + ' ' + esc((t.goal || '').slice(0, 70)) + ' <span class="muted small">' + esc(t.repository || '—') + '@' + esc(t.branch || 'default') + '</span></li>').join('');
+        box.innerHTML = '<p>Sr: ' + esc(wf.sr_status || '—') +
+          (wf.sr_url ? ' — <a href="' + esc(wf.sr_url) + '" target="_blank" rel="noopener">открыть в Cloud</a>' : '') +
+          '</p><p class="muted small">Причина: ' + esc(wf.reason || '—') + '</p>' +
+          '<ul>' + (tasks || '<li class="muted small">Задач нет</li>') + '</ul>';
+      } catch (e) { $('#project-workflows').querySelector('.wf-detail[data-id="' + button.dataset.id + '"]').textContent = e.message; }
+    });
+  } catch (e) { if (SELECTED_PROJECT === id) $('#project-workflows').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+}
+
+async function loadProjectTasks(id) {
+  try {
+    const result = await api('/api/v1/projects/' + encodeURIComponent(id) + '/tasks');
+    if (SELECTED_PROJECT !== id) return;
+    const tasks = result.tasks || [];
+    $('#project-tasks').innerHTML = tasks.length ? tasks.map(t =>
+      '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' + pill(t.state) +
+      ' <span class="muted small">' + esc(t.goal.slice(0, 80)) + '</span> ' +
+      '<span class="muted small">' + esc(t.repository || '—') + '@' + esc(t.branch || 'default') + '</span> ' +
+      '<button type="button" class="ghost task-open" data-id="' + esc(t.id) + '">Детали</button>' +
+      '<div class="muted small task-detail hidden" data-id="' + esc(t.id) + '"></div></div>'
+    ).join('') : '<p class="muted small">Задач пока нет.</p>';
+    $$('.task-open', $('#project-tasks')).forEach(button => button.onclick = async () => {
+      try {
+        const detail = await api('/api/v1/projects/' + encodeURIComponent(id) + '/tasks/' + encodeURIComponent(button.dataset.id));
+        const task = detail.task || {};
+        const box = $('#project-tasks').querySelector('.task-detail[data-id="' + button.dataset.id + '"]');
+        if (!box) return;
+        box.classList.toggle('hidden');
+        const events = (task.events || []).slice(0, 10).map(e =>
+          '<li><span class="mono small">' + esc(e.kind) + '</span> <span class="muted small">' + esc(JSON.stringify(e.detail || {}).slice(0, 120)) + '</span></li>').join('');
+        const conv = task.conversation || {};
+        box.innerHTML = '<p>Попытка ' + esc(task.attempt) + '/' + esc(task.max_attempts) + ' · владелец ' + esc(task.owner || '—') + '</p>' +
+          '<p class="muted small">Conversation: ' + esc(conv.external_conversation_id || '—') + '</p>' +
+          (task.result ? '<p style="white-space:pre-wrap">' + esc(task.result.slice(0, 500)) + '</p>' : '') +
+          '<ul>' + (events || '<li class="muted small">Событий нет</li>') + '</ul>';
+      } catch (e) { $('#project-tasks').querySelector('.task-detail[data-id="' + button.dataset.id + '"]').textContent = e.message; }
+    });
+  } catch (e) { if (SELECTED_PROJECT === id) $('#project-tasks').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+}
+
+function evidenceVerdictPill(verdict) {
+  const cls = verdict === 'VERIFIED' ? 'completed' : (verdict === 'FAILED' ? 'failed' : 'queued');
+  return '<span class="pill ' + cls + '">' + esc(verdict) + '</span>';
+}
+
+async function loadProjectEvidence(id) {
+  try {
+    const result = await api('/api/v1/projects/' + encodeURIComponent(id) + '/evidence');
+    if (SELECTED_PROJECT !== id) return;
+    const evidence = result.evidence || [];
+    const container = $('#project-evidence');
+    container.innerHTML = evidence.length ? evidence.map(e =>
+      '<div style="padding:8px 0;border-bottom:1px solid var(--line)">' + evidenceVerdictPill(e.verdict) +
+      ' <span class="mono small">' + esc(e.commit_sha || '—') + '</span> ' +
+      '<span class="muted small">' + esc(e.summary || '') + '</span> ' +
+      '<span class="muted small">ключ ' + esc(e.key_id) + '</span> ' +
+      '<button type="button" class="ghost evidence-verify" data-id="' + esc(e.id) + '">Проверить заново</button>' +
+      '<div class="muted small evidence-detail hidden" data-id="' + esc(e.id) + '"></div></div>'
+    ).join('') : '<p class="muted small">Evidence пока нет.</p>';
+    $$('.evidence-verify', container).forEach(button => button.onclick = async () => {
+      try {
+        const out = await api('/api/v1/projects/' + encodeURIComponent(id) + '/evidence/' +
+                              encodeURIComponent(button.dataset.id) + '/verify', {method:'POST', body: '{}'});
+        const rec = out.evidence || {};
+        // Re-render first (which recreates the detail node), then fill it in, so
+        // the explanation survives the refresh.
+        await loadProjectEvidence(id);
+        const fresh = $('#project-evidence').querySelector('.evidence-detail[data-id="' + button.dataset.id + '"]');
+        if (fresh) {
+          fresh.classList.remove('hidden');
+          const checks = (rec.verification_detail && rec.verification_detail.checks) || {};
+          fresh.textContent = 'Verdict: ' + rec.verdict + ' — ' + ((rec.verification_detail||{}).reason || '') +
+            ' | commit ' + (rec.commit_sha || '—') + ' | ключ ' + (rec.key_id || '—') +
+            ' | подпись ' + (checks.signature_valid ? 'ок' : 'нет');
+        }
+      } catch (e) { $('#project-evidence-msg').textContent = e.message; }
+    });
+  } catch (e) { if (SELECTED_PROJECT === id) $('#project-evidence').innerHTML = '<p class="muted small">' + esc(e.message) + '</p>'; }
+}
+
+
 
 function setupVoice() {
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1118,6 +1324,58 @@ async function boot() {
       if (SELECTED_PROJECT === project) { $('#files-input').value = ''; $('#files-msg').textContent = 'Файлы загружены.'; }
     } catch (error) { if (SELECTED_PROJECT === project) { $('#files-input').value = ''; $('#files-msg').textContent = 'Загрузка остановлена: ' + error.message + ' Ранее загруженные файлы сохранены; выберите повторно только отсутствующие файлы.'; } }
     finally { button.disabled = false; if (SELECTED_PROJECT === project) await loadProjectFiles(project); }
+  };
+  $('#project-repo-form').onsubmit = async e => {
+    e.preventDefault();
+    const project = SELECTED_PROJECT; if (!project) return;
+    const name = $('#project-repo-name').value.trim();
+    if (!name) return;
+    const button = $('button[type="submit"]', e.currentTarget); button.disabled = true;
+    try {
+      await api('/api/v1/projects/' + encodeURIComponent(project) + '/repositories',
+                {method:'POST', body: JSON.stringify({full_name: name})});
+      if (SELECTED_PROJECT === project) { $('#project-repo-name').value = ''; $('#project-repo-msg').textContent = 'Репозиторий привязан.'; }
+    } catch (error) { if (SELECTED_PROJECT === project) $('#project-repo-msg').textContent = error.message; }
+    finally { button.disabled = false; if (SELECTED_PROJECT === project) await loadProjectRepos(project); }
+  };
+  $('#project-task-repo').onchange = updateTaskContext;
+  $('#project-task-branch').oninput = updateTaskContext;
+  $('#project-task-form').onsubmit = async e => {
+    e.preventDefault();
+    const project = SELECTED_PROJECT; if (!project) return;
+    const goal = $('#project-task-goal').value.trim();
+    if (!goal) return;
+    const body = {goal: goal, repository: $('#project-task-repo').value || null,
+                  branch: $('#project-task-branch').value.trim() || null};
+    const button = $('#project-task-go'); button.disabled = true;
+    $('#project-task-msg').textContent = 'Запускаем…';
+    try {
+      const out = await api('/api/v1/projects/' + encodeURIComponent(project) + '/tasks',
+                            {method:'POST', body: JSON.stringify(body)});
+      if (SELECTED_PROJECT === project) {
+        $('#project-task-goal').value = '';
+        $('#project-task-msg').textContent = 'Workflow ' + out.workflow_id +
+          (out.sr_conversation_id ? ' запущен.' : ' создан; Sr стартует в фоне.');
+      }
+    } catch (error) { if (SELECTED_PROJECT === project) $('#project-task-msg').textContent = 'Не удалось запустить: ' + error.message; }
+    finally { button.disabled = false; if (SELECTED_PROJECT === project) { await loadProjectWorkflows(project); await loadProjectTasks(project); } }
+  };
+  $('#project-evidence-form').onsubmit = async e => {
+    e.preventDefault();
+    const project = SELECTED_PROJECT; if (!project) return;
+    const summary = $('#project-evidence-summary').value.trim();
+    if (!summary) return;
+    const button = $('button[type="submit"]', e.currentTarget); button.disabled = true;
+    try {
+      const body = {subject_kind: 'manual', summary: summary,
+                    commit_sha: $('#project-evidence-commit').value.trim() || null,
+                    branch: $('#project-evidence-branch').value.trim() || null,
+                    repository: $('#project-task-repo').value || null};
+      await api('/api/v1/projects/' + encodeURIComponent(project) + '/evidence',
+                {method:'POST', body: JSON.stringify(body)});
+      if (SELECTED_PROJECT === project) { $('#project-evidence-summary').value = ''; $('#project-evidence-msg').textContent = 'Evidence записан и подписан.'; }
+    } catch (error) { if (SELECTED_PROJECT === project) $('#project-evidence-msg').textContent = error.message; }
+    finally { button.disabled = false; if (SELECTED_PROJECT === project) await loadProjectEvidence(project); }
   };
   $('#github-form').onsubmit = async e => {
     e.preventDefault();

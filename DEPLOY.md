@@ -126,6 +126,10 @@ Read from the source, not assumed. Names must match exactly.
 | `LOGIN_MAX_ATTEMPTS_GLOBAL` | no | `web_server.py` | In-memory endpoint-wide login ceiling per minute, independent of the client IP. Default `120`. |
 | `APP_VERSION` / `RENDER_GIT_COMMIT` | no | `web_server.py` | Shown on the System screen. |
 | `TEST_SUPABASE_DB_URL` | tests only | `tests/` | DSN for the test suite. |
+| `GITHUB_API_URL` | no | `github_client.py` | Override the GitHub REST base URL (default `https://api.github.com`). Must be `http(s)` with a host and no embedded credentials, or construction raises. |
+| `LOCAL_AGENT_SERVER_URL` | dev only | `local_runtime.py` | Base URL of a local agent-server for the local end-to-end scripts. Default `http://127.0.0.1:60000`. |
+| `OHP_LOCAL_LLM_MODEL` | dev only | `local_runtime.py` | Model the local runtime asks the local agent-server to use. |
+| `SESSION_API_KEY` | dev only | `openhands_client.py` | Session key for the local agent-server adapter. Not used by the Cloud transports. |
 
 The server **refuses to bind `0.0.0.0`** unless `WEB_AUTH_TOKEN` is set **and**
 the three `AUTH_*` variables are present, so a public deploy can never come up
@@ -294,7 +298,44 @@ psql "$SUPABASE_DB_URL" -f migrations/0008_sr_lifecycle.sql
 psql "$SUPABASE_DB_URL" -f migrations/0009_nexus_projects.sql
 psql "$SUPABASE_DB_URL" -f migrations/0010_nexus_plans.sql
 psql "$SUPABASE_DB_URL" -f migrations/0011_nexus_files.sql
+psql "$SUPABASE_DB_URL" -f migrations/0014_nexus_project_binding.sql
+psql "$SUPABASE_DB_URL" -f migrations/0015_task_workspace_lock.sql
+psql "$SUPABASE_DB_URL" -f migrations/0016_secret_tables_rls.sql
 ```
+
+`0012` and `0013` are intentionally unused: they are reserved for the deferred
+File Lab (D-1) workstream. The runner applies every `*.sql` in lexical order and
+does not require a contiguous sequence, so the gap is safe.
+
+`0014_nexus_project_binding.sql` is additive: it adds the project↔repository
+link table, nullable `project_id` on `tasks`/`workflows`, the canonical
+repository-identity trigger and the `nexus_evidence` table. It does **not**
+backfill legacy rows; a legacy task/workflow keeps `project_id IS NULL`.
+
+`0015_task_workspace_lock.sql` adds the partial unique index that serializes
+repository work across processes. `0016_secret_tables_rls.sql` locks the sandbox
+session-key tables. Both are additive and idempotent.
+
+### Backup and restore
+
+Before applying a new migration to a database with real data, back it up:
+
+```
+pg_dump "$SUPABASE_DB_URL" --format=custom --file=nexus-$(date +%F).dump
+```
+
+Restore into a **disposable** database and verify the schema guard, then point
+the service at it:
+
+```
+createdb nexus_restore
+pg_restore --dbname=nexus_restore --no-owner nexus-2026-01-01.dump
+psql "postgresql://.../nexus_restore" -c "SELECT filename FROM schema_migrations ORDER BY filename;"
+```
+
+`tests/test_migration_d2.py` exercises the apply/idempotency/legacy-preservation
+properties against a disposable database; it is the automated proxy for a
+restore drill, not a substitute for one against a real backup.
 
 Do not run migrations against production without authorization. Applying them on
 boot is still a deliberate step: it happens once per file, the SQL is
