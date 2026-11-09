@@ -315,6 +315,14 @@ class PostgresStore:
                           "attempts", "delivered_at"),
         "sessions": ("token_hash", "username", "csrf_token", "expires_at"),
         "login_attempts": ("key", "failures", "locked_until"),
+        "nexus_files": ("id", "project_id", "filename", "size", "sha256", "data",
+                        "is_archive"),
+        "nexus_workspaces": ("id", "project_id", "name", "created_by"),
+        "nexus_workspace_files": ("workspace_id", "path", "is_dir", "size", "data"),
+        "nexus_pending_actions": ("id", "actor", "action", "payload", "token_hash",
+                                  "status", "expires_at"),
+        "nexus_voice_notes": ("id", "project_id", "content_type", "size", "data",
+                              "transcript"),
     }
 
     def verify_schema(self) -> list[str]:

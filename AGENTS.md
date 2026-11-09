@@ -208,13 +208,62 @@ successful-completion e2e needs a valid key and is not yet exercised.
   responsive. It must not embed any secret; actions must be implemented and
   accurately described (browser-local voice input need not call an endpoint).
 
+## NEXUS laboratory, files, voice and guarded GitHub (second increment)
+
+- `orchestration/archive_safety.py` is the only place an uploaded archive is
+  read. It refuses traversal, absolute paths, drive letters, UNC, symlinks,
+  hardlinks, device/FIFO entries and bombs (entry count, total/per-file size,
+  compression ratio) **before any row is written**. It never writes to disk;
+  it yields validated `(path, bytes)` pairs. Do not "stream" extraction to the
+  filesystem later -- the whole point is that no member name becomes a path.
+  The ratio ceiling only applies above `ratio_floor_bytes` (1 MiB), so a tiny
+  file with a big ratio is not rejected for nothing.
+- `orchestration/file_lab.py` stores uploaded bytes in PostgreSQL
+  (`nexus_files`, `nexus_voice_notes`, `nexus_workspace_files`), never on the
+  server. A filename is metadata: directory separators are stripped, and a
+  workspace path is normalized and re-checked by a DB `CHECK`. `original_data`
+  keeps the pre-edit bytes so `workspace_diff` shows the imported version.
+- `orchestration/nexus_actions.py` is the confirmation handshake for actions
+  that must not happen on one click. Only `SHA-256(token)` is stored; the token
+  is returned exactly once. A retried confirm is `409` (never a second side
+  effect). Expiry is checked at confirm time.
+- `orchestration/github_client.py`: `GitHubClient` reads and also carries the
+  legacy ``create_repository``/``set_visibility`` used by the confirmation flow;
+  `GitHubWriter` is the guarded writer for the Integrations tab.
+  `set_repository_visibility(private=False)` raises unless
+  `acknowledge_public=True`, which only the confirmed-action handler sets -- so
+  even a caller that forgot the confirmation step cannot publish a repository.
+  `gh.writes` on the fake server proves an unconfirmed action never left.
+- `orchestration/multipart.py` exists because `cgi` was removed in Python 3.13.
+  It does not honour `filename*=`, only the plain `filename="..."` form.
+- **Trap:** `Handler._json()` returns `None`. A dispatcher that returns its
+  result as the "handled" signal therefore reports "not handled" after already
+  writing a response, and the caller sends a second response (a 404 after a
+  201). `_post_project_resource` returns an explicit `bool` for this reason; do
+  not collapse it back to returning `self._json(...)`.
+- The UI gained **Лаборатория** and **GitHub** tabs in `web_ui.py`. The GitHub
+  confirm dialog is a real two-step flow (propose -> confirm), with a separate
+  warning for public. Nothing is sent to GitHub until "Подтвердить".
+- **Two upload designs share `nexus_files` and `/files`.** The unified
+  `migrations/0011_nexus_files.sql` makes the table a superset: an opaque row
+  (main) carries `name`/`content`/`created_by`; a File Lab row carries
+  `filename`/`data`/`uploaded_by`/`content_type`/`is_archive`. `App` holds both
+  services (`files` = `FileLabService`, `opaque_files` = `FileService`).
+  `GET /files/{id}` disambiguates by provenance (`FileService.is_opaque`):
+  an opaque row is a raw attachment, a File Lab row is a JSON preview. Do not
+  collapse this to one service without reworking both contracts and their tests.
+- Tests: `tests/test_archive_safety.py` (no DB; every rejection by name),
+  `tests/test_file_lab.py` (real HTTP + PostgreSQL + `tests/fake_github.py`),
+  `tests/test_lab_files.py` (the opaque design), and the extended
+  `tests/test_github_client.py`. The fake GitHub now implements
+  `POST /user/repos`, `PATCH /repos/{owner}/{name}` and the detail sections, and
+  records writes in `gh.writes`.
+- `tests/test_nexus_projects.py::store` truncates **every** table that
+  references `nexus_projects`. Adding a new project-scoped table means adding
+  it there too, or the truncate fails with a foreign-key error.
+
 ## GitHub repository discovery and confirmed writes
 
-- `orchestration/github_client.py` reads `GITHUB_TOKEN` and calls
-  `GET /user/repos`. Discovery is read-only, but optional repository creation and visibility writes
-  exist behind `GITHUB_ENABLE_WRITES` and a session-bound, one-use confirmation.
-  Sync only writes the local allowlist. `_request` must stay the single place
-  the token is attached; redirects must never forward the token.
 - The token value must never be logged, returned by the API or rendered in the
   UI. `GitHubClient.__repr__` is redacted on purpose; keep it that way. Only
   `configured` (a bool) is exposed, and `/api/system` and `/api/capabilities`

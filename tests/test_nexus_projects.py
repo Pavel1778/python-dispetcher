@@ -25,10 +25,16 @@ pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to a d
 def store():
     instance = PostgresStore(DSN)
     with instance._tx() as cur:
-        # CASCADE also clears workflows/tasks, which now reference nexus_projects
-        # (D-2 project binding). Truncating the projects alone would fail on the
-        # foreign key; these tests never rely on pre-existing execution rows.
-        cur.execute("TRUNCATE nexus_evidence, nexus_project_repositories, nexus_files, nexus_plan_dependencies, nexus_plan_tasks, nexus_plans, nexus_project_events, nexus_goals, nexus_project_members, nexus_projects RESTART IDENTITY CASCADE")
+        # Every NEXUS table that references nexus_projects must be listed, or
+        # TRUNCATE is refused with a foreign-key error. CASCADE also clears
+        # workflows/tasks (D-2 project binding), which these tests never rely on.
+        cur.execute(
+            "TRUNCATE nexus_evidence, nexus_project_repositories, "
+            "nexus_voice_notes, nexus_pending_actions, nexus_workspace_files, "
+            "nexus_workspaces, nexus_files, nexus_plan_dependencies, nexus_plan_tasks, "
+            "nexus_plans, nexus_project_events, nexus_goals, nexus_project_members, "
+            "nexus_projects RESTART IDENTITY CASCADE"
+        )
     yield instance
     instance.close()
 

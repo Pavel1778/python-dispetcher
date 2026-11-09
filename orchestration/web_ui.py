@@ -274,6 +274,8 @@ APP_HTML = r"""<!doctype html>
 
   <nav class="tabs" role="tablist" aria-label="Разделы" style="margin-top:24px">
     <button class="tab" role="tab" id="tab-projects" aria-selected="true" aria-controls="panel-projects">Проекты NEXUS</button>
+    <button class="tab" role="tab" id="tab-lab" aria-selected="false" aria-controls="panel-lab">Лаборатория</button>
+    <button class="tab" role="tab" id="tab-github" aria-selected="false" aria-controls="panel-github">GitHub</button>
     <button class="tab" role="tab" id="tab-new" aria-selected="false" aria-controls="panel-new">Dispatcher: новая задача</button>
     <button class="tab" role="tab" id="tab-queue" aria-selected="false" aria-controls="panel-queue">Очередь и задачи</button>
     <button class="tab" role="tab" id="tab-integrations" aria-selected="false" aria-controls="panel-integrations">Интеграции</button>
@@ -383,6 +385,106 @@ APP_HTML = r"""<!doctype html>
       <p id="plan-msg" class="small" role="status" aria-live="polite"></p>
       <div id="plan-list"></div>
       <div id="plan-detail"></div>
+    </div>
+  </section>
+
+  <section id="panel-lab" role="tabpanel" aria-labelledby="tab-lab" class="hidden">
+    <div class="banner info">
+      Лаборатория работает в границах выбранного проекта. Файлы хранятся в базе и не
+      выполняются на сервере. Выберите проект во вкладке «Проекты NEXUS».
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Проект лаборатории</h3></div>
+      <label for="lab-project">Проект</label>
+      <select id="lab-project"><option value="">— выберите проект —</option></select>
+      <p class="muted small" id="lab-hint">Файлы, рабочие пространства и голосовые заметки привязаны к проекту.</p>
+    </div>
+
+    <div class="grid cols-2" id="lab-body" style="margin-top:16px">
+      <div class="card">
+        <div class="card-head"><h3>Файлы</h3></div>
+        <p class="muted small">
+          PDF, DOCX, XLSX, PPTX, CSV, TXT, JSON, XML, изображения, исходный код и
+          архивы (ZIP/TAR/GZ). Архивы распаковываются в изолированное рабочее
+          пространство с защитой от Zip Slip, символьных ссылок и архивных бомб.
+        </p>
+        <form id="upload-form">
+          <label for="upload-file">Файл</label>
+          <input id="upload-file" type="file" required>
+          <div class="actions"><button type="submit">Загрузить</button>
+            <span class="muted small" id="upload-msg" role="status" aria-live="polite"></span></div>
+        </form>
+        <div id="file-list" style="margin-top:16px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Рабочие пространства</h3></div>
+        <form id="workspace-form">
+          <label for="workspace-name">Новое рабочее пространство</label>
+          <input id="workspace-name" maxlength="120" placeholder="Название">
+          <div class="actions"><button type="submit">Создать</button>
+            <span class="muted small" id="workspace-msg" role="status" aria-live="polite"></span></div>
+        </form>
+        <div id="workspace-list" style="margin-top:16px"></div>
+        <div id="workspace-detail" class="hidden" style="margin-top:16px"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>Голосовая заметка</h3></div>
+      <p class="muted small">
+        Запись ведётся браузером. Распознавание речи на сервере не подключено:
+        если браузер вернул текст, он сохраняется как «browser» и не считается
+        серверной проверкой.
+      </p>
+      <div class="actions">
+        <button type="button" id="rec-start">Начать запись</button>
+        <button type="button" id="rec-stop" class="ghost" disabled>Остановить и сохранить</button>
+        <span class="muted small" id="rec-msg" role="status" aria-live="polite"></span>
+      </div>
+      <div id="voice-list" style="margin-top:12px"></div>
+    </div>
+  </section>
+
+  <section id="panel-github" role="tabpanel" aria-labelledby="tab-github" class="hidden">
+    <div class="banner info">
+      Интеграция с GitHub. Создание репозитория и смена видимости выполняются
+      только после отдельного подтверждения ниже. Пока подтверждение не нажато,
+      ничего не происходит.
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Проект интеграции</h3></div>
+      <label for="gh-project">Проект</label>
+      <select id="gh-project"><option value="">— выберите проект —</option></select>
+      <p class="muted small" id="gh-hint">Создание и смена видимости привязаны к проекту.</p>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>Доступные репозитории</h3>
+        <div class="spacer" style="flex:1"></div>
+        <button class="ghost" id="gh-refresh" type="button">Обновить список</button>
+      </div>
+      <p class="muted small">Только чтение. Токен не отображается.</p>
+      <div id="gh-repos" class="tablewrap" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>Создать репозиторий</h3></div>
+      <form id="gh-create-form">
+        <label for="gh-new-name">Название</label>
+        <input id="gh-new-name" maxlength="100" placeholder="nexus-project" required>
+        <label for="gh-new-desc">Описание</label>
+        <input id="gh-new-desc" maxlength="350" placeholder="Необязательно">
+        <label for="gh-new-vis">Видимость</label>
+        <select id="gh-new-vis"><option value="private">Private</option><option value="public">Public</option></select>
+        <div class="actions"><button type="submit">Подготовить создание</button>
+          <span class="muted small" id="gh-create-msg" role="status" aria-live="polite"></span></div>
+      </form>
+    </div>
+
+    <div class="card" id="gh-confirm-card" style="margin-top:16px;display:none">
+      <div class="card-head"><h3>Требуется подтверждение</h3></div>
+      <div id="gh-confirm-body"></div>
     </div>
   </section>
 
@@ -972,6 +1074,8 @@ async function loadProjects() {
       '" style="width:100%;text-align:left;margin-top:6px">' + esc(p.name) + '</button>'
     ).join('') : '<p class="muted small">Проектов пока нет.</p>';
     $$('.project-select', container).forEach(button => button.onclick = () => selectProject(button.dataset.id));
+    fillLabProjectSelect();
+    fillGhProjectSelect();
   } catch (e) { $('#project-msg').textContent = 'Не удалось загрузить проекты: ' + e.message; }
 }
 async function selectProject(id) {
@@ -1264,6 +1368,413 @@ function parsePlanLines(value) {
   })};
 }
 
+/* ----------------------------------------------------- project selects */
+function fillProjectSelect(sel) {
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— выберите проект —</option>' +
+    PROJECTS.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('');
+  if (PROJECTS.some(p => p.id === cur)) sel.value = cur;
+}
+function fillLabProjectSelect() {
+  const sel = $('#lab-project');
+  if (sel) fillProjectSelect(sel);
+}
+function fillGhProjectSelect() {
+  const sel = $('#gh-project');
+  if (sel) fillProjectSelect(sel);
+}
+
+/* ------------------------------------------------------------- lab: files */
+async function uploadFile(projectId, file) {
+  // A multipart upload cannot go through api(): the browser must set the
+  // Content-Type (with the boundary) itself, so it is sent directly here with
+  // only the CSRF header added.
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  const r = await fetch('/api/v1/projects/' + encodeURIComponent(projectId) + '/files', {
+    method: 'POST', body: fd, headers: {'X-CSRF-Token': CSRF, 'Accept': 'application/json'}
+  });
+  if (r.status === 401) { window.location.href = '/login'; throw new Error('unauthorized'); }
+  const t = await r.text();
+  let d = {}; try { d = t ? JSON.parse(t) : {}; } catch (e) { d = {error: t}; }
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+function fileBase(projectId) {
+  return '/api/v1/projects/' + encodeURIComponent(projectId);
+}
+async function loadFiles(projectId) {
+  const box = $('#file-list');
+  if (!projectId) { box.innerHTML = '<p class="muted small">Выберите проект.</p>'; return; }
+  try {
+    const d = await api(fileBase(projectId) + '/files');
+    const files = d.files || [];
+    if (!files.length) { box.innerHTML = '<p class="muted small">Файлов пока нет.</p>'; return; }
+    box.innerHTML = '<div class="tablewrap"><table><thead><tr><th>Файл</th><th>Размер</th>' +
+      '<th>Архив</th><th></th></tr></thead><tbody>' + files.map(f =>
+      '<tr><td class="mono">' + esc(f.filename) + '</td>' +
+      '<td class="faint">' + esc(f.size) + ' Б</td>' +
+      '<td>' + (f.is_archive ? '<span class="pill queued">архив</span>' : '<span class="faint">—</span>') + '</td>' +
+      '<td style="text-align:right">' +
+        '<button class="link" type="button" data-preview="' + esc(f.id) + '">просмотр</button> ' +
+        '<a class="link" href="' + esc(fileBase(projectId)) + '/files/' + esc(f.id) + '/download">скачать</a> ' +
+        (f.is_archive ? '<button class="link" type="button" data-extract="' + esc(f.id) + '">распаковать</button> ' : '') +
+        '<button class="link" type="button" data-delfile="' + esc(f.id) + '">удалить</button>' +
+      '</td></tr>').join('') + '</tbody></table></div><div id="file-preview"></div>';
+    box.querySelectorAll('button[data-preview]').forEach(b => b.onclick = () => previewFile(projectId, b.dataset.preview));
+    box.querySelectorAll('button[data-extract]').forEach(b => b.onclick = () => extractFile(projectId, b.dataset.extract));
+    box.querySelectorAll('button[data-delfile]').forEach(b => b.onclick = async () => {
+      if (!window.confirm('Удалить файл?')) return;
+      try { await api(fileBase(projectId) + '/files/' + encodeURIComponent(b.dataset.delfile), {method:'DELETE'}); await loadFiles(projectId); }
+      catch (e) { $('#upload-msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    });
+  } catch (e) { box.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+async function previewFile(projectId, fileId) {
+  const out = $('#file-preview');
+  out.innerHTML = '<p class="muted small">Загрузка…</p>';
+  try {
+    const d = await api(fileBase(projectId) + '/files/' + encodeURIComponent(fileId));
+    const f = d.file;
+    let h = '<h4 style="margin-top:14px">' + esc(f.filename) + '</h4>';
+    if (f.kind === 'text') {
+      h += '<pre style="max-height:360px;overflow:auto">' + esc(f.text) + '</pre>';
+      if (f.truncated) h += '<p class="muted small">Показаны первые байты файла (обрезано).</p>';
+    } else if (f.kind === 'image') {
+      h += '<img src="' + esc(fileBase(projectId)) + '/files/' + esc(f.id) + '/download" alt="" style="max-width:100%">';
+    } else {
+      h += '<p class="muted small">Двоичный файл: предпросмотр недоступен, скачайте его.</p>';
+    }
+    out.innerHTML = h;
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+async function extractFile(projectId, fileId) {
+  const name = window.prompt('Название рабочего пространства:', 'workspace');
+  if (!name) return;
+  $('#upload-msg').textContent = 'Распаковка…';
+  try {
+    const d = await api(fileBase(projectId) + '/workspaces/from-file', {
+      method:'POST', body: JSON.stringify({file_id: fileId, name: name})});
+    $('#upload-msg').innerHTML = '<span class="ok">Создано рабочее пространство с ' +
+      esc(d.workspace.file_count) + ' файлами.</span>';
+    await loadWorkspaces(projectId);
+  } catch (e) { $('#upload-msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+}
+
+/* ------------------------------------------------------- lab: workspaces */
+async function loadWorkspaces(projectId) {
+  const box = $('#workspace-list');
+  if (!projectId) { box.innerHTML = '<p class="muted small">Выберите проект.</p>'; return; }
+  try {
+    const d = await api(fileBase(projectId) + '/workspaces');
+    const ws = d.workspaces || [];
+    if (!ws.length) { box.innerHTML = '<p class="muted small">Рабочих пространств пока нет.</p>'; return; }
+    box.innerHTML = ws.map(w =>
+      '<div style="border-bottom:1px solid var(--line);padding:10px 0">' +
+      '<strong>' + esc(w.name) + '</strong> <span class="muted small">' + esc(w.file_count) + ' файл(ов)</span><br>' +
+      '<button class="link" type="button" data-ws="' + esc(w.id) + '">открыть</button> ' +
+      '<button class="link" type="button" data-wsdiff="' + esc(w.id) + '">diff</button> ' +
+      '<button class="link" type="button" data-wsdel="' + esc(w.id) + '">удалить</button></div>').join('');
+    box.querySelectorAll('button[data-ws]').forEach(b => b.onclick = () => openWorkspace(projectId, b.dataset.ws));
+    box.querySelectorAll('button[data-wsdiff]').forEach(b => b.onclick = () => showDiff(projectId, b.dataset.wsdiff));
+    box.querySelectorAll('button[data-wsdel]').forEach(b => b.onclick = async () => {
+      if (!window.confirm('Удалить рабочее пространство со всеми файлами?')) return;
+      try { await api(fileBase(projectId) + '/workspaces/' + encodeURIComponent(b.dataset.wsdel), {method:'DELETE'}); await loadWorkspaces(projectId); }
+      catch (e) { $('#workspace-msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    });
+  } catch (e) { box.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+async function openWorkspace(projectId, wsId) {
+  const out = $('#workspace-detail');
+  out.classList.remove('hidden');
+  out.innerHTML = '<p class="muted small">Загрузка…</p>';
+  try {
+    const d = await api(fileBase(projectId) + '/workspaces/' + encodeURIComponent(wsId));
+    const files = d.files || [];
+    out.innerHTML = '<h4>Файлы</h4>' + (files.length
+      ? '<div class="tablewrap"><table><thead><tr><th>Путь</th><th>Размер</th><th>Изменён</th></tr></thead><tbody>' +
+        files.map(f => '<tr><td class="mono">' + esc(f.path) + (f.is_dir ? '/' : '') + '</td>' +
+          '<td class="faint">' + esc(f.size) + '</td><td class="faint">' + (f.edited ? 'да' : '—') + '</td></tr>').join('') +
+        '</tbody></table></div>'
+      : '<p class="muted small">Пусто.</p>') +
+      '<form id="ws-file-form" style="margin-top:12px">' +
+      '<label for="ws-file-path">Файл (путь)</label>' +
+      '<input id="ws-file-path" placeholder="src/main.py" maxlength="1024">' +
+      '<label for="ws-file-text">Содержимое</label>' +
+      '<textarea id="ws-file-text" rows="6"></textarea>' +
+      '<div class="actions"><button type="submit">Сохранить файл</button>' +
+      '<span class="muted small" id="ws-file-msg" role="status" aria-live="polite"></span></div></form>';
+    $('#ws-file-form').onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        await api(fileBase(projectId) + '/workspaces/' + encodeURIComponent(wsId) + '/files', {
+          method:'POST', body: JSON.stringify({path: $('#ws-file-path').value, text: $('#ws-file-text').value})});
+        $('#ws-file-msg').textContent = 'Сохранено.';
+        await openWorkspace(projectId, wsId);
+        await loadWorkspaces(projectId);
+      } catch (err) { $('#ws-file-msg').innerHTML = '<span class="err">' + esc(err.message) + '</span>'; }
+    };
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+async function showDiff(projectId, wsId) {
+  const out = $('#workspace-detail');
+  out.classList.remove('hidden');
+  try {
+    const d = await api(fileBase(projectId) + '/workspaces/' + encodeURIComponent(wsId) + '/diff');
+    const diff = d.diff || [];
+    out.innerHTML = '<h4>Изменения</h4>' + (diff.length
+      ? diff.map(x => '<p class="mono small">' + esc(x.path) + '</p><pre style="max-height:300px;overflow:auto">' + esc(x.diff) + '</pre>').join('')
+      : '<p class="muted small">Изменений нет.</p>');
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+
+/* ------------------------------------------------------------- lab: voice */
+let RECORDER = null, REC_CHUNKS = [], REC_START = 0;
+async function loadVoice(projectId) {
+  const box = $('#voice-list');
+  if (!projectId) { box.innerHTML = ''; return; }
+  try {
+    const d = await api(fileBase(projectId) + '/voice');
+    const notes = d.voice_notes || [];
+    box.innerHTML = notes.length ? '<div class="tablewrap"><table><thead><tr><th>Размер</th><th>Транскрипт</th><th></th></tr></thead><tbody>' +
+      notes.map(n => '<tr><td class="faint">' + esc(n.size) + ' Б</td>' +
+        '<td>' + (n.transcript ? esc(n.transcript.slice(0, 200)) +
+          ' <span class="faint small">(' + esc(n.transcript_engine || 'неизвестно') + ')</span>'
+          : '<span class="muted small">нет распознавания</span>') + '</td>' +
+        '<td><a class="link" href="' + esc(fileBase(projectId)) + '/voice/' + esc(n.id) + '/audio">прослушать</a></td></tr>').join('') +
+      '</tbody></table></div>' : '<p class="muted small">Заметок пока нет.</p>';
+  } catch (e) { box.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+function pickRecorderMime() {
+  const cands = ['audio/webm', 'audio/ogg', 'audio/mp4'];
+  for (const c of cands) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return '';
+}
+async function startRecording() {
+  const projectId = $('#lab-project').value;
+  if (!projectId) { $('#rec-msg').innerHTML = '<span class="err">Выберите проект.</span>'; return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    $('#rec-msg').innerHTML = '<span class="err">Запись не поддерживается этим браузером.</span>'; return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    const mime = pickRecorderMime();
+    RECORDER = mime ? new MediaRecorder(stream, {mimeType: mime}) : new MediaRecorder(stream);
+    REC_CHUNKS = [];
+    REC_START = Date.now();
+    RECORDER.ondataavailable = (e) => { if (e.data && e.data.size) REC_CHUNKS.push(e.data); };
+    RECORDER.start();
+    $('#rec-start').disabled = true; $('#rec-stop').disabled = false;
+    $('#rec-msg').textContent = 'Идёт запись…';
+  } catch (e) {
+    $('#rec-msg').innerHTML = '<span class="err">Нет доступа к микрофону: ' + esc(e.message) + '</span>';
+  }
+}
+async function stopRecording() {
+  if (!RECORDER) return;
+  const projectId = $('#lab-project').value;
+  const duration = Date.now() - REC_START;
+  const mime = RECORDER.mimeType || 'audio/webm';
+  await new Promise(res => { RECORDER.onstop = res; RECORDER.stop(); });
+  RECORDER.stream.getTracks().forEach(t => t.stop());
+  $('#rec-start').disabled = false; $('#rec-stop').disabled = true;
+  const blob = new Blob(REC_CHUNKS, {type: mime});
+  RECORDER = null;
+  if (!blob.size) { $('#rec-msg').innerHTML = '<span class="err">Пустая запись.</span>'; return; }
+  $('#rec-msg').textContent = 'Сохранение…';
+  try {
+    const fd = new FormData();
+    fd.append('audio', blob, 'note.webm');
+    fd.append('duration_ms', String(duration));
+    const r = await fetch(fileBase(projectId) + '/voice', {
+      method:'POST', body: fd, headers: {'X-CSRF-Token': CSRF, 'Accept': 'application/json'}});
+    const t = await r.text();
+    let d = {}; try { d = t ? JSON.parse(t) : {}; } catch (e) { d = {error: t}; }
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    $('#rec-msg').innerHTML = '<span class="ok">Сохранено. Транскрипт не создавался на сервере.</span>';
+    await loadVoice(projectId);
+  } catch (e) { $('#rec-msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+}
+
+/* -------------------------------------------------------------- lab boot */
+let LAB_READY = false;
+async function initLab() {
+  if (!PROJECTS.length) { try { await loadProjects(); } catch (e) { /* ignore */ } }
+  fillLabProjectSelect();
+  if (!LAB_READY) {
+    LAB_READY = true;
+    $('#lab-project').onchange = async () => {
+      const pid = $('#lab-project').value;
+      await loadFiles(pid); await loadWorkspaces(pid); await loadVoice(pid);
+      $('#workspace-detail').classList.add('hidden');
+    };
+    $('#upload-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const pid = $('#lab-project').value;
+      const file = $('#upload-file').files[0];
+      if (!pid) { $('#upload-msg').innerHTML = '<span class="err">Выберите проект.</span>'; return; }
+      if (!file) { $('#upload-msg').innerHTML = '<span class="err">Выберите файл.</span>'; return; }
+      $('#upload-msg').textContent = 'Загрузка…';
+      try {
+        await uploadFile(pid, file);
+        $('#upload-file').value = '';
+        $('#upload-msg').innerHTML = '<span class="ok">Загружено.</span>';
+        await loadFiles(pid);
+      } catch (err) { $('#upload-msg').innerHTML = '<span class="err">' + esc(err.message) + '</span>'; }
+    };
+    $('#workspace-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const pid = $('#lab-project').value;
+      if (!pid) { $('#workspace-msg').innerHTML = '<span class="err">Выберите проект.</span>'; return; }
+      try {
+        await api(fileBase(pid) + '/workspaces', {method:'POST', body: JSON.stringify({name: $('#workspace-name').value})});
+        $('#workspace-name').value = '';
+        $('#workspace-msg').textContent = 'Создано.';
+        await loadWorkspaces(pid);
+      } catch (err) { $('#workspace-msg').innerHTML = '<span class="err">' + esc(err.message) + '</span>'; }
+    };
+    $('#rec-start').onclick = startRecording;
+    $('#rec-stop').onclick = stopRecording;
+  }
+  const pid = $('#lab-project').value;
+  if (pid) { await loadFiles(pid); await loadWorkspaces(pid); await loadVoice(pid); }
+}
+
+/* ----------------------------------------------------------- github panel */
+let GH_READY = false;
+async function initGithub() {
+  if (!PROJECTS.length) { try { await loadProjects(); } catch (e) { /* ignore */ } }
+  fillGhProjectSelect();
+  if (!GH_READY) {
+    GH_READY = true;
+    $('#gh-refresh').onclick = () => loadGithubRepos();
+    $('#gh-create-form').onsubmit = (e) => { e.preventDefault(); proposeCreate(); };
+  }
+  await loadGithubRepos();
+}
+async function loadGithubRepos() {
+  const box = $('#gh-repos');
+  box.innerHTML = '<p class="muted small">Загрузка…</p>';
+  try {
+    const d = await api('/api/v1/projects/' + encodeURIComponent($('#gh-project').value || '00000000-0000-0000-0000-000000000000') + '/github/repositories');
+    renderGithubRepos(d.repositories || []);
+  } catch (e) {
+    // Without a project id the request above is a 404; fall back to the
+    // account-wide discovery list, which needs no project.
+    try {
+      const d = await api('/api/github/repositories');
+      renderGithubRepos(d.repositories || []);
+    } catch (e2) { box.innerHTML = '<p class="err">' + esc(e2.message) + '</p>'; }
+  }
+}
+function renderGithubRepos(repos) {
+  const box = $('#gh-repos');
+  if (!repos.length) { box.innerHTML = '<p class="muted small">Репозитории не найдены (проверьте токен GitHub).</p>'; return; }
+  box.innerHTML = '<table><thead><tr><th>Репозиторий</th><th>Видимость</th><th>Ветка</th><th></th></tr></thead><tbody>' +
+    repos.map(r => '<tr><td class="mono">' + esc(r.full_name) + '</td>' +
+      '<td>' + (r.private ? '<span class="pill queued">Private</span>' : '<span class="pill completed">Public</span>') + '</td>' +
+      '<td class="faint mono">' + esc(r.default_branch || '—') + '</td>' +
+      '<td style="text-align:right">' +
+        '<button class="link" type="button" data-gh-detail="' + esc(r.full_name) + '">детали</button> ' +
+        '<button class="link" type="button" data-gh-vis="' + esc(r.full_name) + '" data-gh-private="' + (r.private ? '1' : '0') + '">сменить видимость</button>' +
+      '</td></tr>').join('') + '</tbody></table>';
+  box.querySelectorAll('button[data-gh-detail]').forEach(b => b.onclick = () => showRepoDetail(b.dataset.ghDetail));
+  box.querySelectorAll('button[data-gh-vis]').forEach(b => b.onclick = () => {
+    const nowPrivate = b.dataset.ghPrivate === '1';
+    proposeVisibility(b.dataset.ghVis, !nowPrivate);
+  });
+}
+async function showRepoDetail(fullName) {
+  const box = $('#gh-repos');
+  try {
+    const [owner, name] = fullName.split('/');
+    const base = '/api/v1/projects/' + encodeURIComponent($('#gh-project').value) + '/github/repositories/' + owner + '/' + name;
+    const [branches, commits, issues, pulls] = await Promise.all([
+      api(base + '/branches'), api(base + '/commits'),
+      api(base + '/issues'), api(base + '/pulls')
+    ]);
+    box.innerHTML = '<h4 class="mono">' + esc(fullName) + '</h4>' +
+      '<p class="muted small">Ветки: ' + esc((branches.branches || []).map(x => x.name).join(', ') || '—') + '</p>' +
+      '<p class="muted small">Issues: ' + esc((issues.issues || []).length) + ', Pull requests: ' + esc((pulls.pulls || []).length) + '</p>' +
+      '<div class="tablewrap"><table><thead><tr><th>Commit</th><th>Сообщение</th><th>Автор</th></tr></thead><tbody>' +
+      (commits.commits || []).slice(0, 10).map(c => '<tr><td class="mono faint">' + esc((c.sha || '').slice(0, 8)) + '</td>' +
+        '<td>' + esc(c.message) + '</td><td class="faint">' + esc(c.author || '—') + '</td></tr>').join('') +
+      '</tbody></table></div><button class="ghost" type="button" id="gh-back">Назад</button>';
+    $('#gh-back').onclick = () => loadGithubRepos();
+  } catch (e) { box.innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+function ghProjectId() {
+  const pid = $('#gh-project').value;
+  if (!pid) { $('#gh-create-msg').innerHTML = '<span class="err">Выберите проект.</span>'; return null; }
+  return pid;
+}
+async function proposeCreate() {
+  const pid = ghProjectId(); if (!pid) return;
+  const name = $('#gh-new-name').value.trim();
+  if (!name) { $('#gh-create-msg').innerHTML = '<span class="err">Введите название.</span>'; return; }
+  const vis = $('#gh-new-vis').value;
+  try {
+    const d = await api('/api/v1/projects/' + encodeURIComponent(pid) + '/github/repositories', {
+      method:'POST', body: JSON.stringify({name: name, private: vis === 'private', description: $('#gh-new-desc').value})
+    });
+    showConfirm(pid, d.action, {
+      title: 'Создание репозитория',
+      rows: [['Название', name], ['Видимость', vis === 'private' ? 'Private' : 'Public']],
+      warn: vis === 'public' ? 'Public-репозиторий будет виден всем.' : ''
+    });
+    $('#gh-create-msg').textContent = 'Подготовлено. Подтвердите ниже.';
+  } catch (e) { $('#gh-create-msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+}
+async function proposeVisibility(fullName, makePrivate) {
+  const pid = ghProjectId(); if (!pid) return;
+  try {
+    const [owner, name] = fullName.split('/');
+    const d = await api('/api/v1/projects/' + encodeURIComponent(pid) +
+      '/github/repositories/' + owner + '/' + name + '/visibility', {
+      method:'POST', body: JSON.stringify({private: makePrivate})});
+    showConfirm(pid, d.action, {
+      title: 'Изменение видимости',
+      rows: [['Репозиторий', fullName], ['Новое значение', makePrivate ? 'Private' : 'Public']],
+      warn: makePrivate ? '' :
+        'ВНИМАНИЕ: код и история станут публично доступны. Это изменение необратимо для уже опубликованных данных.'
+    });
+  } catch (e) { $('#gh-repos').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+function showConfirm(projectId, action, view) {
+  const card = $('#gh-confirm-card');
+  card.style.display = '';
+  $('#gh-confirm-body').innerHTML =
+    '<p><strong>' + esc(view.title) + '</strong></p>' +
+    '<dl class="kv">' + view.rows.map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('') + '</dl>' +
+    (view.warn ? '<div class="banner bad">' + esc(view.warn) + '</div>' : '') +
+    '<p class="muted small">Это демонстрация подтверждения. Действие выполнится на GitHub только после нажатия кнопки.</p>' +
+    '<div class="actions"><button type="button" id="gh-confirm">Подтвердить</button>' +
+    '<button type="button" class="ghost" id="gh-cancel">Отмена</button>' +
+    '<span class="muted small" id="gh-confirm-msg" role="status" aria-live="polite"></span></div>';
+  $('#gh-cancel').onclick = async () => {
+    try { await api('/api/v1/projects/' + encodeURIComponent(projectId) + '/actions/' + encodeURIComponent(action.id) + '/cancel', {method:'POST', body:'{}'}); }
+    catch (e) { /* a cancel of an expired action is not worth surfacing */ }
+    card.style.display = 'none';
+  };
+  $('#gh-confirm').onclick = async () => {
+    const btn = $('#gh-confirm');
+    btn.disabled = true;
+    $('#gh-confirm-msg').textContent = 'Выполняется…';
+    try {
+      await api('/api/v1/projects/' + encodeURIComponent(projectId) + '/actions/' + encodeURIComponent(action.id) + '/confirm', {
+        method:'POST', body: JSON.stringify({token: action.confirmation_token})});
+      $('#gh-confirm-msg').innerHTML = '<span class="ok">Готово.</span>';
+      await loadGithubRepos();
+      setTimeout(() => { card.style.display = 'none'; }, 1500);
+    } catch (e) {
+      $('#gh-confirm-msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+      btn.disabled = false;
+    }
+  };
+}
+
 /* --------------------------------------------------------------- refresh */
 async function refresh() {
   clearBanners();
@@ -1300,11 +1811,14 @@ async function boot() {
   };
   $$('.tab').forEach(tab => tab.onclick = () => {
     $$('.tab').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
-    $$('#panel-projects, #panel-new, #panel-queue, #panel-integrations, #panel-system').forEach(p => p.classList.add('hidden'));
+    $$('#panel-projects, #panel-lab, #panel-github, #panel-new, #panel-queue, #panel-integrations, #panel-system')
+      .forEach(p => p.classList.add('hidden'));
     $('#' + tab.getAttribute('aria-controls')).classList.remove('hidden');
     if (tab.id === 'tab-system') loadSystem();
     if (tab.id === 'tab-integrations') loadGitHubStatus();
     if (tab.id === 'tab-projects') loadProjects();
+    if (tab.id === 'tab-lab') initLab();
+    if (tab.id === 'tab-github') initGithub();
   });
   setupVoice();
   $('#files-form').onsubmit = async e => {

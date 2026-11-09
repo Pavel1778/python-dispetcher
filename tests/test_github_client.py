@@ -141,3 +141,88 @@ def test_payload_without_full_name_is_skipped():
     assert _repo_from_payload("not-a-dict") is None
     repo = _repo_from_payload({"full_name": "a/b"})
     assert repo is not None and repo.default_branch == "main"
+
+
+# ------------------------------------------------------------- detail reads
+def test_repository_detail_is_read_only(gh_server):
+    repo = client_for(gh_server).get_repository("Pavel1778/python-dispetcher")
+    assert repo["full_name"] == "Pavel1778/python-dispetcher"
+    assert gh_server.gh.writes == []
+
+
+def test_branches_commits_issues_and_pulls(gh_server):
+    c = client_for(gh_server)
+    assert [b["name"] for b in c.list_branches("Pavel1778/python-dispetcher")] == ["main", "dev"]
+    commits = c.list_commits("Pavel1778/python-dispetcher")
+    assert commits[0]["sha"] == "abc123" and commits[0]["message"] == "Initial commit"
+    # The issues endpoint mixes PRs in; the client filters them out.
+    assert [i["number"] for i in c.list_issues("Pavel1778/python-dispetcher")] == [1]
+    assert c.list_pulls("Pavel1778/python-dispetcher")[0]["head"] == "feature"
+    assert gh_server.gh.writes == []
+
+
+def test_detail_rejects_a_bad_full_name(gh_server):
+    with pytest.raises(ValueError):
+        client_for(gh_server).get_repository("no-slash")
+    with pytest.raises(ValueError):
+        client_for(gh_server).list_issues("a/b", state="bogus")
+
+
+# ------------------------------------------------------------ guarded writes
+def test_writer_create_repository_sends_the_body(gh_server):
+    from orchestration.github_client import GitHubWriter
+
+    writer = GitHubWriter(client_for(gh_server))
+    result = writer.create_repository(name="nexus-project", private=True,
+                                      description="lab")
+    assert result["full_name"] == "Pavel1778/nexus-project"
+    method, path, body = gh_server.gh.writes[-1]
+    assert method == "POST" and path == "/user/repos"
+    assert body == {"name": "nexus-project", "private": True,
+                    "description": "lab", "auto_init": True}
+
+
+def test_writer_rejects_a_slash_in_the_name(gh_server):
+    from orchestration.github_client import GitHubWriter
+
+    writer = GitHubWriter(client_for(gh_server))
+    with pytest.raises(ValueError):
+        writer.create_repository(name="owner/name", private=True)
+    assert gh_server.gh.writes == []
+
+
+def test_public_visibility_needs_acknowledgement(gh_server):
+    from orchestration.github_client import GitHubWriter, VisibilityError
+
+    writer = GitHubWriter(client_for(gh_server))
+    with pytest.raises(VisibilityError):
+        writer.set_repository_visibility(full_name="Pavel1778/python-dispetcher",
+                                         private=False)
+    assert gh_server.gh.writes == []  # nothing was sent
+
+
+def test_public_visibility_with_acknowledgement_writes(gh_server):
+    from orchestration.github_client import GitHubWriter
+
+    writer = GitHubWriter(client_for(gh_server))
+    result = writer.set_repository_visibility(
+        full_name="Pavel1778/python-dispetcher", private=False, acknowledge_public=True)
+    assert result["private"] is False
+    assert gh_server.gh.writes[-1] == ("PATCH", "/repos/Pavel1778/python-dispetcher",
+                                       {"private": False})
+
+
+def test_making_a_repo_private_needs_no_acknowledgement(gh_server):
+    from orchestration.github_client import GitHubWriter
+
+    writer = GitHubWriter(client_for(gh_server))
+    writer.set_repository_visibility(full_name="Pavel1778/Klyrshift", private=True)
+    assert gh_server.gh.writes[-1] == ("PATCH", "/repos/Pavel1778/Klyrshift", {"private": True})
+
+
+def test_writer_repr_never_exposes_the_token(gh_server):
+    from orchestration.github_client import GitHubWriter
+
+    writer = GitHubWriter(client_for(gh_server))
+    assert TOKEN not in repr(writer)
+    assert "configured=True" in repr(writer)

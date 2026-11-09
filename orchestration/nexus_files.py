@@ -51,9 +51,27 @@ class FileService:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT id, project_id, name, size, sha256, created_by, created_at "
-                        "FROM nexus_files WHERE project_id=%s ORDER BY created_at DESC, id LIMIT %s",
+                        "FROM nexus_files WHERE project_id=%s AND name IS NOT NULL "
+                        "ORDER BY created_at DESC, id LIMIT %s",
                         (project_id, MAX_PROJECT_FILES))
             return [dict(row) for row in cur.fetchall()]
+
+    def is_opaque(self, principal: str, project_id: str, file_id: str) -> bool:
+        """Whether a file row was written by this (opaque) service.
+
+        The unified ``nexus_files`` table holds rows from two upload designs.
+        An opaque row carries ``name``; a File Lab row carries ``filename``.
+        The GET route uses this to decide between a raw attachment and a JSON
+        preview without changing either contract.
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT (name IS NOT NULL) AS opaque FROM nexus_files "
+                        "WHERE project_id=%s AND id=%s", (project_id, file_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("file not found")
+            return bool(row["opaque"])
 
     def download(self, principal: str, project_id: str, file_id: str) -> dict:
         with self.store._tx() as cur:
