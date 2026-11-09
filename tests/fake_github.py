@@ -40,6 +40,8 @@ class FakeGitHub:
         self.paths: list[str] = []
         #: Page size used to emulate pagination; 0 disables paging.
         self.page_size = 0
+        #: The authenticated login returned by GET /user.
+        self.login = "Pavel1778"
         #: Every write the fake received, as ``(method, path, body)``.
         self.writes: list[tuple[str, str, dict]] = []
         #: Extra read payloads keyed by path suffix, for the detail endpoints.
@@ -111,6 +113,10 @@ class _Handler(BaseHTTPRequestHandler):
                 per_page = gh.page_size
             start = (page - 1) * per_page
             self._json(200, gh.repos[start:start + per_page])
+            return
+
+        if parsed.path == "/user":
+            self._json(200, {"login": gh.login, "type": "User"})
             return
 
         # /repos/{owner}/{name}[/section]

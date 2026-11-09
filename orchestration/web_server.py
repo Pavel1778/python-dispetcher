@@ -357,12 +357,14 @@ class App:
         # The web server can *start* a run; a separate worker process advances
         # it, so closing the browser never stops execution.
         from .nexus_context import ContextService, MemoryService
+        from .nexus_github_accounts import GitHubAccountService
         from .nexus_lab_store import LabStore
         from .nexus_planner import Planner
         self.lab = LabStore(self.store)
         self.context = ContextService(self.store)
         self.memory = MemoryService(self.store)
         self.planner = Planner(self.providers)
+        self.github_accounts = GitHubAccountService(self.store)
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -1190,6 +1192,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"run": self.app.lab.set_run_state(
                 principal, project_id, rest[1], state)})
             return True
+        # POST /api/v1/projects/{id}/github/account  (bind one account)
+        if rest == ["github", "account"]:
+            account_id = body.get("account_id")
+            if account_id is not None and not UUID_RE.fullmatch(str(account_id)):
+                self._json(400, {"error": "account_id must be a uuid or null"})
+                return True
+            try:
+                project = self.app.github_accounts.bind_project(
+                    principal, project_id, str(account_id) if account_id else None)
+            except NotFound:
+                self._json(404, {"error": "account not found or not active"})
+                return True
+            self._json(200, {"project": project})
+            return True
         return False
 
     def _lab_refresh_context(self, principal: str, project_id: str, body: dict) -> None:
@@ -1704,6 +1720,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
                 return self._json(200, self.app.system_info())
+            if path == "/api/github/accounts":
+                # Token-free views only; the PAT never leaves the server.
+                return self._json(200, {"accounts": self.app.github_accounts.list_accounts(
+                    self._project_principal())})
             if path == "/api/config":
                 return self._json(200, {
                     "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
@@ -1902,6 +1922,15 @@ class Handler(BaseHTTPRequestHandler):
                 goal, created = self.app.projects.create_goal(
                     principal, parsed[0], body.get("text"), self.headers.get("Idempotency-Key"))
                 return self._json(201 if created else 200, {"goal": goal, "created": created})
+            if path == "/api/github/accounts":
+                try:
+                    account = self.app.github_accounts.add(
+                        self._project_principal(),
+                        label=body.get("label"), token=body.get("token"),
+                        base_url=(body.get("base_url") or None))
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(201, {"account": account})
             if path == "/api/repositories":
                 name = (body.get("full_name") or "").strip()
                 if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
