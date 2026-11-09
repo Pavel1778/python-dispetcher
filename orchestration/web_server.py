@@ -90,6 +90,7 @@ from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
+from .nexus_planner import store_plan
 from .providers import ProviderCascade
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
@@ -352,6 +353,16 @@ class App:
         # OpenHands). It only proposes plans; it never executes them. Only
         # configured providers are used, and only their presence is reported.
         self.providers = ProviderCascade()
+        # The autonomous lab: durable runs/tasks, project context and memory.
+        # The web server can *start* a run; a separate worker process advances
+        # it, so closing the browser never stops execution.
+        from .nexus_context import ContextService, MemoryService
+        from .nexus_lab_store import LabStore
+        from .nexus_planner import Planner
+        self.lab = LabStore(self.store)
+        self.context = ContextService(self.store)
+        self.memory = MemoryService(self.store)
+        self.planner = Planner(self.providers)
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -1026,6 +1037,27 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/v1/projects/{id}/actions/{action_id}
         if len(rest) == 2 and rest[0] == "actions" and UUID_RE.fullmatch(rest[1]):
             return (200, {"action": self.app.actions.get(principal, rest[1])}, None)
+        # GET /api/v1/projects/{id}/runs            (the autonomous lab)
+        if rest == ["runs"]:
+            return (200, {"runs": self.app.lab.list_runs(principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/runs/{run_id}
+        if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
+            run = self.app.lab.get_run(principal, project_id, rest[1])
+            tasks = self.app.lab.list_tasks(principal, project_id, rest[1])
+            return (200, {"run": run, "tasks": tasks}, None)
+        # GET /api/v1/projects/{id}/context          (current project context)
+        if rest == ["context"]:
+            return (200, {"context": self.app.context.current(principal, project_id)}, None)
+        # GET /api/v1/projects/{id}/memory?q=...
+        if rest and rest[0] == "memory" and len(rest) == 1:
+            query = None
+            if "?" in path:
+                from urllib.parse import parse_qs
+                query = (parse_qs(path.split("?", 1)[1]).get("q") or [None])[0]
+            return (200, {"memory": self.app.memory.retrieve(principal, project_id, query=query)}, None)
+        # GET /api/v1/projects/{id}/notifications
+        if rest == ["notifications"]:
+            return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
         # GET /api/v1/projects/{id}/github/repositories[/{owner}/{name}[/section]]
         if rest and rest[0] == "github" and len(rest) >= 2 and rest[1] == "repositories":
             # The GitHub views read no project data, but the route still names a
@@ -1142,7 +1174,101 @@ class Handler(BaseHTTPRequestHandler):
                 project_id=project_id)
             self._json(201, {"action": action})
             return True
+        # POST /api/v1/projects/{id}/context/refresh  (analyze the repository)
+        if rest == ["context", "refresh"]:
+            self._lab_refresh_context(principal, project_id, body)
+            return True
+        # POST /api/v1/projects/{id}/goals/{gid}/run  (start an autonomous run)
+        if (len(rest) == 3 and rest[0] == "goals" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "run"):
+            self._lab_start_run(principal, project_id, rest[1], body)
+            return True
+        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel}
+        if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] in ("pause", "resume", "cancel")):
+            state = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[rest[2]]
+            self._json(200, {"run": self.app.lab.set_run_state(
+                principal, project_id, rest[1], state)})
+            return True
         return False
+
+    def _lab_refresh_context(self, principal: str, project_id: str, body: dict) -> None:
+        """Read the project's bound repository and store a context snapshot."""
+        from .nexus_analysis import analyze_repository
+
+        repository = (body.get("repository") or "").strip()
+        if not repository:
+            self._json(400, {"error": "repository (owner/name) is required"})
+            return
+        branch = (body.get("branch") or "").strip() or None
+        try:
+            summary = analyze_repository(self.app.github, repository, branch=branch)
+        except GitHubAuthError as e:
+            self._json(400, {"error": f"github auth: {e}"})
+            return
+        except GitHubUnavailable as e:
+            self._json(503, {"error": f"github unavailable: {e}"})
+            return
+        except GitHubError as e:
+            self._json(502, {"error": f"github: {e}"})
+            return
+        row, created = self.app.context.refresh(
+            principal, project_id, repository=repository,
+            revision=summary.get("revision") or "", summary=summary)
+        self._json(201 if created else 200, {"context": row, "created": created})
+
+    def _lab_start_run(self, principal: str, project_id: str, goal_id: str,
+                       body: dict) -> None:
+        """Plan the goal (provider cascade) and start a run. Nothing runs inline.
+
+        The plan is validated by the application; a provider outage is a 503,
+        not a fabricated plan. Starting the run does not dispatch: the durable
+        worker advances it, so closing the browser cannot stop it.
+        """
+        from .providers import AllProvidersFailed, ProviderError
+
+        # Membership + goal existence are checked by start_run; read the goal
+        # text and project name for the prompt first.
+        try:
+            project = self.app.projects.get(principal, project_id)
+            goals = self.app.projects.list_goals(principal, project_id)
+        except NotFound:
+            self._json(404, {"error": "not found"})
+            return
+        goal = next((g for g in goals if str(g["id"]) == goal_id), None)
+        if goal is None:
+            self._json(404, {"error": "goal not found"})
+            return
+        context = self.app.context.current(principal, project_id)
+        memory = self.app.memory.retrieve(principal, project_id, limit=30)
+        try:
+            tasks, meta = self.app.planner.plan(
+                goal=goal["text"], project_name=project["name"],
+                context=(context or {}).get("summary") or {}, memory=memory)
+        except AllProvidersFailed as e:
+            self._json(503, {"error": "no orchestrator provider succeeded",
+                             "failures": e.failures})
+            return
+        except ProviderError as e:
+            self._json(503, {"error": str(e)})
+            return
+        except ValueError as e:
+            self._json(502, {"error": f"provider returned an invalid plan: {e}"})
+            return
+        repository = (body.get("repository") or "").strip()
+        branch = (body.get("branch") or "").strip()
+        try:
+            run = self.app.lab.start_run(
+                principal, project_id, goal_id,
+                max_iterations=int(body.get("max_iterations") or 50),
+                max_attempts_per_task=int(body.get("max_attempts_per_task") or 3),
+                deadline_seconds=int(body["deadline_seconds"]) if body.get("deadline_seconds") else None)
+        except ValueError as e:
+            self._json(409, {"error": str(e)})
+            return
+        stored = store_plan(self.app.lab, principal, project_id, str(run["id"]),
+                            tasks=tasks, repository=repository, branch=branch)
+        self._json(201, {"run": run, "tasks": stored, "plan": meta})
 
     def _confirm_action(self, principal: str, project_id: str, action_id: str,
                         body: dict):
