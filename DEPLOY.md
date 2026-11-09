@@ -298,7 +298,38 @@ psql "$SUPABASE_DB_URL" -f migrations/0008_sr_lifecycle.sql
 psql "$SUPABASE_DB_URL" -f migrations/0009_nexus_projects.sql
 psql "$SUPABASE_DB_URL" -f migrations/0010_nexus_plans.sql
 psql "$SUPABASE_DB_URL" -f migrations/0011_nexus_files.sql
+psql "$SUPABASE_DB_URL" -f migrations/0014_nexus_project_binding.sql
 ```
+
+`0012` and `0013` are intentionally unused: they are reserved for the deferred
+File Lab (D-1) workstream. The runner applies every `*.sql` in lexical order and
+does not require a contiguous sequence, so the gap is safe.
+
+`0014_nexus_project_binding.sql` is additive: it adds the project↔repository
+link table, nullable `project_id` on `tasks`/`workflows`, the canonical
+repository-identity trigger and the `nexus_evidence` table. It does **not**
+backfill legacy rows; a legacy task/workflow keeps `project_id IS NULL`.
+
+### Backup and restore
+
+Before applying a new migration to a database with real data, back it up:
+
+```
+pg_dump "$SUPABASE_DB_URL" --format=custom --file=nexus-$(date +%F).dump
+```
+
+Restore into a **disposable** database and verify the schema guard, then point
+the service at it:
+
+```
+createdb nexus_restore
+pg_restore --dbname=nexus_restore --no-owner nexus-2026-01-01.dump
+psql "postgresql://.../nexus_restore" -c "SELECT filename FROM schema_migrations ORDER BY filename;"
+```
+
+`tests/test_migration_d2.py` exercises the apply/idempotency/legacy-preservation
+properties against a disposable database; it is the automated proxy for a
+restore drill, not a substitute for one against a real backup.
 
 Do not run migrations against production without authorization. Applying them on
 boot is still a deliberate step: it happens once per file, the SQL is

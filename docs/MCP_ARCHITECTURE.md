@@ -1,8 +1,15 @@
 # NEXUS MCP — Architecture (design)
 
-Status: **design only.** Nothing here is implemented. This specifies the MCP
-client and server (brief §6) and is written to reuse existing NEXUS services
-rather than duplicate them.
+Status: **partly implemented.** The **server** is implemented
+(`orchestration/mcp_server.py`, stdio transport) with the limited tool set in
+§4; see [MVP_RELEASE_REPORT.md](MVP_RELEASE_REPORT.md). The **client** and the
+Streamable-HTTP transport remain designs below and are **not** implemented.
+
+Implemented tools: `list_projects`, `get_project`, `list_repositories`,
+`list_tasks`, `get_task`, `create_task`, `dispatch_task`,
+`get_execution_status`, `list_evidence`, `verify_evidence`. Every write
+re-checks project membership through the same services the HTTP API uses; there
+is no shell/SQL/eval tool.
 
 ---
 
