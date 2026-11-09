@@ -2465,7 +2465,7 @@ class Handler(BaseHTTPRequestHandler):
                         conversation = self.app.conversations.set_mode(
                             principal, project_id, rest[1], body["mode"])
                     return self._json(200, {"conversation": conversation})
-                return self._json(404, {"error": "not found"})
+                # Any other sub-resource falls through to the project PATCH below.
             parsed = self._project_path(path)
             if parsed is None or parsed[1]:
                 return self._json(404, {"error": "not found"})

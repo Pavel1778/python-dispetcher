@@ -177,7 +177,7 @@ class Provider:
 
     def complete(self, prompt: str, system: str = "") -> ProviderResponse:
         """Call the provider, retrying only transient failures, bounded."""
-        text = self._text_with_retry(prompt, system)
+        text, attempts = self._text_with_retry(prompt, system)
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as e:
@@ -185,7 +185,7 @@ class Provider:
         if not isinstance(parsed, dict):
             raise ProviderRejected(f"{self.name}: completion was not a JSON object")
         return ProviderResponse(provider=self.name, model=self.model,
-                                data=parsed, attempts=1)
+                                data=parsed, attempts=attempts)
 
     def complete_text(self, prompt: str, system: str = "") -> str:
         """Call the provider and return the raw text of its answer.
@@ -193,9 +193,9 @@ class Provider:
         Used by the chat surface, which needs prose, not a plan. The retry
         policy is identical: only a transient failure is retried, bounded.
         """
-        return self._text_with_retry(prompt, system)
+        return self._text_with_retry(prompt, system)[0]
 
-    def _text_with_retry(self, prompt: str, system: str) -> str:
+    def _text_with_retry(self, prompt: str, system: str) -> tuple[str, int]:
         if not self.configured:
             raise ProviderAuthError(f"{self.name}: no API key configured")
         attempts = 0
@@ -213,7 +213,7 @@ class Provider:
             text = self._extract_text(body)
             if not text:
                 raise ProviderRejected(f"{self.name}: empty completion")
-            return text
+            return text, attempts
         raise last or ProviderUnavailable(f"{self.name}: exhausted retries")
 
 

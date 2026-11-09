@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "Диспетчер OpenHands — NEXUS",
-  "short_name": "Диспетчер",
-  "description": "Панель управления проектами и задачами диспетчера",
+  "name": "NEXUS — AI Development Environment",
+  "short_name": "NEXUS",
+  "description": "NEXUS: рабочий стол разработки с ИИ — чат, IDE и автономные агенты",
   "lang": "ru",
   "start_url": "/",
   "scope": "/",

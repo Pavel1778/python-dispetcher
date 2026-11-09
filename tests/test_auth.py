@@ -232,8 +232,8 @@ def test_cookie_is_secure_on_https(server, browser):
 def test_login_page_redirects_when_already_logged_in(browser):
     browser.login()
     st, raw, _ = browser.request("GET", "/login")
-    # Followed the redirect to the dashboard, not the login form.
-    assert "Диспетчер OpenHands" in raw
+    # Followed the redirect to the workspace, not the login form.
+    assert "NEXUS" in raw
 
 
 # --------------------------------------------------------------- protected
