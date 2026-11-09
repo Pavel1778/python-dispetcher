@@ -9,3 +9,5 @@ state/
 .env.*
 !.env.example
 .audit-baseline/
+dist/
+*.deb

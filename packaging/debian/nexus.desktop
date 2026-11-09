@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NEXUS
+GenericName=AI Development Lab
+Comment=Open the NEXUS autonomous development lab dashboard
+Exec=nexus-client
+Icon=nexus
+Terminal=false
+Categories=Development;
+Keywords=AI;Development;Automation;NEXUS;
+StartupNotify=true
