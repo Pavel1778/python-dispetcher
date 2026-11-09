@@ -299,6 +299,8 @@ psql "$SUPABASE_DB_URL" -f migrations/0009_nexus_projects.sql
 psql "$SUPABASE_DB_URL" -f migrations/0010_nexus_plans.sql
 psql "$SUPABASE_DB_URL" -f migrations/0011_nexus_files.sql
 psql "$SUPABASE_DB_URL" -f migrations/0014_nexus_project_binding.sql
+psql "$SUPABASE_DB_URL" -f migrations/0015_task_workspace_lock.sql
+psql "$SUPABASE_DB_URL" -f migrations/0016_secret_tables_rls.sql
 ```
 
 `0012` and `0013` are intentionally unused: they are reserved for the deferred
@@ -309,6 +311,10 @@ does not require a contiguous sequence, so the gap is safe.
 link table, nullable `project_id` on `tasks`/`workflows`, the canonical
 repository-identity trigger and the `nexus_evidence` table. It does **not**
 backfill legacy rows; a legacy task/workflow keeps `project_id IS NULL`.
+
+`0015_task_workspace_lock.sql` adds the partial unique index that serializes
+repository work across processes. `0016_secret_tables_rls.sql` locks the sandbox
+session-key tables. Both are additive and idempotent.
 
 ### Backup and restore
 

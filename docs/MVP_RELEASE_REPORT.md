@@ -95,6 +95,43 @@ real component status (database, OpenHands, GitHub, auth, evidence).
 `GET /readyz` — liveness plus a real database round-trip (503 when the DB is
 unreachable). `GET /healthz` stays a one-line probe.
 
+### 2.8 Repository selection is explicit on the direct transport
+
+The `direct` transport starts a sandbox conversation in an empty
+`LocalWorkspace` and has no native `selected_repository` field, so a repository
+task used to run against the wrong (empty) checkout with no error.
+`OPENHANDS_DIRECT_REPO_MODE` now controls it: `prompt` (default) prepends a
+deterministic clone instruction, `refuse` raises so the task dead-letters with a
+clear reason, `allow` keeps the old behavior. `supports_repository_selection` is
+exposed on the client, `/api/config` and the System screen.
+
+### 2.9 Database-enforced workspace lock (migration `0015`)
+
+`claim_task`'s workspace check read other rows, so two dispatchers could claim
+two different queued tasks for one repository+branch at the same instant. A
+partial unique index (`uq_tasks_workspace_active`) now enforces exclusivity in
+the database; `claim_task` claims inside a savepoint and treats a
+`UniqueViolation` as "workspace taken". Repository-less tasks never contend.
+
+### 2.10 MCP Streamable HTTP
+
+`POST /mcp` serves the same JSON-RPC tool surface over HTTP, mounted on the web
+server with its session/CSRF or bearer auth. A notification returns 202, a parse
+error 400.
+
+### 2.11 Secret-table RLS (migration `0016`)
+
+`conversation_routes` and `cloud_sandboxes` store a live sandbox
+`session_api_key`; they now have RLS enabled with no client policy and their
+default grants revoked, so a Supabase `anon`/`authenticated` role cannot read a
+key through PostgREST.
+
+### 2.12 Task and workflow detail views
+
+Each task and workflow row in the project panel loads the real record: task
+events, attempt/owner, conversation id and result; workflow Sr state with a link
+to the Cloud transcript, the failure reason and its child tasks.
+
 ---
 
 ## 3. Verification
@@ -103,15 +140,19 @@ All commands run in this sandbox on PostgreSQL 17.
 
 | Check | Command | Result |
 |---|---|---|
-| Full test suite | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | **451 passed, 1 skipped** |
+| Full test suite | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | **465 passed, 1 skipped** |
 | Lint | `python -m ruff check .` | **All checks passed** |
 | Migrations | `tests/test_migration_d2.py` | apply + record + idempotent + legacy preserved |
-| Browser E2E | `tests/test_browser_e2e.py` (Chromium) | **passed** — full journey + mobile overflow |
+| Backup/restore drill | `tests/test_backup_restore.py` | real `pg_dump` → `pg_restore` into a fresh DB; data intact |
+| Secret-table RLS | `tests/test_backup_restore.py` | `conversation_routes`/`cloud_sandboxes` RLS + no PUBLIC grant |
+| Browser E2E | `tests/test_browser_e2e.py` (Chromium) | **passed** — full journey, detail view, mobile overflow |
 | Security negative | `tests/test_project_binding.py`, `test_evidence_trust.py`, `test_route_auth.py`, `test_cli_mcp.py`, `test_dispatch_authorization.py` | **passed** |
+| Workspace lock | `tests/test_reliability.py` | two-connection race + deterministic index test |
+| Direct repo mode | `tests/test_cloud_direct.py` | prompt / refuse / allow / repository-less |
 | Clean startup | server start + `GET /healthz` / `GET /readyz` | **200 / ready** |
 | Docker Compose | `docker compose up --build` then `/readyz`, `/login`, CLI | **ready / 200 / works** |
 
-New test files (62 new tests over the 382 baseline):
+New test files (83 new tests over the 382 baseline):
 
 - `test_evidence_trust.py` — signing, verification, tamper detection, key
   revocation, hash chain, project-scoped storage, cross-project read refusal.
@@ -127,6 +168,9 @@ New test files (62 new tests over the 382 baseline):
 - `test_browser_e2e.py` — the real user journey in Chromium.
 - `test_migration_d2.py` — migration apply/idempotency/legacy preservation and
   the readiness endpoint.
+- `test_backup_restore.py` — a real `pg_dump`/`pg_restore` drill and the
+  secret-table RLS check.
+- `test_cloud_direct.py` (extended) — the direct transport's repository modes.
 
 ---
 
@@ -148,20 +192,24 @@ E2E_VERIFIED.
 | Dispatch authorization (project/repo/branch/member) | IMPLEMENTED, TESTED |
 | Execution state durability | IMPLEMENTED, TESTED |
 | OpenHands adapter (create/track/result/timeout/retry/recovery) | IMPLEMENTED, TESTED against the fake Cloud; **live execution UNVERIFIED** |
+| Repository selection on the direct transport | IMPLEMENTED (explicit prompt/refuse/allow), TESTED; **live clone UNVERIFIED** |
+| Database-enforced workspace lock | IMPLEMENTED, TESTED (concurrency + index) |
 | Failure is never reported as success | IMPLEMENTED, TESTED |
 | Evidence Trust Engine (Ed25519, keyring, chain, verdicts) | IMPLEMENTED, TESTED |
 | Evidence repository identity + commit | IMPLEMENTED, TESTED, BROWSER_VERIFIED |
 | Project-scoped evidence signing | IMPLEMENTED, TESTED |
 | UI shows real statuses | IMPLEMENTED, BROWSER_VERIFIED |
+| UI task/workflow detail views | IMPLEMENTED, BROWSER_VERIFIED |
 | No critical IDOR / cross-project access | IMPLEMENTED, TESTED |
 | CLI core operations | IMPLEMENTED, TESTED |
-| MCP limited tool set | IMPLEMENTED, TESTED |
+| MCP limited tool set (stdio) | IMPLEMENTED, TESTED |
+| MCP Streamable HTTP | IMPLEMENTED, TESTED |
 | Dashboard shows real data | IMPLEMENTED, TESTED |
 | PWA (manifest, service worker, no-store on private) | IMPLEMENTED, TESTED |
 | Integration diagnostics | IMPLEMENTED, TESTED |
 | Security events visible to operator | IMPLEMENTED, TESTED |
+| Backup/restore drill | IMPLEMENTED, TESTED |
 | Live OpenHands end-to-end | **UNVERIFIED** (no key in sandbox) |
-| Streamable-HTTP MCP transport | NOT_IMPLEMENTED (documented) |
 | File Lab (D-1), Android, voice, multi-account, billing | NOT_IMPLEMENTED (deferred by the brief) |
 
 ---
@@ -189,19 +237,20 @@ verification, which is an environment gap, not a missing feature.
 1. **Live OpenHands execution is unverified here** (no API key). Provide
    `OPENHANDS_API_KEY` (and `OPENHANDS_DEFAULT_MODEL` if the sandbox default has
    no key) and run `tests/e2e_cloud_sr_jr.py` to close it.
-2. **`selected_repository`/`selected_branch` are not proven to be applied by the
-   `direct` transport** (documented in `DEPLOY.md` / `NEXUS-SPEC.md`). The
-   *authorization* is enforced; that the remote checkout honours the selection is
-   not asserted by this code.
-3. **`session_api_key` is stored in `conversation_routes`/`cloud_sandboxes`**
-   (migration `0007`). Those tables need a grant/RLS review before multi-tenant
-   use; the MVP is single-owner.
-4. **Legacy RLS is permissive** (`USING (true)`) on the pre-NEXUS tables. New
-   `nexus_*` tables are locked; the legacy ones are not project-isolated.
-5. **Workspace claim is a check, not a cross-process lock** (`claim_task`).
-   Documented in `NEXUS-SPEC.md`; unchanged here.
-6. **Single-owner auth.** There is no membership-management UI; the machine
+2. **The `direct` transport selects a repository by instruction, not natively.**
+   `supports_repository_selection` is `False`; the default `prompt` mode tells
+   the agent to clone the repository itself, and `refuse` mode blocks the task
+   instead. Whether the clone actually happens is only provable with a live key.
+3. **Legacy RLS is permissive** (`USING (true)`) on the pre-NEXUS tables
+   (`workflows`, `tasks`, `conversations`, `task_events`). They are not
+   project-isolated. The new `nexus_*` tables and the secret tables are locked.
+4. **Single-owner auth.** There is no membership-management UI; the machine
    bearer acts as the configured owner. Multi-user IAM is out of MVP scope.
+
+Resolved since the first report: the workspace claim is now a real
+database-enforced lock (migration `0015`); the sandbox `session_api_key` tables
+now have RLS (migration `0016`); the `direct` transport no longer silently
+ignores repository selection; MCP Streamable HTTP is implemented.
 
 ---
 
@@ -238,12 +287,12 @@ python -m ruff check .
 ## 8. Next five actions
 
 1. Provide a live OpenHands key and run `tests/e2e_cloud_sr_jr.py`; record the
-   result in §5.
-2. Prove (or document as unsupported) that `direct` applies
-   `selected_repository`/`selected_branch`, and gate dispatch on the answer.
-3. Review grants/RLS for `conversation_routes`/`cloud_sandboxes`
-   (`session_api_key`) and the legacy tables.
-4. Decide the File Lab (D-1) unification (the colliding `0011`) or keep it
+   result in §5. This is the only P0 gap.
+2. Decide the `direct` repository-selection policy for production
+   (`OPENHANDS_DIRECT_REPO_MODE`) and prove the chosen mode against a live key.
+3. Decide the File Lab (D-1) unification (the colliding `0011`) or keep it
    deferred explicitly.
-5. Implement the workspace cross-process lock (DB constraint or advisory lock)
-   so two conversations can never share one checkout.
+4. Tighten the legacy tables' RLS (`USING (true)`) to project-scoped policies
+   once a user/organization model exists.
+5. Add a lightweight CI job that runs the browser E2E and the backup/restore
+   drill (they need Chromium and the pg client tools).

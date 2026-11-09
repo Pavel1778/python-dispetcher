@@ -496,3 +496,33 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
   `test_dispatch_authorization.py`, `test_route_auth.py`, `test_cli_mcp.py`,
   `test_browser_e2e.py`, `test_migration_d2.py`. `docs/MVP_RELEASE_REPORT.md`
   states what is verified and what still needs a live OpenHands key.
+
+## Additional MVP invariants (round two)
+
+- **`OPENHANDS_DIRECT_REPO_MODE` governs repository selection on the direct
+  transport.** The sandbox agent-server create call has no `selected_repository`
+  field; the workspace starts empty. `prompt` (default) prepends a deterministic
+  clone instruction, `refuse` raises so the task dead-letters, `allow` is the old
+  silent-ignore behavior. `CloudClient.supports_repository_selection` is `True`,
+  `CloudDirectClient`'s is `False`; both are surfaced in `/api/config` and the
+  System screen. Never go back to silently ignoring the field.
+- **The workspace lock is the database index, not the check.** Migration `0015`
+  adds `uq_tasks_workspace_active` (partial unique on
+  `(selected_repository, COALESCE(selected_branch,''))` over the active states).
+  `claim_task` claims inside a `SAVEPOINT` and treats a `UniqueViolation` as
+  "workspace taken". The `_workspace_holder` read is only the fast path.
+  Repository-less tasks never contend (NULL is distinct in a unique index).
+- **The sandbox session-key tables have RLS.** Migration `0016` enables RLS and
+  revokes PUBLIC/anon/authenticated grants on `conversation_routes` and
+  `cloud_sandboxes`. They hold a live `session_api_key`; do not add a client
+  policy. The app connects as the owner and bypasses RLS.
+- **MCP has two transports.** stdio (`python -m orchestration.mcp_server`) and
+  Streamable HTTP at `POST /mcp`, which reuses the web server's session/CSRF or
+  bearer auth. A notification returns 202, a parse error 400. The tool surface
+  re-checks project membership either way.
+- **`tests/test_backup_restore.py` is the restore drill.** A real
+  `pg_dump`/`pg_restore` into a fresh database; keep it passing — it is the
+  automated proof that a dump restores.
+- **Migrations are now `0001`–`0011`, `0014`, `0015`, `0016`.** `0012`/`0013`
+  stay reserved for the deferred File Lab. The runner applies `*.sql` in lexical
+  order; a gap is fine.

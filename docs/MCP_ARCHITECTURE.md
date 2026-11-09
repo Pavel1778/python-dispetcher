@@ -1,9 +1,11 @@
 # NEXUS MCP — Architecture (design)
 
 Status: **partly implemented.** The **server** is implemented
-(`orchestration/mcp_server.py`, stdio transport) with the limited tool set in
-§4; see [MVP_RELEASE_REPORT.md](MVP_RELEASE_REPORT.md). The **client** and the
-Streamable-HTTP transport remain designs below and are **not** implemented.
+(`orchestration/mcp_server.py`) over two transports: stdio
+(`python -m orchestration.mcp_server`) and Streamable HTTP at `POST /mcp`,
+mounted on the web server with its session/CSRF or bearer auth. See
+[MVP_RELEASE_REPORT.md](MVP_RELEASE_REPORT.md). The **client** (NEXUS connecting
+to external MCP servers) remains a design below and is **not** implemented.
 
 Implemented tools: `list_projects`, `get_project`, `list_repositories`,
 `list_tasks`, `get_task`, `create_task`, `dispatch_task`,

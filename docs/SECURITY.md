@@ -81,13 +81,15 @@ public allowlist stays reachable. A protected endpoint added without wiring
 
 ## 7. Open items (real, not exhaustive)
 
-1. `session_api_key` is stored in `conversation_routes`/`cloud_sandboxes`
-   (migration `0007`); those tables need a grant/RLS review.
-2. Legacy tables use permissive RLS (`USING (true)`). New `nexus_*` tables are
-   locked; the legacy ones are not project-isolated.
-3. `claim_task`'s workspace check is not a cross-process lock.
-4. Single-owner auth: no membership-management UI; the bearer is owner-level.
-5. The `direct` transport does not prove it applied
-   `selected_repository`/`selected_branch` to the remote checkout.
+1. Legacy tables use permissive RLS (`USING (true)`). New `nexus_*` tables and
+   the secret tables (`conversation_routes`, `cloud_sandboxes`, migration `0016`)
+   are locked; the legacy ones are not project-isolated.
+2. The `direct` transport selects a repository by instruction, not natively
+   (`OPENHANDS_DIRECT_REPO_MODE`; `supports_repository_selection` is `False`).
+   Whether the agent actually clones is only provable with a live key.
+3. Single-owner auth: no membership-management UI; the bearer is owner-level.
+
+Resolved: the workspace claim is now a database-enforced lock (migration
+`0015`); the sandbox session-key tables have RLS (migration `0016`).
 
 Passing the test suite is not, by itself, a claim that the system is secure.
