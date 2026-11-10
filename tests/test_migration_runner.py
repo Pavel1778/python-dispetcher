@@ -8,12 +8,14 @@ not a mock of it. The cases map one-to-one onto the audit's list:
 2. a failing migration is visible, not marked applied;
 3. migrations after a failure do not run;
 4. the error names the exact migration;
-5. a changed body for an already-applied migration is refused, not re-run;
+5. a changed body for an already-applied migration is refused, not re-run —
+   whether or not the manifest was updated along with the file;
 6. a duplicate number is refused (the ``0011`` case), with both files named;
 7. an applied history that skips a step is refused;
 8. a clean bootstrap applies everything and is idempotent;
 9. an upgrade of a database from the ``main`` schema converges and verifies;
-10. the manifest itself tracks the files it claims to describe.
+10. the manifest itself tracks the files it claims to describe, and the runner
+    refuses a body the manifest did not review.
 
 Tests 1-7 use a temporary directory with synthetic migrations so the real
 ``migrations/`` directory is never mutated, and every test runs in its own
@@ -219,6 +221,64 @@ def test_editing_an_applied_migration_is_refused_not_re_executed(
         assert {r[0] for r in cur.fetchall()} == {"id"}
 
 
+def test_editing_an_applied_migration_without_touching_the_manifest_is_refused(
+        schema_dsn, tmp_migrations):
+    """The edit nobody reviews: the file changes and the manifest does not.
+
+    This is the shape of the real incident — ``0011`` rewritten in place on
+    ``main`` — because whoever edits an applied migration is not thinking about a
+    manifest. Both bodies are idempotent on purpose, like the real migrations: the
+    edited file *would* run cleanly, so only a checksum gate can stop it. Without
+    one the recorded history still equals the manifest, the apply loop re-executes
+    the new body and overwrites the recorded checksum, and nothing reports it.
+    """
+    _, dsn = schema_dsn
+    add_migration(tmp_migrations, "0001_table.sql",
+                  "CREATE TABLE IF NOT EXISTS t (id int);")
+    write_manifest(tmp_migrations)
+    assert migrate(dsn, tmp_migrations) == ["0001_table.sql"]
+    before = recorded(dsn)
+
+    # The applied file is edited; the manifest is left exactly as reviewed.
+    add_migration(tmp_migrations, "0001_table.sql",
+                  "CREATE TABLE IF NOT EXISTS t (id int);\n"
+                  "ALTER TABLE t ADD COLUMN IF NOT EXISTS extra text;")
+    with pytest.raises(MigrationError) as exc:
+        migrate(dsn, tmp_migrations)
+    assert exc.value.kind == "manifest_mismatch"
+    assert exc.value.filename == "0001_table.sql"
+    # Nothing ran, and the history was not rewritten to match the edit.
+    assert recorded(dsn) == before
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='t' AND table_schema=current_schema()"
+        )
+        assert {r[0] for r in cur.fetchall()} == {"id"}
+
+
+def test_a_body_the_manifest_did_not_review_is_refused_on_an_empty_database(
+        schema_dsn, tmp_migrations):
+    """With no history to compare against, the manifest checksum is the only gate.
+
+    The refusal happens in pre-flight, so the database is left untouched: not even
+    the ``schema_migrations`` bookkeeping table is created.
+    """
+    _, dsn = schema_dsn
+    add_migration(tmp_migrations, "0001_table.sql", "CREATE TABLE t (id int);")
+    write_manifest(tmp_migrations)
+    add_migration(tmp_migrations, "0001_table.sql",
+                  "CREATE TABLE t (id int, extra text);")
+    with pytest.raises(MigrationError) as exc:
+        migrate(dsn, tmp_migrations)
+    assert exc.value.kind == "manifest_mismatch"
+    assert exc.value.filename == "0001_table.sql"
+    assert set(exc.value.detail["files"]) == {"0001_table.sql"}
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('t'), to_regclass('schema_migrations')")
+        assert cur.fetchone() == (None, None)
+
+
 def test_an_unlisted_migration_file_is_refused(schema_dsn, tmp_migrations):
     """An unreviewed file cannot be applied just by dropping it in the directory."""
     _, dsn = schema_dsn
@@ -333,9 +393,10 @@ def test_the_manifest_describes_the_files_it_is_shipped_with():
     """The manifest's checksums and the reviewed SQL must agree.
 
     This is the coupling that makes the other tests meaningful: if someone edits a
-    migration and forgets the manifest, every real database would fail the
-    checksum comparison at the next start. Failing here, in CI, names the file
-    before a deploy does.
+    migration and forgets the manifest, the runner refuses to start with
+    ``manifest_mismatch`` (see
+    ``test_editing_an_applied_migration_without_touching_the_manifest_is_refused``).
+    Failing here, in CI, names the file before a deploy does.
     """
     manifest = runner.load_manifest(REPO_MIGRATIONS)
     stale = [
