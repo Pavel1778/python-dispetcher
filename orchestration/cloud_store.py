@@ -24,7 +24,6 @@ and never logged. The service-role credential must stay server-side.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import threading
 import time
@@ -250,20 +249,43 @@ class PostgresStore:
 
     # ------------------------------------------------------------ migrations
     def apply_migrations(self, directory: str | None = None) -> list[str]:
-        """Apply every ``*.sql`` migration in order, skipping applied ones.
+        """Apply every migration, verifying history and effects first.
 
-        Returns the names of the files actually run. A file whose checksum was
-        already recorded is skipped, so a restart does not re-execute it; the
-        SQL is idempotent regardless, so a partially-applied run still converges.
+        The rules, in the order they are enforced:
 
-        Each file runs through ``_tx``, so a file that fails is rolled back and
-        the original SQL error reaches the caller instead of leaving the shared
-        connection aborted.
+        1. **Pre-flight, before any SQL runs.** The manifest
+           (``migrations/0000_manifest.json``) must list exactly the files on
+           disk, numbers must be unique, and the history already recorded in
+           ``schema_migrations`` must be a prefix of this tree with matching
+           checksums. A violation raises
+           :class:`~orchestration.migration_runner.MigrationError` naming the
+           file, and the database is left untouched — so a partially provisioned
+           environment reports the missing step instead of being silently
+           "upgraded" over it.
+        2. **One transaction per file.** The file's SQL and its
+           ``schema_migrations`` row commit together or not at all. A failing
+           migration is not recorded, and later files are not attempted.
+        3. **Effects are verified inside that transaction.** After the SQL, the
+           tables, columns, indexes and RLS flags the manifest says the file
+           creates must exist. ``CREATE TABLE IF NOT EXISTS`` against a
+           differently shaped table therefore fails the file instead of recording
+           a success whose effect is absent.
+
+        This replaces "re-execute any file whose checksum changed", which is how
+        an edited-but-already-applied migration used to be replayed silently: the
+        database's history said the file had run while a different body had.
+
+        Returns the names of the files actually applied (skipped files are not
+        included, so a restart reports an empty list).
         """
-        base = Path(directory) if directory else Path(__file__).resolve().parent.parent / "migrations"
-        files = sorted(base.glob("*.sql"))
+        from . import migration_runner as runner
+
+        base = Path(directory) if directory else runner.default_directory()
+        manifest = runner.load_manifest(base)
+        files = runner.discover(base, manifest)
         if not files:
             return []
+
         with self._tx() as cur:
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
@@ -271,25 +293,41 @@ class PostgresStore:
                 "  checksum text NOT NULL,"
                 "  applied_at timestamptz NOT NULL DEFAULT now())"
             )
-        applied: list[str] = []
-        for path in files:
-            sql = path.read_text(encoding="utf-8")
-            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-            with self._tx() as cur:
-                cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
-                            (path.name,))
-                row = cur.fetchone()
-                if row is not None and row["checksum"] == checksum:
-                    continue
-                cur.execute(sql)
-                cur.execute(
-                    "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s) "
-                    "ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum,"
-                    " applied_at = now()",
-                    (path.name, checksum),
-                )
-            applied.append(path.name)
-        return applied
+            cur.execute("SELECT filename, checksum FROM schema_migrations")
+            applied = [
+                runner.AppliedMigration(filename=r["filename"], checksum=r["checksum"])
+                for r in cur.fetchall()
+            ]
+        # Raises before anything is written if the history is not this tree's.
+        runner.validate_history(files, applied, manifest)
+
+        recorded = {a.filename: a.checksum for a in applied}
+        out: list[str] = []
+        for migration in files:
+            if recorded.get(migration.name) == migration.checksum:
+                continue
+            try:
+                with self._tx() as cur:
+                    cur.execute(migration.path.read_text(encoding="utf-8"))
+                    if migration.verified:
+                        runner.verify_effects(cur, migration)
+                    cur.execute(
+                        "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s) "
+                        "ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum,"
+                        " applied_at = now()",
+                        (migration.name, migration.checksum),
+                    )
+            except runner.MigrationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - re-raised, with context
+                # Name the file: an operator must not have to bisect eighteen
+                # migrations to find which one the database rejected.
+                raise runner.MigrationError(
+                    f"migration failed and was rolled back: {type(exc).__name__}: {exc}",
+                    filename=migration.name, kind="apply_failed",
+                ) from exc
+            out.append(migration.name)
+        return out
 
     def close(self) -> None:
         with self._lock:
