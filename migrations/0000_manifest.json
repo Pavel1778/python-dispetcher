@@ -4,24 +4,56 @@
       [
         "workflows",
         "sr_conversation_id"
+      ],
+      [
+        "workflows",
+        "sr_start_task_id"
+      ],
+      [
+        "workflows",
+        "sr_status"
       ]
     ],
     "0003_tool_call_recovery.sql": [
       [
         "sr_tool_calls",
         "claimed_at"
+      ],
+      [
+        "sr_tool_calls",
+        "attempts"
+      ],
+      [
+        "sr_tool_calls",
+        "delivered_at"
       ]
     ],
     "0005_sr_start_retry.sql": [
       [
         "workflows",
         "sr_attempt"
+      ],
+      [
+        "workflows",
+        "sr_last_error"
+      ],
+      [
+        "workflows",
+        "sr_next_attempt_at"
       ]
     ],
     "0006_workflow_idempotency.sql": [
       [
         "workflows",
         "idempotency_key"
+      ],
+      [
+        "workflows",
+        "sr_start_lease_expires"
+      ],
+      [
+        "workflows",
+        "sr_start_owner"
       ]
     ],
     "0007_cloud_direct.sql": [

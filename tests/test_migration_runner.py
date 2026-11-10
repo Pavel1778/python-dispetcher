@@ -14,12 +14,14 @@ not a mock of it. The cases map one-to-one onto the audit's list:
 7. an applied history that skips a step is refused;
 8. a clean bootstrap applies everything and is idempotent;
 9. an upgrade of a database from the ``main`` schema converges and verifies;
-10. the manifest itself tracks the files it claims to describe, and the runner
+10. the manifest itself tracks the files it claims to describe — their bodies
+    and, file by file, everything they add to the schema — and the runner
     refuses a body the manifest did not review.
 
 Tests 1-7 use a temporary directory with synthetic migrations so the real
 ``migrations/`` directory is never mutated, and every test runs in its own
-schema so the eleven production migrations are not re-run per test.
+schema, so the tests that do apply the real migrations cannot disturb each
+other or ``public``.
 """
 
 from __future__ import annotations
@@ -430,6 +432,77 @@ def test_every_real_migration_declares_a_verifiable_effect():
     assert not unverified, (
         "migrations without a declared effect (add them to columns/table_columns): "
         + ", ".join(unverified)
+    )
+
+
+def schema_additions(cur) -> dict[str, set]:
+    """What a migration can add that the manifest is able to declare.
+
+    Read from the catalog, not parsed out of SQL. Indexes that back a primary-key
+    or unique constraint are left out: they come with their table and carry
+    generated names, so the manifest declares the table's columns instead.
+    """
+    cur.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema()"
+    )
+    columns = {f"{table}.{column}" for table, column in cur.fetchall()}
+    cur.execute(
+        "SELECT ic.relname FROM pg_class ic WHERE ic.relkind = 'i' "
+        "AND ic.relnamespace = current_schema()::regnamespace AND NOT EXISTS ("
+        "  SELECT 1 FROM pg_constraint con WHERE con.conindid = ic.oid"
+        "  AND con.contype IN ('p', 'u', 'x'))"
+    )
+    indexes = {name for (name,) in cur.fetchall()}
+    cur.execute(
+        "SELECT relname FROM pg_class WHERE relkind = 'r' AND relrowsecurity "
+        "AND relnamespace = current_schema()::regnamespace"
+    )
+    rls = {name for (name,) in cur.fetchall()}
+    return {"column": columns, "index": indexes, "rls": rls}
+
+
+def test_each_real_migration_declares_exactly_what_it_adds(schema_dsn):
+    """File by file, the manifest's effects equal what the SQL does to the schema.
+
+    The runner can only verify what the manifest declares, so an effect the
+    manifest leaves out is an effect nobody checks — and nothing else notices the
+    omission, because a missing declaration cannot fail a bootstrap. That is how
+    eight columns went undeclared: four ``ALTER TABLE`` statements add several
+    columns each (``0002``, ``0003``, ``0005``, ``0006``) and only the first
+    column of each had been written down.
+
+    Each file is executed on its own and the catalog is compared before and
+    after, so the expectation comes from PostgreSQL rather than from reading SQL.
+    Both directions are asserted: an addition that is not declared is unverified,
+    and a declaration the file does not produce is a check that proves nothing
+    (it would pass because an earlier file already created the object).
+    """
+    _, dsn = schema_dsn
+    manifest = runner.load_manifest(REPO_MIGRATIONS)
+    problems: list[str] = []
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        before = schema_additions(cur)
+        for migration in runner.discover(REPO_MIGRATIONS, manifest):
+            cur.execute(migration.path.read_text(encoding="utf-8"))
+            after = schema_additions(cur)
+            declared = {
+                "column": {f"{table}.{column}" for table, column in migration.columns}
+                | {f"{table}.{column}"
+                   for table, columns in migration.tables.items() for column in columns},
+                "index": set(migration.indexes),
+                "rls": set(migration.rls),
+            }
+            for kind in ("column", "index", "rls"):
+                added = after[kind] - before[kind]
+                problems += [f"{migration.name}: adds {kind} {item}, which the manifest "
+                             "does not declare" for item in sorted(added - declared[kind])]
+                problems += [f"{migration.name}: declares {kind} {item}, which this file "
+                             "does not add" for item in sorted(declared[kind] - added)]
+            before = after
+    assert not problems, (
+        "migrations/0000_manifest.json does not describe the migrations:\n  "
+        + "\n  ".join(problems)
     )
 
 
