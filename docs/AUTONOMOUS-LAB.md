@@ -68,7 +68,13 @@ shape; **no live LLM-provider call was made** because no provider key is set.
 ## Tests
 
 - `ruff check .` → **All checks passed**
-- `pytest tests/ -q` → **625 passed, 1 skipped** (was 557 before this work)
+- `pytest tests/ -q` → re-measured at the current tip as **618 passed,
+  8 skipped** of 626 collected. The figure "625 passed, 1 skipped" that earlier
+  drafts of this document quoted is the *same* suite measured where the Android
+  SDK and mingw-w64 were installed, so its 7 packaging tests ran instead of
+  skipping (625 = 618 + 7); the total (626) is unchanged. The canonical,
+  re-runnable record is `docs/GROUND-TRUTH-BUILD-LINT-TEST.md` (run
+  `tools/verify_build_lint_test.sh`).
 
 ## Remaining blockers (genuine, distinguished)
 

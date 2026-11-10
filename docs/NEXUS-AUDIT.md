@@ -80,9 +80,14 @@ production: живые OpenHands Cloud, GitHub-аккаунт и Render здес
 
 ```bash
 TEST_SUPABASE_DB_URL="postgresql://.../disposable" \
-  python -m pytest tests/ -q -p no:cacheprovider   # 433 passed
+  python -m pytest tests/ -q -p no:cacheprovider   # 433 passed (historical snapshot)
 python -m ruff check .                              # clean
 ```
+
+> Историческая цифра (433) относилась к промежуточному срезу и не
+> воспроизводится на текущем `main`. Актуальный результат —
+> **618 passed / 8 skipped** (626 collected) на `e85d1c6`; см.
+> `docs/GROUND-TRUTH-BUILD-LINT-TEST.md` и `tools/verify_build_lint_test.sh`.
 
 Тесты, добавленные этой работой: `tests/test_archive_safety.py` (38),
 `tests/test_file_lab.py` (25), расширенный `tests/test_github_client.py`,

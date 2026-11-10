@@ -19,7 +19,7 @@ AI-Agent / QA-Automation roles) on behalf of the repository owner.
 | Working tree | clean |
 | Preservation tags | `preservation/main-tip` → `bd31381`, `preservation/nexus-tip` → `9287a44`, `preservation/v2.0.0` → `363f20f`, `preservation/audit-baseline-2026-11-08` → `bd31381`, `preservation/docs-dff2966` → `dff2966` |
 | Open PR | #19 `docs/branch-topology-env-table` → `main` (docs only) |
-| Local test run | `382 passed, 1 skipped` against PostgreSQL 17 (`TEST_SUPABASE_DB_URL`) |
+| Local test run (historical, @ `bd31381`) | `382 passed, 1 skipped` against PostgreSQL 17 (`TEST_SUPABASE_DB_URL`). **Superseded** at the current tip by 618 passed / 8 skipped — see `docs/GROUND-TRUTH-BUILD-LINT-TEST.md` |
 | Lint | `ruff check .` → All checks passed |
 | CI | **RED on every branch** (see §4.1) |
 

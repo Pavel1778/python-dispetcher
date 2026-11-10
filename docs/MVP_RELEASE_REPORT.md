@@ -140,7 +140,7 @@ All commands run in this sandbox on PostgreSQL 17.
 
 | Check | Command | Result |
 |---|---|---|
-| Full test suite | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | **465 passed, 1 skipped** |
+| Full test suite (historical, this increment) | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | **465 passed, 1 skipped** — superseded; current tip `e85d1c6` is 618 passed / 8 skipped (`docs/GROUND-TRUTH-BUILD-LINT-TEST.md`) |
 | Lint | `python -m ruff check .` | **All checks passed** |
 | Migrations | `tests/test_migration_d2.py` | apply + record + idempotent + legacy preserved |
 | Backup/restore drill | `tests/test_backup_restore.py` | real `pg_dump` → `pg_restore` into a fresh DB; data intact |

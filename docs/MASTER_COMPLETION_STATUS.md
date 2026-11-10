@@ -35,7 +35,7 @@ Last updated: Phase 0 (2026-11-08).
 | Check | Command | Result |
 |---|---|---|
 | Lint | `python -m ruff check .` | All checks passed |
-| Tests | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | 382 passed, 1 skipped |
+| Tests (historical, `main` @ `bd31381`) | `TEST_SUPABASE_DB_URL=... python -m pytest tests/ -q` | 382 passed, 1 skipped — **superseded**; current tip `e85d1c6` is 618 passed / 8 skipped (`docs/GROUND-TRUTH-BUILD-LINT-TEST.md`) |
 | CI (before fix) | Actions on `main` @ `bd31381` | ❌ `python 3.12.6` unavailable on runner |
 | CI (after fix) | Actions run 42521226852 on `fix/ci-python-version` | ✅ **success** |
 | Migration inventory | `ls migrations/` | `0001`..`0011` (no `0015`) |

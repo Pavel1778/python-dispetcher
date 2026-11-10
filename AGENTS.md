@@ -461,8 +461,16 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
 
 - `main` is the integration branch and is green: `ruff check .` passes and the
   full pytest suite passes against a disposable PostgreSQL (`TEST_SUPABASE_DB_URL`).
-  Verified 2026-11-08: `main` 382 passed / 1 skipped; the nexus branch 445 passed
-  / 1 skipped.
+  **Current ground truth** (measured 2026-11-10 at `e85d1c6`): `main`
+  618 passed / 8 skipped of 626 collected; `ruff` clean; the wheel builds.
+  Reproduce with `tools/verify_build_lint_test.sh`; the canonical record is
+  `docs/GROUND-TRUTH-BUILD-LINT-TEST.md`. A bare passed count is environment-
+  dependent: the 7 `test_android_apk.py` / `test_windows_exe.py` tests skip
+  without their toolchains, so the same commit reports 625 passed / 1 skipped
+  where Android SDK + mingw-w64 are installed (625 = 618 + 7). Older counts
+  quoted elsewhere (382/433/445/465/557/625) are historical snapshots of
+  earlier commits, branches or environments — cite the `collected` total (626)
+  or this document, not a bare count.
 - All five `arena/*` branches are already merged into `main` through PRs #13–#18
   (`arena/06dcb2d2` docs+NEXUS spec, `arena/22525405` NEXUS projects/goals,
   `arena/1d4f42a1` versioned DAG plans, `arena/5a479709` installable PWA,
