@@ -24,6 +24,7 @@ schema so the eleven production migrations are not re-run per test.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -433,19 +434,50 @@ def test_every_real_migration_declares_a_verifiable_effect():
 
 
 # ---------------------------------------- 9. upgrade from an existing main schema
-def test_upgrading_a_main_schema_database_converges(schema_dsn):
-    """A database created by the previous runner upgrades without re-running.
+def apply_like_the_previous_runner(dsn: str, base: pathlib.Path) -> None:
+    """Write a database the way ``apply_migrations`` did before this module.
 
-    The main-schema database is reproduced the way it exists in the wild: the
-    eleven migrations applied and recorded, then the server starts again. The
-    upgrade must recognise the history, run nothing, and report the schema valid.
+    Every ``*.sql`` in name order, executed and recorded as ``sha256(text)``, with
+    no manifest, no history check and no effect check. Every database that
+    predates the runner was written like this, so it is the honest starting point
+    for an upgrade test; calling the new runner twice is not. The checksum is
+    computed with ``hashlib`` here rather than through the runner on purpose: if
+    the runner ever hashed differently, existing databases would stop matching
+    and this is where it has to show.
+    """
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "  filename text PRIMARY KEY,"
+            "  checksum text NOT NULL,"
+            "  applied_at timestamptz NOT NULL DEFAULT now())"
+        )
+        for path in sorted(base.glob("*.sql")):
+            sql = path.read_text(encoding="utf-8")
+            cur.execute(sql)
+            cur.execute(
+                "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s)",
+                (path.name, hashlib.sha256(sql.encode("utf-8")).hexdigest()),
+            )
+
+
+def test_upgrading_a_main_schema_database_converges(schema_dsn):
+    """A database written by the previous runner upgrades without re-running.
+
+    The main-schema database is reproduced the way it exists in the wild: every
+    migration executed and recorded by the previous runner's algorithm, with no
+    manifest involved. Then the server starts on this code. The upgrade must
+    recognise the history, run nothing, rewrite nothing, and report the schema
+    valid.
     """
     _, dsn = schema_dsn
-    migrate(dsn, REPO_MIGRATIONS)
+    apply_like_the_previous_runner(dsn, REPO_MIGRATIONS)
     before = recorded(dsn)
-    # Restart: a new store runs apply_migrations again in its constructor.
+    assert len(before) == len(list(REPO_MIGRATIONS.glob("*.sql")))
+    # Restart on this code: a new store runs apply_migrations in its constructor.
     store = PostgresStore(dsn)
     try:
+        assert store.apply_migrations() == [], "the upgrade must not re-execute anything"
         missing = store.verify_schema()
     finally:
         store.close()
