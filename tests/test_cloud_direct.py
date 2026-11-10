@@ -271,6 +271,23 @@ def test_direct_transport_reports_no_native_repository_selection():
     assert CloudClient.supports_repository_selection is True
 
 
+def test_direct_transport_reports_the_cloud_base_url():
+    """The direct transport must expose ``base_url``, not just wrap a client.
+
+    ``/api/system`` and ``/api/config`` report ``self.client.base_url`` for
+    operator diagnostics. ``CloudDirectClient`` composes a ``CloudClient``, so
+    without a delegating property both endpoints raised ``AttributeError`` and
+    answered 500 -- on the default transport. The failure was found by driving
+    the real HTTP server with ``OPENHANDS_TRANSPORT=direct``, not by reading the
+    two classes, which is why this asserts through the public attribute.
+    """
+    for transport in ("direct", "app"):
+        inner = CloudClient("https://cloud.example.test/", api_key="test-key")
+        client = (CloudDirectClient(inner, store=None)  # type: ignore[arg-type]
+                  if transport == "direct" else inner)
+        assert client.base_url == "https://cloud.example.test"
+
+
 def test_repository_task_default_mode_injects_a_clone_instruction(monkeypatch):
     """The workspace is empty, so the agent must be told to clone first.
 
