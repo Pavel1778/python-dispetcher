@@ -271,12 +271,13 @@ _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _ATX = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
 _KEYWORD = re.compile(
     r"^(?:раздел|глава|часть|этап|шаг|приложение|section|chapter|part|stage|phase|step|appendix)"
-    r"[ \t]+(\d{1,3}(?:\.\d{1,3}){0,5}|[IVXLC]{1,6}|[A-ZА-ЯЁ])(?![\w])[.:)]?", re.IGNORECASE)
-_NUMBERED = re.compile(r"^(?:(\d{1,3}(?:\.\d{1,3}){1,5})[.)]?|(\d{1,3})[.)])[ \t]+(\S.*)$")
-_LEADING_NUMBER = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){0,5})[.)]?[ \t]+(\S.*)$")
+    r"[ \t]+(\d{1,5}(?:\.\d{1,4}){0,5}|[IVXLC]{1,6}|[A-ZА-ЯЁ])(?![\w])[.:)]?", re.IGNORECASE)
+# A long specification numbers its items past 999; "1381." is an item like "13.".
+_NUMBERED = re.compile(r"^(?:(\d{1,4}(?:\.\d{1,4}){1,5})[.)]?|(\d{1,5})[.)])[ \t]+(\S.*)$")
+_LEADING_NUMBER = re.compile(r"^(\d{1,5}(?:\.\d{1,4}){0,5})[.)]?[ \t]+(\S.*)$")
 _BOLD = re.compile(r"^\*\*([^*].{0,158}?)\*\*:?[ \t]*$")
 _BULLET = re.compile(
-    r"^[ \t]*(?:[-*+•·▪◦‣–—]|\[[ xX]\]|\d{1,3}(?:\.\d{1,3}){0,5}[.)]|[A-Za-zА-Яа-яЁё][.)])[ \t]+\S")
+    r"^[ \t]*(?:[-*+•·▪◦‣–—]|\[[ xX]\]|\d{1,5}(?:\.\d{1,4}){0,5}[.)]|[A-Za-zА-Яа-яЁё][.)])[ \t]+\S")
 _TABLE_ROW = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
 _TABLE_RULE = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(?:\|[ \t]*:?-{2,}:?[ \t]*)*\|?[ \t]*$")
 _NORMATIVE = re.compile(
@@ -304,7 +305,7 @@ _ORDER = re.compile(
 _REFERENCE = re.compile(
     r"(?:раздел[а-яё]{0,3}|пункт[а-яё]{0,3}|пп?\.|глав[а-яё]{0,2}|§|этап[а-яё]{0,2}|"
     r"шаг[а-яё]{0,2}|приложени[а-яё]{1,2}|section|sec\.|clause|chapter|step|stage|phase|"
-    r"appendix)[ \t]*№?[ \t]*(\d{1,3}(?:\.\d{1,3}){0,5})", re.IGNORECASE)
+    r"appendix)[ \t]*№?[ \t]*(\d{1,5}(?:\.\d{1,4}){0,5})", re.IGNORECASE)
 
 
 def _is_caps_heading(line: str) -> bool:
@@ -373,9 +374,17 @@ def build_index(text: str) -> SpecIndex:
         else:
             kinds[i] = "text"
 
-    def neighbour(i: int, step: int) -> Any:
+    def indent(i: int) -> int:
+        return len(lines[i]) - len(lines[i].lstrip(" \t"))
+
+    def neighbour(i: int, step: int, *, own: bool = False) -> Any:
+        """The kind of the nearest line that is not blank. With *own*, lines
+        indented deeper than line *i* are passed over as well: sub-items and
+        continuation lines belong to an item, they do not end its list."""
+        depth = indent(i) if own else None
         j = i + step
-        while 0 <= j < line_count and kinds[j] == "blank":
+        while 0 <= j < line_count and (kinds[j] == "blank" or (
+                depth is not None and kinds[j] != "fence" and indent(j) > depth)):
             j += step
         return kinds[j] if 0 <= j < line_count else None
 
@@ -401,7 +410,9 @@ def build_index(text: str) -> SpecIndex:
             continue
         if isinstance(kind, tuple):
             _, number, depth, title = kind
-            before, after = neighbour(i, -1), neighbour(i, 1)
+            # "3. Title" on its own is a heading; next to "2. ..." or "4. ..."
+            # it is the third item of a list, whatever is nested under them.
+            before, after = neighbour(i, -1, own=True), neighbour(i, 1, own=True)
             in_a_list = any(isinstance(n, tuple) and n[2] == depth for n in (before, after))
             if not in_a_list:
                 headings[i] = (min(depth, 6), number, title.strip()[:300])
@@ -454,16 +465,22 @@ def build_index(text: str) -> SpecIndex:
             tokens=line_tokens[last_line] - line_tokens[first_line]))
 
     # ---- addressable pieces --------------------------------------------
+    # Every line that is not blank belongs to exactly one piece - headings
+    # included. A heading can be the only place a demand is written ("### 3.2
+    # Добавить индекс"), and a line this index takes for a heading may be an
+    # item; either way it must be something a plan can be held to.
     pieces: list[tuple[int, int, int, str]] = []        # (section, first line, last line + 1, kind)
     for section in sections:
         i, stop = section.start_line - 1, section.end_line
         while i < stop:
             kind = kinds[i]
-            if kind == "blank" or i in headings:
+            if kind == "blank":
                 i += 1
                 continue
             j = i + 1
-            if kind == "fence":
+            if i in headings:
+                pieces.append((section.ordinal, i, j, "heading"))
+            elif kind == "fence":
                 while j < stop and kinds[j] == "fence":
                     j += 1
                 pieces.append((section.ordinal, i, j, "code"))
@@ -485,9 +502,11 @@ def build_index(text: str) -> SpecIndex:
     requirements: list[Requirement] = []
     for ordinal, (section_ordinal, first, last, kind) in enumerate(pieces):
         body = text[starts[first]:starts[last]]
+        # A heading is judged by its title, without the "##" and the number.
+        said = headings[first][2] if kind == "heading" else body
         normative = kind in ("item", "row") or (
-            kind == "paragraph" and bool(_NORMATIVE.search(body) or _IMPERATIVE.match(body)
-                                         or _ORDER.match(body)))
+            kind in ("paragraph", "heading")
+            and bool(_NORMATIVE.search(said) or _IMPERATIVE.match(said) or _ORDER.match(said)))
         requirements.append(Requirement(
             ordinal=ordinal, key=f"R-{ordinal + 1:0{width}d}", section=section_ordinal,
             kind=kind, normative=normative, start=starts[first], end=starts[last],

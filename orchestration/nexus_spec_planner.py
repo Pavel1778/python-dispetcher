@@ -21,7 +21,8 @@ module turns one into a run:
   Plans of finished stages are kept, so nothing is planned twice.
 * **A stage that is too large is cut, not truncated.** When a provider says the
   request does not fit, the stage is replaced by smaller stages that cover the
-  same text exactly.
+  same text exactly. The same is done when the model returns more tasks for a
+  stage than one stage may have: a smaller part needs fewer.
 * **Every piece of the text is accounted for by the application, not the
   model.** The model is asked which pieces each task covers. Whatever it leaves
   out is not dropped: an obligation nobody claimed goes into a verification
@@ -120,6 +121,15 @@ PLANNER_SYSTEM = (
 class PlanningFailed(RuntimeError):
     """A plan cannot be made from this specification as things are. The message
     says why, in words meant for the person who sent the text."""
+
+
+class TooManyTasks(ValueError):
+    """The model planned more tasks for one stage than a stage may have."""
+
+    def __init__(self, count: int, limit: int):
+        self.count, self.limit = count, limit
+        super().__init__(f"{count} tasks for one part of the specification; "
+                         f"a part may have at most {limit}")
 
 
 class _Lost(Exception):
@@ -349,11 +359,15 @@ def stage_plan(data: Any, *, pieces: list[dict], count: int, earlier_keys: set[s
     The one exception is not an exception: a text that consists of a single
     piece is what every task of its plan is about, whether the model says so
     or not.
-    Raises ``ValueError`` when the answer is not a usable plan.
+    Raises ``ValueError`` when the answer is not a usable plan, and its
+    subclass :class:`TooManyTasks` when the only thing wrong is the number of
+    tasks - which a smaller stage cures.
     """
     if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
         raise ValueError("the answer has no 'tasks' list")
     raw = data["tasks"]
+    if len(raw) > max_tasks:
+        raise TooManyTasks(len(raw), max_tasks)
     local = {task.get("id") or f"task-{i + 1}" for i, task in enumerate(raw)
              if isinstance(task, dict) and isinstance(task.get("id") or "", str)}
     prepared: list[Any] = []
@@ -762,14 +776,16 @@ class SpecPlanner:
         try:
             plan, provider, failovers = self._ask(providers, prompt, validate, timeout)
         except AllProvidersFailed as e:
-            if e.too_large:
+            if e.too_large or "too_many" in e.kinds:
+                # Too much text for the model, or too much work for one stage:
+                # either way the cure is the same text in smaller stages.
                 smaller = self._smaller(text, index, stage)
                 if smaller is not None:
                     rows, budget = smaller
                     split = self.specs.split_stage(spec_id, ordinal, owner, pieces=rows,
                                                    budget=budget)
                     return "split" if split else "lost"
-                if all(kind == "too_large" for kind in e.kinds):
+                if e.kinds and all(kind == "too_large" for kind in e.kinds):
                     # Nobody can read it and it cannot be made smaller.
                     return self._stop(stage, owner, interactive, AllProvidersFailed(
                         [*e.failures,
@@ -809,6 +825,9 @@ class SpecPlanner:
             except ProviderError as e:
                 failures.append((provider.name, str(e)))
                 kinds.append(failure_kind(e))
+            except TooManyTasks as e:
+                failures.append((provider.name, f"invalid plan: {e}"))
+                kinds.append("too_many")
             except ValueError as e:
                 failures.append((provider.name, f"invalid plan: {e}"))
                 kinds.append("rejected")

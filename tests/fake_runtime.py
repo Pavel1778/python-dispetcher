@@ -11,10 +11,12 @@ tells it to, which keeps the suite offline and deterministic.
 from __future__ import annotations
 
 import json
+import posixpath
 import threading
+import urllib.parse
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -31,6 +33,37 @@ class FakeConversation:
     #: dispatcher forwarded the verified state rather than an empty default.
     agent_context: dict[str, Any] = field(default_factory=dict)
     mcp_config: dict[str, Any] = field(default_factory=dict)
+    #: The text of the first message, exactly as the create request carried it:
+    #: what the agent is given to work from. ``None`` when there was none.
+    initial_message: str | None = None
+    tags: dict[str, Any] = field(default_factory=dict)
+    #: The sandbox's files at the moment this conversation was created. A file
+    #: that arrives later was not there when the agent started.
+    files_at_start: dict[str, bytes] = field(default_factory=dict)
+
+
+def parse_upload(body: bytes, content_type: str) -> tuple[str, bytes] | None:
+    """``(field name, data)`` of the one part of a ``multipart/form-data`` body.
+
+    Written here, strictly, instead of borrowing a parser: the fake checks that
+    what the client sends is a well-formed upload, and takes the bytes between
+    the part's headers and the closing boundary exactly as they are.
+    """
+    marker = "boundary="
+    if not content_type.startswith("multipart/form-data") or marker not in content_type:
+        return None
+    boundary = content_type.split(marker, 1)[1].split(";")[0].strip().strip('"').encode()
+    opening, closing = b"--" + boundary + b"\r\n", b"\r\n--" + boundary + b"--\r\n"
+    if not body.startswith(opening) or not body.endswith(closing):
+        return None
+    head, separator, data = body[len(opening):-len(closing)].partition(b"\r\n\r\n")
+    if not separator:
+        return None
+    for line in head.decode("latin-1").split("\r\n"):
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "content-disposition" and 'name="' in value:
+            return value.split('name="', 1)[1].split('"', 1)[0], data
+    return None
 
 
 @dataclass
@@ -60,6 +93,24 @@ class FakeRuntime:
     patch_fail_times: int = 0
     #: When True, PATCH /api/settings answers 404 (endpoint unsupported).
     patch_unsupported: bool = False
+    #: The sandbox's file system: absolute path -> content. Written by
+    #: ``POST /api/file/upload`` and read by ``GET /api/file/download``, the two
+    #: routes of the live agent-server's file router.
+    files: dict[str, bytes] = field(default_factory=dict)
+    #: Every upload received, in order: ``(path, bytes sent)``.
+    uploads: list[tuple[str, int]] = field(default_factory=list)
+    #: Directories that cannot be written to: an upload under one answers 500,
+    #: as the live server does for a path it has no permission for.
+    read_only_dirs: set[str] = field(default_factory=set)
+    #: When > 0, the next N uploads answer this status.
+    upload_status: int = 0
+    upload_status_times: int = 0
+    #: Applied to an upload before it is stored: a disk that keeps something
+    #: other than what was sent (cut short, altered). ``None`` stores it as is.
+    store_as: Callable[[str, bytes], bytes] | None = None
+    #: When > 0, the next N downloads answer this status.
+    download_status: int = 0
+    download_status_times: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def finish(self, conversation_id: str, response: str | None) -> None:
@@ -133,6 +184,29 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, json.loads(json.dumps(self.runtime.settings)))
             return
 
+        # /api/file/download?path=<absolute path>
+        if parts == ["api", "file", "download"]:
+            rt = self.runtime
+            target = self._query_path()
+            with rt.lock:
+                if rt.download_status_times > 0:
+                    rt.download_status_times -= 1
+                    self._json(rt.download_status, {"detail": "Failed to download file"})
+                    return
+                data = rt.files.get(target or "")
+            if not target or not target.startswith("/"):
+                self._json(400, {"detail": "Path must be absolute"})
+                return
+            if data is None:
+                self._json(404, {"detail": "File not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         # /api/conversations/{id}/events/search
         if len(parts) == 5 and parts[3] == "events" and parts[4] == "search":
             c = self.runtime.conversations.get(parts[2])
@@ -182,6 +256,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         parts = [p for p in path.split("/") if p]
+        # POST /api/file/upload?path=<absolute path>   (multipart, field "file")
+        if parts == ["api", "file", "upload"]:
+            self._upload()
+            return
         body = self._read_body()
         # POST /api/conversations
         if len(parts) == 2 and parts[1] == "conversations":
@@ -205,6 +283,16 @@ class _Handler(BaseHTTPRequestHandler):
                     working_dir=(body.get("workspace") or {}).get("working_dir", ""),
                     title=body.get("title"),
                 )
+                message = body.get("initial_message")
+                if isinstance(message, dict):
+                    c.initial_message = "".join(
+                        part.get("text", "") for part in message.get("content") or []
+                        if isinstance(part, dict))
+                    if message.get("run"):
+                        c.status = "running"
+                        c.runs += 1
+                c.tags = dict(body.get("tags") or {})
+                c.files_at_start = dict(rt.files)
                 # Mirror the live server: the conversation inherits exactly the
                 # agent_context and mcp_config the request carried. Nothing is
                 # copied from the stored settings — that is the whole defect the
@@ -303,12 +391,48 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._json(404, {"detail": "Not Found"})
 
+    def _query_path(self) -> str | None:
+        query = urllib.parse.urlparse(self.path).query
+        return (urllib.parse.parse_qs(query).get("path") or [None])[0]
+
+    def _upload(self) -> None:
+        rt = self.runtime
+        target = self._query_path()
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        with rt.lock:
+            if rt.upload_status_times > 0:
+                rt.upload_status_times -= 1
+                self._json(rt.upload_status, {"detail": "Failed to upload file"})
+                return
+        if not target:
+            self._json(422, {"detail": "path is required"})
+            return
+        if not target.startswith("/"):
+            self._json(400, {"detail": "Path must be absolute"})
+            return
+        part = parse_upload(raw, self.headers.get("Content-Type", ""))
+        if part is None or part[0] != "file":
+            self._json(422, {"detail": "a multipart 'file' field is required"})
+            return
+        directory = posixpath.dirname(target)
+        with rt.lock:
+            if any(directory == d or directory.startswith(d.rstrip("/") + "/")
+                   for d in rt.read_only_dirs):
+                self._json(500, {"detail": "Failed to upload file: [Errno 13] "
+                                           f"Permission denied: '{target}'"})
+                return
+            rt.uploads.append((target, len(part[1])))
+            rt.files[target] = rt.store_as(target, part[1]) if rt.store_as else part[1]
+        self._json(200, {"success": True, "file_size": len(part[1])})
+
     @staticmethod
     def _info(c: FakeConversation) -> dict[str, Any]:
         return {
             "id": c.id,
             "execution_status": c.status,
             "title": c.title,
+            "tags": c.tags,
             "workspace": {"kind": "LocalWorkspace", "working_dir": c.working_dir},
         }
 

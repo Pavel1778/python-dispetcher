@@ -34,7 +34,12 @@ PLAN = {"tasks": [{"id": "t1", "title": "Do the thing",
 
 
 class FakeProvider(BaseHTTPRequestHandler):
-    """A configurable provider endpoint. ``server.script`` drives each call."""
+    """A configurable provider endpoint. ``server.script`` drives each call.
+
+    A test that needs an answer made from the request sets ``server.respond``
+    to a function of the request body returning ``(status, payload)``; it then
+    takes the place of the script.
+    """
 
     def log_message(self, *a):  # silence
         pass
@@ -58,6 +63,12 @@ class FakeProvider(BaseHTTPRequestHandler):
             "gkey": self.headers.get("x-goog-api-key"),
             "body": body,
         })
+        respond = getattr(self.server, "respond", None)
+        if respond is not None:
+            self.server.index += 1
+            status, payload = respond(body)
+            self._reply(status, payload)
+            return
         # Each entry in the script is consumed in order; the last repeats.
         step = self.server.script[min(self.server.index, len(self.server.script) - 1)]
         self.server.index += 1

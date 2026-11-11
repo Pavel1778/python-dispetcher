@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS nexus_spec_requirements (
     ordinal integer NOT NULL CHECK (ordinal >= 0),
     key text NOT NULL,
     section integer NOT NULL,
-    kind text NOT NULL CHECK (kind IN ('item', 'paragraph', 'row', 'code')),
+    kind text NOT NULL CHECK (kind IN ('heading', 'item', 'paragraph', 'row', 'code')),
     -- Reads as an obligation ("должен", "must", an imperative, a list item).
     normative boolean NOT NULL DEFAULT false,
     start_char integer NOT NULL,
