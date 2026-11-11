@@ -8,20 +8,25 @@ not a mock of it. The cases map one-to-one onto the audit's list:
 2. a failing migration is visible, not marked applied;
 3. migrations after a failure do not run;
 4. the error names the exact migration;
-5. a changed body for an already-applied migration is refused, not re-run;
+5. a changed body for an already-applied migration is refused, not re-run —
+   whether or not the manifest was updated along with the file;
 6. a duplicate number is refused (the ``0011`` case), with both files named;
 7. an applied history that skips a step is refused;
 8. a clean bootstrap applies everything and is idempotent;
 9. an upgrade of a database from the ``main`` schema converges and verifies;
-10. the manifest itself tracks the files it claims to describe.
+10. the manifest itself tracks the files it claims to describe — their bodies
+    and, file by file, everything they add to the schema — and the runner
+    refuses a body the manifest did not review.
 
 Tests 1-7 use a temporary directory with synthetic migrations so the real
 ``migrations/`` directory is never mutated, and every test runs in its own
-schema so the eleven production migrations are not re-run per test.
+schema, so the tests that do apply the real migrations cannot disturb each
+other or ``public``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -219,6 +224,64 @@ def test_editing_an_applied_migration_is_refused_not_re_executed(
         assert {r[0] for r in cur.fetchall()} == {"id"}
 
 
+def test_editing_an_applied_migration_without_touching_the_manifest_is_refused(
+        schema_dsn, tmp_migrations):
+    """The edit nobody reviews: the file changes and the manifest does not.
+
+    This is the shape of the real incident — ``0011`` rewritten in place on
+    ``main`` — because whoever edits an applied migration is not thinking about a
+    manifest. Both bodies are idempotent on purpose, like the real migrations: the
+    edited file *would* run cleanly, so only a checksum gate can stop it. Without
+    one the recorded history still equals the manifest, the apply loop re-executes
+    the new body and overwrites the recorded checksum, and nothing reports it.
+    """
+    _, dsn = schema_dsn
+    add_migration(tmp_migrations, "0001_table.sql",
+                  "CREATE TABLE IF NOT EXISTS t (id int);")
+    write_manifest(tmp_migrations)
+    assert migrate(dsn, tmp_migrations) == ["0001_table.sql"]
+    before = recorded(dsn)
+
+    # The applied file is edited; the manifest is left exactly as reviewed.
+    add_migration(tmp_migrations, "0001_table.sql",
+                  "CREATE TABLE IF NOT EXISTS t (id int);\n"
+                  "ALTER TABLE t ADD COLUMN IF NOT EXISTS extra text;")
+    with pytest.raises(MigrationError) as exc:
+        migrate(dsn, tmp_migrations)
+    assert exc.value.kind == "manifest_mismatch"
+    assert exc.value.filename == "0001_table.sql"
+    # Nothing ran, and the history was not rewritten to match the edit.
+    assert recorded(dsn) == before
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='t' AND table_schema=current_schema()"
+        )
+        assert {r[0] for r in cur.fetchall()} == {"id"}
+
+
+def test_a_body_the_manifest_did_not_review_is_refused_on_an_empty_database(
+        schema_dsn, tmp_migrations):
+    """With no history to compare against, the manifest checksum is the only gate.
+
+    The refusal happens in pre-flight, so the database is left untouched: not even
+    the ``schema_migrations`` bookkeeping table is created.
+    """
+    _, dsn = schema_dsn
+    add_migration(tmp_migrations, "0001_table.sql", "CREATE TABLE t (id int);")
+    write_manifest(tmp_migrations)
+    add_migration(tmp_migrations, "0001_table.sql",
+                  "CREATE TABLE t (id int, extra text);")
+    with pytest.raises(MigrationError) as exc:
+        migrate(dsn, tmp_migrations)
+    assert exc.value.kind == "manifest_mismatch"
+    assert exc.value.filename == "0001_table.sql"
+    assert set(exc.value.detail["files"]) == {"0001_table.sql"}
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('t'), to_regclass('schema_migrations')")
+        assert cur.fetchone() == (None, None)
+
+
 def test_an_unlisted_migration_file_is_refused(schema_dsn, tmp_migrations):
     """An unreviewed file cannot be applied just by dropping it in the directory."""
     _, dsn = schema_dsn
@@ -333,9 +396,10 @@ def test_the_manifest_describes_the_files_it_is_shipped_with():
     """The manifest's checksums and the reviewed SQL must agree.
 
     This is the coupling that makes the other tests meaningful: if someone edits a
-    migration and forgets the manifest, every real database would fail the
-    checksum comparison at the next start. Failing here, in CI, names the file
-    before a deploy does.
+    migration and forgets the manifest, the runner refuses to start with
+    ``manifest_mismatch`` (see
+    ``test_editing_an_applied_migration_without_touching_the_manifest_is_refused``).
+    Failing here, in CI, names the file before a deploy does.
     """
     manifest = runner.load_manifest(REPO_MIGRATIONS)
     stale = [
@@ -371,20 +435,122 @@ def test_every_real_migration_declares_a_verifiable_effect():
     )
 
 
-# ---------------------------------------- 9. upgrade from an existing main schema
-def test_upgrading_a_main_schema_database_converges(schema_dsn):
-    """A database created by the previous runner upgrades without re-running.
+def schema_additions(cur) -> dict[str, set]:
+    """What a migration can add that the manifest is able to declare.
 
-    The main-schema database is reproduced the way it exists in the wild: the
-    eleven migrations applied and recorded, then the server starts again. The
-    upgrade must recognise the history, run nothing, and report the schema valid.
+    Read from the catalog, not parsed out of SQL. Indexes that back a primary-key
+    or unique constraint are left out: they come with their table and carry
+    generated names, so the manifest declares the table's columns instead.
+    """
+    cur.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema()"
+    )
+    columns = {f"{table}.{column}" for table, column in cur.fetchall()}
+    cur.execute(
+        "SELECT ic.relname FROM pg_class ic WHERE ic.relkind = 'i' "
+        "AND ic.relnamespace = current_schema()::regnamespace AND NOT EXISTS ("
+        "  SELECT 1 FROM pg_constraint con WHERE con.conindid = ic.oid"
+        "  AND con.contype IN ('p', 'u', 'x'))"
+    )
+    indexes = {name for (name,) in cur.fetchall()}
+    cur.execute(
+        "SELECT relname FROM pg_class WHERE relkind = 'r' AND relrowsecurity "
+        "AND relnamespace = current_schema()::regnamespace"
+    )
+    rls = {name for (name,) in cur.fetchall()}
+    return {"column": columns, "index": indexes, "rls": rls}
+
+
+def test_each_real_migration_declares_exactly_what_it_adds(schema_dsn):
+    """File by file, the manifest's effects equal what the SQL does to the schema.
+
+    The runner can only verify what the manifest declares, so an effect the
+    manifest leaves out is an effect nobody checks — and nothing else notices the
+    omission, because a missing declaration cannot fail a bootstrap. That is how
+    eight columns went undeclared: four ``ALTER TABLE`` statements add several
+    columns each (``0002``, ``0003``, ``0005``, ``0006``) and only the first
+    column of each had been written down.
+
+    Each file is executed on its own and the catalog is compared before and
+    after, so the expectation comes from PostgreSQL rather than from reading SQL.
+    Both directions are asserted: an addition that is not declared is unverified,
+    and a declaration the file does not produce is a check that proves nothing
+    (it would pass because an earlier file already created the object).
     """
     _, dsn = schema_dsn
-    migrate(dsn, REPO_MIGRATIONS)
+    manifest = runner.load_manifest(REPO_MIGRATIONS)
+    problems: list[str] = []
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        before = schema_additions(cur)
+        for migration in runner.discover(REPO_MIGRATIONS, manifest):
+            cur.execute(migration.path.read_text(encoding="utf-8"))
+            after = schema_additions(cur)
+            declared = {
+                "column": {f"{table}.{column}" for table, column in migration.columns}
+                | {f"{table}.{column}"
+                   for table, columns in migration.tables.items() for column in columns},
+                "index": set(migration.indexes),
+                "rls": set(migration.rls),
+            }
+            for kind in ("column", "index", "rls"):
+                added = after[kind] - before[kind]
+                problems += [f"{migration.name}: adds {kind} {item}, which the manifest "
+                             "does not declare" for item in sorted(added - declared[kind])]
+                problems += [f"{migration.name}: declares {kind} {item}, which this file "
+                             "does not add" for item in sorted(declared[kind] - added)]
+            before = after
+    assert not problems, (
+        "migrations/0000_manifest.json does not describe the migrations:\n  "
+        + "\n  ".join(problems)
+    )
+
+
+# ---------------------------------------- 9. upgrade from an existing main schema
+def apply_like_the_previous_runner(dsn: str, base: pathlib.Path) -> None:
+    """Write a database the way ``apply_migrations`` did before this module.
+
+    Every ``*.sql`` in name order, executed and recorded as ``sha256(text)``, with
+    no manifest, no history check and no effect check. Every database that
+    predates the runner was written like this, so it is the honest starting point
+    for an upgrade test; calling the new runner twice is not. The checksum is
+    computed with ``hashlib`` here rather than through the runner on purpose: if
+    the runner ever hashed differently, existing databases would stop matching
+    and this is where it has to show.
+    """
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "  filename text PRIMARY KEY,"
+            "  checksum text NOT NULL,"
+            "  applied_at timestamptz NOT NULL DEFAULT now())"
+        )
+        for path in sorted(base.glob("*.sql")):
+            sql = path.read_text(encoding="utf-8")
+            cur.execute(sql)
+            cur.execute(
+                "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s)",
+                (path.name, hashlib.sha256(sql.encode("utf-8")).hexdigest()),
+            )
+
+
+def test_upgrading_a_main_schema_database_converges(schema_dsn):
+    """A database written by the previous runner upgrades without re-running.
+
+    The main-schema database is reproduced the way it exists in the wild: every
+    migration executed and recorded by the previous runner's algorithm, with no
+    manifest involved. Then the server starts on this code. The upgrade must
+    recognise the history, run nothing, rewrite nothing, and report the schema
+    valid.
+    """
+    _, dsn = schema_dsn
+    apply_like_the_previous_runner(dsn, REPO_MIGRATIONS)
     before = recorded(dsn)
-    # Restart: a new store runs apply_migrations again in its constructor.
+    assert len(before) == len(list(REPO_MIGRATIONS.glob("*.sql")))
+    # Restart on this code: a new store runs apply_migrations in its constructor.
     store = PostgresStore(dsn)
     try:
+        assert store.apply_migrations() == [], "the upgrade must not re-execute anything"
         missing = store.verify_schema()
     finally:
         store.close()

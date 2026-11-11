@@ -25,8 +25,9 @@ This module keeps the good part (one transaction per file: SQL and its
   contain, including per-file checksums and the schema effects each file must
   produce;
 * pre-flight validation — duplicate numbers, gaps in the applied history,
-  checksum drift, unlisted files, missing predecessors — all reported before any
-  SQL runs;
+  a file whose body no longer hashes to its manifest checksum, a recorded
+  checksum that differs from the manifest, unlisted files, missing
+  predecessors — all reported before any SQL runs;
 * post-conditions — after a file runs, the tables, columns, indexes and RLS
   flags it claims to create must exist, or the transaction is rolled back and
   the file is *not* recorded. Indexes matter: task-level workspace exclusivity
@@ -142,7 +143,16 @@ def discover(base: Path, manifest: dict[str, Any]) -> list[MigrationFile]:
     * every ``*.sql`` on disk has a valid name and is listed in the manifest
       (an unlisted file is an unreviewed migration);
     * every manifest entry exists on disk (a lost step);
-    * numbers are unique (the duplicate-``0011`` failure) and ascending.
+    * numbers are unique (the duplicate-``0011`` failure) and ascending;
+    * every file's body hashes to the checksum the manifest records for it.
+
+    The last check is what makes the manifest a gate rather than a comment.
+    Without it, whoever edits an applied migration only has to *not* touch the
+    manifest: the recorded history still equals the manifest, nothing looks
+    wrong to :func:`validate_history`, and the apply loop re-executes the new
+    body and overwrites the recorded checksum — the silent re-run this module
+    exists to end. It also means an unreviewed body cannot be applied to an
+    empty database, where there is no history to compare against at all.
     """
     listed: dict[str, Any] = manifest.get("files") or {}
     on_disk = {p.name: p for p in base.glob("*.sql")}
@@ -165,6 +175,7 @@ def discover(base: Path, manifest: dict[str, Any]) -> list[MigrationFile]:
 
     by_number: dict[int, list[str]] = {}
     files: list[MigrationFile] = []
+    stale: dict[str, dict[str, Any]] = {}
     for name in sorted(on_disk):
         match = FILENAME_RE.match(name)
         if not match:
@@ -175,11 +186,14 @@ def discover(base: Path, manifest: dict[str, Any]) -> list[MigrationFile]:
         number = int(match.group(1))
         by_number.setdefault(number, []).append(name)
         text = on_disk[name].read_text(encoding="utf-8")
+        checksum = sha256_text(text)
+        if checksum != listed[name]:
+            stale[name] = {"manifest": listed[name], "disk": checksum}
         files.append(MigrationFile(
             name=name,
             number=number,
             path=on_disk[name],
-            checksum=sha256_text(text),
+            checksum=checksum,
             columns=[tuple(c) for c in (manifest.get("columns") or {}).get(name, [])],
             tables={
                 table: list(cols)
@@ -198,6 +212,17 @@ def discover(base: Path, manifest: dict[str, Any]) -> list[MigrationFile]:
             "; numbers identify a step for the life of a database and cannot be reused",
             filename=sorted(duplicates[first])[1], kind="duplicate_number",
             detail={"numbers": {f"{n:04d}": names for n, names in duplicates.items()}},
+        )
+    if stale:
+        first = sorted(stale)[0]
+        raise MigrationError(
+            "file does not match the checksum reviewed in "
+            f"{MANIFEST_NAME}"
+            + (f" (also: {', '.join(sorted(stale)[1:])})" if len(stale) > 1 else "")
+            + ". If this migration has been applied anywhere, do not edit it: "
+            "ship a new migration. If it is new, record its checksum in the "
+            "manifest in the same change.",
+            filename=first, kind="manifest_mismatch", detail={"files": stale},
         )
     files.sort(key=lambda f: f.number)
     return files
@@ -235,18 +260,17 @@ def validate_history(files: list[MigrationFile],
                 filename=gaps[0], kind="missing_predecessor",
                 detail={"missing": gaps},
             )
+        # ``discover`` has already established that the file on disk is the
+        # body the manifest records, so one comparison covers both.
         if row.checksum != listed_checksums.get(row.filename):
-            if row.checksum != next(
-                f.checksum for f in files if f.name == row.filename
-            ):
-                raise MigrationError(
-                    "database applied a different body for this migration than the "
-                    "manifest records; the file changed after it was applied. "
-                    "Ship a new migration instead of editing an applied one.",
-                    filename=row.filename, kind="checksum_changed",
-                    detail={"recorded": row.checksum,
-                            "manifest": listed_checksums.get(row.filename)},
-                )
+            raise MigrationError(
+                "database applied a different body for this migration than the "
+                "manifest records; the file changed after it was applied. "
+                "Ship a new migration instead of editing an applied one.",
+                filename=row.filename, kind="checksum_changed",
+                detail={"recorded": row.checksum,
+                        "manifest": listed_checksums.get(row.filename)},
+            )
         seen.add(row.filename)
 
     gaps = [f.name for f in files if f.name not in seen and f.number < _highest(applied, order)]

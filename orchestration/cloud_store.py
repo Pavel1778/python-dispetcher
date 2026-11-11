@@ -255,9 +255,10 @@ class PostgresStore:
 
         1. **Pre-flight, before any SQL runs.** The manifest
            (``migrations/0000_manifest.json``) must list exactly the files on
-           disk, numbers must be unique, and the history already recorded in
-           ``schema_migrations`` must be a prefix of this tree with matching
-           checksums. A violation raises
+           disk, each file's body must hash to the checksum the manifest
+           records for it, numbers must be unique, and the history already
+           recorded in ``schema_migrations`` must be a prefix of this tree with
+           matching checksums. A violation raises
            :class:`~orchestration.migration_runner.MigrationError` naming the
            file, and the database is left untouched — so a partially provisioned
            environment reports the missing step instead of being silently
