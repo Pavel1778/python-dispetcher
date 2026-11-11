@@ -7,7 +7,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # TEMPORARY (diagnosis): the same job on both images that `ubuntu-latest`
+    # currently resolves to, to see which one the dependency step fails on.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
 
     # The Cloud integration tests run against a real PostgreSQL server and skip
     # cleanly when it is absent, so the service is only here to keep them
@@ -44,13 +50,43 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      # One command per step, each with its own limit. The step list is all that
+      # is left of a run once its log has expired or cannot be fetched, so it has
+      # to say which command failed; and a download that hangs must fail in
+      # minutes with its last lines attached, not sit until the job limit.
+      - name: Runner image
+        run: |
+          . /etc/os-release
+          echo "::notice title=Runner image::$PRETTY_NAME (image ${ImageOS:-?} ${ImageVersion:-?}); $(pg_dump --version 2>&1 | head -1)"
+
+      - name: Install Python packages
+        timeout-minutes: 6
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
-          # Chromium for the browser E2E (playwright is in requirements-dev).
-          # The backup/restore drill uses the runner's own postgresql-client.
-          python -m playwright install --with-deps chromium
+          echo "::notice title=Playwright::$(python -m playwright --version)"
+
+      # Chromium for the browser E2E (playwright is in requirements-dev). Its
+      # system libraries come from apt, the browser itself from Playwright's CDN.
+      - name: Install Chromium system libraries
+        timeout-minutes: 8
+        run: |
+          set -o pipefail
+          timeout 420 python -m playwright install-deps chromium 2>&1 | tee /tmp/step.log || {
+            code=$?
+            tail -n 9 /tmp/step.log | while IFS= read -r line; do echo "::error title=playwright install-deps (exit $code)::$line"; done
+            exit 1
+          }
+
+      - name: Download Chromium
+        timeout-minutes: 6
+        run: |
+          set -o pipefail
+          timeout 300 python -m playwright install chromium 2>&1 | tee /tmp/step.log || {
+            code=$?
+            tail -n 9 /tmp/step.log | while IFS= read -r line; do echo "::error title=playwright install (exit $code)::$line"; done
+            exit 1
+          }
 
       - name: Lint
         run: ruff check .
