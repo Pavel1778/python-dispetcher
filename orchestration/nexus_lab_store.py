@@ -443,18 +443,28 @@ class LabStore:
                 (lease_seconds, task["id"]))
             return self._task_row(cur.fetchone())
 
-    def mark_running(self, task_id: str, *, conversation_id: str | None = None) -> dict:
+    def mark_running(self, task_id: str, *, conversation_id: str | None = None,
+                     delivery: dict | None = None) -> dict:
         """Bind the conversation that was started and mark the task running.
 
         The conversation id is always kept. The state changes only if the task
         is still ``dispatched``: a task settled between the claim and this call
         (its run was cancelled) stays settled.
+
+        *delivery* is the executor's record of how the task's original text was
+        handed to the agent (inline, or a file with the path, size and SHA-256
+        that were read back). It is kept under ``spec_ref.delivery``.
         """
+        proof = _jsonb(delivery) if delivery else None
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_run_tasks SET "
                         "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
-                        "conversation_id=COALESCE(%s, conversation_id), updated_at=now() "
-                        "WHERE id=%s RETURNING *", (conversation_id, task_id))
+                        "conversation_id=COALESCE(%s, conversation_id), "
+                        "spec_ref = CASE WHEN %s::jsonb IS NULL THEN spec_ref ELSE "
+                        "  COALESCE(spec_ref, '{}'::jsonb) || jsonb_build_object("
+                        "    'delivery', %s::jsonb || jsonb_build_object('at', now())) END, "
+                        "updated_at=now() "
+                        "WHERE id=%s RETURNING *", (conversation_id, proof, proof, task_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")

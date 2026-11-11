@@ -6,6 +6,8 @@ tested without a live OpenHands:
 
 * :class:`OpenHandsExecutor` — starts a conversation for a task and polls it.
   It never decides the task is done; it only reports what the conversation said.
+  It hands the agent the task's original text along with the planner's summary
+  (``nexus_spec_delivery``), and starts nothing when that cannot be done exactly.
 * :class:`GitVerifier` — reads the head of the task's branch through the
   read-only GitHub client and compares it with the commit the agent named. An
   agent's summary is an input to verification, never a substitute for it.
@@ -28,12 +30,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .cloud_client import CloudError, CloudNotFound
+from .cloud_client import CloudError, CloudNotFound, DeliveryError
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
 from .nexus_binding import AuthorizationError, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
+from .nexus_spec_delivery import Delivery, prepare
+from .nexus_specs import SpecService
 
 log = logging.getLogger("nexus_lab")
 
@@ -69,6 +73,21 @@ class Verification:
         return {"verdict": self.verdict, "reason": self.reason}
 
 
+class Dispatched(str):
+    """A conversation id that also says how the task was handed to the agent.
+
+    A plain ``str`` everywhere a conversation id is expected; ``delivery`` is
+    the evidence the scheduler records on the task (see ``mark_running``).
+    """
+
+    delivery: dict[str, Any] | None = None
+
+    def __new__(cls, conversation_id: str, delivery: dict[str, Any] | None = None):
+        self = super().__new__(cls, conversation_id)
+        self.delivery = delivery
+        return self
+
+
 class Executor(Protocol):
     """Dispatch a task and observe it. No completion decision lives here."""
 
@@ -89,26 +108,41 @@ class OpenHandsExecutor:
     The instructions tell the agent to inspect before changing, follow repo
     instructions, run the relevant tests, and report exact commits/files. The
     executor does **not** treat the reply as proof; that is the verifier's job.
+
+    A task is a planner's summary of part of what the user asked for. With
+    *specs* the agent is also given the original: inside the message when it is
+    short, as a file in the sandbox when it is long. A task that refers to a
+    specification is never started without it - ``dispatch`` raises
+    :class:`~orchestration.cloud_client.DeliveryError` and the scheduler puts
+    the task back with that reason.
     """
 
     def __init__(self, client: Any, *, poll_interval: float = 2.0,
-                 start_poll_attempts: int = 40):
+                 start_poll_attempts: int = 40, specs: SpecService | None = None):
         self.client = client
         self.poll_interval = poll_interval
         self.start_poll_attempts = start_poll_attempts
+        self.specs = specs
 
     @staticmethod
-    def instructions(task: dict) -> str:
+    def instructions(task: dict, original: str = "") -> str:
+        """The agent's first message. *original* is the block that carries or
+        points at the text the task was planned from."""
         acceptance = task.get("acceptance") or []
         criteria = "\n".join(f"- {c}" for c in acceptance) or "- (no explicit criteria)"
         repo = task.get("repository") or "(no repository)"
         branch = task.get("branch") or "(default branch)"
+        # The run is named so that the same plan, run again, starts new
+        # conversations: the direct transport derives a conversation's id from
+        # its title and first message, and a sandbox is reused between runs.
+        run = f"NEXUS run {task['run_id']}, task {task['task_key']}.\n" if task.get("run_id") else ""
         return (
             "You are a coding agent working inside a repository checkout.\n"
-            f"Repository: {repo}\nBranch: {branch}\n\n"
+            f"Repository: {repo}\nBranch: {branch}\n{run}\n"
             f"Task: {task['title']}\n{task.get('description') or ''}\n\n"
             "Acceptance criteria:\n"
             f"{criteria}\n\n"
+            + (f"{original}\n\n" if original else "") +
             "Rules:\n"
             "1. Inspect the repository before changing anything.\n"
             "2. Preserve unrelated user changes; do not revert others' work.\n"
@@ -121,27 +155,62 @@ class OpenHandsExecutor:
             "you did not verify."
         )
 
+    def delivery(self, task: dict) -> Delivery | None:
+        """How *task*'s original text reaches the agent, or ``None`` if the task
+        was planned from none (a row older than specifications)."""
+        if not (task.get("spec_ref") or {}).get("spec_id"):
+            return None
+        if self.specs is None:
+            raise DeliveryError(
+                "the task was planned from a specification, and this executor was built "
+                "without access to specifications; the agent would not get the task")
+        delivery = prepare(self.specs, task)
+        if delivery is not None and delivery.files and not getattr(
+                self.client, "supports_files", False):
+            raise DeliveryError(
+                f"the task's original text is {delivery.proof['chars']} characters and has to "
+                "reach the agent as a file, and this OpenHands transport cannot place a file "
+                "in the sandbox. Use OPENHANDS_TRANSPORT=direct")
+        return delivery
+
     def dispatch(self, task: dict) -> str:
+        delivery = self.delivery(task)
+        extra: dict[str, Any] = {}
+        if delivery is not None and delivery.files:
+            extra["files"] = delivery.files
         start = self.client.start_conversation(
-            initial_message=self.instructions(task),
+            initial_message=self.instructions(task, delivery.block if delivery else ""),
             selected_repository=task.get("repository") or None,
             selected_branch=task.get("branch") or None,
             title=f"lab:{task['task_key']}",
             tags={"nexusrun": str(task["run_id"])[:40], "nexustask": task["task_key"][:40]},
+            **extra,
         )
+        proof: dict[str, Any] | None = None
+        if delivery is not None:
+            proof = dict(delivery.proof)
+            if delivery.files:
+                placed = list(getattr(start, "files", ()) or ())
+                if len(placed) != len(delivery.files):
+                    # The transport said it started the conversation and cannot
+                    # show that the files are there. Not a start to build on.
+                    raise DeliveryError(
+                        "the conversation was created, but the transport did not confirm "
+                        "that the specification file is in the sandbox")
+                proof["files"] = placed
         # Two-phase start: the conversation id appears only at READY. Wait for
         # it (bounded) so the returned id is a real conversation, not a start
         # task that a later poll would report as "missing". If the client has no
         # start-task API (e.g. a local agent-server), fall back to its id.
         conv_id = getattr(start, "app_conversation_id", None)
         if conv_id:
-            return conv_id
+            return Dispatched(conv_id, proof)
         if hasattr(self.client, "get_start_task") and getattr(start, "id", None):
             current = start
             for _ in range(self.start_poll_attempts):
                 conv_id = getattr(current, "app_conversation_id", None)
                 if conv_id:
-                    return conv_id
+                    return Dispatched(conv_id, proof)
                 if getattr(current, "failed", False):
                     raise CloudError(f"start task failed: {getattr(current, 'detail', '')}")
                 time.sleep(self.poll_interval)
@@ -150,7 +219,7 @@ class OpenHandsExecutor:
                     raise CloudError("start task disappeared")
                 current = nxt
             raise CloudError("start task not READY within the poll budget")
-        return getattr(start, "id", "")
+        return Dispatched(getattr(start, "id", ""), proof)
 
     def poll(self, task: dict, conversation_id: str) -> TaskReport:
         try:
@@ -427,7 +496,8 @@ class LabScheduler:
                                         requeue=task["attempt"] < task["max_attempts"])
                 result.note = f"dispatch failed: {type(e).__name__}"
                 return result
-            self.store.mark_running(task["id"], conversation_id=conversation_id or None)
+            self.store.mark_running(task["id"], conversation_id=conversation_id or None,
+                                    delivery=getattr(conversation_id, "delivery", None))
             result.dispatched = True
 
         # 3. Decide the run's fate.

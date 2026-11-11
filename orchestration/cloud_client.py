@@ -107,6 +107,29 @@ class ExecutionStatus(str, Enum):
     DELETING = "deleting"
 
 
+class DeliveryError(CloudError):
+    """A file the conversation needs is not in the sandbox, whole and unchanged.
+
+    Raised before the conversation is created, so an agent is never started on
+    a task it has only part of. The message says what was expected and what was
+    found.
+    """
+
+
+#: Written in an initial message where the directory of the delivered files
+#: belongs. The transport replaces it with the directory that was verified.
+FILES_DIR_TOKEN = "{{NEXUS_FILES_DIR}}"
+
+
+@dataclass(frozen=True)
+class SandboxFile:
+    """A file to place in the sandbox before a conversation starts."""
+
+    name: str                 # a plain file name, no directories
+    data: bytes
+    sha256: str               # of ``data``; what the sandbox's copy must hash to
+
+
 @dataclass(frozen=True)
 class StartTask:
     """A ``AppConversationStartTask``."""
@@ -117,6 +140,9 @@ class StartTask:
     sandbox_id: str | None = None
     agent_server_url: str | None = None
     detail: str | None = None
+    #: Files placed in the sandbox for this conversation, each read back and
+    #: compared: ``[{"path", "bytes", "sha256"}]``. Empty when none were sent.
+    files: tuple[dict[str, Any], ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -146,6 +172,11 @@ class CloudConversation:
 
 class CloudClient:
     """Minimal, dependency-free client for the OpenHands Cloud V1 API."""
+
+    #: The app-conversation API has no way to put a file into the sandbox
+    #: before the agent starts, so a task that must travel as a file cannot use
+    #: this transport. Callers read this before they try.
+    supports_files = False
 
     #: The app-conversation start request carries ``selected_repository`` /
     #: ``selected_branch`` as documented fields, so this transport can select a

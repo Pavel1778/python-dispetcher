@@ -36,6 +36,7 @@ from .github_client import GitHubClient
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
+from .nexus_specs import SpecService
 
 log = logging.getLogger("lab_worker")
 
@@ -64,7 +65,9 @@ class LabWorker:
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
         self.github = github if github is not None else GitHubClient()
-        self.executor = OpenHandsExecutor(self.client)
+        # The executor reads a task's original text from the store, to hand it
+        # to the agent along with the planner's summary.
+        self.executor = OpenHandsExecutor(self.client, specs=SpecService(store))
         # A branch is read with the GitHub account its project is bound to, as
         # the studio reads it; the server token only where no account is bound.
         self.verifier = GitVerifier(self.github, client_for=project_github(
