@@ -116,10 +116,24 @@ class ProjectService:
             self._event(cur, project_id, principal, "goal.created", row["id"])
             return dict(row), True
 
+    def get_goal(self, principal: str, project_id: str, goal_id: str) -> dict:
+        """One goal of a project the caller is a member of, or ``NotFound``."""
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT id, project_id, text, state, created_by, created_at, spec_id "
+                        "FROM nexus_goals WHERE id=%s AND project_id=%s", (goal_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("goal not found")
+            return dict(row)
+
     def list_goals(self, principal: str, project_id: str) -> list[dict]:
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            cur.execute("SELECT id, project_id, text, state, created_by, created_at "
+            # ``text`` is the goal's label. A goal whose task is longer than the
+            # column holds (20 000 characters) carries the beginning of it here;
+            # the task itself is the specification ``spec_id`` points at.
+            cur.execute("SELECT id, project_id, text, state, created_by, created_at, spec_id "
                         "FROM nexus_goals WHERE project_id=%s ORDER BY created_at DESC, id LIMIT 200",
                         (project_id,))
             return [dict(row) for row in cur.fetchall()]

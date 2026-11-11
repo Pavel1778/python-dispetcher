@@ -158,6 +158,62 @@ def _membership_ok(cur: Any, project_id: str, principal: str) -> bool:
     return cur.fetchone() is not None
 
 
+def repository_refusal(cur: Any, project_id: str | None, repository: str,
+                       branch: str | None) -> str | None:
+    """Why work may not run against *repository* / *branch*; ``None`` if it may.
+
+    The one statement of the repository rule, shared by every path that starts
+    a conversation: the repository is in the allowlist, it is linked to the
+    project (when the work is project-scoped), it is enabled, and the branch is
+    one the allowlist permits (an empty list there means "default branch only").
+    """
+    cur.execute(
+        "SELECT id, full_name, default_branch, allowed_branches, enabled "
+        "FROM repositories WHERE full_name=%s", (repository,))
+    repo_row = cur.fetchone()
+    if repo_row is None:
+        return f"repository {repository} is not in the allowlist"
+    if project_id is not None:
+        cur.execute(
+            "SELECT 1 FROM nexus_project_repositories pr "
+            "WHERE pr.project_id=%s AND pr.repository_id=%s",
+            (project_id, repo_row["id"]))
+        if cur.fetchone() is None:
+            return f"repository {repository} is not linked to project {project_id}"
+    if not repo_row["enabled"]:
+        return f"repository {repository} is disabled"
+    if branch:
+        allowed = repo_row["allowed_branches"] or []
+        if allowed and branch not in allowed:
+            return f"branch {branch} is not allowed"
+        if not allowed and branch != repo_row["default_branch"]:
+            return f"branch {branch} is not allowed (default branch only)"
+    return None
+
+
+def authorize_run_task(store: PostgresStore, *, project_id: str, repository: str,
+                       branch: str) -> None:
+    """The dispatch gate for the autonomous lab. Raises :class:`AuthorizationError`.
+
+    A run task lives in ``nexus_run_tasks``, not in ``tasks``, so it cannot go
+    through :func:`authorize_dispatch`; the repository rule is the same one.
+    Called when a run is started (so a refusal reaches the person asking) and
+    again immediately before each conversation is created (so a link removed or
+    a repository disabled in between still stops the work).
+
+    A task with no repository has nothing to authorize, exactly as a legacy task
+    with no ``selected_repository``.
+    """
+    with store._tx() as cur:
+        cur.execute("SELECT 1 FROM nexus_projects WHERE id=%s", (project_id,))
+        if cur.fetchone() is None:
+            raise AuthorizationError("the run's project no longer exists")
+        if repository:
+            refusal = repository_refusal(cur, project_id, repository, branch or None)
+            if refusal:
+                raise AuthorizationError(refusal)
+
+
 def authorize_dispatch(store: PostgresStore, *, task: Task,
                        principal: str | None = None) -> dict[str, Any]:
     """Re-check every dispatch precondition for *task*. Raise on any failure.
@@ -202,32 +258,10 @@ def authorize_dispatch(store: PostgresStore, *, task: Task,
 
         # 4-6. repository authorization.
         repo_full = task.selected_repository
-        repo_row = None
         if repo_full is not None:
-            cur.execute(
-                "SELECT id, full_name, default_branch, allowed_branches, enabled "
-                "FROM repositories WHERE full_name=%s", (repo_full,))
-            repo_row = cur.fetchone()
-            if repo_row is None:
-                raise AuthorizationError(f"repository {repo_full} is not in the allowlist")
-            if project_id is not None:
-                cur.execute(
-                    "SELECT 1 FROM nexus_project_repositories pr "
-                    "WHERE pr.project_id=%s AND pr.repository_id=%s",
-                    (project_id, repo_row["id"]))
-                if cur.fetchone() is None:
-                    raise AuthorizationError(
-                        f"repository {repo_full} is not linked to project {project_id}")
-            if not repo_row["enabled"]:
-                raise AuthorizationError(f"repository {repo_full} is disabled")
-            branch = task.selected_branch
-            if branch:
-                allowed = repo_row["allowed_branches"] or []
-                if allowed and branch not in allowed:
-                    raise AuthorizationError(f"branch {branch} is not allowed")
-                if not allowed and branch != repo_row["default_branch"]:
-                    raise AuthorizationError(
-                        f"branch {branch} is not allowed (default branch only)")
+            refusal = repository_refusal(cur, project_id, repo_full, task.selected_branch)
+            if refusal:
+                raise AuthorizationError(refusal)
 
         # 7. principal rights.
         if principal is not None and project_id is not None:

@@ -152,15 +152,43 @@ class ConversationService:
                         (conversation_id, project_id))
             if cur.fetchone() is None:
                 raise NotFound("conversation not found")
-            cur.execute(
-                "INSERT INTO nexus_conversation_messages(conversation_id, role, content, meta) "
-                "VALUES (%s,%s,%s,%s) "
-                "RETURNING id, conversation_id, role, content, meta, created_at",
-                (conversation_id, role, content, _json(meta or {})))
-            row = dict(cur.fetchone())
-            cur.execute("UPDATE nexus_conversations SET updated_at=now() WHERE id=%s",
-                        (conversation_id,))
-            return row
+            return self.append_internal(cur, conversation_id, role=role, content=content,
+                                        meta=meta)
+
+    @staticmethod
+    def append_internal(cur: Any, conversation_id: str, *, role: str, content: str,
+                        meta: dict | None = None, run_id: str | None = None,
+                        state: str | None = None) -> dict:
+        """Append a message inside the caller's transaction. No membership check.
+
+        For work that finishes after the request that asked for it has returned
+        (a plan built in the background): the message is written in the same
+        transaction as the thing it announces, so the chat never says a run
+        started that did not, and never stays silent about one that did.
+        *run_id* links the conversation to a run; *state* sets its state.
+        """
+        cur.execute(
+            "INSERT INTO nexus_conversation_messages(conversation_id, role, content, meta) "
+            "VALUES (%s,%s,%s,%s) "
+            "RETURNING id, conversation_id, role, content, meta, created_at",
+            (conversation_id, role, content, _json(meta or {})))
+        row = dict(cur.fetchone())
+        cur.execute("UPDATE nexus_conversations SET updated_at=now(), "
+                    "run_id=COALESCE(%s, run_id), state=COALESCE(%s, state) WHERE id=%s",
+                    (run_id, state, conversation_id))
+        return row
+
+    def post_internal(self, conversation_id: str, messages: list[dict], *,
+                      state: str | None = None) -> None:
+        """Append system-originated *messages* to a conversation, if it still exists."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_conversations WHERE id=%s", (conversation_id,))
+            if cur.fetchone() is None:
+                return
+            for message in messages:
+                self.append_internal(cur, conversation_id, role=message["role"],
+                                     content=message["content"], meta=message.get("meta"),
+                                     state=state)
 
     def list_messages(self, principal: str, project_id: str, conversation_id: str,
                       *, limit: int = 500) -> list[dict]:

@@ -6,11 +6,15 @@ tested without a live OpenHands:
 
 * :class:`OpenHandsExecutor` — starts a conversation for a task and polls it.
   It never decides the task is done; it only reports what the conversation said.
-* :class:`GitVerifier` — checks the *actual* repository state (branch, commit,
-  changed files) through the read-only GitHub client. An agent's summary is an
-  input to verification, never a substitute for it.
-* :class:`LabScheduler` — one tick = reclaim → claim → dispatch → poll →
-  verify → record → decide. This is the only place that moves a run forward.
+  It hands the agent the task's original text along with the planner's summary
+  (``nexus_spec_delivery``), and starts nothing when that cannot be done exactly.
+* :class:`GitVerifier` — reads the head of the task's branch through the
+  read-only GitHub client and compares it with the commit the agent named. An
+  agent's summary is an input to verification, never a substitute for it.
+* :class:`LabScheduler` — one tick = reclaim → poll → verify → record →
+  claim → authorize → dispatch → decide. This is the only place that moves a
+  run forward, and it does so only while the run is ``running``, inside its
+  budgets, and only against a repository the project is allowed to use.
 
 The core rule the whole module enforces: a task is `completed_verified` only
 when the verifier observed the required state. Otherwise it is
@@ -20,13 +24,20 @@ stays gated.
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .cloud_client import CloudError, CloudNotFound
+from .cloud_client import CloudError, CloudNotFound, DeliveryError
+from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
-from .nexus_lab_store import LabStore
+from .nexus_binding import AuthorizationError, authorize_run_task
+from .nexus_github_accounts import GitHubAccountService, SecretsError
+from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
+from .nexus_spec_delivery import Delivery, prepare
+from .nexus_specs import SpecService
 
 log = logging.getLogger("nexus_lab")
 
@@ -62,6 +73,21 @@ class Verification:
         return {"verdict": self.verdict, "reason": self.reason}
 
 
+class Dispatched(str):
+    """A conversation id that also says how the task was handed to the agent.
+
+    A plain ``str`` everywhere a conversation id is expected; ``delivery`` is
+    the evidence the scheduler records on the task (see ``mark_running``).
+    """
+
+    delivery: dict[str, Any] | None = None
+
+    def __new__(cls, conversation_id: str, delivery: dict[str, Any] | None = None):
+        self = super().__new__(cls, conversation_id)
+        self.delivery = delivery
+        return self
+
+
 class Executor(Protocol):
     """Dispatch a task and observe it. No completion decision lives here."""
 
@@ -82,26 +108,41 @@ class OpenHandsExecutor:
     The instructions tell the agent to inspect before changing, follow repo
     instructions, run the relevant tests, and report exact commits/files. The
     executor does **not** treat the reply as proof; that is the verifier's job.
+
+    A task is a planner's summary of part of what the user asked for. With
+    *specs* the agent is also given the original: inside the message when it is
+    short, as a file in the sandbox when it is long. A task that refers to a
+    specification is never started without it - ``dispatch`` raises
+    :class:`~orchestration.cloud_client.DeliveryError` and the scheduler puts
+    the task back with that reason.
     """
 
     def __init__(self, client: Any, *, poll_interval: float = 2.0,
-                 start_poll_attempts: int = 40):
+                 start_poll_attempts: int = 40, specs: SpecService | None = None):
         self.client = client
         self.poll_interval = poll_interval
         self.start_poll_attempts = start_poll_attempts
+        self.specs = specs
 
     @staticmethod
-    def instructions(task: dict) -> str:
+    def instructions(task: dict, original: str = "") -> str:
+        """The agent's first message. *original* is the block that carries or
+        points at the text the task was planned from."""
         acceptance = task.get("acceptance") or []
         criteria = "\n".join(f"- {c}" for c in acceptance) or "- (no explicit criteria)"
         repo = task.get("repository") or "(no repository)"
         branch = task.get("branch") or "(default branch)"
+        # The run is named so that the same plan, run again, starts new
+        # conversations: the direct transport derives a conversation's id from
+        # its title and first message, and a sandbox is reused between runs.
+        run = f"NEXUS run {task['run_id']}, task {task['task_key']}.\n" if task.get("run_id") else ""
         return (
             "You are a coding agent working inside a repository checkout.\n"
-            f"Repository: {repo}\nBranch: {branch}\n\n"
+            f"Repository: {repo}\nBranch: {branch}\n{run}\n"
             f"Task: {task['title']}\n{task.get('description') or ''}\n\n"
             "Acceptance criteria:\n"
             f"{criteria}\n\n"
+            + (f"{original}\n\n" if original else "") +
             "Rules:\n"
             "1. Inspect the repository before changing anything.\n"
             "2. Preserve unrelated user changes; do not revert others' work.\n"
@@ -114,27 +155,62 @@ class OpenHandsExecutor:
             "you did not verify."
         )
 
+    def delivery(self, task: dict) -> Delivery | None:
+        """How *task*'s original text reaches the agent, or ``None`` if the task
+        was planned from none (a row older than specifications)."""
+        if not (task.get("spec_ref") or {}).get("spec_id"):
+            return None
+        if self.specs is None:
+            raise DeliveryError(
+                "the task was planned from a specification, and this executor was built "
+                "without access to specifications; the agent would not get the task")
+        delivery = prepare(self.specs, task)
+        if delivery is not None and delivery.files and not getattr(
+                self.client, "supports_files", False):
+            raise DeliveryError(
+                f"the task's original text is {delivery.proof['chars']} characters and has to "
+                "reach the agent as a file, and this OpenHands transport cannot place a file "
+                "in the sandbox. Use OPENHANDS_TRANSPORT=direct")
+        return delivery
+
     def dispatch(self, task: dict) -> str:
+        delivery = self.delivery(task)
+        extra: dict[str, Any] = {}
+        if delivery is not None and delivery.files:
+            extra["files"] = delivery.files
         start = self.client.start_conversation(
-            initial_message=self.instructions(task),
+            initial_message=self.instructions(task, delivery.block if delivery else ""),
             selected_repository=task.get("repository") or None,
             selected_branch=task.get("branch") or None,
             title=f"lab:{task['task_key']}",
             tags={"nexusrun": str(task["run_id"])[:40], "nexustask": task["task_key"][:40]},
+            **extra,
         )
+        proof: dict[str, Any] | None = None
+        if delivery is not None:
+            proof = dict(delivery.proof)
+            if delivery.files:
+                placed = list(getattr(start, "files", ()) or ())
+                if len(placed) != len(delivery.files):
+                    # The transport said it started the conversation and cannot
+                    # show that the files are there. Not a start to build on.
+                    raise DeliveryError(
+                        "the conversation was created, but the transport did not confirm "
+                        "that the specification file is in the sandbox")
+                proof["files"] = placed
         # Two-phase start: the conversation id appears only at READY. Wait for
         # it (bounded) so the returned id is a real conversation, not a start
         # task that a later poll would report as "missing". If the client has no
         # start-task API (e.g. a local agent-server), fall back to its id.
         conv_id = getattr(start, "app_conversation_id", None)
         if conv_id:
-            return conv_id
+            return Dispatched(conv_id, proof)
         if hasattr(self.client, "get_start_task") and getattr(start, "id", None):
             current = start
             for _ in range(self.start_poll_attempts):
                 conv_id = getattr(current, "app_conversation_id", None)
                 if conv_id:
-                    return conv_id
+                    return Dispatched(conv_id, proof)
                 if getattr(current, "failed", False):
                     raise CloudError(f"start task failed: {getattr(current, 'detail', '')}")
                 time.sleep(self.poll_interval)
@@ -143,7 +219,7 @@ class OpenHandsExecutor:
                     raise CloudError("start task disappeared")
                 current = nxt
             raise CloudError("start task not READY within the poll budget")
-        return getattr(start, "id", "")
+        return Dispatched(getattr(start, "id", ""), proof)
 
     def poll(self, task: dict, conversation_id: str) -> TaskReport:
         try:
@@ -170,18 +246,57 @@ class OpenHandsExecutor:
 # --------------------------------------------------------------------- verifier
 
 
+def project_github(store: PostgresStore, fallback: GitHubClient, *,
+                   accounts: GitHubAccountService | None = None
+                   ) -> Callable[[dict], GitHubClient]:
+    """``client_for(task)``: the GitHub identity a task's project reads with.
+
+    A project that has a stored GitHub account bound is read with that account,
+    exactly as the studio reads its files; a project without one is read with
+    *fallback* (the server's ``GITHUB_TOKEN``). The bound account is never
+    swapped for another: if it was revoked, or its token cannot be decrypted,
+    the call raises and the task is ``blocked`` - not verified by other means.
+    """
+    service = accounts or GitHubAccountService(store)
+
+    def client_for(task: dict) -> GitHubClient:
+        with store._tx() as cur:
+            cur.execute(
+                "SELECT a.id, a.principal FROM nexus_projects p "
+                "JOIN nexus_github_accounts a ON a.id = p.github_account_id "
+                "WHERE p.id=%s", (task["project_id"],))
+            row = cur.fetchone()
+        if row is None:
+            return fallback
+        return service.client_for_account(row["principal"], str(row["id"]))
+
+    return client_for
+
+
 class GitVerifier:
     """Check a task's result against the real repository.
 
-    The default policy: a task is `completed_verified` only when the agent
-    finished *and* the verifier observed a new commit on the task's branch that
-    the agent named. A finished conversation with no observable commit is
-    `completed_unverified` — never verified.
+    A task is `completed_verified` only when the conversation finished *and*
+    the head of the task's branch, read from GitHub now, is a commit the agent
+    named in its report (in full, or by an abbreviation of seven characters or
+    more). Everything else is something weaker: a finished conversation that
+    names no commit, or a commit that is not the head, is
+    `completed_unverified`; a branch that cannot be read is `blocked`.
+
+    What this does **not** establish: that the commit is new, or that it does
+    what the task asked. An agent that changed nothing and named the existing
+    head is verified; so "verified" means "the report refers to the real,
+    current state of the branch", and the acceptance criteria remain the
+    agent's own claim.
+
+    *client_for* picks the GitHub identity per task (see ``project_github``).
     """
 
-    def __init__(self, github: GitHubClient, *, require_commit: bool = True):
+    def __init__(self, github: GitHubClient, *, require_commit: bool = True,
+                 client_for: Callable[[dict], GitHubClient] | None = None):
         self.github = github
         self.require_commit = require_commit
+        self.client_for = client_for
 
     def verify(self, task: dict, report: TaskReport) -> Verification:
         if report.state == "missing":
@@ -204,8 +319,9 @@ class GitVerifier:
                                 "no repository bound; cannot verify remote state",
                                 evidence)
         try:
-            sha = self.github.default_branch_sha(repository, branch or None)
-        except (GitHubError, ValueError) as e:
+            github = self.client_for(task) if self.client_for is not None else self.github
+            sha = github.default_branch_sha(repository, branch or None)
+        except (GitHubError, ValueError, NotFound, SecretsError) as e:
             return Verification("blocked", f"github unavailable: {type(e).__name__}",
                                 {**evidence, "error": str(e)})
         evidence["remote_sha"] = sha
@@ -214,10 +330,13 @@ class GitVerifier:
             return Verification("completed_unverified",
                                 "branch has no readable commit", evidence)
         # The agent should have named the commit it produced; check it is real.
-        named = _extract_sha(report.final_text)
+        # Any commit-like token in the report counts, and an abbreviation
+        # matches the head it abbreviates: agents write "3f2a1b9", git-style.
+        named = _named_shas(report.final_text)
         if named:
-            evidence["named_sha"] = named
-            if named == sha:
+            match = next((token for token in named if sha.startswith(token)), None)
+            evidence["named_sha"] = match or named[0]
+            if match:
                 return Verification("completed_verified",
                                     "remote branch is at the reported commit", evidence)
             return Verification("completed_unverified",
@@ -229,16 +348,24 @@ class GitVerifier:
                             "no verifiable commit reported by the agent", evidence)
 
 
-def _extract_sha(text: str) -> str | None:
-    """Find a 7-40 char hex commit SHA in the agent's report, if present."""
-    import re
+_SHA_LIKE = re.compile(r"\b[0-9a-f]{7,40}\b")
 
-    for match in re.finditer(r"\b[0-9a-f]{7,40}\b", text or ""):
+
+def _named_shas(text: str) -> list[str]:
+    """Every 7-40 char hex token in the agent's report that could be a commit."""
+    found: list[str] = []
+    for match in _SHA_LIKE.finditer(text or ""):
         token = match.group(0)
         # Skip pure-digit runs (sizes, ids) that are not hex letters.
-        if any(c in "abcdef" for c in token):
-            return token
-    return None
+        if any(c in "abcdef" for c in token) and token not in found:
+            found.append(token)
+    return found
+
+
+def _extract_sha(text: str) -> str | None:
+    """The first commit-like token in the agent's report, if there is one."""
+    found = _named_shas(text)
+    return found[0] if found else None
 
 
 # -------------------------------------------------------------------- scheduler
@@ -254,16 +381,30 @@ class TickResult:
     verified: str | None = None
     verdict: str | None = None
     finished: bool = False
+    #: The run is alive but ticking cannot move it: it is paused, blocked or
+    #: waiting, and nothing of it is in flight. A person has to act first.
+    idle: bool = False
     note: str = ""
 
 
 class LabScheduler:
     """Drive one run forward by one step per tick.
 
-    One tick = reclaim expired leases → claim one claimable task → dispatch it →
-    poll → verify → record → decide (complete the run, or keep going). All state
-    lives in PostgreSQL, so the loop can run in a separate worker process and
-    survive a restart.
+    One tick = reclaim expired leases → poll what is in flight → verify and
+    record → claim one claimable task → authorize → dispatch → decide (complete
+    the run, or keep going). All state lives in PostgreSQL, so the loop can run
+    in a separate worker process and survive a restart.
+
+    What a tick may do depends on the run:
+
+    * a **terminal** run (completed, failed, cancelled) is not touched at all;
+    * a run that is alive but **not running** (paused, blocked, waiting) has the
+      results of work already in flight collected - that work was started and
+      paid for, and leaving it unread would lose the answer - and nothing new is
+      started;
+    * only a **running** run starts tasks, and only while it has iterations left
+      and its deadline has not passed. The store checks that again inside the
+      claim itself, so a pause or cancel is never overtaken.
     """
 
     def __init__(self, store: LabStore, executor: Executor, verifier: Verifier, *,
@@ -278,17 +419,38 @@ class LabScheduler:
 
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
+        run = self.store.run_row(run_id)
+        if run is None:
+            result.finished = True
+            result.note = "run not found"
+            return result
+        if run["state"] in TERMINAL_RUN_STATES:
+            result.finished = True
+            result.note = f"run is {run['state']}"
+            return result
         result.reclaimed = len(self.store.reclaim_expired(run_id))
 
-        # 1. Poll any task already dispatched, so a slow conversation advances.
-        for task in self._in_flight(run_id):
+        # 1. Poll every task already dispatched, so a slow conversation advances.
+        in_flight = 0
+        for task in self.store.in_flight_tasks(run_id):
             conv = task.get("conversation_id")
             if not conv:
+                in_flight += 1
                 continue
             report = self.executor.poll(task, conv)
             if report.state == "running":
-                continue
-            verdict = self.verifier.verify(task, report)
+                if task["running_seconds"] <= task["timeout_seconds"]:
+                    in_flight += 1
+                    continue
+                # The task's own time limit. The conversation is left as it is
+                # (its transcript is the explanation); the task is over, and it
+                # is not started a second time behind the first one's back.
+                verdict = Verification(
+                    "failed",
+                    f"timed out after {task['timeout_seconds']} s; the conversation was left running",
+                    {"state": "running", "conversation_id": conv})
+            else:
+                verdict = self.verifier.verify(task, report)
             self.store.record_verification(
                 task["id"], verdict=verdict.verdict,
                 evidence={"reason": verdict.reason, **verdict.evidence},
@@ -296,10 +458,34 @@ class LabScheduler:
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
 
-        # 2. Claim and dispatch the next claimable task.
+        if run["state"] != "running":
+            result.idle = in_flight == 0
+            result.note = f"run is {run['state']}: nothing new is started"
+            return result
+
+        # 2. Claim and dispatch the next claimable task. The claim refuses by
+        #    itself when the run stopped running or is out of budget.
         task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds)
         if task is not None:
             result.claimed = task["task_key"]
+            try:
+                # The gate every other path to a conversation goes through. It
+                # ran when the run was started; the link or the allowlist may
+                # have changed since.
+                authorize_run_task(self.store.store, project_id=str(task["project_id"]),
+                                   repository=task.get("repository") or "",
+                                   branch=task.get("branch") or "")
+            except AuthorizationError as e:
+                reason = f"not authorized: {e}"
+                self.store.record_verification(
+                    task["id"], verdict="blocked", evidence={"reason": reason},
+                    detail={"verdict": "blocked", "reason": reason})
+                applied = self.store.set_run_state_internal(
+                    run_id, "blocked",
+                    last_error=f"task {task['task_key']} was not started: {e}")
+                result.finished = applied is not None
+                result.note = "blocked: dispatch not authorized"
+                return result
             try:
                 conversation_id = self.executor.dispatch(task)
             except (CloudError, GitHubError) as e:
@@ -310,37 +496,48 @@ class LabScheduler:
                                         requeue=task["attempt"] < task["max_attempts"])
                 result.note = f"dispatch failed: {type(e).__name__}"
                 return result
-            self.store.mark_running(task["id"], conversation_id=conversation_id or None)
+            self.store.mark_running(task["id"], conversation_id=conversation_id or None,
+                                    delivery=getattr(conversation_id, "delivery", None))
             result.dispatched = True
 
         # 3. Decide the run's fate.
-        if self.store.all_verified(run_id):
-            self.store.set_run_state_internal(run_id, "completed")
-            result.finished = True
-        elif not self.store.has_pending(run_id):
+        outcome = self._decide(run_id)
+        if outcome is not None:
+            state, last_error, note = outcome
+            applied = self.store.set_run_state_internal(run_id, state, last_error=last_error)
+            result.finished = applied is not None
+            if applied is not None and note:
+                result.note = result.note or note
+        return result
+
+    def _decide(self, run_id: str) -> tuple[str, str | None, str] | None:
+        """The state the run should move to now, or ``None`` to keep going."""
+        counts = self.store.count_tasks(run_id)
+        total = sum(counts.values())
+        if total == 0:
+            # A run with nothing in it has not achieved its goal.
+            return ("failed", "the run has no tasks", "failed: no tasks")
+        if counts.get("completed_verified", 0) == total:
+            return ("completed", None, "")
+        unfinished = sum(counts.get(state, 0) for state in UNFINISHED_TASK_STATES)
+        if unfinished == 0:
             # Nothing left to do and not all verified: the run is blocked, not
-            # complete. A human or a replan step must resolve it.
-            self.store.set_run_state_internal(
-                run_id, "blocked",
-                last_error="no claimable tasks; some tasks not verified")
-            result.finished = True
-            result.note = result.note or "blocked: tasks remain unverified"
-        elif not self.store.has_in_flight(run_id) and not self.store.has_claimable(run_id):
+            # complete. A person resumes it (retry) or cancels it.
+            return ("blocked", "no claimable tasks; some tasks not verified",
+                    "blocked: tasks remain unverified")
+        if unfinished - counts.get("pending", 0) > 0:
+            return None                     # work is in flight; wait for it
+        spent = self.store.budget_spent(run_id)
+        if spent:
+            # Tasks are waiting and the run may not start them any more.
+            return ("failed", spent, f"failed: {spent}")
+        if not self.store.has_claimable(run_id):
             # A pending task exists but can never be claimed: a dependency ended
             # unverified/failed/blocked. That is a deadlock, not progress, so the
             # run is blocked rather than left spinning.
-            self.store.set_run_state_internal(
-                run_id, "blocked",
-                last_error="dependency graph deadlocked: a dependency is not verified")
-            result.finished = True
-            result.note = result.note or "blocked: dependency not verified"
-        return result
-
-    def _in_flight(self, run_id: str) -> list[dict]:
-        with self.store.store._tx() as cur:
-            cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s "
-                        "AND state IN ('dispatched','running')", (run_id,))
-            return [self.store._task_row(r) for r in cur.fetchall()]
+            return ("blocked", "dependency graph deadlocked: a dependency is not verified",
+                    "blocked: dependency not verified")
+        return None
 
     def _project_of(self, run_id: str) -> str:
         with self.store.store._tx() as cur:
@@ -354,7 +551,7 @@ class LabScheduler:
         last = TickResult()
         for _ in range(max_ticks):
             last = self.tick(run_id)
-            if last.finished:
+            if last.finished or last.idle:
                 return last
             if sleep:
                 time.sleep(sleep)

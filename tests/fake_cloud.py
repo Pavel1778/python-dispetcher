@@ -54,6 +54,12 @@ class FakeCloud:
         #: Lets a test drive the "orphan lookup is down" path.
         self.search_status = 0
         self.calls: list[tuple[str, str]] = []
+        # Sandboxes (``/api/v1/sandboxes``), for the direct transport: a sandbox
+        # is provisioned here and then spoken to at its own agent-server URL.
+        # A test points ``agent_server_url`` at a ``fake_runtime.FakeServer``.
+        self.sandboxes: dict[str, dict] = {}
+        self.agent_server_url: str | None = None
+        self.sandbox_session_key = "test-key"
 
     def make_conversation(self, *, title, repo=None, branch=None,
                           execution_status="running", tags=None) -> str:
@@ -180,6 +186,10 @@ class _Handler(BaseHTTPRequestHandler):
                 out.append(st)
             return self._json(200, out)
 
+        if path == "/api/v1/sandboxes":
+            sandbox = self.cloud.sandboxes.get(self._query("id"))
+            return self._json(200, [sandbox] if sandbox else [])
+
         if path.startswith("/api/v1/conversation/") and path.endswith("/events/search"):
             cid = path.split("/")[4]
             events = self.cloud.events.get(cid, [])
@@ -238,6 +248,17 @@ class _Handler(BaseHTTPRequestHandler):
                 "_polls": 0,
             }
             return self._json(200, self.cloud.start_tasks[st_id])
+
+        if path == "/api/v1/sandboxes":
+            self._read_body()
+            sid = "sbx-" + uuid.uuid4().hex[:12]
+            self.cloud.sandboxes[sid] = {
+                "id": sid, "status": "RUNNING",
+                "session_api_key": self.cloud.sandbox_session_key,
+                "exposed_urls": ([{"name": "AGENT_SERVER", "url": self.cloud.agent_server_url,
+                                   "port": 60000}] if self.cloud.agent_server_url else None),
+            }
+            return self._json(200, self.cloud.sandboxes[sid])
 
         if path.endswith("/send-message"):
             cid = path.split("/")[4]

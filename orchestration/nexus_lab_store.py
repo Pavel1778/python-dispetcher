@@ -13,16 +13,28 @@ writes run/task state, so the invariants live in one spot:
   A blocked or unverified dependency keeps the child ``pending``.
 * **Verification is explicit.** ``record_verification`` sets the terminal task
   state from a *verifier's* verdict, never from the agent's own text.
+* **Only a running run starts work.** ``claim_task`` checks the run's state, its
+  iteration budget and its deadline in the same transaction that claims the
+  task, so a pause or a cancel cannot be overtaken by a claim already on its way.
+* **No run is open-ended.** A run that names no deadline gets
+  ``DEFAULT_DEADLINE_SECONDS``. A run nobody served - no executor was running -
+  fails when that time is up; it does not spring to life days later.
+* **Run states follow a table** (``_RUN_ENTERED_FROM``). A finished or cancelled
+  run cannot be brought back, and a decision the scheduler made a moment too
+  late never overwrites what a person just asked for.
+* **A started conversation is never abandoned for a second one.** Only a task
+  that has no conversation bound is requeued when its lease runs out.
 
 Membership is checked in the same query that touches a row.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
-from .cloud_store import NotFound, PostgresStore
+from .cloud_store import InvalidTransition, NotFound, PostgresStore
 from .nexus_projects import ProjectService
 
 #: Task states that count as "done well enough to unblock a child".
@@ -35,6 +47,41 @@ TERMINAL_TASK_STATES = frozenset({
 
 #: Run states that are still active (the loop should keep servicing them).
 ACTIVE_RUN_STATES = frozenset({"running", "paused", "waiting_for_approval", "blocked"})
+
+#: Run states with no way forward. A terminal run is never serviced again.
+TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+
+#: The run state machine: for each state, the states it may be entered from.
+#: Asking for the state a run is already in is a no-op, not an error.
+_RUN_ENTERED_FROM: dict[str, frozenset[str]] = {
+    "running": frozenset({"paused", "blocked"}),
+    "paused": frozenset({"running"}),
+    "waiting_for_approval": frozenset({"running"}),
+    "blocked": frozenset({"running"}),
+    "completed": frozenset({"running"}),
+    "failed": frozenset({"running"}),
+    "cancelled": frozenset({"running", "paused", "waiting_for_approval", "blocked"}),
+}
+
+#: Task states that still expect work.
+UNFINISHED_TASK_STATES = ("pending", "dispatched", "running", "verifying")
+
+#: Task states a person's "resume" may send back to the queue.
+_RETRYABLE_TASK_STATES = ("completed_unverified", "partial", "failed", "blocked")
+
+#: Upper bounds for what a caller may ask of one run.
+MAX_RUN_ITERATIONS = 500
+MAX_TASK_ATTEMPTS = 10
+MAX_DEADLINE_SECONDS = 30 * 24 * 3600
+
+#: The deadline of a run that names none.
+DEFAULT_DEADLINE_SECONDS = 24 * 3600
+
+#: A run's deadline, in SQL. Rows written before deadlines were enforced have
+#: none; they are read as if they had been given the default when they were
+#: created, so an old run is bounded by the same rule as a new one.
+_DEADLINE_SQL = (f"COALESCE(deadline_at, created_at + "
+                 f"interval '{DEFAULT_DEADLINE_SECONDS} seconds')")
 
 
 def _jsonb(value: Any) -> str:
@@ -58,12 +105,30 @@ class LabStore:
     # ------------------------------------------------------------------ runs
     def start_run(self, principal: str, project_id: str, goal_id: str, *,
                   max_iterations: int = 50, max_attempts_per_task: int = 3,
-                  deadline_seconds: int | None = None) -> dict:
-        """Create the single active run for a goal. Refuses a second one."""
-        if max_iterations <= 0 or max_attempts_per_task <= 0:
-            raise ValueError("budgets must be positive")
-        deadline = (datetime.now(timezone.utc) + timedelta(seconds=deadline_seconds)
-                    if deadline_seconds else None)
+                  deadline_seconds: int | None = None,
+                  plan: list[dict[str, Any]] | None = None,
+                  repository: str = "", branch: str = "",
+                  also: Callable[[Any, dict], None] | None = None) -> dict:
+        """Create the single active run for a goal. Refuses a second one.
+
+        With *plan* (validated tasks from ``nexus_planner``) the tasks are stored
+        in the same transaction as the run, so a run never exists with half of
+        its plan - or with none, which would look like a run with nothing left
+        to do.
+
+        *also* is called with the cursor and the new run before the transaction
+        commits, for what must become true together with the run (the
+        specification it was planned from is marked planned; the chat is told).
+        If it raises, the run is not created.
+        """
+        if not 0 < max_iterations <= MAX_RUN_ITERATIONS:
+            raise ValueError(f"max_iterations must be between 1 and {MAX_RUN_ITERATIONS}")
+        if not 0 < max_attempts_per_task <= MAX_TASK_ATTEMPTS:
+            raise ValueError(f"max_attempts_per_task must be between 1 and {MAX_TASK_ATTEMPTS}")
+        if deadline_seconds is None:
+            deadline_seconds = DEFAULT_DEADLINE_SECONDS
+        if not 0 < deadline_seconds <= MAX_DEADLINE_SECONDS:
+            raise ValueError(f"deadline_seconds must be between 1 and {MAX_DEADLINE_SECONDS}")
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT id, state FROM nexus_goals WHERE id=%s AND project_id=%s FOR UPDATE",
@@ -78,15 +143,79 @@ class LabStore:
             cur.execute(
                 "INSERT INTO nexus_runs(project_id, goal_id, max_iterations, "
                 "max_attempts_per_task, deadline_at, created_by) "
-                "VALUES (%s,%s,%s,%s,%s,%s) RETURNING *",
+                "VALUES (%s,%s,%s,%s, now() + %s * interval '1 second', %s) RETURNING *",
                 (project_id, goal_id, max_iterations, max_attempts_per_task,
-                 deadline, principal))
-            run = dict(cur.fetchone())
+                 deadline_seconds, principal))
+            run = self._run_view(cur.fetchone())
             cur.execute("UPDATE nexus_goals SET state='running', active_run_id=%s, updated_at=now() "
                         "WHERE id=%s", (run["id"], goal_id))
+            for position, task in enumerate(plan or []):
+                self._insert_task(
+                    cur, run["id"], project_id, task_key=task["id"], title=task["title"],
+                    description=task.get("description") or "",
+                    acceptance=task.get("acceptance") or [],
+                    dependencies=task.get("dependencies") or [],
+                    repository=repository, branch=branch,
+                    max_attempts=max_attempts_per_task, position=position,
+                    spec_ref=task.get("spec_ref"))
             ProjectService._event(cur, project_id, principal, "run.started", run["id"])
             self._notify(cur, project_id, "goal_started", "Цель запущена", run["id"])
+            if also is not None:
+                also(cur, run)
             return run
+
+    def active_run_for_goal(self, principal: str, project_id: str, goal_id: str) -> dict | None:
+        """The goal's live run, if it has one. Lets a caller refuse a second
+        start before it spends a planning call; ``start_run`` still decides."""
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT * FROM nexus_runs WHERE goal_id=%s AND project_id=%s "
+                        "AND state = ANY(%s)", (goal_id, project_id, list(ACTIVE_RUN_STATES)))
+            row = cur.fetchone()
+            return self._run_view(row) if row else None
+
+    def active_run_internal(self, goal_id: str) -> dict | None:
+        """The goal's live run, for the planning loop (not a project member)."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_runs WHERE goal_id=%s AND state = ANY(%s)",
+                        (goal_id, list(ACTIVE_RUN_STATES)))
+            row = cur.fetchone()
+            return self._run_view(row) if row else None
+
+    @staticmethod
+    def _run_view(row: Any) -> dict:
+        """A run as callers see it: always with the deadline it is held to."""
+        run = dict(row)
+        if run.get("deadline_at") is None and run.get("created_at") is not None:
+            run["deadline_at"] = run["created_at"] + timedelta(seconds=DEFAULT_DEADLINE_SECONDS)
+        return run
+
+    def budget_spent(self, run_id: str) -> str | None:
+        """Which of the run's limits stops new work, if any.
+
+        Read on the database's clock - the one ``claim_task`` uses - so the
+        scheduler's reason and the claim's refusal can never disagree.
+        """
+        with self.store._tx() as cur:
+            cur.execute(f"SELECT iteration, max_iterations, {_DEADLINE_SQL} <= now() AS late "
+                        "FROM nexus_runs WHERE id=%s", (run_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        if row["iteration"] >= row["max_iterations"]:
+            return (f"iteration budget used: {row['iteration']} of "
+                    f"{row['max_iterations']} task starts")
+        if row["late"]:
+            return "deadline passed"
+        return None
+
+    def run_row(self, run_id: str) -> dict | None:
+        """The run as the scheduler sees it. No membership check: the worker is
+        not a project member, and this never leaves the process."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_runs WHERE id=%s", (run_id,))
+            row = cur.fetchone()
+            return self._run_view(row) if row else None
 
     def get_run(self, principal: str, project_id: str, run_id: str) -> dict:
         with self.store._tx() as cur:
@@ -96,67 +225,113 @@ class LabStore:
             row = cur.fetchone()
             if row is None:
                 raise NotFound("run not found")
-            return dict(row)
+            return self._run_view(row)
 
     def list_runs(self, principal: str, project_id: str, *, limit: int = 50) -> list[dict]:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT * FROM nexus_runs WHERE project_id=%s "
                         "ORDER BY created_at DESC, id LIMIT %s", (project_id, limit))
-            return [dict(r) for r in cur.fetchall()]
+            return [self._run_view(r) for r in cur.fetchall()]
 
     def set_run_state(self, principal: str, project_id: str, run_id: str, state: str,
                       *, last_error: str | None = None) -> dict:
-        if state not in ("running", "paused", "waiting_for_approval", "blocked",
-                         "completed", "failed", "cancelled"):
+        """Move a run on a member's behalf. Raises ``InvalidTransition`` when the
+        run's current state does not lead there (see ``_RUN_ENTERED_FROM``)."""
+        if state not in _RUN_ENTERED_FROM:
             raise ValueError("invalid run state")
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
-            return self._apply_run_state(cur, project_id, run_id, state, last_error)
+            run = self._apply_run_state(cur, project_id, run_id, state, last_error, strict=True)
+            assert run is not None
+            return run
 
     def set_run_state_internal(self, run_id: str, state: str,
-                               *, last_error: str | None = None) -> dict:
+                               *, last_error: str | None = None) -> dict | None:
         """State transition by the scheduler itself, not a user request.
 
         The worker is not a project member, so it cannot pass the membership
         check a user request must. It is still not a bypass of *authorization*:
         the run must exist, and only the scheduler calls this.
+
+        Returns ``None`` when the run is no longer in a state the transition can
+        start from. The scheduler decides from what it read a moment ago; if a
+        person paused or cancelled the run since, their request stands.
         """
-        if state not in ("running", "paused", "waiting_for_approval", "blocked",
-                         "completed", "failed", "cancelled"):
+        if state not in _RUN_ENTERED_FROM:
             raise ValueError("invalid run state")
         with self.store._tx() as cur:
             cur.execute("SELECT project_id FROM nexus_runs WHERE id=%s", (run_id,))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("run not found")
-            return self._apply_run_state(cur, str(row["project_id"]), run_id, state, last_error)
+            return self._apply_run_state(cur, str(row["project_id"]), run_id, state,
+                                         last_error, strict=False)
 
     def _apply_run_state(self, cur: Any, project_id: str, run_id: str, state: str,
-                         last_error: str | None) -> dict:
-        cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
-                    "updated_at=now() WHERE id=%s AND project_id=%s RETURNING *",
-                    (state, last_error, run_id, project_id))
+                         last_error: str | None, *, strict: bool) -> dict | None:
+        # The run row is locked first, here and in ``claim_task``: one order for
+        # everyone, so a cancel and a claim can wait for each other but never
+        # deadlock.
+        cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
+                    (run_id, project_id))
         row = cur.fetchone()
         if row is None:
             raise NotFound("run not found")
-        run = dict(row)
+        current = row["state"]
+        if current == state:
+            return self._run_view(row)
+        if current not in _RUN_ENTERED_FROM[state]:
+            if not strict:
+                return None
+            raise InvalidTransition(f"a {current} run cannot become {state}")
+        if state == "running" and current == "blocked":
+            # "Resume" on a blocked run means "try again". It needs something to
+            # try: tasks that did not verify and still have attempts left.
+            if not self._requeue_retryable(cur, run_id, "resumed"):
+                raise InvalidTransition(
+                    "nothing to retry: every task that did not verify has used all its attempts")
+        if state in ("cancelled", "failed"):
+            # Nothing of a cancelled or failed run is started or polled again,
+            # so its unfinished tasks must not go on saying "pending" or
+            # "running".
+            why = "run cancelled" if state == "cancelled" else f"run failed: {last_error or 'no reason given'}"
+            cur.execute(
+                "UPDATE nexus_run_tasks SET state='blocked', lease_expires=NULL, "
+                "last_error=%s, updated_at=now() "
+                "WHERE run_id=%s AND state = ANY(%s)",
+                (why[:500], run_id, list(UNFINISHED_TASK_STATES)))
+        if state == "running":
+            # A run that is going again no longer has the error that stopped it.
+            cur.execute("UPDATE nexus_runs SET state=%s, last_error=NULL, updated_at=now() "
+                        "WHERE id=%s RETURNING *", (state, run_id))
+        else:
+            cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
+                        "updated_at=now() WHERE id=%s RETURNING *", (state, last_error, run_id))
+        run = self._run_view(cur.fetchone())
         # Mirror terminal states onto the goal so the goal is not left
         # "running" after its only run finished.
-        if state in ("completed", "failed", "cancelled"):
+        if state in TERMINAL_RUN_STATES:
             cur.execute("UPDATE nexus_goals SET state=%s, updated_at=now() WHERE id=%s",
                         (state, run["goal_id"]))
             self._notify(cur, project_id, f"goal_{state}", f"Цель: {state}", run_id)
         return run
 
-    def bump_iteration(self, run_id: str) -> int:
-        with self.store._tx() as cur:
-            cur.execute("UPDATE nexus_runs SET iteration=iteration+1, updated_at=now() "
-                        "WHERE id=%s RETURNING iteration", (run_id,))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("run not found")
-            return row["iteration"]
+    @staticmethod
+    def _requeue_retryable(cur: Any, run_id: str, why: str) -> int:
+        """Send back to the queue every task that ended without verifying and
+        still has attempts left. Returns how many. The conversation of the
+        attempt that is over is kept in the task's evidence, not on the task: a
+        task's ``conversation_id`` always belongs to its current attempt."""
+        cur.execute(
+            "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
+            "evidence = evidence || jsonb_build_array(jsonb_build_object("
+            "  'requeued', %s::text, 'attempt', attempt, 'was', state, "
+            "  'conversation_id', conversation_id)), "
+            "conversation_id=NULL, verification=NULL, updated_at=now() "
+            "WHERE run_id=%s AND state = ANY(%s) AND attempt < max_attempts",
+            (why, run_id, list(_RETRYABLE_TASK_STATES)))
+        return cur.rowcount
 
     # -------------------------------------------------------------- run tasks
     def add_task(self, principal: str, project_id: str, run_id: str, *,
@@ -170,14 +345,35 @@ class LabStore:
                         (run_id, project_id))
             if cur.fetchone() is None:
                 raise NotFound("run not found")
-            cur.execute(
-                "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title, description, "
-                "acceptance, dependencies, repository, branch, timeout_seconds, max_attempts, executor) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
-                (run_id, project_id, task_key, title, description, _jsonb(acceptance or []),
-                 _jsonb(dependencies or []), repository, branch, timeout_seconds,
-                 max_attempts, executor))
-            return self._task_row(cur.fetchone())
+            return self._insert_task(
+                cur, run_id, project_id, task_key=task_key, title=title,
+                description=description, acceptance=acceptance or [],
+                dependencies=dependencies or [], repository=repository, branch=branch,
+                timeout_seconds=timeout_seconds, max_attempts=max_attempts, executor=executor)
+
+    def _insert_task(self, cur: Any, run_id: Any, project_id: str, *, task_key: str,
+                     title: str, description: str = "", acceptance: list[str],
+                     dependencies: list[str], repository: str = "", branch: str = "",
+                     timeout_seconds: int = 1800, max_attempts: int = 3,
+                     executor: str = "openhands", position: int = 0,
+                     spec_ref: dict | None = None) -> dict:
+        # Tasks are listed and claimed in ``created_at`` order, and ``now()`` is
+        # the same instant for every row of one transaction. *position* keeps a
+        # plan stored in one go in the order it was written.
+        #
+        # *spec_ref* says which part of the goal's specification the task
+        # covers (see migration 0021); the executor uses it to hand the agent
+        # the original text.
+        cur.execute(
+            "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title, description, "
+            "acceptance, dependencies, repository, branch, timeout_seconds, max_attempts, "
+            "executor, spec_ref, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
+            "        now() + %s * interval '1 microsecond') RETURNING *",
+            (run_id, project_id, task_key, title, description, _jsonb(acceptance),
+             _jsonb(dependencies), repository, branch, timeout_seconds,
+             max_attempts, executor, _jsonb(spec_ref) if spec_ref else None, position))
+        return self._task_row(cur.fetchone())
 
     def list_tasks(self, principal: str, project_id: str, run_id: str) -> list[dict]:
         with self.store._tx() as cur:
@@ -203,6 +399,7 @@ class LabStore:
         out["dependencies"] = _loads(out.get("dependencies")) or []
         out["evidence"] = _loads(out.get("evidence")) or []
         out["verification"] = _loads(out.get("verification"))
+        out["spec_ref"] = _loads(out.get("spec_ref"))
         return out
 
     def dependency_states(self, cur: Any, task: dict) -> dict[str, str]:
@@ -222,8 +419,21 @@ class LabStore:
         computed in SQL and the row is locked with ``FOR UPDATE SKIP LOCKED``
         one at a time, so N workers claim N distinct tasks rather than one
         worker locking the whole queue (the bug the concurrency test caught).
+
+        The run itself is part of the claim: nothing is claimed unless the run
+        is ``running``, has iterations left and is inside its deadline. That is
+        checked on the locked run row in this transaction, so a pause or a
+        cancel that committed first always wins - there is no moment between
+        "the run looked fine" and "the task was taken". Each claim uses one
+        iteration: an iteration is one start of one task.
         """
         with self.store._tx() as cur:
+            cur.execute(
+                "SELECT id FROM nexus_runs WHERE id=%s AND state='running' "
+                "AND iteration < max_iterations "
+                f"AND {_DEADLINE_SQL} > now() FOR UPDATE", (run_id,))
+            if cur.fetchone() is None:
+                return None
             cur.execute(
                 "SELECT t.* FROM nexus_run_tasks t "
                 "WHERE t.run_id=%s AND t.state='pending' AND t.attempt < t.max_attempts "
@@ -240,18 +450,38 @@ class LabStore:
             if row is None:
                 return None
             task = self._task_row(row)
+            cur.execute("UPDATE nexus_runs SET iteration=iteration+1, updated_at=now() "
+                        "WHERE id=%s", (run_id,))
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='dispatched', attempt=attempt+1, "
+                "conversation_id=NULL, "
                 "lease_expires=now() + (%s || ' seconds')::interval, updated_at=now() "
                 "WHERE id=%s RETURNING *",
                 (lease_seconds, task["id"]))
             return self._task_row(cur.fetchone())
 
-    def mark_running(self, task_id: str, *, conversation_id: str | None = None) -> dict:
+    def mark_running(self, task_id: str, *, conversation_id: str | None = None,
+                     delivery: dict | None = None) -> dict:
+        """Bind the conversation that was started and mark the task running.
+
+        The conversation id is always kept. The state changes only if the task
+        is still ``dispatched``: a task settled between the claim and this call
+        (its run was cancelled) stays settled.
+
+        *delivery* is the executor's record of how the task's original text was
+        handed to the agent (inline, or a file with the path, size and SHA-256
+        that were read back). It is kept under ``spec_ref.delivery``.
+        """
+        proof = _jsonb(delivery) if delivery else None
         with self.store._tx() as cur:
-            cur.execute("UPDATE nexus_run_tasks SET state='running', "
-                        "conversation_id=COALESCE(%s, conversation_id), updated_at=now() "
-                        "WHERE id=%s RETURNING *", (conversation_id, task_id))
+            cur.execute("UPDATE nexus_run_tasks SET "
+                        "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
+                        "conversation_id=COALESCE(%s, conversation_id), "
+                        "spec_ref = CASE WHEN %s::jsonb IS NULL THEN spec_ref ELSE "
+                        "  COALESCE(spec_ref, '{}'::jsonb) || jsonb_build_object("
+                        "    'delivery', %s::jsonb || jsonb_build_object('at', now())) END, "
+                        "updated_at=now() "
+                        "WHERE id=%s RETURNING *", (conversation_id, proof, proof, task_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
@@ -263,6 +493,11 @@ class LabStore:
 
         ``verdict`` is one of the five task outcomes. Only
         ``completed_verified`` unblocks children.
+
+        The verdict is recorded only while the task is still in flight. A task
+        that was settled in the meantime (its run was cancelled while the
+        conversation was being polled) keeps the state it was given, and is
+        returned as it is.
         """
         if verdict not in ("completed_verified", "completed_unverified",
                            "partial", "failed", "blocked"):
@@ -271,11 +506,15 @@ class LabStore:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state=%s, verification=%s, "
                 "evidence = evidence || %s::jsonb, lease_expires=NULL, updated_at=now() "
-                "WHERE id=%s RETURNING *",
+                "WHERE id=%s AND state IN ('dispatched','running','verifying') RETURNING *",
                 (verdict, _jsonb(detail or {}), _jsonb([evidence]), task_id))
             row = cur.fetchone()
             if row is None:
-                raise NotFound("task not found")
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise NotFound("task not found")
+                return self._task_row(row)
             task = self._task_row(row)
             cur.execute("SELECT project_id FROM nexus_runs WHERE id=%s", (task["run_id"],))
             project_id = cur.fetchone()["project_id"]
@@ -283,19 +522,35 @@ class LabStore:
             return task
 
     def release_task(self, task_id: str, *, error: str, requeue: bool) -> dict:
-        """Return a claimed task to ``pending`` (requeue) or mark it ``failed``."""
+        """Return a claimed task to ``pending`` (requeue) or mark it ``failed``.
+
+        Only a task that is still ``dispatched`` is released. One that was
+        settled while its start was failing (the run was cancelled) keeps the
+        state it was given.
+        """
         state = "pending" if requeue else "failed"
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, last_error=%s, "
-                "updated_at=now() WHERE id=%s RETURNING *", (state, error, task_id))
+                "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
+                (state, error, task_id))
             row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
             return self._task_row(row)
 
     def reclaim_expired(self, run_id: str) -> list[dict]:
-        """Requeue tasks whose lease expired (a worker died mid-task).
+        """Requeue tasks a worker claimed and never started (it died in between).
+
+        Only a task with **no conversation bound** is taken back. Polling is
+        stateless - any worker can follow a conversation by its id - so a task
+        whose conversation exists was not lost with the worker that started it,
+        and requeueing it would start a second conversation for the same work
+        while the first is still running. How long such a task may run is the
+        task's own ``timeout_seconds`` (see ``in_flight_tasks``), not the lease.
 
         A task that has exhausted its attempts is marked ``failed`` instead of
         being requeued forever.
@@ -304,6 +559,7 @@ class LabStore:
         with self.store._tx() as cur:
             cur.execute(
                 "SELECT * FROM nexus_run_tasks WHERE run_id=%s AND state IN ('dispatched','running') "
+                "AND conversation_id IS NULL "
                 "AND lease_expires IS NOT NULL AND lease_expires < now() FOR UPDATE",
                 (run_id,))
             for row in cur.fetchall():
@@ -318,6 +574,28 @@ class LabStore:
                                 (task["id"],))
                 out.append(self._task_row(cur.fetchone()))
             return out
+
+    def in_flight_tasks(self, run_id: str) -> list[dict]:
+        """Tasks with a conversation under way, each with ``running_seconds``:
+        how long ago it was started (``mark_running`` is the last write to a
+        running task, so its ``updated_at`` is the start)."""
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT t.*, EXTRACT(EPOCH FROM (now() - t.updated_at)) AS running_seconds "
+                "FROM nexus_run_tasks t WHERE t.run_id=%s "
+                "AND t.state IN ('dispatched','running') ORDER BY t.created_at, t.id",
+                (run_id,))
+            out = []
+            for row in cur.fetchall():
+                task = self._task_row(row)
+                task["running_seconds"] = float(task["running_seconds"] or 0)
+                out.append(task)
+            return out
+
+    def count_tasks(self, run_id: str) -> dict[str, int]:
+        """How many of the run's tasks are in each state (absent = none)."""
+        with self.store._tx() as cur:
+            return self.run_progress(cur, run_id)
 
     def run_progress(self, cur: Any, run_id: str) -> dict[str, int]:
         cur.execute("SELECT state, count(*) AS n FROM nexus_run_tasks WHERE run_id=%s "

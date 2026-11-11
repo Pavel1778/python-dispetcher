@@ -1019,10 +1019,24 @@ def test_global_ceiling_holds_when_the_ip_is_untrustworthy(server):
     b = Browser(f"http://127.0.0.1:{server.port}")
     throttle = server.app.login_throttle
     throttle.max_attempts = 10_000          # disable the per-IP ceiling
+    # A small ceiling, so the whole burst fits the 60-second window on any
+    # machine. With the default of 120 this test needed 125 password checks
+    # inside one window: about 20 s on an idle machine, about 100 s beside
+    # another job - and then the oldest attempts aged out before the ceiling
+    # was reached and the test failed without anything being wrong.
+    throttle.global_max_attempts = ceiling = 12
     codes = []
-    for i in range(throttle.global_max_attempts + 5):
+    for i in range(ceiling + 5):
         st, _, _ = b.request("POST", "/login",
                              form={"username": f"u{i}", "password": "WRONG"},
                              headers={"X-Forwarded-For": f"203.0.113.{i % 250}"})
         codes.append(st)
-    assert 429 in codes, "the global ceiling never engaged"
+    # Every attempt up to the ceiling is judged on its password; every one
+    # after it is turned away, whatever address and name it claims.
+    assert 429 not in codes[:ceiling], codes
+    assert codes[ceiling:] == [429] * 5, codes
+
+
+def test_the_global_ceiling_defaults_to_120_a_minute(server):
+    throttle = server.app.login_throttle
+    assert (throttle.global_max_attempts, throttle.global_window_seconds) == (120, 60.0)

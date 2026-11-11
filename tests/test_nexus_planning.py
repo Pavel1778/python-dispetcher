@@ -219,6 +219,10 @@ def test_plan_body_size_limit(http_server):
         "Authorization": "Bearer machine-token", "Content-Length": str(4 * 1024 * 1024 + 1),
     })
     try:
-        assert conn.getresponse().status == 400
+        # Too much to accept is 413, as it already was for file uploads; the
+        # answer names the size sent and the size this route takes.
+        response = conn.getresponse()
+        assert response.status == 413
+        assert str(4 * 1024 * 1024) in response.read().decode()
     finally:
         conn.close()

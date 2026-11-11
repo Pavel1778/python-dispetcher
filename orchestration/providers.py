@@ -24,6 +24,12 @@ Design rules, each enforced in code:
 * **Structured output.** Every provider returns a plan-shaped object validated
   by :func:`validate_plan_json`; an invalid response is a failure of that
   provider, not a result.
+* **A request is sized before it is sent.** Each provider knows how many tokens
+  its model reads at once (``context_tokens``, overridable per provider with
+  ``<NAME>_CONTEXT_TOKENS``). A prompt that cannot fit is not sent to that
+  provider at all; the reason names both numbers. A provider that still answers
+  "too large" raises :class:`ProviderTooLarge`, which a caller that can make the
+  request smaller (``nexus_spec_planner``) acts on.
 
 The module is standard-library only, like the rest of the orchestration layer,
 so it needs no new dependency and is exercised against a real local HTTP server
@@ -34,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -60,13 +67,85 @@ class ProviderRejected(ProviderError):
     """400/422 or a malformed body. The request or the response is wrong."""
 
 
-class AllProvidersFailed(ProviderError):
-    """Every provider in the cascade failed. Carries each provider's reason."""
+class ProviderTooLarge(ProviderRejected):
+    """The request does not fit the model: 413, or a 400 that says so, or a
+    prompt this module already knows is larger than the model's window."""
 
-    def __init__(self, failures: list[tuple[str, str]]):
+
+# --------------------------------------------------------------------- tokens
+
+_LONG_RUN = re.compile(r"[!-~]{33,}")
+_GREEK_CYRILLIC = re.compile(r"[\u0370-\u052f]")
+#: What a provider's 400/422 body says when the problem is the size of the request.
+_TOO_LARGE_BODY = re.compile(
+    r"context[ _-]?(?:length|window)|too (?:large|long|many tokens)|maximum[^.]{0,40}tokens|"
+    r"token limit|tokens per minute|request_too_large|exceeds? the (?:limit|maximum)", re.IGNORECASE)
+
+#: Tokens left free in a model's window for its answer.
+RESPONSE_RESERVE_TOKENS = 2_000
+
+
+def estimate_tokens(text: str) -> int:
+    """How many model tokens *text* is likely to be, erring high.
+
+    No tokenizer is available (this layer is standard-library only, and each
+    provider has its own), so this is a per-script estimate: three ASCII
+    characters per token, two for long unbroken ASCII runs (hashes, base64 and
+    URLs tokenise badly), two Cyrillic or Greek letters per token, one token
+    per other character, two per astral character (emoji). Real tokenizers do
+    better than this on prose in every script, which is the point: a request
+    that fits by this count fits.
+    """
+    if not text:
+        return 0
+    total = len(text)
+    ascii_count = len(text.encode("ascii", "ignore"))
+    astral = len(text.encode("utf-16-le", "surrogatepass")) // 2 - total
+    cyrillic = total - len(_GREEK_CYRILLIC.sub("", text)) if ascii_count < total else 0
+    other = total - ascii_count - cyrillic - astral
+    long_runs = sum(len(m.group(0)) for m in _LONG_RUN.finditer(text)) if ascii_count else 0
+    tokens = ((ascii_count - long_runs) / 3.0 + long_runs / 2.0
+              + cyrillic * 0.5 + other * 1.0 + astral * 2.0)
+    return int(tokens) + 1
+
+
+class AllProvidersFailed(ProviderError):
+    """Every provider in the cascade failed. Carries each provider's reason.
+
+    *kinds* says, per failure, what sort it was, for a caller that can act on
+    the difference: ``too_large`` (the request does not fit the model - a
+    smaller request may), ``auth`` (no key, or the key was refused - retrying
+    cannot help), ``unavailable`` (transport, 5xx, 429 - a later attempt may
+    work) and ``rejected`` (the request or the answer was wrong, including an
+    answer that is not a valid plan).
+    """
+
+    def __init__(self, failures: list[tuple[str, str]], kinds: list[str] | None = None):
         self.failures = failures
+        self.kinds = list(kinds or [])
         detail = "; ".join(f"{name}: {reason}" for name, reason in failures) or "no providers configured"
         super().__init__(f"all providers failed ({detail})")
+
+    @property
+    def too_large(self) -> bool:
+        """At least one provider refused the request for its size."""
+        return "too_large" in self.kinds
+
+    @property
+    def permanent(self) -> bool:
+        """No provider could ever answer this: none has a usable key."""
+        return not self.failures or (bool(self.kinds) and all(k == "auth" for k in self.kinds))
+
+
+def failure_kind(error: Exception) -> str:
+    """The sort of failure *error* is, as :class:`AllProvidersFailed` names them."""
+    if isinstance(error, ProviderTooLarge):
+        return "too_large"
+    if isinstance(error, ProviderAuthError):
+        return "auth"
+    if isinstance(error, ProviderUnavailable):
+        return "unavailable"
+    return "rejected"
 
 
 # ------------------------------------------------------------- http plumbing
@@ -115,14 +194,21 @@ class Provider:
     """
 
     name: str = "provider"
+    #: Tokens the model reads in one request when nothing more specific is known.
+    DEFAULT_CONTEXT_TOKENS = 100_000
 
     def __init__(self, *, api_key: str | None = None, base_url: str,
                  model: str, timeout: float = 30.0, max_retries: int = 2,
-                 backoff_base: float = 0.5, sleep: Callable[[float], None] = time.sleep):
+                 backoff_base: float = 0.5, sleep: Callable[[float], None] = time.sleep,
+                 context_tokens: int | None = None):
         self.api_key = api_key if api_key is not None else self._key_from_env()
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        # The model's window. An account can have less than the model does (a
+        # free tier's tokens-per-minute cap rejects a large request outright),
+        # so the operator can state the real figure.
+        self.context_tokens = context_tokens or self._context_from_env()
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self._sleep = sleep
@@ -135,9 +221,22 @@ class Provider:
         value = os.environ.get(self._ENV_KEY, "").strip() if self._ENV_KEY else ""
         return value or None
 
+    def _context_from_env(self) -> int:
+        raw = os.environ.get(f"{self.name.upper()}_CONTEXT_TOKENS", "").strip()
+        try:
+            value = int(raw) if raw else 0
+        except ValueError:
+            value = 0
+        return value if value > 0 else self.DEFAULT_CONTEXT_TOKENS
+
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
+
+    def room_for(self, prompt: str, system: str = "") -> tuple[int, int]:
+        """``(tokens the request needs, tokens the model has for a request)``."""
+        return (estimate_tokens(prompt) + estimate_tokens(system),
+                self.context_tokens - RESPONSE_RESERVE_TOKENS)
 
     def __repr__(self) -> str:  # never expose the key
         return f"{type(self).__name__}(name={self.name!r}, model={self.model!r}, configured={self.configured})"
@@ -162,13 +261,14 @@ class Provider:
         raise NotImplementedError
 
     # -- shared request path ----------------------------------------------
-    def _post(self, prompt: str, system: str, *, prose: bool = False) -> Any:
+    def _post(self, prompt: str, system: str, *, prose: bool = False,
+              timeout: float | None = None) -> Any:
         data = json.dumps(self._payload(prompt, system, prose=prose)).encode()
         req = urllib.request.Request(self._endpoint(), data=data, method="POST")
         for key, value in self._headers().items():
             req.add_header(key, value)
         try:
-            with self._opener.open(req, timeout=self.timeout) as resp:
+            with self._opener.open(req, timeout=timeout or self.timeout) as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
@@ -178,13 +278,30 @@ class Provider:
                 raise ProviderUnavailable(f"{self.name} -> 429") from e
             if e.code >= 500:
                 raise ProviderUnavailable(f"{self.name} -> {e.code}") from e
+            if e.code == 413 or self._says_too_large(e):
+                raise ProviderTooLarge(
+                    f"{self.name} -> {e.code}: the request is too large for the model") from e
             raise ProviderRejected(f"{self.name} -> {e.code}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
 
-    def complete(self, prompt: str, system: str = "") -> ProviderResponse:
+    @staticmethod
+    def _says_too_large(error: urllib.error.HTTPError) -> bool:
+        """Whether a 4xx body blames the size of the request.
+
+        Only a bounded prefix is read, and it is used for this one decision:
+        an error body can echo the prompt, so it is never kept or logged.
+        """
+        try:
+            body = error.read(4000).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - an unreadable body decides nothing
+            return False
+        return bool(_TOO_LARGE_BODY.search(body))
+
+    def complete(self, prompt: str, system: str = "", *,
+                 timeout: float | None = None) -> ProviderResponse:
         """Call the provider, retrying only transient failures, bounded."""
-        text, attempts = self._text_with_retry(prompt, system)
+        text, attempts = self._text_with_retry(prompt, system, timeout=timeout)
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as e:
@@ -202,16 +319,23 @@ class Provider:
         """
         return self._text_with_retry(prompt, system, prose=True)[0]
 
-    def _text_with_retry(self, prompt: str, system: str, *,
-                         prose: bool = False) -> tuple[str, int]:
+    def _text_with_retry(self, prompt: str, system: str, *, prose: bool = False,
+                         timeout: float | None = None) -> tuple[str, int]:
         if not self.configured:
             raise ProviderAuthError(f"{self.name}: no API key configured")
+        needed, room = self.room_for(prompt, system)
+        if needed > room:
+            # Not sent: the model cannot read it, and a provider's own refusal
+            # of an oversized request is slower and says less.
+            raise ProviderTooLarge(
+                f"{self.name}: the request needs about {needed} tokens and the model "
+                f"reads {room} ({self.name.upper()}_CONTEXT_TOKENS={self.context_tokens})")
         attempts = 0
         last: ProviderUnavailable | None = None
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                body = self._post(prompt, system, prose=prose)
+                body = self._post(prompt, system, prose=prose, timeout=timeout)
             except ProviderUnavailable as e:
                 last = e
                 if attempts > self.max_retries:
@@ -228,6 +352,7 @@ class Provider:
 class GeminiProvider(Provider):
     name = "gemini"
     _ENV_KEY = "GEMINI_API_KEY"
+    DEFAULT_CONTEXT_TOKENS = 1_000_000
 
     def __init__(self, **kw: Any):
         kw.setdefault("base_url", os.environ.get(
@@ -289,6 +414,7 @@ class _OpenAICompatProvider(Provider):
 class GroqProvider(_OpenAICompatProvider):
     name = "groq"
     _ENV_KEY = "GROQ_API_KEY"
+    DEFAULT_CONTEXT_TOKENS = 128_000
 
     def __init__(self, **kw: Any):
         kw.setdefault("base_url", os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"))
@@ -299,6 +425,7 @@ class GroqProvider(_OpenAICompatProvider):
 class OpenRouterProvider(_OpenAICompatProvider):
     name = "openrouter"
     _ENV_KEY = "OPENROUTER_API_KEY"
+    DEFAULT_CONTEXT_TOKENS = 128_000
 
     def __init__(self, **kw: Any):
         kw.setdefault("base_url", os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
@@ -408,7 +535,12 @@ class ProviderCascade:
     def configured(self) -> list[str]:
         return [p.name for p in self.providers if p.configured]
 
-    def plan(self, prompt: str, system: str = "") -> CascadeResult:
+    def usable(self) -> list[Provider]:
+        """The providers that have a key, in cascade order."""
+        return [p for p in self.providers if p.configured]
+
+    def plan(self, prompt: str, system: str = "", *,
+             timeout: float | None = None) -> CascadeResult:
         """Ask each configured provider for a plan until one answers validly.
 
         Failover happens only on a provider/transport failure or an invalid
@@ -421,7 +553,7 @@ class ProviderCascade:
             if not provider.configured:
                 continue
             try:
-                response = provider.complete(prompt, system)
+                response = provider.complete(prompt, system, timeout=timeout)
                 plan = validate_plan_json(response.data)
             except ProviderError as e:
                 failures.append((provider.name, str(e)))

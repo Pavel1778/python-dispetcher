@@ -46,18 +46,23 @@ so :class:`~orchestration.cloud_dispatcher.CloudDispatcher`,
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import posixpath
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from .cloud_client import (
+    FILES_DIR_TOKEN,
     CloudClient,
     CloudConversation,
     CloudError,
     CloudNotFound,
     CloudUnavailable,
+    DeliveryError,
+    SandboxFile,
     StartStatus,
     StartTask,
 )
@@ -116,6 +121,85 @@ class CloudDirectClient:
         self.llm_model = llm_model
         self._http = OpenHandsClient("", api_key="", timeout=timeout)
         self._cache: dict[str, SandboxRoute] = {}
+
+    #: This transport can place a file in the sandbox before the agent starts
+    #: (the agent-server's ``/api/file`` routes) and read it back to check it.
+    supports_files = True
+
+    def files_dirs(self) -> list[str]:
+        """Where delivered files may go inside a sandbox, in order of preference.
+
+        Never inside the working directory: the agent is told to clone the
+        repository into it, and ``git clone`` refuses a directory that is not
+        empty. The first choice is beside it, on the same volume; ``/tmp`` is
+        the fallback for a sandbox where that is not writable. A directory is
+        used only if the file read back from it is the file that was sent.
+        ``NEXUS_SPEC_SANDBOX_DIR`` names one directory to use instead.
+        """
+        configured = os.environ.get("NEXUS_SPEC_SANDBOX_DIR", "").strip()
+        if configured:
+            if not configured.startswith("/"):
+                raise DeliveryError("NEXUS_SPEC_SANDBOX_DIR must be an absolute path")
+            return [configured.rstrip("/") or "/"]
+        beside = posixpath.join(posixpath.dirname(self.working_dir.rstrip("/")) or "/",
+                                ".nexus")
+        return [beside, "/tmp/.nexus"]
+
+    def _deliver_files(self, route: SandboxRoute,
+                       files: list[SandboxFile]) -> tuple[str, tuple[dict[str, Any], ...]]:
+        """Place *files* in the sandbox and prove they arrived whole.
+
+        Every file is uploaded, downloaded again and compared by size and
+        SHA-256. Returns the directory and what was verified. Raises
+        :class:`DeliveryError` when no directory holds exact copies, and
+        :class:`CloudUnavailable` when the sandbox cannot be reached at all -
+        a different directory would not help with that, a later attempt might.
+        """
+        for item in files:
+            if not item.name or "/" in item.name or item.name in (".", ".."):
+                raise DeliveryError(f"{item.name!r} is not a plain file name")
+            if hashlib.sha256(item.data).hexdigest() != item.sha256:
+                raise DeliveryError(f"{item.name}: the data does not match its own SHA-256")
+        refusals: list[str] = []
+        for directory in self.files_dirs():
+            try:
+                placed = tuple(self._deliver_one(route, posixpath.join(directory, item.name), item)
+                               for item in files)
+            except DeliveryError as e:
+                refusals.append(str(e))
+                continue
+            return directory, placed
+        raise DeliveryError("the files could not be placed in the sandbox: "
+                            + "; ".join(refusals))
+
+    def _deliver_one(self, route: SandboxRoute, path: str, item: SandboxFile) -> dict[str, Any]:
+        try:
+            status, payload = self._http._upload_to(
+                route.agent_server_url, route.session_api_key, path, item.data,
+                filename=item.name)
+        except ApiUnavailable as e:
+            raise CloudUnavailable(str(e)) from e
+        if status in (401, 403):
+            raise CloudError(f"upload to the sandbox -> {status}")
+        if status not in (200, 201):
+            detail = payload.get("detail") if isinstance(payload, dict) else None
+            raise DeliveryError(f"{path}: upload -> {status}"
+                                + (f" ({str(detail)[:200]})" if detail else ""))
+        try:
+            status, stored = self._http._download_from(
+                route.agent_server_url, route.session_api_key, path, limit=len(item.data))
+        except ApiUnavailable as e:
+            raise CloudUnavailable(str(e)) from e
+        if status != 200:
+            raise DeliveryError(f"{path}: reading the file back -> {status}")
+        digest = hashlib.sha256(stored).hexdigest()
+        if len(stored) != len(item.data) or digest != item.sha256:
+            more = "more than " if len(stored) > len(item.data) else ""
+            raise DeliveryError(
+                f"{path}: the sandbox holds {more}{min(len(stored), len(item.data) + 1)} bytes "
+                f"(SHA-256 {digest[:16]}…), {len(item.data)} bytes were sent "
+                f"(SHA-256 {item.sha256[:16]}…)")
+        return {"path": path, "bytes": len(stored), "sha256": digest}
 
     # ------------------------------------------------------------- sandboxes
     def _new_sandbox(
@@ -203,6 +287,7 @@ class CloudDirectClient:
         agent_profile_id: str | None = None,
         agent_type: str | None = None,
         plugins: list[dict[str, Any]] | None = None,
+        files: list[SandboxFile] | None = None,
     ) -> StartTask:
         """Provision a sandbox (or reuse one) and create the conversation on it.
 
@@ -232,6 +317,12 @@ class CloudDirectClient:
         The account-selection fields (``agent_profile_id``, ``agent_type``,
         ``plugins``) are accepted for interface parity and not forwarded; the
         sandbox uses its own account settings.
+
+        **Files come first.** *files* are placed in the sandbox and read back
+        before the conversation is created (see :meth:`_deliver_files`); the
+        message refers to their directory as ``FILES_DIR_TOKEN``, which is
+        replaced by the directory that was verified. If they cannot be placed
+        exactly, nothing is created and :class:`DeliveryError` says why.
         """
         initial_message = self._apply_repository_mode(
             initial_message, selected_repository, selected_branch
@@ -239,6 +330,14 @@ class CloudDirectClient:
         route = self._new_sandbox(
             force_new=client_tools is not None,  # an Sr gets its own sandbox
         )
+        delivered: tuple[dict[str, Any], ...] = ()
+        if files:
+            directory, delivered = self._deliver_files(route, files)
+            initial_message = initial_message.replace(FILES_DIR_TOKEN, directory)
+        if FILES_DIR_TOKEN in initial_message:
+            # A message that points at files nobody delivered would start an
+            # agent on a task it cannot read.
+            raise DeliveryError("the message refers to delivered files, but none were sent")
         conversation_id = self._conversation_id(initial_message, title)
         agent_settings = self._sandbox_agent_settings(route)
         body: dict[str, Any] = {
@@ -283,6 +382,7 @@ class CloudDirectClient:
             app_conversation_id=actual_id,
             sandbox_id=route.sandbox_id,
             agent_server_url=route.agent_server_url,
+            files=delivered,
         )
 
     def _conversation_id(self, initial_message: str, title: str | None) -> str:

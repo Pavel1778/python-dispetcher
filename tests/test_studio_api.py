@@ -9,6 +9,7 @@ endpoint that records every request body).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchestration.cloud_client import CloudClient  # noqa: E402
+from orchestration.cloud_direct import CloudDirectClient  # noqa: E402
 from orchestration.github_client import GitHubClient  # noqa: E402
 from orchestration.nexus_chat import ChatResponder  # noqa: E402
 from orchestration.nexus_planner import Planner  # noqa: E402
@@ -30,6 +32,7 @@ from orchestration.web_auth import hash_password  # noqa: E402
 from orchestration.web_server import App, WebServer, title_from_message  # noqa: E402
 from tests.fake_cloud import FakeCloudServer  # noqa: E402
 from tests.fake_github import FakeGitHub, FakeGitHubServer  # noqa: E402
+from tests.fake_runtime import FakeServer  # noqa: E402
 from tests.test_providers import FakeProvider  # noqa: E402
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
@@ -86,10 +89,15 @@ class Api:
 
 
 class Studio:
-    """Everything a test needs: the HTTP client and the three fakes."""
+    """Everything a test needs: the HTTP client and the fakes.
 
-    def __init__(self, api, app, cloud, github, llm):
+    ``sandbox`` is the state of the stand-in agent-server (``tests/fake_runtime``)
+    and is only spoken to on the direct transport.
+    """
+
+    def __init__(self, api, app, cloud, github, llm, sandbox=None):
         self.api, self.app, self.cloud, self.github, self.llm = api, app, cloud, github, llm
+        self.sandbox = sandbox
 
     def project(self, name: str = "Studio") -> str:
         status, body = self.api.post("/api/v1/projects", {"name": name})
@@ -118,8 +126,15 @@ class Studio:
         return (self.github.auth_headers[-1] or "").split()[-1]
 
 
-@pytest.fixture
-def studio(monkeypatch):
+@contextlib.contextmanager
+def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
+    """The real server on the fakes. *app_options* go to ``App``.
+
+    *transport* is how the server reaches OpenHands: ``app`` is the
+    app-conversation API of the fake Cloud; ``direct`` provisions a sandbox
+    there and then talks to its agent-server, a second socket server
+    (``tests/fake_runtime.py``) - the transport a deployment uses by default.
+    """
     _reset_schema()
     monkeypatch.setenv("OPENHANDS_API_KEY", "cloud-key-value")
     monkeypatch.setenv("NEXUS_SECRET_KEY", "studio-tests-secret-key")
@@ -134,9 +149,15 @@ def studio(monkeypatch):
     llm.script, llm.calls, llm.index = [{"payload": {}}], [], 0
     threading.Thread(target=llm.serve_forever, daemon=True).start()
 
-    with FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server:
-        app = App(DSN, poll_interval=0.2, token=TOKEN)
+    with (FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server,
+          FakeServer() as sandbox):
+        app = App(DSN, poll_interval=0.2, token=TOKEN, **app_options)
         app.client = CloudClient(cloud.base_url, api_key="cloud-key-value", timeout=10.0)
+        if transport == "direct":
+            cloud.cloud.agent_server_url = sandbox.base_url
+            cloud.cloud.sandbox_session_key = sandbox.runtime.expected_key
+            app.client = CloudDirectClient(app.client, app.store, wait_interval=0.01,
+                                           timeout=10.0)
         app.dispatcher.client = app.client
         app.runtime.client = app.client
         app.verifier.client = app.client
@@ -152,12 +173,19 @@ def studio(monkeypatch):
         server = WebServer(app, "127.0.0.1", 0)
         server.start()
         try:
-            yield Studio(Api(f"http://127.0.0.1:{server.port}"), app, cloud, github, llm)
+            yield Studio(Api(f"http://127.0.0.1:{server.port}"), app, cloud, github, llm,
+                         sandbox.runtime)
         finally:
             server.stop()
             app.store.close()
             llm.shutdown()
             llm.server_close()
+
+
+@pytest.fixture
+def studio(monkeypatch):
+    with studio_stack(monkeypatch) as stack:
+        yield stack
 
 
 # ------------------------------------------------------------------ status
@@ -169,6 +197,8 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     assert body["openhands"] == {"server_key": True, "transport": "direct"}
     assert body["github"] == {"server_token": True}
     assert body["accounts"] == {"encryption_key": True}
+    # This server does not advance autonomous runs unless it is told to.
+    assert body["lab"] == {"inline": False}
     assert isinstance(body["version"], str) and body["version"]
     # The page asks on every load, so the answer must not depend on OpenHands
     # being reachable: no request reaches the Cloud API.
@@ -534,6 +564,33 @@ def test_an_autonomous_turn_plans_and_starts_a_run_for_the_asker(studio):
     assert sorted(t["title"] for t in detail["tasks"]) == ["Внести изменение", "Изучить код"]
     # The conversation remembers the run it started.
     assert studio.api.get(base)[1]["conversation"]["run_id"] == run
+
+
+def test_an_autonomous_turn_is_refused_once_the_repository_is_switched_off(studio):
+    """The repository was fine when it was connected; that is not permission for ever.
+
+    The chat passes the project's bound repository to the lab, and the lab used
+    to start work on it without asking again. Now the turn is refused before a
+    plan is requested, and the reason is what the person reads.
+    """
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository", {"full_name": REPO})[0] == 200
+    with studio.app.store._tx() as cur:
+        cur.execute("UPDATE repositories SET enabled=false WHERE full_name=%s", (REPO,))
+    conversation = studio.conversation(project, mode="autonomous")
+    base = f"/api/v1/projects/{project}/conversations/{conversation}"
+    studio.answers(json.dumps({"tasks": [{"id": "a", "title": "A", "acceptance": [],
+                                          "dependencies": []}]}))
+
+    status, body = studio.api.post(f"{base}/messages", {"text": "Цель: навести порядок",
+                                                        "mode": "autonomous"})
+    assert status == 502, body
+    assert body["error"] == (
+        f"could not start the autonomous run: repository {REPO} is disabled")
+    assert [m["role"] for m in body["messages"]] == ["user", "system"]
+    assert studio.llm.calls == [], "a plan was requested for work that may not run"
+    assert studio.api.get(f"/api/v1/projects/{project}/runs")[1]["runs"] == []
+    assert studio.api.get(f"/api/v1/projects/{project}/goals")[1]["goals"] == []
 
 
 def test_archiving_hides_a_conversation_and_restoring_brings_it_back(studio):

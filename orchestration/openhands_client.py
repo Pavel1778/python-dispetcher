@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -212,6 +213,67 @@ class OpenHandsClient:
             return e.code, payload
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise ApiUnavailable(f"{method} {path}: {type(e).__name__}") from e
+
+    def _upload_to(self, base_url: str, key: str, path: str, data: bytes,
+                   *, filename: str = "file") -> tuple[int, Any]:
+        """``POST /api/file/upload?path=<absolute path>`` with *data* as the file.
+
+        The agent-server's own file route: it writes the bytes to *path* inside
+        the sandbox, creating the directories above it. Returns the status and
+        the decoded body for **every** HTTP answer, 5xx included: the server
+        reports a path it cannot write to as a 500, and the caller has to tell
+        that from a sandbox that is unreachable (:class:`ApiUnavailable`).
+        """
+        boundary = "nexus-" + uuid.uuid4().hex
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "file"
+        body = b"".join((
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'.encode(),
+            b"Content-Type: application/octet-stream\r\n\r\n",
+            data,
+            f"\r\n--{boundary}--\r\n".encode(),
+        ))
+        url = (f"{base_url.rstrip('/')}/api/file/upload?"
+               + urllib.parse.urlencode({"path": path}))
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Accept", "application/json")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        req.add_header("Content-Length", str(len(body)))
+        if key:
+            req.add_header("X-Session-API-Key", key)
+        try:
+            with self._opener().open(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            raw, status = e.read(64_000), e.code
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ApiUnavailable(f"POST /api/file/upload: {type(e).__name__}") from e
+        try:
+            return status, (json.loads(raw) if raw else None)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return status, None
+
+    def _download_from(self, base_url: str, key: str, path: str,
+                       *, limit: int) -> tuple[int, bytes]:
+        """``GET /api/file/download?path=<absolute path>`` -> the file's bytes.
+
+        At most *limit* + 1 bytes are read, so a caller comparing against an
+        expected size sees "too long" without buffering whatever is there.
+        """
+        url = (f"{base_url.rstrip('/')}/api/file/download?"
+               + urllib.parse.urlencode({"path": path}))
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/octet-stream")
+        if key:
+            req.add_header("X-Session-API-Key", key)
+        try:
+            with self._opener().open(req, timeout=self.timeout) as resp:
+                return resp.status, resp.read(limit + 1)
+        except urllib.error.HTTPError as e:
+            return e.code, b""
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ApiUnavailable(f"GET /api/file/download: {type(e).__name__}") from e
 
     # ----------------------------------------------------------- operations
     def health(self) -> bool:
