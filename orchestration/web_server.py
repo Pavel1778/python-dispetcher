@@ -1,9 +1,11 @@
-"""Web control panel for the Sr/Jr dispatcher (stdlib-only HTTP server).
+"""NEXUS Studio and its API (stdlib-only HTTP server).
 
 A single owner logs in with a username and password; every page and API is
-protected by a server-side session (see :mod:`orchestration.web_auth`). The user
-submits a task, the server creates a workflow and starts a real Sr conversation
-on OpenHands Cloud, and a background loop drives both sides:
+protected by a server-side session (see :mod:`orchestration.web_auth`). The
+browser gets one application, the studio (:mod:`orchestration.web_ui`): a chat
+with the assistant, the bound repository's files, and the progress of the work
+a chat turn started. A "Code" turn creates a workflow and starts a real Sr
+conversation on OpenHands Cloud, and a background loop drives both sides:
 
 * :class:`~orchestration.sr_runtime.SrRuntime` services the Sr's client-tool
   calls, which create and manage Jr tasks.
@@ -28,12 +30,13 @@ Public endpoints (no session):
     POST /login                  authenticate (rate limited)
     GET  /healthz                minimal liveness probe for Render
     GET  /readyz                 readiness probe (liveness + DB round-trip)
-    GET  /static/app.css         stylesheet
+    GET  /static/...             the studio's assets (closed list, see web_ui.STATIC)
 
 Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
-    GET  /                       the dashboard
+    GET  /                       the studio
     POST /logout                 revoke the session
     GET  /api/session            current user + CSRF token
+    GET  /api/studio             what is configured (names only, never a value)
     GET  /api/dashboard          real counts + store/Cloud health
     GET  /api/config             whether a Cloud key is configured
     GET  /api/repositories       the repository allowlist
@@ -106,7 +109,7 @@ from .web_auth import (
     parse_cookie,
     session_cookie_header,
 )
-from .web_ui import APP_CSS, APP_HTML, APP_JS, FAVICON_SVG
+from . import web_ui
 from .workflow_verifier import WorkflowVerifier
 
 log = logging.getLogger("web_server")
@@ -142,41 +145,33 @@ UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
-LOGIN_PAGE = """<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Вход — Диспетчер OpenHands</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#0b0d12">
-<script defer src="/static/pwa/register.js"></script>
-<link rel="stylesheet" href="/static/app.css">
-</head>
-<body class="auth-body">
-<main class="auth-card">
-  <div class="auth-brand">
-    <span class="dot" aria-hidden="true"></span>
-    <h1>Диспетчер OpenHands</h1>
-  </div>
-  <p class="muted">Войдите, чтобы отправлять задачи в OpenHands Cloud.</p>
-  <form method="post" action="/login" id="loginform" autocomplete="on">
-    <label for="username">Логин</label>
-    <input id="username" name="username" type="text" required
-           autocomplete="username" autocapitalize="none" spellcheck="false"
-           aria-describedby="loginerr">
-    <label for="password">Пароль</label>
-    <input id="password" name="password" type="password" required
-           autocomplete="current-password" aria-describedby="loginerr">
-    <p class="err" id="loginerr" role="alert">__ERROR__</p>
-    <button type="submit" id="loginbtn">Войти</button>
-  </form>
-  <p class="muted small">Доступ только для владельца. Публичной регистрации нет.</p>
-</main>
-</body>
-</html>
-"""
+#: Sent with every HTML page. The studio renders model output, repository files
+#: and GitHub names, all of which are untrusted text. The renderer escapes them;
+#: this policy is the second line: with no inline script and no foreign origin
+#: allowed, markup that slipped through an escaping bug still cannot run code or
+#: send data anywhere. ``style-src 'self'`` is why the UI never emits a ``style``
+#: attribute and sets dynamic sizes through the CSSOM instead.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; "
+    "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+
+
+def title_from_message(text: str, *, limit: int = 60) -> str:
+    """A conversation title made from the first line of its first message.
+
+    Cut at a word boundary so the history never shows half a word, and marked
+    with an ellipsis when something was dropped.
+    """
+    stripped = (text or "").strip()
+    line = " ".join(stripped.splitlines()[0].split()) if stripped else ""
+    if len(line) <= limit:
+        return line
+    cut = line[:limit]
+    if " " in cut[limit // 2:]:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" ,.;:-") + "…"
 
 
 def _task_brief(task: Any) -> dict[str, Any]:
@@ -589,6 +584,135 @@ class App:
                             branch=request.get("branch") or "")
         return {"run_id": str(run["id"]), "tasks": stored}
 
+    def studio_status(self) -> dict[str, Any]:
+        """What the studio needs in order to explain itself: what is configured.
+
+        Names and booleans only. No key, token, URL or hash is returned, and
+        nothing here calls an external service, so the page can ask on every
+        load. It deliberately does not touch the Cloud client.
+        """
+        return {
+            "version": os.environ.get("APP_VERSION") or _version(),
+            # The LLM providers that can serve an "ask" or "plan" turn. The UI
+            # warns before the first message when none of them can.
+            "providers": self.providers.configured(),
+            "openhands": {
+                "server_key": bool(os.environ.get("OPENHANDS_API_KEY")),
+                "transport": os.environ.get("OPENHANDS_TRANSPORT", "direct"),
+            },
+            "github": {"server_token": self.github.configured},
+            # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
+            # adding one is refused (orchestration/secrets.py).
+            "accounts": {
+                "encryption_key": bool(os.environ.get("NEXUS_SECRET_KEY", "").strip()),
+            },
+        }
+
+    def github_for_project(self, principal: str, project_id: str) -> GitHubClient:
+        """The GitHub client a project's reads go through.
+
+        A project with an account bound reads with that account's token, so the
+        branches and files shown are the ones the connected identity can see.
+        Without a binding the process-wide client (``GITHUB_TOKEN``) is used, as
+        before. A bound account that was revoked or rejected is an error, never a
+        silent switch to another identity.
+        """
+        binding = self.project_binding.get(principal, project_id)
+        if binding.get("github_account_id"):
+            return self.github_accounts.client_for_project(principal, project_id)
+        return self.github
+
+    def connect_repository(self, principal: str, project_id: str, *, full_name: Any,
+                           branch: Any = None, account_id: str | None = None,
+                           use_server_token: bool = False) -> dict[str, Any]:
+        """Connect a repository and branch to a project, checked against GitHub.
+
+        One explicit action replaces the three calls a client had to make in the
+        right order (allowlist, account, binding) and adds the check none of them
+        made: the repository and the branch are looked up on GitHub with the
+        identity that will read them. A typo or a repository that identity cannot
+        see is refused here, not discovered later when a task fails.
+
+        The identity is the caller's explicit choice, and it becomes the
+        project's identity for every later read:
+
+        * ``account_id`` - that stored account; it is bound to the project;
+        * ``use_server_token`` - the process ``GITHUB_TOKEN``; any bound account
+          is unbound, so the project does not keep reading as someone else;
+        * neither - whatever the project already uses.
+
+        Every GitHub check happens before the first write. The allowlist is only
+        ever extended: an unlisted repository is added, and the chosen branch is
+        added to a listed repository when the dispatch gate would otherwise
+        refuse it (an empty list there means "default branch only"). Nothing is
+        removed, and a disabled repository stays disabled and is refused.
+        """
+        full_name = full_name.strip() if isinstance(full_name, str) else ""
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", full_name):
+            raise ValueError("full_name must be owner/name")
+        if branch is not None and not isinstance(branch, str):
+            raise ValueError("branch must be a string")
+        branch = (branch or "").strip() or None
+        self.projects.get(principal, project_id)  # membership; NotFound otherwise
+        if account_id is not None and use_server_token:
+            raise ValueError("choose a GitHub account or the server token, not both")
+        if account_id is not None:
+            client = self.github_accounts.client_for_account(principal, account_id)
+        elif use_server_token:
+            client = self.github
+        else:
+            client = self.github_for_project(principal, project_id)
+
+        try:
+            details = client.get_repository(full_name)
+        except (GitHubAuthError, GitHubUnavailable):
+            raise
+        except GitHubError as e:
+            if "404" in str(e):
+                raise ValueError(f"repository {full_name} was not found, or this GitHub "
+                                 "account cannot see it") from e
+            raise
+        canonical = details.get("full_name") or full_name
+        default_branch = details.get("default_branch") or "main"
+        chosen = branch or default_branch
+        if chosen != default_branch:
+            names = [b["name"] for b in client.list_branches(canonical)]
+            if chosen not in names:
+                # Only the first page of branches is listed; ask about this one
+                # directly before refusing it.
+                found = False
+                if len(names) >= 100:
+                    try:
+                        found = client.default_branch_sha(canonical, chosen) is not None
+                    except (GitHubAuthError, GitHubUnavailable):
+                        raise
+                    except GitHubError:
+                        found = False
+                if not found:
+                    raise ValueError(f"branch {chosen} does not exist in {canonical}")
+
+        existing = next((r for r in self.store.list_repositories(enabled_only=False)
+                         if r["full_name"] == canonical), None)
+        if existing is None:
+            allowed = [default_branch] if chosen == default_branch else [default_branch, chosen]
+            self.store.add_repository(canonical, default_branch=default_branch,
+                                      allowed_branches=allowed)
+        else:
+            if not existing["enabled"]:
+                raise ProjectBindingError("repository is disabled in the allowlist")
+            allowed = list(existing.get("allowed_branches") or [])
+            permitted = chosen in allowed if allowed else chosen == existing["default_branch"]
+            if not permitted:
+                self.store.add_repository(
+                    canonical, provider=existing["provider"],
+                    default_branch=existing["default_branch"],
+                    allowed_branches=(allowed or [existing["default_branch"]]) + [chosen])
+        if account_id is not None or use_server_token:
+            self.github_accounts.bind_project(principal, project_id, account_id)
+        self.project_binding.set_repository(principal, project_id,
+                                            full_name=canonical, branch=chosen)
+        return self.project_binding.get(principal, project_id)
+
     def cancel_workflow(self, workflow_id: str) -> dict[str, Any]:
         """Stop a workflow for good. Terminal and idempotent.
 
@@ -801,6 +925,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
@@ -1148,9 +1273,13 @@ class Handler(BaseHTTPRequestHandler):
             # become a way to probe the account's repositories.
             try:
                 self.app.projects.get(principal, project_id)
+                client = self.app.github_for_project(principal, project_id)
             except NotFound:
                 return None
-            return self._get_github(principal, rest)
+            except ValueError as e:
+                # The bound account is revoked or was rejected by GitHub.
+                return (400, {"error": f"github account: {e}"}, None)
+            return self._get_github(principal, rest, client)
         return None
 
     def _github_account_get(self, path: str):
@@ -1160,29 +1289,40 @@ class Handler(BaseHTTPRequestHandler):
         comes from the named account, never from the process-wide token. The PAT
         never leaves the server.
         """
-        parts = path.strip("/").split("/")
+        from urllib.parse import unquote
+
+        parts = [unquote(part) for part in path.strip("/").split("/")]
         principal = self._project_principal()
+        if len(parts) < 4 or not UUID_RE.fullmatch(parts[3]):
+            return self._json(404, {"error": "not found"})
         if len(parts) == 4:  # /api/github/accounts/{id}
             account = self._find_account(self.app.github_accounts.list_accounts(principal),
                                          parts[3])
             return self._json(200, {"account": account})
-        if len(parts) == 5 and parts[4] == "repositories":
-            try:
-                client = self.app.github_accounts.client_for_account(principal, parts[3])
-                repos = client.list_repositories()
-            except NotFound:
-                return self._json(404, {"error": "account not found"})
-            except ValueError as e:
-                return self._json(400, {"error": str(e)})
-            except GitHubAuthError as e:
-                return self._json(400, {"error": f"github auth: {e}"})
-            except GitHubUnavailable as e:
-                return self._json(503, {"error": f"github unavailable: {e}"})
-            except GitHubError as e:
-                return self._json(502, {"error": f"github: {e}"})
-            return self._json(200, {"repositories": [r.as_dict() for r in repos],
-                                    "count": len(repos)})
-        return self._json(404, {"error": "not found"})
+        listing = len(parts) == 5 and parts[4] == "repositories"
+        # /api/github/accounts/{id}/repositories/{owner}/{name}/branches - what
+        # the repository dialog offers before the project is bound to anything.
+        branches = len(parts) == 8 and parts[4] == "repositories" and parts[7] == "branches"
+        if not (listing or branches):
+            return self._json(404, {"error": "not found"})
+        try:
+            client = self.app.github_accounts.client_for_account(principal, parts[3])
+            if branches:
+                return self._json(200, {"branches": client.list_branches(
+                    f"{parts[5]}/{parts[6]}")})
+            repos = client.list_repositories()
+        except NotFound:
+            return self._json(404, {"error": "account not found"})
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        except GitHubAuthError as e:
+            return self._json(400, {"error": f"github auth: {e}"})
+        except GitHubUnavailable as e:
+            return self._json(503, {"error": f"github unavailable: {e}"})
+        except GitHubError as e:
+            return self._json(502, {"error": f"github: {e}"})
+        return self._json(200, {"repositories": [r.as_dict() for r in repos],
+                                "count": len(repos)})
 
     def _openhands_account_get(self, path: str):
         """GET one OpenHands account, or its discovered capabilities.
@@ -1192,6 +1332,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         parts = path.strip("/").split("/")
         principal = self._project_principal()
+        if len(parts) < 4 or not UUID_RE.fullmatch(parts[3]):
+            return self._json(404, {"error": "not found"})
         account = self._find_account(self.app.openhands_accounts.list_accounts(principal),
                                      parts[3])
         if len(parts) == 4:
@@ -1265,8 +1407,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         return self._json(404, {"error": "not found"})
 
-    def _get_github(self, principal: str, rest: list[str]):
-        """Read-only GitHub views. Never writes and never returns the token."""
+    def _get_github(self, principal: str, rest: list[str], client: GitHubClient):
+        """Read-only GitHub views. Never writes and never returns the token.
+
+        *client* is the project's own (see :meth:`App.github_for_project`), so a
+        project bound to an account reads with that account, not with whatever
+        ``GITHUB_TOKEN`` the process happens to hold.
+        """
         from urllib.parse import parse_qs, unquote
 
         # The path segments arrive percent-encoded; decode each so a Cyrillic
@@ -1276,32 +1423,35 @@ class Handler(BaseHTTPRequestHandler):
         ref = (query.get("ref") or [None])[0]
         try:
             if len(rest) == 2:
-                repos = self.app.github.list_repositories()
+                repos = client.list_repositories()
                 return (200, {"repositories": [r.as_dict() for r in repos],
                               "count": len(repos)}, None)
             if len(rest) >= 4:
                 full_name = f"{rest[2]}/{rest[3]}"
                 if len(rest) == 4:
-                    return (200, {"repository": self.app.github.get_repository(full_name)}, None)
+                    return (200, {"repository": client.get_repository(full_name)}, None)
                 section = rest[4]
                 if section == "branches":
-                    return (200, {"branches": self.app.github.list_branches(full_name)}, None)
+                    return (200, {"branches": client.list_branches(full_name)}, None)
                 if section == "commits":
-                    return (200, {"commits": self.app.github.list_commits(
+                    return (200, {"commits": client.list_commits(
                         full_name, branch=ref)}, None)
                 if section == "issues":
-                    return (200, {"issues": self.app.github.list_issues(full_name)}, None)
+                    return (200, {"issues": client.list_issues(full_name)}, None)
                 if section == "pulls":
-                    return (200, {"pulls": self.app.github.list_pulls(full_name)}, None)
+                    return (200, {"pulls": client.list_pulls(full_name)}, None)
                 # The IDE view: the file tree and one file's text, at a ref.
                 if section == "tree":
-                    return (200, {"tree": self.app.github.list_tree(full_name, branch=ref)}, None)
+                    return (200, {"tree": client.list_tree(full_name, branch=ref)}, None)
                 if section == "contents" and len(rest) >= 5:
                     path = "/".join(rest[5:])
-                    text = self.app.github.read_file(full_name, path, branch=ref)
-                    if text is None:
+                    found = client.read_text_file(full_name, path, branch=ref)
+                    if found is None:
                         return (404, {"error": "file not found or binary"}, None)
-                    return (200, {"path": path, "content": text, "ref": ref}, None)
+                    # ``truncated`` lets the viewer say that it shows only the
+                    # beginning, instead of presenting a cut file as the whole.
+                    return (200, {"path": path, "content": found["content"], "ref": ref,
+                                  "truncated": found["truncated"]}, None)
         except GitHubAuthError as e:
             return (400, {"error": f"github auth: {e}"}, None)
         except GitHubUnavailable as e:
@@ -1415,6 +1565,27 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "messages"):
             self._chat_turn(principal, project_id, rest[1], body)
             return True
+        # POST /api/v1/projects/{id}/repository   (connect: verify, allowlist, bind)
+        #   {"full_name": "owner/name", "branch"?: "...", "account_id"?: uuid | null}
+        # ``account_id`` picks the identity: a uuid is that stored account, an
+        # explicit null is the server's GITHUB_TOKEN, and leaving the key out
+        # keeps the identity the project already has.
+        if rest == ["repository"]:
+            account_id = body.get("account_id")
+            if account_id is not None and not (isinstance(account_id, str)
+                                               and UUID_RE.fullmatch(account_id)):
+                self._json(400, {"error": "account_id must be a uuid or null"})
+                return True
+            try:
+                binding = self.app.connect_repository(
+                    principal, project_id, full_name=body.get("full_name"),
+                    branch=body.get("branch"), account_id=account_id,
+                    use_server_token="account_id" in body and account_id is None)
+            except ProjectBindingError as e:
+                self._json(400, {"error": str(e)})
+                return True
+            self._json(200, {"binding": binding})
+            return True
         # POST /api/v1/projects/{id}/binding   (bind repository + branch)
         if rest == ["binding"]:
             try:
@@ -1478,7 +1649,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         branch = (body.get("branch") or "").strip() or None
         try:
-            summary = analyze_repository(self.app.github, repository, branch=branch)
+            client = self.app.github_for_project(principal, project_id)
+        except ValueError as e:
+            self._json(400, {"error": f"github account: {e}"})
+            return
+        try:
+            summary = analyze_repository(client, repository, branch=branch)
         except GitHubAuthError as e:
             self._json(400, {"error": f"github auth: {e}"})
             return
@@ -1570,6 +1746,12 @@ class Handler(BaseHTTPRequestHandler):
             # Re-read so the joined repository/branch fields are present; set_mode
             # returns only the conversation row itself.
             conversation = self.app.conversations.get(principal, project_id, conversation_id)
+        if not (conversation.get("title") or "").strip():
+            # An untitled conversation is named after its first message, so the
+            # history reads as what was asked. This only fills a blank; a title
+            # the user chose is never replaced.
+            self.app.conversations.rename(
+                principal, project_id, conversation_id, title_from_message(text))
         # Persist the user turn first: it must not be lost to an assistant failure.
         user_msg = self.app.conversations.add_message(
             principal, project_id, conversation_id, role="user", content=text)
@@ -1583,7 +1765,10 @@ class Handler(BaseHTTPRequestHandler):
                 mode=conversation["mode"], goal=text, context=context, memory=memory,
                 repository=conversation.get("repository") or "",
                 branch=conversation.get("selected_branch") or "",
-                history=history)
+                history=history,
+                # The work a turn starts belongs to this conversation's project
+                # and to the person who asked for it.
+                project_id=project_id, principal=principal)
         except ChatError as e:
             self.app.conversations.set_state(principal, project_id, conversation_id, "error")
             err = self.app.conversations.add_message(
@@ -1602,6 +1787,9 @@ class Handler(BaseHTTPRequestHandler):
             if meta.get("workflow_id") and msg["role"] == "assistant":
                 self._record_agent_session(principal, project_id, conversation_id,
                                            meta, msg)
+            if meta.get("run_id") and msg["role"] == "assistant":
+                self.app.conversations.link_run(
+                    principal, project_id, conversation_id, str(meta["run_id"]))
         self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
         self._json(200, {"messages": appended})
 
@@ -1949,7 +2137,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/login":
                 if self._session() is not None:
                     return self._redirect("/")
-                return self._html(200, LOGIN_PAGE.replace("__ERROR__", ""))
+                return self._html(200, web_ui.login_page(""))
             if path == "/healthz":
                 return self._json(200, HEALTHZ)
             if path == "/readyz":
@@ -1966,23 +2154,17 @@ class Handler(BaseHTTPRequestHandler):
                 name, content_type, cache_control = PWA_ASSETS[path]
                 return self._static(200, (_PWA_DIR / name).read_bytes(), content_type,
                                     cache_control=cache_control)
-            if path == "/static/app.css":
-                return self._static(200, APP_CSS, "text/css; charset=utf-8")
-            if path == "/static/app.js":
-                return self._static(200, APP_JS, "application/javascript; charset=utf-8")
-            if path == "/favicon.ico":
-                # SVG works as a favicon in every browser that renders this
-                # dashboard; declaring it in the markup avoids a 404 for the
-                # default /favicon.ico probe.
-                return self._static(200, FAVICON_SVG, "image/svg+xml")
-            if path == "/favicon.svg":
-                return self._static(200, FAVICON_SVG, "image/svg+xml")
+            if path in web_ui.STATIC:
+                # A closed mapping, not a directory lookup: a path that is not a
+                # key here is never read from disk (see web_ui.STATIC).
+                body, content_type, cache_control = web_ui.STATIC[path]
+                return self._static(200, body, content_type, cache_control=cache_control)
 
             # --- everything below requires authentication ---
             if path == "/":
                 if self._session() is None and not self._bearer_ok():
                     return self._redirect("/login")
-                return self._html(200, APP_HTML)
+                return self._html(200, web_ui.APP_HTML)
             if not self._require_read():
                 return
 
@@ -2057,6 +2239,8 @@ class Handler(BaseHTTPRequestHandler):
                     "username": s.username if s else "api",
                     "csrf_token": s.csrf_token if s else "",
                 })
+            if path == "/api/studio":
+                return self._json(200, self.app.studio_status())
             if path == "/api/dashboard":
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
@@ -2069,6 +2253,10 @@ class Handler(BaseHTTPRequestHandler):
                 # API-key-free views only; the key never leaves the server.
                 return self._json(200, {"accounts": self.app.openhands_accounts.list_accounts(
                     self._project_principal())})
+            if path.startswith("/api/github/accounts/"):
+                return self._github_account_get(path)
+            if path.startswith("/api/openhands/accounts/"):
+                return self._openhands_account_get(path)
             if path == "/api/config":
                 return self._json(200, {
                     "cloud_key": bool(os.environ.get("OPENHANDS_API_KEY")),
@@ -2105,6 +2293,23 @@ class Handler(BaseHTTPRequestHandler):
                     "repositories": [r.as_dict() for r in repos],
                     "count": len(repos),
                 })
+            server_branches = re.fullmatch(
+                r"/api/github/repositories/([^/]+)/([^/]+)/branches", path)
+            if server_branches:
+                # The same list with the server's GITHUB_TOKEN, for a project
+                # that is connected without a stored account.
+                from urllib.parse import unquote
+                full_name = "/".join(unquote(part) for part in server_branches.groups())
+                try:
+                    return self._json(200, {"branches": self.app.github.list_branches(full_name)})
+                except GitHubAuthError as e:
+                    return self._json(400, {"error": f"github auth: {e}"})
+                except GitHubUnavailable as e:
+                    return self._json(503, {"error": f"github unavailable: {e}"})
+                except GitHubError as e:
+                    return self._json(502, {"error": f"github: {e}"})
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
             if path == "/api/tasks":
                 return self._json(200, {"tasks": self.app.store.list_tasks_all()})
             if path == "/api/workflows":
@@ -2464,6 +2669,13 @@ class Handler(BaseHTTPRequestHandler):
                     if "mode" in body:
                         conversation = self.app.conversations.set_mode(
                             principal, project_id, rest[1], body["mode"])
+                    if "archived" in body:
+                        # DELETE archives; this is the way back. Without it an
+                        # archived conversation could never be restored.
+                        if not isinstance(body["archived"], bool):
+                            return self._json(400, {"error": "archived must be a boolean"})
+                        conversation = self.app.conversations.set_archived(
+                            principal, project_id, rest[1], body["archived"])
                     return self._json(200, {"conversation": conversation})
                 # Any other sub-resource falls through to the project PATCH below.
             parsed = self._project_path(path)
@@ -2492,9 +2704,7 @@ class Handler(BaseHTTPRequestHandler):
             log.error("login is not configured: %s", "; ".join(reasons))
             return self._html(
                 503,
-                LOGIN_PAGE.replace(
-                    "__ERROR__",
-                    "Вход не настроен на сервере: "
+                web_ui.login_page("Вход не настроен на сервере: "
                     + "; ".join(reasons)
                     + ". Сгенерируйте хеш командой "
                     "`python -m orchestration.web_auth hash` и задайте "
@@ -2510,9 +2720,7 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("login throttled by IP (retry in %ss)", wait)
             return self._html(
                 429,
-                LOGIN_PAGE.replace(
-                    "__ERROR__",
-                    "Слишком много попыток входа с этого адреса. Повторите "
+                web_ui.login_page("Слишком много попыток входа с этого адреса. Повторите "
                     f"через {max(1, (wait + 59) // 60)} мин.",
                 ),
             )
@@ -2522,9 +2730,7 @@ class Handler(BaseHTTPRequestHandler):
             minutes = max(1, (e.retry_after + 59) // 60)
             return self._html(
                 429,
-                LOGIN_PAGE.replace(
-                    "__ERROR__",
-                    "Слишком много неудачных попыток. Повторите через "
+                web_ui.login_page("Слишком много неудачных попыток. Повторите через "
                     f"{minutes} мин. Если пароль забыт, хеш можно пересоздать "
                     "(см. DEPLOY.md).",
                 ),
@@ -2535,8 +2741,7 @@ class Handler(BaseHTTPRequestHandler):
             # The same message for every failure: no user enumeration.
             return self._html(
                 401,
-                LOGIN_PAGE.replace(
-                    "__ERROR__", "Неверный логин или пароль. Попробуйте ещё раз."
+                web_ui.login_page("Неверный логин или пароль. Попробуйте ещё раз."
                 ),
             )
         cookie = session_cookie_header(

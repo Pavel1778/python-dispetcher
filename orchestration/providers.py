@@ -148,15 +148,22 @@ class Provider:
     def _headers(self) -> dict[str, str]:
         raise NotImplementedError
 
-    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+    def _payload(self, prompt: str, system: str, *, prose: bool = False) -> dict[str, Any]:
+        """The request body. ``prose=True`` asks for plain text, not a JSON object.
+
+        A plan must be machine-readable, so the default constrains the model to
+        JSON where the API supports it. A chat answer is the opposite: sending
+        the same constraint makes the model wrap its answer in JSON, or makes the
+        API reject the request outright because the prompt never mentions JSON.
+        """
         raise NotImplementedError
 
     def _extract_text(self, body: Any) -> str:
         raise NotImplementedError
 
     # -- shared request path ----------------------------------------------
-    def _post(self, prompt: str, system: str) -> Any:
-        data = json.dumps(self._payload(prompt, system)).encode()
+    def _post(self, prompt: str, system: str, *, prose: bool = False) -> Any:
+        data = json.dumps(self._payload(prompt, system, prose=prose)).encode()
         req = urllib.request.Request(self._endpoint(), data=data, method="POST")
         for key, value in self._headers().items():
             req.add_header(key, value)
@@ -193,9 +200,10 @@ class Provider:
         Used by the chat surface, which needs prose, not a plan. The retry
         policy is identical: only a transient failure is retried, bounded.
         """
-        return self._text_with_retry(prompt, system)[0]
+        return self._text_with_retry(prompt, system, prose=True)[0]
 
-    def _text_with_retry(self, prompt: str, system: str) -> tuple[str, int]:
+    def _text_with_retry(self, prompt: str, system: str, *,
+                         prose: bool = False) -> tuple[str, int]:
         if not self.configured:
             raise ProviderAuthError(f"{self.name}: no API key configured")
         attempts = 0
@@ -203,7 +211,7 @@ class Provider:
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                body = self._post(prompt, system)
+                body = self._post(prompt, system, prose=prose)
             except ProviderUnavailable as e:
                 last = e
                 if attempts > self.max_retries:
@@ -233,11 +241,12 @@ class GeminiProvider(Provider):
     def _headers(self) -> dict[str, str]:
         return {"Content-Type": "application/json", "x-goog-api-key": self.api_key or ""}
 
-    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+    def _payload(self, prompt: str, system: str, *, prose: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
         }
+        if not prose:
+            payload["generationConfig"] = {"responseMimeType": "application/json"}
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
         return payload
@@ -260,13 +269,15 @@ class _OpenAICompatProvider(Provider):
         return {"Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key or ''}"}
 
-    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+    def _payload(self, prompt: str, system: str, *, prose: bool = False) -> dict[str, Any]:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        return {"model": self.model, "messages": messages,
-                "response_format": {"type": "json_object"}}
+        payload: dict[str, Any] = {"model": self.model, "messages": messages}
+        if not prose:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     def _extract_text(self, body: Any) -> str:
         try:
@@ -321,7 +332,7 @@ class OpenHandsOrchestratorProvider(Provider):
         return {"Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key or ''}"}
 
-    def _payload(self, prompt: str, system: str) -> dict[str, Any]:
+    def _payload(self, prompt: str, system: str, *, prose: bool = False) -> dict[str, Any]:
         content = (system + "\n\n" + prompt).strip() if system else prompt
         return {"initial_message": {"role": "user", "content": [{"type": "text", "text": content}]},
                 "llm_model": self.model}

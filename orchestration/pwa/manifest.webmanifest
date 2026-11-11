@@ -2,7 +2,7 @@
   "id": "/",
   "name": "NEXUS — AI Development Environment",
   "short_name": "NEXUS",
-  "description": "NEXUS: рабочий стол разработки с ИИ — чат, IDE и автономные агенты",
+  "description": "NEXUS — студия разработки с ИИ: чат, файлы репозитория и агент",
   "lang": "ru",
   "start_url": "/",
   "scope": "/",

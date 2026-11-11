@@ -381,6 +381,19 @@ class GitHubClient:
     def read_file(self, full_name: str, path: str, *, branch: str | None = None,
                   max_bytes: int = 200_000) -> str | None:
         """The decoded text of one file, or ``None`` if it is missing/binary."""
+        found = self.read_text_file(full_name, path, branch=branch, max_bytes=max_bytes)
+        return found["content"] if found else None
+
+    def read_text_file(self, full_name: str, path: str, *, branch: str | None = None,
+                       max_bytes: int = 200_000) -> dict[str, Any] | None:
+        """One file as text: ``{"content", "truncated"}``; ``None`` if missing/binary.
+
+        A file longer than ``max_bytes`` is cut there and reported as truncated.
+        The cut is made on a character boundary: slicing bytes can split a
+        multi-byte character, and decoding that strictly made a large UTF-8 file
+        look binary. Only an incomplete *last* character is dropped; an invalid
+        byte anywhere else still means the file is not text.
+        """
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:
             raise ValueError("full_name must be owner/name")
@@ -390,18 +403,24 @@ class GitHubClient:
             return None
         if data.get("encoding") == "base64" and isinstance(data.get("content"), str):
             import base64
+            import codecs
             try:
                 raw = base64.b64decode(data["content"])
             except (ValueError, TypeError):
                 return None
-            if len(raw) > max_bytes:
-                raw = raw[:max_bytes]
+            truncated = len(raw) > max_bytes
             try:
-                return raw.decode("utf-8")
+                if truncated:
+                    # final=False keeps an unfinished trailing sequence in the
+                    # decoder instead of raising; everything before it is strict.
+                    text = codecs.getincrementaldecoder("utf-8")().decode(raw[:max_bytes])
+                else:
+                    text = raw.decode("utf-8")
             except UnicodeDecodeError:
                 return None
+            return {"content": text, "truncated": truncated}
         if isinstance(data.get("content"), str):
-            return data["content"]
+            return {"content": data["content"], "truncated": False}
         return None
 
     def _default_branch(self, full_name: str) -> str:
