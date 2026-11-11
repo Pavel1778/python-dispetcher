@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Вход — NEXUS</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0b0d12">
+<script src="/static/boot.js?v=__ASSET_VERSION__"></script>
+<link rel="stylesheet" href="/static/app.css?v=__ASSET_VERSION__">
+<script defer src="/static/pwa/register.js"></script>
+</head>
+<body class="auth">
+<main class="auth-card">
+  <div class="auth-brand">
+    <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true">
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#8f7dff"/><stop offset="1" stop-color="#3fc4f5"/>
+      </linearGradient></defs>
+      <rect width="64" height="64" rx="16" fill="url(#lg)"/>
+      <path d="M21 44V20l22 24V20" fill="none" stroke="#fff" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div>
+      <h1>NEXUS</h1>
+      <p class="auth-tag">Студия разработки с ИИ</p>
+    </div>
+  </div>
+  <form method="post" action="/login" id="loginform" autocomplete="on">
+    <label class="field">
+      <span class="field-label">Логин</span>
+      <input class="input" id="username" name="username" type="text" required
+             autocomplete="username" autocapitalize="none" spellcheck="false"
+             aria-describedby="loginerr">
+    </label>
+    <label class="field">
+      <span class="field-label">Пароль</span>
+      <input class="input" id="password" name="password" type="password" required
+             autocomplete="current-password" aria-describedby="loginerr">
+    </label>
+    <p class="auth-error" id="loginerr" role="alert">__ERROR__</p>
+    <button class="btn btn-primary btn-block" type="submit" id="loginbtn">Войти</button>
+  </form>
+  <p class="auth-note">Доступ только для владельца. Публичной регистрации нет.</p>
+</main>
+</body>
+</html>

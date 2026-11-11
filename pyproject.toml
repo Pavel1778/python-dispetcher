@@ -27,4 +27,4 @@ nexus = "orchestration.cli:main"
 packages = ["orchestration"]
 
 [tool.setuptools.package-data]
-orchestration = ["pwa/*"]
+orchestration = ["pwa/*", "studio/*", "studio/fonts/*"]

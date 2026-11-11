@@ -38,11 +38,17 @@ UUID = "11111111-1111-1111-1111-111111111111"
 
 # Endpoints that must be reachable with no credentials at all.
 PUBLIC_GET = {"/login", "/healthz", "/readyz", "/static/app.css", "/static/app.js",
-              "/favicon.svg", "/manifest.webmanifest", "/service-worker.js"}
+              "/favicon.svg", "/manifest.webmanifest", "/service-worker.js",
+              # The login page is styled before there is a session, so the
+              # stylesheet, the scripts and the fonts are public. They hold no data.
+              "/static/boot.js", "/static/markdown.js", "/static/highlight.js",
+              "/static/fonts/inter-latin.woff2", "/static/fonts/inter-cyrillic.woff2",
+              "/static/fonts/jetbrains-mono-latin.woff2",
+              "/static/fonts/jetbrains-mono-cyrillic.woff2", "/favicon.ico"}
 
 # Endpoints that must require a session or bearer. Method + path.
 PROTECTED_GET = [
-    "/", "/api/session", "/api/dashboard", "/api/system", "/api/config",
+    "/", "/api/session", "/api/studio", "/api/dashboard", "/api/system", "/api/config",
     "/api/repositories", "/api/github/status", "/api/github/repositories",
     "/api/tasks", "/api/workflows", f"/api/workflows/{UUID}", "/api/health",
     "/api/capabilities", "/api/v1/projects",
@@ -56,6 +62,16 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/agents", f"/api/v1/projects/{UUID}/binding",
     "/api/openhands/accounts", f"/api/openhands/accounts/{UUID}",
     f"/api/github/accounts/{UUID}/repositories",
+    "/api/github/accounts", f"/api/github/accounts/{UUID}",
+    f"/api/github/accounts/{UUID}/repositories/owner/name/branches",
+    "/api/github/repositories/owner/name/branches",
+    f"/api/openhands/accounts/{UUID}/capabilities",
+    f"/api/v1/projects/{UUID}/workflows/{UUID}", f"/api/v1/projects/{UUID}/runs/{UUID}",
+    f"/api/v1/projects/{UUID}/context",
+    f"/api/v1/projects/{UUID}/github/repositories/owner/name/tree",
+    f"/api/v1/projects/{UUID}/github/repositories/owner/name/contents/README.md",
+    # A path under /static/ that is not a listed asset is not public either.
+    "/static/app.js.map", "/static/index.html",
 ]
 PROTECTED_POST = [
     "/mcp",
@@ -70,6 +86,9 @@ PROTECTED_POST = [
     f"/api/v1/projects/{UUID}/conversations",
     f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
     f"/api/v1/projects/{UUID}/binding", f"/api/v1/projects/{UUID}/binding/branch",
+    f"/api/v1/projects/{UUID}/repository", f"/api/v1/projects/{UUID}/context/refresh",
+    f"/api/v1/projects/{UUID}/runs/{UUID}/pause", f"/api/v1/projects/{UUID}/runs/{UUID}/cancel",
+    "/api/github/accounts", f"/api/github/accounts/{UUID}/revoke",
     f"/api/v1/projects/{UUID}/openhands-account",
     "/api/openhands/accounts",
     f"/api/openhands/accounts/{UUID}/verify",
@@ -160,6 +179,17 @@ def test_protected_post_endpoints_require_auth(base):
         assert status == 401, (path, status)
 
 
+def test_protected_patch_and_delete_endpoints_require_auth(base):
+    """The studio renames and archives with PATCH; neither works without a credential."""
+    for method, path, body in [
+        ("PATCH", f"/api/v1/projects/{UUID}", {"name": "x"}),
+        ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"archived": True}),
+        ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"title": "x"}),
+        ("DELETE", f"/api/v1/projects/{UUID}/conversations/{UUID}", None),
+    ]:
+        assert _status(method, base + path, body) == 401, (method, path)
+
+
 def test_bearer_token_is_accepted(base):
     status = _status("GET", base + "/api/system",
                      headers={"Authorization": f"Bearer {TOKEN}"})
@@ -198,4 +228,59 @@ def test_login_sets_a_session_and_csrf_is_enforced(base):
         assert e.code == 403
 
 
-import urllib.parse  # noqa: E402  (used by test_login_sets_a_session_and_csrf_is_enforced)
+def test_the_studio_writes_need_the_csrf_token_of_their_session(base):
+    """Every write the page makes carries X-CSRF-Token; without it a session is not enough."""
+    data = urllib.parse.urlencode({"username": "owner", "password": "pw"}).encode()
+    login = urllib.request.Request(base + "/login", data=data, method="POST")
+    login.add_header("Content-Type", "application/x-www-form-urlencoded")
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+    with opener.open(login, timeout=10):
+        pass
+
+    def call(method: str, path: str, body: dict | None, csrf: str | None = None):
+        raw = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(base + path, data=raw, method=method)
+        if raw is not None:
+            request.add_header("Content-Type", "application/json")
+        if csrf:
+            request.add_header("X-CSRF-Token", csrf)
+        try:
+            with opener.open(request, timeout=10) as response:
+                return response.status, json.loads(response.read() or b"null")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"null")
+
+    status, session = call("GET", "/api/session", None)
+    assert status == 200 and session["username"] == "owner"
+    csrf = session["csrf_token"]
+    assert len(csrf) >= 32
+    # Reads work with the cookie alone; the page status is one of them.
+    assert call("GET", "/api/studio", None)[0] == 200
+
+    status, created = call("POST", "/api/v1/projects", {"name": "CSRF"}, csrf)
+    assert status == 201
+    project = created["project"]["id"]
+    status, conversation = call("POST", f"/api/v1/projects/{project}/conversations", {"title": "t"}, csrf)
+    assert status == 201
+    cid = conversation["conversation"]["id"]
+
+    writes = [
+        ("POST", f"/api/v1/projects/{project}/repository", {"full_name": "owner/name"}),
+        ("POST", f"/api/v1/projects/{project}/conversations", {"title": "x"}),
+        ("POST", f"/api/v1/projects/{project}/conversations/{cid}/messages", {"text": "x"}),
+        ("PATCH", f"/api/v1/projects/{project}/conversations/{cid}", {"archived": True}),
+        ("PATCH", f"/api/v1/projects/{project}", {"name": "renamed"}),
+        ("POST", "/api/github/accounts", {"label": "x", "token": "y"}),
+    ]
+    for method, path, body in writes:
+        assert call(method, path, body)[0] == 403, (method, path, "no token")
+        assert call(method, path, body, "0" * len(csrf))[0] == 403, (method, path, "wrong token")
+    # Nothing was changed by the refused requests.
+    assert call("GET", f"/api/v1/projects/{project}", None)[1]["project"]["name"] == "CSRF"
+    listed = call("GET", f"/api/v1/projects/{project}/conversations", None)[1]["conversations"]
+    assert [c["archived"] for c in listed] == [False]
+    # ... and with the token the same write is accepted.
+    assert call("PATCH", f"/api/v1/projects/{project}/conversations/{cid}", {"archived": True}, csrf)[0] == 200
+
+
+import urllib.parse  # noqa: E402  (used by the two session tests above)

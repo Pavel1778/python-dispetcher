@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>NEXUS</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0b0d12">
+<link rel="preload" href="/static/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/inter-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
+<script src="/static/boot.js?v=__ASSET_VERSION__"></script>
+<link rel="stylesheet" href="/static/app.css?v=__ASSET_VERSION__">
+<script defer src="/static/pwa/register.js"></script>
+<script defer src="/static/markdown.js?v=__ASSET_VERSION__"></script>
+<script defer src="/static/highlight.js?v=__ASSET_VERSION__"></script>
+<script defer src="/static/app.js?v=__ASSET_VERSION__"></script>
+</head>
+<body>
+
+<!-- Icons: one sprite, referenced with <use>. 24px grid, drawn with strokes. -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <defs>
+    <linearGradient id="brand-gradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8f7dff"/><stop offset="1" stop-color="#3fc4f5"/>
+    </linearGradient>
+  </defs>
+  <symbol id="i-logo" viewBox="0 0 64 64">
+    <rect width="64" height="64" rx="16" fill="url(#brand-gradient)"/>
+    <path d="M21 44V20l22 24V20" fill="none" stroke="#fff" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+  <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></symbol>
+  <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/></symbol>
+  <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-12.2 7.5L3 21l2-5.6A8.4 8.4 0 1 1 21 11.5Z"/></symbol>
+  <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M11 3l1.9 5.1L18 10l-5.1 1.9L11 17l-1.9-5.1L4 10l5.1-1.9L11 3Z"/><path d="M19 15v5M16.5 17.5h5"/></symbol>
+  <symbol id="i-plan" viewBox="0 0 24 24"><path d="M11 6h10M11 12h10M11 18h10"/><path d="m3 6 1.6 1.6L7.4 4.8M3 12l1.6 1.6 2.8-2.8M3 18l1.6 1.6 2.8-2.8"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V5M9 13v2M15 13v2M2 13v3M22 13v3"/><circle cx="12" cy="3.6" r="1.2"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.5.7L12 7h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+  <symbol id="i-repo" viewBox="0 0 24 24"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v14H6.5A2.5 2.5 0 0 0 4 19.5Zm0 0A2.5 2.5 0 0 0 6.5 22H19v-5"/><path d="M9 7h6"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/></symbol>
+  <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.57 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.38 9.38 0 0 1 12 6.84c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.6.69.49A10.02 10.02 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><g fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></g></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3Z"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="5" rx="1.5"/><path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9M10 13h4"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2.5"/><path d="M8 21h8M12 17v4"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5-12-7.5Z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.6 1.6"/><path d="M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.6-1.6"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+</svg>
+
+<div class="app" id="app" data-view="home">
+
+  <aside class="sidebar" id="sidebar" aria-label="Проекты и чаты">
+    <div class="sb-head">
+      <a class="brand" href="#/" aria-label="NEXUS — на главную">
+        <svg class="brand-mark" aria-hidden="true"><use href="#i-logo"/></svg>
+        <span class="brand-name">NEXUS</span>
+      </a>
+      <button class="icon-btn" type="button" data-action="toggle-sidebar"
+              aria-label="Скрыть панель чатов" title="Скрыть панель">
+        <svg class="icon"><use href="#i-sidebar"/></svg>
+      </button>
+    </div>
+
+    <button class="sb-project" type="button" id="project-switch" data-action="project-menu"
+            aria-haspopup="menu" aria-expanded="false" title="Сменить проект">
+      <span class="sb-project-icon" aria-hidden="true"><svg class="icon"><use href="#i-layers"/></svg></span>
+      <span class="sb-project-text">
+        <span class="sb-project-name" id="project-name">Проект</span>
+        <span class="sb-project-repo" id="project-repo">Репозиторий не подключён</span>
+      </span>
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+    </button>
+
+    <button class="btn btn-new" type="button" id="new-chat" data-action="new-chat">
+      <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>
+      <span>Новый чат</span>
+    </button>
+
+    <label class="sb-search">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="chat-search" type="search" placeholder="Поиск по чатам" autocomplete="off"
+             aria-label="Поиск по чатам">
+    </label>
+
+    <nav class="sb-list" id="chat-list" aria-label="История чатов"></nav>
+
+    <div class="sb-foot">
+      <button class="sb-user" type="button" id="user-menu" data-action="user-menu"
+              aria-haspopup="menu" aria-expanded="false">
+        <span class="avatar" id="user-avatar" aria-hidden="true"></span>
+        <span class="sb-user-name" id="whoami"></span>
+        <svg class="icon icon-sm" aria-hidden="true"><use href="#i-more"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim" data-action="close-overlays" hidden></div>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <button class="icon-btn" type="button" id="open-sidebar" data-action="toggle-sidebar"
+              aria-label="Показать панель чатов" title="Чаты">
+        <svg class="icon"><use href="#i-sidebar"/></svg>
+      </button>
+      <button class="title-btn" type="button" id="conv-title" data-action="rename-chat" hidden></button>
+      <div class="topbar-spacer"></div>
+      <button class="chip" type="button" id="repo-chip" data-action="open-repo" title="Репозиторий и ветка">
+        <svg class="icon icon-sm" aria-hidden="true"><use href="#i-branch"/></svg>
+        <span id="repo-chip-text">Подключить репозиторий</span>
+      </button>
+      <button class="icon-btn" type="button" id="ws-toggle" data-action="toggle-workspace"
+              aria-label="Рабочая область: файлы и агент" aria-pressed="false" title="Рабочая область">
+        <svg class="icon"><use href="#i-panel"/></svg>
+        <span class="badge-dot" id="ws-dot" hidden></span>
+      </button>
+    </header>
+
+    <section class="thread" id="thread" aria-label="Диалог"></section>
+
+    <div class="composer-wrap" id="composer-wrap">
+      <form class="composer" id="composer" autocomplete="off">
+        <textarea id="prompt" rows="1" aria-label="Сообщение"
+                  placeholder="Спросите о коде или опишите задачу"></textarea>
+        <div class="composer-bar">
+          <button class="chip chip-mode" type="button" id="mode-btn" data-action="mode-menu"
+                  aria-haspopup="menu" aria-expanded="false" title="Режим работы">
+            <svg class="icon icon-sm" aria-hidden="true"><use id="mode-icon" href="#i-message"/></svg>
+            <span id="mode-label">Вопрос</span>
+            <svg class="icon icon-xs" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+          </button>
+          <span class="composer-hint" id="composer-hint"></span>
+          <button class="send" type="submit" id="send" aria-label="Отправить" title="Отправить (Enter)" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-arrow-up"/></svg>
+          </button>
+        </div>
+      </form>
+      <p class="composer-note" id="composer-note" role="status"></p>
+    </div>
+
+    <section class="home-extras" id="home-extras" aria-label="С чего начать"></section>
+  </main>
+
+  <aside class="workspace" id="workspace" aria-label="Рабочая область" hidden>
+    <div class="ws-resizer" id="ws-resizer" role="separator" aria-orientation="vertical"
+         aria-label="Ширина рабочей области" tabindex="0"></div>
+    <header class="ws-head">
+      <div class="tabs" role="tablist" aria-label="Разделы рабочей области">
+        <button class="tab" type="button" role="tab" id="tab-files" data-action="ws-tab" data-tab="files"
+                aria-selected="true" aria-controls="ws-body">
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#i-folder"/></svg><span>Файлы</span>
+        </button>
+        <button class="tab" type="button" role="tab" id="tab-agent" data-action="ws-tab" data-tab="agent"
+                aria-selected="false" aria-controls="ws-body">
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#i-bot"/></svg><span>Агент</span>
+          <span class="tab-count" id="agent-count" hidden></span>
+        </button>
+      </div>
+      <div class="topbar-spacer"></div>
+      <button class="icon-btn" type="button" data-action="toggle-workspace" aria-label="Закрыть рабочую область" title="Закрыть">
+        <svg class="icon"><use href="#i-x"/></svg>
+      </button>
+    </header>
+    <div class="ws-body" id="ws-body" role="tabpanel"></div>
+  </aside>
+</div>
+
+<div class="layer" id="layer"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<noscript><div class="noscript">Для работы NEXUS нужен JavaScript.</div></noscript>
+</body>
+</html>

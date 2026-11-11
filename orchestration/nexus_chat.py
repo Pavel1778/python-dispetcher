@@ -66,12 +66,18 @@ class ChatResponder:
 
     def respond(self, *, mode: str, goal: str, context: dict | None = None,
                 memory: list[dict] | None = None, repository: str = "",
-                branch: str = "", history: list[dict] | None = None) -> list[dict]:
+                branch: str = "", history: list[dict] | None = None,
+                project_id: str | None = None,
+                principal: str | None = None) -> list[dict]:
         """Return the messages to append for this turn.
 
         Each message is ``{"role", "content", "meta"}``. A failure is raised as
         :class:`ChatError` so the caller records it as an ``error`` message
         rather than presenting a made-up answer.
+
+        *project_id* and *principal* identify whose turn this is. They are handed
+        to the dispatch hooks unchanged, so the work a turn starts is scoped to
+        the conversation's project instead of being created outside any project.
         """
         if mode not in _MODES:
             raise ValueError("mode must be ask, code, plan or autonomous")
@@ -79,9 +85,10 @@ class ChatResponder:
             return [self._ask(goal, context, memory, history)]
         if mode == "plan":
             return [self._plan(goal, context, memory)]
+        scope = {"project_id": project_id, "principal": principal}
         if mode == "code":
-            return self._code(goal, repository, branch)
-        return self._autonomous(goal, repository, branch)
+            return self._code(goal, repository, branch, scope)
+        return self._autonomous(goal, repository, branch, scope)
 
     # ------------------------------------------------------------------- modes
     def _ask(self, goal: str, context: dict | None, memory: list[dict] | None,
@@ -118,44 +125,45 @@ class ChatResponder:
                 "meta": {"provider": result.provider, "mode": "plan",
                          "plan": result.plan}}
 
-    def _code(self, goal: str, repository: str, branch: str) -> list[dict]:
+    def _code(self, goal: str, repository: str, branch: str,
+              scope: dict | None = None) -> list[dict]:
         if self._dispatch_code is None:
             raise ChatError("code mode is not wired to a dispatcher")
         if not repository:
             raise ChatError("bind a repository to the project before using Code mode")
         try:
             out = self._dispatch_code({"goal": goal, "repository": repository,
-                                       "branch": branch})
+                                       "branch": branch, **(scope or {})})
         except Exception as e:  # noqa: BLE001 - surfaced, never swallowed
             raise ChatError(f"could not start the OpenHands workflow: {e}") from e
         workflow_id = out.get("workflow_id") or out.get("id")
-        content = ("Запущена задача OpenHands для репозитория "
-                   f"`{repository}` (ветка `{branch}`).\n\n"
-                   f"Идентификатор workflow: `{workflow_id}`.\n"
-                   "Ход выполнения и изменения доступны на панели агента справа.")
+        # The id travels in ``meta`` and in the tool message; the text is what a
+        # person reads, so it names the repository and where to watch the work.
+        content = (f"Задача передана OpenHands: репозиторий `{repository}`, "
+                   f"ветка `{branch}`.\n\n"
+                   "Ход работы виден на вкладке «Агент».")
         tool = {"role": "tool", "content": f"start_workflow → {workflow_id}",
                 "meta": {"tool": "start_workflow", "workflow_id": workflow_id,
                          "repository": repository, "branch": branch}}
         return [tool, {"role": "assistant", "content": content,
                        "meta": {"mode": "code", "workflow_id": workflow_id}}]
 
-    def _autonomous(self, goal: str, repository: str, branch: str) -> list[dict]:
+    def _autonomous(self, goal: str, repository: str, branch: str,
+                    scope: dict | None = None) -> list[dict]:
         if self._start_autonomous is None:
             raise ChatError("autonomous mode is not wired to the lab")
         if not repository:
             raise ChatError("bind a repository to the project before using Autonomous mode")
         try:
             out = self._start_autonomous({"goal": goal, "repository": repository,
-                                          "branch": branch})
+                                          "branch": branch, **(scope or {})})
         except Exception as e:  # noqa: BLE001 - surfaced, never swallowed
             raise ChatError(f"could not start the autonomous run: {e}") from e
         run_id = out.get("run_id") or out.get("id")
         tasks = out.get("tasks") or []
-        content = (f"Запущена автономная работа над целью в `{repository}` "
-                   f"(ветка `{branch}`).\n\n"
-                   f"Идентификатор запуска: `{run_id}`.\n"
-                   f"Задач в плане: {len(tasks)}.\n"
-                   "Прогресс и проверки доступны на вкладке «Автономная лаборатория».")
+        content = (f"Автономный прогон запущен: репозиторий `{repository}`, "
+                   f"ветка `{branch}`, задач в плане: {len(tasks)}.\n\n"
+                   "Ход работы и проверки видны на вкладке «Агент».")
         tool = {"role": "tool", "content": f"start_run → {run_id}",
                 "meta": {"tool": "start_run", "run_id": run_id,
                          "tasks": len(tasks), "repository": repository,

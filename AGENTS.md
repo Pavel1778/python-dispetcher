@@ -204,9 +204,10 @@ successful-completion e2e needs a valid key and is not yet exercised.
   one-line JSON with no configuration.
 - The server refuses to bind `0.0.0.0` unless `WEB_AUTH_TOKEN` and all three
   `AUTH_*` variables are set (`web_server.main`).
-- The UI (`orchestration/web_ui.py`) is static strings: dark theme, Russian,
-  responsive. It must not embed any secret; actions must be implemented and
-  accurately described (browser-local voice input need not call an endpoint).
+- The UI is the studio in `orchestration/studio/` (see "NEXUS Studio" at the end
+  of this file): static files, Russian, dark and light, responsive. It must not
+  embed any secret; every control must call a real endpoint and say accurately
+  what it does.
 
 ## NEXUS laboratory, files, voice and guarded GitHub (second increment)
 
@@ -241,9 +242,10 @@ successful-completion e2e needs a valid key and is not yet exercised.
   writing a response, and the caller sends a second response (a 404 after a
   201). `_post_project_resource` returns an explicit `bool` for this reason; do
   not collapse it back to returning `self._json(...)`.
-- The UI gained **Лаборатория** and **GitHub** tabs in `web_ui.py`. The GitHub
-  confirm dialog is a real two-step flow (propose -> confirm), with a separate
-  warning for public. Nothing is sent to GitHub until "Подтвердить".
+- The UI had **Лаборатория** and **GitHub** tabs for these. The studio removed
+  both tabs; the routes below are unchanged and are reachable through the API,
+  the CLI and MCP. The create/visibility flow is still two-step on the server
+  (propose -> confirm): nothing is sent to GitHub before the confirmation.
 - **Two upload designs share `nexus_files` and `/files`.** The unified
   `migrations/0011_nexus_files.sql` makes the table a superset: an opaque row
   (main) carries `name`/`content`/`created_by`; a File Lab row carries
@@ -365,8 +367,8 @@ Three defects were fixed here; each has a test that fails if the fix is undone.
 ## Operator controls and the workspace check (PR #4; historical)
 
 - Workflow lifecycle actions live in `cloud_store` (`cancel_workflow`,
-  `resume_workflow`, `retry_task`) with routes in `web_server` and buttons in
-  the detail panel of `web_ui`. The UI renders only the actions the current
+  `resume_workflow`, `retry_task`) with routes in `web_server` and buttons on
+  the studio's «Агент» tab. The UI renders only the actions the current
   state can accept, so there are no buttons that fail by design. If you add an
   action, gate it the same way rather than relying on the server's 409.
 - `cancel` is terminal and idempotent. It does **not** delete the Sr
@@ -693,9 +695,10 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
 
 ## NEXUS AI IDE transformation (branch `nexus/ai-ide-transformation`)
 
-Turns the dispatcher dashboard into an AI development workspace. The old panels
-are **not removed** — they are secondary tabs behind the sidebar — so nothing
-was lost; the first screen is now chat/IDE.
+Turns the dispatcher dashboard into an AI development workspace. At the time the
+old panels were kept as secondary tabs behind the sidebar. **The studio rewrite
+(last section) removed them and this shell**; the services described here are
+unchanged.
 
 - **`orchestration/secrets.py` is the single credential cipher.** Every stored
   secret (a GitHub PAT, an OpenHands API key) is Fernet-encrypted with
@@ -730,10 +733,11 @@ was lost; the first screen is now chat/IDE.
   `nexus_conversation_attachments`, `nexus_agent_sessions`, and nullable
   `repository_id`/`selected_branch`/`openhands_account_id` on `nexus_projects`.
   No backfill. `REQUIRED_COLUMNS` in `cloud_store.py` names the new tables.
-- **`orchestration/web_ui_ide.py`** holds the shell's CSS and JS, concatenated
-  into `APP_CSS`/`APP_JS` by `web_ui.py`. The shell binds every control through
-  the `on(sel, event, handler)` helper so **one missing element cannot abort the
-  whole shell** — a plain `$('#x').onclick` on a missing id did exactly that.
+- **`orchestration/web_ui_ide.py`** held the shell's CSS and JS. It was deleted
+  by the studio rewrite. The lesson it recorded still holds and is why the
+  studio delegates every event from the document: **one missing element must not
+  abort the whole interface** — a plain `$('#x').onclick` on a missing id did
+  exactly that.
 - **The Unicode fix.** `github_client.repo_path` percent-encodes every path
   segment as UTF-8; the raw form raised `UnicodeEncodeError: 'latin-1' codec`
   from `http.client`. The fake GitHub decodes percent-encoded segments the way
@@ -747,3 +751,84 @@ was lost; the first screen is now chat/IDE.
   through the GitHub API at the bound ref); there is no local terminal because
   execution happens in OpenHands Cloud; the live multi-account and chat paths
   were not exercised against a real OpenHands key in this sandbox.
+
+## NEXUS Studio (front-end rewrite)
+
+The whole interface was replaced by one application: chat history on the left,
+the conversation and its composer in the middle, a workspace on the right with
+two tabs («Файлы», «Агент»). Settings and the repository connection are dialogs.
+There are no dashboards, section tabs or forms outside that.
+
+- **Files.** `orchestration/studio/`: `index.html` (shell + icon sprite),
+  `login.html`, `app.css`, `boot.js` (theme before first paint), `markdown.js`,
+  `highlight.js`, `app.js`, `favicon.svg`, `fonts/` (Inter and JetBrains Mono,
+  latin + cyrillic, OFL-1.1 with the licence texts). No framework, no build step,
+  no third-party script, nothing loaded from another origin.
+- **`orchestration/web_ui.py` only reads those files.** `STATIC` is a closed
+  mapping URL -> bytes; the server looks a path up in it and never maps a URL
+  onto a directory. A new asset is a new line in `_FILES` **and** must match the
+  `package-data` globs in `pyproject.toml` (`tests/test_studio_ui.py` checks
+  both). Pages reference assets as `?v=<ASSET_VERSION>` (a content hash).
+- **Content-Security-Policy.** `_html` sends `default-src 'self'; script-src
+  'self'; style-src 'self'; ...`. Consequences that are easy to trip over:
+  - no inline `<script>`, no `style="..."` attribute, no `on*=` handler, in the
+    pages **or in HTML built in a string**. Set sizes through the CSSOM
+    (`el.style.width = ...`), state through classes and attributes;
+  - Playwright's `page.wait_for_function` does not work (it evaluates a string).
+    Wait on selectors; `page.evaluate` is fine.
+- **Untrusted text.** Model output and repository files reach `innerHTML` only
+  through `markdown.js` / `highlight.js`, which escape every source character and
+  emit a fixed set of tags; everything else goes through `esc()`. Links are
+  http/https/mailto only; an image becomes a link (nothing is loaded
+  cross-origin). `tests/studio_render_test.js` holds the hostile corpus.
+- **Events** are delegated from `document` through `data-action` and the
+  `ACTIONS` table in `app.js`. `tests/test_studio_ui.py` fails when a control has
+  no handler, a handler has no control, or the script asks for an element id or
+  an icon that does not exist. Keep new controls in that scheme.
+- **Navigation** is `#/p/<project>/c/<conversation>`. `navigate()` routes at
+  once; while a route is in flight the composer is held, so a message cannot land
+  in the conversation being left.
+- **Colour tokens** live at the top of `app.css` for both themes. The contrast of
+  every text/surface pair is asserted (4.5:1) in `tests/test_studio_ui.py`; change
+  a token and that test tells you which pair broke.
+- **Server changes made for the studio** (`web_server.py`, `nexus_chat.py`,
+  `providers.py`):
+  - `GET /api/studio` — what is configured, booleans and names only; it never
+    calls the Cloud client (unlike `/api/system` and `/api/config`);
+  - `POST /api/v1/projects/{id}/repository` — `App.connect_repository`: look the
+    repository and branch up on GitHub, extend the allowlist, bind. `account_id`
+    is the identity: a uuid = that stored account, explicit `null` = the server
+    `GITHUB_TOKEN` (and the account is unbound), key absent = keep;
+  - `App.github_for_project` — project GitHub reads (`/github/repositories/...`,
+    context refresh) use the project's bound account. A revoked bound account is
+    a 400, never a silent switch to the server token;
+  - `GET /api/github/accounts/{id}[/repositories[/{owner}/{name}/branches]]` and
+    `GET /api/openhands/accounts/{id}[/capabilities]` — the handlers existed but
+    `do_GET` never dispatched them, so they answered 404;
+    `GET /api/github/repositories/{owner}/{name}/branches` is new;
+  - a chat turn passes `project_id`/`principal` to the dispatch hooks. Before,
+    `autonomous` always failed with `KeyError` and a `code` workflow was created
+    outside any project (its project-scoped view was a 404);
+  - `complete_text` no longer asks Gemini/Groq/OpenRouter for JSON output;
+  - an untitled conversation is named after its first message; `PATCH
+    .../conversations/{id}` accepts `archived` (the only way to restore one).
+- **Features that have routes but no screen now:** lab file uploads, workspaces
+  and voice notes; evidence; plan approval; GitHub create-repository and
+  visibility confirmations; the legacy task form and the queue; the system
+  diagnostics page; the allowlist editor; OpenHands account management.
+- **Limits, stated in the UI where they bite.** Stored OpenHands accounts are not
+  used for execution: workflows run under the server `OPENHANDS_API_KEY`
+  (nothing calls `openhands_accounts.client_for_project`). Files are read-only
+  and come from the GitHub API at the bound branch; the tree stops at 500
+  entries and a file at 200 KB. A reply arrives as one response, not a stream.
+  Autonomous runs advance only while `python -m orchestration.lab_worker` runs.
+- **Tests.** `tests/test_studio_ui.py` (structure, packaging, contrast; no
+  database), `tests/studio_render_test.js` (Node), `tests/test_studio_api.py`
+  (the server changes, with the fake GitHub recording which token each read
+  used), `tests/test_browser_e2e.py` (Chromium: the journey, hostile text,
+  failure and retry, phone and five other widths). The browser tests take
+  `E2E_CHROMIUM_EXECUTABLE` / `E2E_CHROMIUM_LD_LIBRARY_PATH` for a Chromium that
+  is not Playwright's own; outside CI they skip when no browser starts.
+- **Not verified.** A live OpenHands account, a real GitHub token and a real LLM
+  provider: every test uses the local fake servers. Safari and Firefox were not
+  run; only Chromium was.

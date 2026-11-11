@@ -127,38 +127,92 @@ def test_page_is_served(http):
     assert "/static/app.js" in text
 
 
-def test_page_has_the_lab_and_github_tabs(http):
+def test_page_is_the_studio_shell(http):
+    """One screen: chat history, the conversation with its composer, a workspace."""
     st, text = http.get_text("/")
     assert st == 200
-    # Every button in the UI must target a real element; these ids are what the
-    # new panels and their handlers rely on.
-    for marker in ('id="tab-lab"', 'id="panel-lab"', 'id="tab-github"',
-                   'id="panel-github"', 'id="upload-form"', 'id="rec-start"',
-                   'id="gh-create-form"', 'id="gh-confirm-card"'):
+    for marker in ('id="app"', 'id="sidebar"', 'id="project-switch"', 'id="new-chat"',
+                   'id="chat-search"', 'id="chat-list"', 'id="user-menu"',
+                   'id="thread"', 'id="composer"', 'id="prompt"', 'id="send"',
+                   'id="mode-btn"', 'id="repo-chip"', 'id="ws-toggle"',
+                   'id="workspace"', 'id="tab-files"', 'id="tab-agent"', 'id="ws-body"'):
         assert marker in text, marker
+    # Nothing of the dashboard is left: no metric strip and no bar of sections.
+    for gone in ('id="metrics"', 'id="tab-lab"', 'id="tab-github"', 'id="tab-projects"',
+                 'id="tab-system"', 'id="panel-'):
+        assert gone not in text, gone
 
 
-def test_page_is_the_ai_ide_shell(http):
-    """The first screen is the AI IDE workspace, not the old dashboard."""
+def test_studio_assets_are_served_with_their_types(server):
+    base = f"http://127.0.0.1:{server.port}"
+    expected = {
+        "/static/app.css": "text/css; charset=utf-8",
+        "/static/boot.js": "application/javascript; charset=utf-8",
+        "/static/markdown.js": "application/javascript; charset=utf-8",
+        "/static/highlight.js": "application/javascript; charset=utf-8",
+        "/static/app.js": "application/javascript; charset=utf-8",
+        "/static/fonts/inter-latin.woff2": "font/woff2",
+        "/static/fonts/inter-cyrillic.woff2": "font/woff2",
+        "/static/fonts/jetbrains-mono-latin.woff2": "font/woff2",
+        "/static/fonts/jetbrains-mono-cyrillic.woff2": "font/woff2",
+    }
+    for path, content_type in expected.items():
+        # Public on purpose: the login page needs the stylesheet and the fonts.
+        st, headers, body = _get_with_headers(base, path)
+        assert st == 200, path
+        assert headers["Content-Type"] == content_type, path
+        assert headers["X-Content-Type-Options"] == "nosniff", path
+        assert body, path
+    # A font really is a WOFF2 file, not an error page with the right header.
+    st, _, body = _get_with_headers(base, "/static/fonts/inter-cyrillic.woff2")
+    assert body[:4] == b"wOF2"
+
+
+def test_static_paths_are_a_closed_list(server):
+    """Only the listed assets exist. Nothing maps a URL onto the package directory."""
+    base = f"http://127.0.0.1:{server.port}"
+    for path in ("/static/index.html", "/static/login.html", "/static/web_ui.py",
+                 "/static/../web_server.py", "/static/%2e%2e/web_server.py",
+                 "/static/fonts/../app.css", "/static/fonts/Inter-LICENSE.txt",
+                 "/static/app.js.map", "/static/", "/static/app.JS"):
+        st, _, body = _get_with_headers(base, path, token="test-token")
+        assert st == 404, path
+        assert b"def " not in body and b"<html" not in body, path
+
+
+def test_pages_reference_assets_by_content_version(http):
+    """A release is picked up at once: every asset URL carries the content hash."""
+    from orchestration import web_ui
+
+    assert len(web_ui.ASSET_VERSION) == 12
+    for page in ("/", "/login"):
+        st, text = http.get_text(page)
+        assert st == 200
+        assert "__ASSET_VERSION__" not in text
+        assert f"/static/app.css?v={web_ui.ASSET_VERSION}" in text
     st, text = http.get_text("/")
-    assert st == 200
-    for marker in ('id="sidebar"', 'id="chat-log"', 'id="chat-input"', 'id="chat-send"',
-                   'id="panel-chat"', 'id="panel-ide"', 'id="panel-agents"',
-                   'id="ws-project"', 'id="repo-picker"', 'id="repo-list"',
-                   'id="repo-account"', 'id="branch-list"', 'id="repo-bind"',
-                   'id="rightpanel"', 'id="rp-toggle"', 'id="new-chat"',
-                   'id="menu-toggle"', 'class="mode-chip"'):
-        assert marker in text, marker
-    # The dashboard metric strip is no longer the first thing a user sees.
-    assert 'id="metrics"' not in text
+    for name in ("boot.js", "markdown.js", "highlight.js", "app.js"):
+        assert f"/static/{name}?v={web_ui.ASSET_VERSION}" in text, name
 
 
-def test_client_script_contains_the_new_capabilities(http):
-    st, text = http.get_text("/static/app.js")
-    assert st == 200
-    for fn in ("initLab", "initGithub", "loadFiles", "startRecording",
-               "proposeCreate", "showConfirm", "uploadFile"):
-        assert fn in text, fn
+def test_pages_carry_a_policy_that_forbids_inline_code(server):
+    base = f"http://127.0.0.1:{server.port}"
+    for path in ("/login", "/"):
+        st, headers, _ = _get_with_headers(base, path, token="test-token")
+        assert st == 200, path
+        policy = dict(part.strip().split(" ", 1) for part in
+                      headers["Content-Security-Policy"].split(";"))
+        # Only this origin may supply code or styles: an escaping bug cannot
+        # turn into script execution, and no page data can be sent elsewhere.
+        assert policy["default-src"] == "'self'"
+        assert policy["script-src"] == "'self'"
+        assert policy["style-src"] == "'self'"
+        assert policy["connect-src"] == "'self'"
+        assert policy["object-src"] == "'none'"
+        assert policy["base-uri"] == "'none'"
+        assert policy["frame-ancestors"] == "'none'"
+        assert headers["X-Frame-Options"] == "DENY"
+        assert headers["Cache-Control"] == "no-store"
 
 
 def test_static_assets_never_embed_a_secret_value(server, monkeypatch):
