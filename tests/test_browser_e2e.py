@@ -48,6 +48,11 @@ from playwright.sync_api import expect, sync_playwright  # noqa: E402
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
 pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run browser E2E tests")
 
+# One budget for every wait. A shared CI runner can be several times slower than
+# a laptop; a short default would then fail on speed, not on behaviour.
+TIMEOUT_MS = 20_000
+expect.set_options(timeout=TIMEOUT_MS)
+
 _MIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
 USERNAME, PASSWORD = "owner", "browser-pw"
 REPO = "acme/storefront"
@@ -158,7 +163,11 @@ def chromium():
 
 
 class Watch:
-    """Everything the page complained about. A clean run leaves it empty."""
+    """What went wrong in the page: uncaught exceptions, console errors (a
+    Content-Security-Policy violation is one) and responses of 400 and above.
+    A clean run leaves ``problems`` empty; an expected failure is allowed by
+    pattern. Console warnings are the browser's own advice and are not counted.
+    """
 
     def __init__(self, page):
         self.problems: list[str] = []
@@ -175,8 +184,8 @@ class Watch:
             self.problems.append(text)
 
     def _console(self, message) -> None:
-        if message.type in ("error", "warning"):
-            self._add(f"console.{message.type}: {message.text}")
+        if message.type == "error":
+            self._add(f"console.error: {message.text}")
 
     def _response(self, response) -> None:
         if response.status >= 400:
@@ -191,7 +200,7 @@ def _open(chromium, **context):
     # stylesheet ends every transition at once, so there is nothing to wait out.
     context.setdefault("reduced_motion", "reduce")
     ctx = chromium.new_context(**context)
-    ctx.set_default_timeout(15000)
+    ctx.set_default_timeout(TIMEOUT_MS)
     page = ctx.new_page()
     return ctx, page, Watch(page)
 
