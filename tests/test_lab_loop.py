@@ -559,3 +559,65 @@ def test_a_run_with_no_tasks_has_not_completed(env):
     empty = _run(env, run)
     assert (empty["state"], empty["last_error"]) == ("failed", "the run has no tasks")
 
+
+# ------------------------------------------------- no run is open-ended in time
+def test_a_run_that_names_no_deadline_gets_a_day(env):
+    run = env["lab"].start_run("user:alice", env["project"], env["goal"])
+    allowed = (run["deadline_at"] - run["created_at"]).total_seconds()
+    assert abs(allowed - 24 * 3600) < 5
+    # ...and one that names a deadline keeps its own.
+    env["lab"].set_run_state("user:alice", env["project"], run["id"], "cancelled")
+    own = env["lab"].start_run("user:alice", env["project"], env["goal"], deadline_seconds=90)
+    assert abs((own["deadline_at"] - own["created_at"]).total_seconds() - 90) < 5
+
+
+def _made_before_deadlines_existed(env, run, age):
+    """A run as the code before this change stored it: no deadline at all."""
+    _sql(env, "UPDATE nexus_runs SET deadline_at=NULL, "
+              "created_at = now() - %s::interval, updated_at = now() - %s::interval "
+              "WHERE id=%s", age, age, run["id"])
+
+
+def test_a_run_nobody_served_does_not_spring_to_life_days_later(env):
+    """What production looked like: runs "running" for days with every task
+    pending, because no executor was deployed. Switching an executor on must
+    not start that old work; the runs are over, and say why."""
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}, {"task_key": "b", "title": "B"}])
+    _made_before_deadlines_existed(env, run, "25 hours")
+    executor = FakeExecutor()
+    result = LabScheduler(env["lab"], executor, FakeVerifier()).tick(run["id"])
+
+    assert executor.dispatched == [] and result.claimed is None
+    assert result.finished is True
+    stale = _run(env, run)
+    assert (stale["state"], stale["last_error"], stale["iteration"]) == (
+        "failed", "deadline passed", 0)
+    assert _states(env, run) == {"a": "blocked", "b": "blocked"}
+    # The deadline it was held to is shown, not an empty field.
+    assert abs((stale["deadline_at"] - stale["created_at"]).total_seconds() - 24 * 3600) < 1
+
+
+def test_an_old_run_still_inside_its_day_is_served(env):
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}])
+    _made_before_deadlines_existed(env, run, "23 hours")
+    executor = FakeExecutor()
+    LabScheduler(env["lab"], executor, FakeVerifier()).run_until_done(run["id"])
+    assert executor.dispatched == ["a"]
+    assert _run(env, run)["state"] == "completed"
+
+
+def test_a_start_that_fails_after_a_cancel_does_not_requeue_the_task(env):
+    """The Cloud refused the start; meanwhile the run was cancelled. Releasing
+    the claim must not turn the settled task back into "pending"."""
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}])
+    task = env["lab"].claim_task(run["id"], "w1")
+    _set_run(env, run, "cancelled")
+    released = env["lab"].release_task(task["id"], error="CloudError: 503", requeue=True)
+    assert (released["state"], released["last_error"]) == ("blocked", "run cancelled")
+    # The ordinary case is unchanged: a failed start goes back to the queue.
+    other = env["lab"].start_run("user:alice", env["project"], env["goal"])
+    env["lab"].add_task("user:alice", env["project"], other["id"], task_key="b", title="B")
+    claimed = env["lab"].claim_task(other["id"], "w1")
+    back = env["lab"].release_task(claimed["id"], error="CloudError: 503", requeue=True)
+    assert (back["state"], back["last_error"]) == ("pending", "CloudError: 503")
+

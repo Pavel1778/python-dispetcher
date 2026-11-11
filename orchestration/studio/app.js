@@ -982,6 +982,10 @@
   function runCard(entry, detail) {
     var run = detail.run, tasks = detail.tasks || [];
     var waiting = tasks.length && tasks.every(function (task) { return task.state === 'pending'; }) && run.state === 'running';
+    var inline = !!(S.status && S.status.lab && S.status.lab.inline);
+    var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state];
+    var budget = 'запусков ' + esc(run.iteration) + ' из ' + esc(run.max_iterations) +
+      (live && run.deadline_at ? ' · до ' + esc(fullTime(run.deadline_at)) : '');
     var steps = tasks.length ? '<ul class="steps">' + tasks.map(function (task) {
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
@@ -997,10 +1001,12 @@
     if ({ running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state]) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
     return '<section class="work"><div class="work-head">' + pill(run.state) +
       '<span class="work-kind">Автономный прогон</span><span class="work-id">' + esc(shortId(entry.id)) + '</span>' +
-      '<span class="topbar-spacer"></span><span class="work-id">итерация ' + esc(run.iteration) + ' из ' + esc(run.max_iterations) + '</span></div>' +
+      '<span class="topbar-spacer"></span><span class="work-id" title="Сколько раз прогон запускал задачи и до какого времени он может их запускать">' + budget + '</span></div>' +
       (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') +
       '<div class="work-section"><p class="work-section-title">План · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач') + '</p>' + steps +
-      (waiting ? '<p class="step-sub">Задачи ждут исполнителя. Прогоны ведёт отдельный процесс: python -m orchestration.lab_worker.</p>' : '') + '</div>' +
+      (waiting ? '<p class="step-sub">' + (inline
+        ? 'Сервер возьмёт первую задачу в течение нескольких секунд.'
+        : 'Задачи ждут исполнителя. Сервер сам прогоны не ведёт: нужен NEXUS_LAB_INLINE=1 в его настройках или отдельный процесс python -m orchestration.lab_worker.') + '</p>' : '') + '</div>' +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
   }
 
@@ -1508,6 +1514,7 @@
     var accounts = S.accounts.github || [];
     var providers = (status.providers || []).filter(function (name) { return name !== 'openhands'; });
     var openhands = status.openhands || {}, github = status.github || {}, crypto = status.accounts || {};
+    var lab = status.lab || {};
     function line(ok, text) {
       return '<dd><span class="dot is-' + (ok ? 'ok' : 'warn') + '"></span>' + text + '</dd>';
     }
@@ -1526,6 +1533,8 @@
         ? 'токен сервера задан' : 'токена сервера нет — нужен аккаунт GitHub выше') +
       '<dt>Шифрование</dt>' + line(crypto.encryption_key, crypto.encryption_key
         ? 'включено' : 'NEXUS_SECRET_KEY не задан — аккаунты не сохранятся') +
+      '<dt>Автономные прогоны</dt>' + line(lab.inline, lab.inline
+        ? 'ведёт сам сервер' : 'сервер не ведёт — нужен NEXUS_LAB_INLINE=1 или процесс lab_worker') +
       '<dt>Версия</dt><dd>' + esc(status.version || '—') + '</dd></dl></div>';
   }
 

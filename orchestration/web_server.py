@@ -190,6 +190,11 @@ def _task_brief(task: Any) -> dict[str, Any]:
     }
 
 
+def _flag_env(name: str) -> bool:
+    """Whether an on/off setting is switched on. Unset or anything else is off."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _int_env(name: str, default: int) -> int:
     """Read a positive integer from the environment, or *default*."""
     raw = os.environ.get(name)
@@ -316,7 +321,7 @@ class App:
     def __init__(self, dsn: str, *, worker_id: str = "web", poll_interval: float = 5.0,
                  token: str | None = None, agent_profile_id: str | None = None,
                  plugins: list[dict[str, Any]] | None = None,
-                 auth: AuthService | None = None):
+                 auth: AuthService | None = None, lab_inline: bool | None = None):
         self.store = PostgresStore(dsn)
         self.projects = ProjectService(self.store)
         self.plans = PlanService(self.store)
@@ -353,8 +358,14 @@ class App:
         # configured providers are used, and only their presence is reported.
         self.providers = ProviderCascade()
         # The autonomous lab: durable runs/tasks, project context and memory.
-        # The web server can *start* a run; a separate worker process advances
-        # it, so closing the browser never stops execution.
+        # The web server *starts* a run. What advances it is the lab loop:
+        # ``python -m orchestration.lab_worker`` as its own process, or - for a
+        # deployment that has only this one - a thread of this server when
+        # NEXUS_LAB_INLINE is on (see ``_run_lab``). Either way a browser
+        # request never drives a run, and closing the browser never stops one.
+        self.lab_inline = (_flag_env("NEXUS_LAB_INLINE") if lab_inline is None
+                           else bool(lab_inline))
+        self._lab_worker_id = f"{worker_id}-lab"
         from .nexus_context import ContextService, MemoryService
         from .nexus_github_accounts import GitHubAccountService
         from .nexus_lab_store import LabStore
@@ -421,7 +432,9 @@ class App:
         )
         self._stop = threading.Event()
         self._loop: threading.Thread | None = None
+        self._lab_loop: threading.Thread | None = None
         self.last_tick: dict[str, Any] = {}
+        self.last_lab_tick: dict[str, Any] = {}
         # Sweep expired sessions and stale rate-limit rows occasionally, not
         # every tick: they are housekeeping, not dispatch work.
         self._sweep_every = 60
@@ -431,12 +444,38 @@ class App:
     def start(self) -> None:
         self._loop = threading.Thread(target=self._run, daemon=True)
         self._loop.start()
+        if self.lab_inline:
+            self._lab_loop = threading.Thread(target=self._run_lab, daemon=True)
+            self._lab_loop.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._loop:
-            self._loop.join(timeout=5)
+        for loop in (self._loop, self._lab_loop):
+            if loop:
+                loop.join(timeout=5)
         self.store.close()
+
+    def _run_lab(self) -> None:
+        """Advance autonomous runs from inside this process.
+
+        The same pass ``python -m orchestration.lab_worker`` makes, on its own
+        thread so a slow conversation start never delays the workflow loop.
+        Nothing about a run lives in this thread: every claim is a lease in
+        PostgreSQL, so a restart continues where the last pass stopped, and a
+        separate worker may run beside it.
+        """
+        from .lab_worker import LabWorker
+        worker = LabWorker(self.store, worker_id=self._lab_worker_id,
+                           client=self.client, github=self.github,
+                           github_accounts=self.github_accounts)
+        while not self._stop.is_set():
+            try:
+                self.last_lab_tick = {"at": time.time(), **worker.tick_once()}
+            except Exception as e:  # noqa: BLE001 - the loop must survive
+                log.exception("lab tick failed")
+                self.last_lab_tick = {"at": time.time(),
+                                      "errors": [f"{type(e).__name__}: {e}"]}
+            self._stop.wait(self.poll_interval)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -605,6 +644,10 @@ class App:
                 "transport": os.environ.get("OPENHANDS_TRANSPORT", "direct"),
             },
             "github": {"server_token": self.github.configured},
+            # Whether this process advances autonomous runs itself. When it
+            # does not, a run waits for ``python -m orchestration.lab_worker``,
+            # and the page says so instead of showing a run that never moves.
+            "lab": {"inline": self.lab_inline},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {
@@ -893,6 +936,8 @@ class App:
                 "poll_interval": self.poll_interval,
                 "last_tick_at": last.get("at"),
                 "last_error": last.get("error") or last.get("cloud_error"),
+                "lab_inline": self.lab_inline,
+                "lab_last_tick_at": self.last_lab_tick.get("at"),
             },
         }
 

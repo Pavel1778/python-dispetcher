@@ -6,9 +6,9 @@ tested without a live OpenHands:
 
 * :class:`OpenHandsExecutor` — starts a conversation for a task and polls it.
   It never decides the task is done; it only reports what the conversation said.
-* :class:`GitVerifier` — checks the *actual* repository state (branch, commit,
-  changed files) through the read-only GitHub client. An agent's summary is an
-  input to verification, never a substitute for it.
+* :class:`GitVerifier` — reads the head of the task's branch through the
+  read-only GitHub client and compares it with the commit the agent named. An
+  agent's summary is an input to verification, never a substitute for it.
 * :class:`LabScheduler` — one tick = reclaim → poll → verify → record →
   claim → authorize → dispatch → decide. This is the only place that moves a
   run forward, and it does so only while the run is ``running``, inside its
@@ -22,14 +22,17 @@ stays gated.
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from .cloud_client import CloudError, CloudNotFound
+from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
 from .nexus_binding import AuthorizationError, authorize_run_task
+from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
 
 log = logging.getLogger("nexus_lab")
@@ -174,18 +177,57 @@ class OpenHandsExecutor:
 # --------------------------------------------------------------------- verifier
 
 
+def project_github(store: PostgresStore, fallback: GitHubClient, *,
+                   accounts: GitHubAccountService | None = None
+                   ) -> Callable[[dict], GitHubClient]:
+    """``client_for(task)``: the GitHub identity a task's project reads with.
+
+    A project that has a stored GitHub account bound is read with that account,
+    exactly as the studio reads its files; a project without one is read with
+    *fallback* (the server's ``GITHUB_TOKEN``). The bound account is never
+    swapped for another: if it was revoked, or its token cannot be decrypted,
+    the call raises and the task is ``blocked`` - not verified by other means.
+    """
+    service = accounts or GitHubAccountService(store)
+
+    def client_for(task: dict) -> GitHubClient:
+        with store._tx() as cur:
+            cur.execute(
+                "SELECT a.id, a.principal FROM nexus_projects p "
+                "JOIN nexus_github_accounts a ON a.id = p.github_account_id "
+                "WHERE p.id=%s", (task["project_id"],))
+            row = cur.fetchone()
+        if row is None:
+            return fallback
+        return service.client_for_account(row["principal"], str(row["id"]))
+
+    return client_for
+
+
 class GitVerifier:
     """Check a task's result against the real repository.
 
-    The default policy: a task is `completed_verified` only when the agent
-    finished *and* the verifier observed a new commit on the task's branch that
-    the agent named. A finished conversation with no observable commit is
-    `completed_unverified` — never verified.
+    A task is `completed_verified` only when the conversation finished *and*
+    the head of the task's branch, read from GitHub now, is a commit the agent
+    named in its report (in full, or by an abbreviation of seven characters or
+    more). Everything else is something weaker: a finished conversation that
+    names no commit, or a commit that is not the head, is
+    `completed_unverified`; a branch that cannot be read is `blocked`.
+
+    What this does **not** establish: that the commit is new, or that it does
+    what the task asked. An agent that changed nothing and named the existing
+    head is verified; so "verified" means "the report refers to the real,
+    current state of the branch", and the acceptance criteria remain the
+    agent's own claim.
+
+    *client_for* picks the GitHub identity per task (see ``project_github``).
     """
 
-    def __init__(self, github: GitHubClient, *, require_commit: bool = True):
+    def __init__(self, github: GitHubClient, *, require_commit: bool = True,
+                 client_for: Callable[[dict], GitHubClient] | None = None):
         self.github = github
         self.require_commit = require_commit
+        self.client_for = client_for
 
     def verify(self, task: dict, report: TaskReport) -> Verification:
         if report.state == "missing":
@@ -208,8 +250,9 @@ class GitVerifier:
                                 "no repository bound; cannot verify remote state",
                                 evidence)
         try:
-            sha = self.github.default_branch_sha(repository, branch or None)
-        except (GitHubError, ValueError) as e:
+            github = self.client_for(task) if self.client_for is not None else self.github
+            sha = github.default_branch_sha(repository, branch or None)
+        except (GitHubError, ValueError, NotFound, SecretsError) as e:
             return Verification("blocked", f"github unavailable: {type(e).__name__}",
                                 {**evidence, "error": str(e)})
         evidence["remote_sha"] = sha
@@ -218,10 +261,13 @@ class GitVerifier:
             return Verification("completed_unverified",
                                 "branch has no readable commit", evidence)
         # The agent should have named the commit it produced; check it is real.
-        named = _extract_sha(report.final_text)
+        # Any commit-like token in the report counts, and an abbreviation
+        # matches the head it abbreviates: agents write "3f2a1b9", git-style.
+        named = _named_shas(report.final_text)
         if named:
-            evidence["named_sha"] = named
-            if named == sha:
+            match = next((token for token in named if sha.startswith(token)), None)
+            evidence["named_sha"] = match or named[0]
+            if match:
                 return Verification("completed_verified",
                                     "remote branch is at the reported commit", evidence)
             return Verification("completed_unverified",
@@ -233,16 +279,24 @@ class GitVerifier:
                             "no verifiable commit reported by the agent", evidence)
 
 
-def _extract_sha(text: str) -> str | None:
-    """Find a 7-40 char hex commit SHA in the agent's report, if present."""
-    import re
+_SHA_LIKE = re.compile(r"\b[0-9a-f]{7,40}\b")
 
-    for match in re.finditer(r"\b[0-9a-f]{7,40}\b", text or ""):
+
+def _named_shas(text: str) -> list[str]:
+    """Every 7-40 char hex token in the agent's report that could be a commit."""
+    found: list[str] = []
+    for match in _SHA_LIKE.finditer(text or ""):
         token = match.group(0)
         # Skip pure-digit runs (sizes, ids) that are not hex letters.
-        if any(c in "abcdef" for c in token):
-            return token
-    return None
+        if any(c in "abcdef" for c in token) and token not in found:
+            found.append(token)
+    return found
+
+
+def _extract_sha(text: str) -> str | None:
+    """The first commit-like token in the agent's report, if there is one."""
+    found = _named_shas(text)
+    return found[0] if found else None
 
 
 # -------------------------------------------------------------------- scheduler
@@ -403,7 +457,7 @@ class LabScheduler:
                     "blocked: tasks remain unverified")
         if unfinished - counts.get("pending", 0) > 0:
             return None                     # work is in flight; wait for it
-        spent = self._budget_spent(run_id)
+        spent = self.store.budget_spent(run_id)
         if spent:
             # Tasks are waiting and the run may not start them any more.
             return ("failed", spent, f"failed: {spent}")
@@ -413,19 +467,6 @@ class LabScheduler:
             # run is blocked rather than left spinning.
             return ("blocked", "dependency graph deadlocked: a dependency is not verified",
                     "blocked: dependency not verified")
-        return None
-
-    def _budget_spent(self, run_id: str) -> str | None:
-        """Which of the run's limits stops new work, if any."""
-        run = self.store.run_row(run_id)
-        if run is None:
-            return None
-        if run["iteration"] >= run["max_iterations"]:
-            return (f"iteration budget used: {run['iteration']} of "
-                    f"{run['max_iterations']} task starts")
-        deadline = run.get("deadline_at")
-        if deadline is not None and deadline <= datetime.now(timezone.utc):
-            return "deadline passed"
         return None
 
     def _project_of(self, run_id: str) -> str:

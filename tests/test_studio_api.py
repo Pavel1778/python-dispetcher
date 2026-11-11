@@ -9,6 +9,7 @@ endpoint that records every request body).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -118,8 +119,9 @@ class Studio:
         return (self.github.auth_headers[-1] or "").split()[-1]
 
 
-@pytest.fixture
-def studio(monkeypatch):
+@contextlib.contextmanager
+def studio_stack(monkeypatch, **app_options):
+    """The real server on the three fakes. *app_options* go to ``App``."""
     _reset_schema()
     monkeypatch.setenv("OPENHANDS_API_KEY", "cloud-key-value")
     monkeypatch.setenv("NEXUS_SECRET_KEY", "studio-tests-secret-key")
@@ -135,7 +137,7 @@ def studio(monkeypatch):
     threading.Thread(target=llm.serve_forever, daemon=True).start()
 
     with FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server:
-        app = App(DSN, poll_interval=0.2, token=TOKEN)
+        app = App(DSN, poll_interval=0.2, token=TOKEN, **app_options)
         app.client = CloudClient(cloud.base_url, api_key="cloud-key-value", timeout=10.0)
         app.dispatcher.client = app.client
         app.runtime.client = app.client
@@ -160,6 +162,12 @@ def studio(monkeypatch):
             llm.server_close()
 
 
+@pytest.fixture
+def studio(monkeypatch):
+    with studio_stack(monkeypatch) as stack:
+        yield stack
+
+
 # ------------------------------------------------------------------ status
 def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch):
     before = list(studio.cloud.cloud.calls)
@@ -169,6 +177,8 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     assert body["openhands"] == {"server_key": True, "transport": "direct"}
     assert body["github"] == {"server_token": True}
     assert body["accounts"] == {"encryption_key": True}
+    # This server does not advance autonomous runs unless it is told to.
+    assert body["lab"] == {"inline": False}
     assert isinstance(body["version"], str) and body["version"]
     # The page asks on every load, so the answer must not depend on OpenHands
     # being reachable: no request reaches the Cloud API.

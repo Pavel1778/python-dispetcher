@@ -8,8 +8,13 @@ Run it with::
 
 It loops over every *active* run (from any project), ticks the scheduler for
 each, and sleeps. Because all state is in PostgreSQL and claims are leases, N
-workers can run at once and a worker that dies mid-task is recovered by the next
-tick (``reclaim_expired``).
+workers can run at once. A worker that dies between claiming a task and
+starting its conversation is recovered when the lease expires
+(``reclaim_expired``); a conversation that was started is simply followed by
+whichever worker ticks next.
+
+A deployment with one process can run the same loop inside the web server
+instead: ``NEXUS_LAB_INLINE=1`` (see ``web_server.App``). Both may run at once.
 
 The worker holds no per-run state in memory, so a restart is a non-event: it
 re-reads the active runs and continues. That is the property the recovery test
@@ -28,7 +33,8 @@ from typing import Any
 from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
 from .github_client import GitHubClient
-from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor
+from .nexus_github_accounts import GitHubAccountService
+from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
 
 log = logging.getLogger("lab_worker")
@@ -52,13 +58,17 @@ class LabWorker:
 
     def __init__(self, store: PostgresStore, *, worker_id: str, poll_interval: float = 5.0,
                  lease_seconds: int = 900, client: Any | None = None,
-                 github: GitHubClient | None = None):
+                 github: GitHubClient | None = None,
+                 github_accounts: GitHubAccountService | None = None):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
         self.github = github if github is not None else GitHubClient()
         self.executor = OpenHandsExecutor(self.client)
-        self.verifier = GitVerifier(self.github)
+        # A branch is read with the GitHub account its project is bound to, as
+        # the studio reads it; the server token only where no account is bound.
+        self.verifier = GitVerifier(self.github, client_for=project_github(
+            store, self.github, accounts=github_accounts))
         self.worker_id = worker_id
         self.poll_interval = poll_interval
         self.lease_seconds = lease_seconds

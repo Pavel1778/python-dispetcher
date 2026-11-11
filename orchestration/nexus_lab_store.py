@@ -16,6 +16,9 @@ writes run/task state, so the invariants live in one spot:
 * **Only a running run starts work.** ``claim_task`` checks the run's state, its
   iteration budget and its deadline in the same transaction that claims the
   task, so a pause or a cancel cannot be overtaken by a claim already on its way.
+* **No run is open-ended.** A run that names no deadline gets
+  ``DEFAULT_DEADLINE_SECONDS``. A run nobody served - no executor was running -
+  fails when that time is up; it does not spring to life days later.
 * **Run states follow a table** (``_RUN_ENTERED_FROM``). A finished or cancelled
   run cannot be brought back, and a decision the scheduler made a moment too
   late never overwrites what a person just asked for.
@@ -27,7 +30,7 @@ Membership is checked in the same query that touches a row.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
@@ -70,6 +73,15 @@ MAX_RUN_ITERATIONS = 500
 MAX_TASK_ATTEMPTS = 10
 MAX_DEADLINE_SECONDS = 30 * 24 * 3600
 
+#: The deadline of a run that names none.
+DEFAULT_DEADLINE_SECONDS = 24 * 3600
+
+#: A run's deadline, in SQL. Rows written before deadlines were enforced have
+#: none; they are read as if they had been given the default when they were
+#: created, so an old run is bounded by the same rule as a new one.
+_DEADLINE_SQL = (f"COALESCE(deadline_at, created_at + "
+                 f"interval '{DEFAULT_DEADLINE_SECONDS} seconds')")
+
 
 def _jsonb(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
@@ -106,10 +118,10 @@ class LabStore:
             raise ValueError(f"max_iterations must be between 1 and {MAX_RUN_ITERATIONS}")
         if not 0 < max_attempts_per_task <= MAX_TASK_ATTEMPTS:
             raise ValueError(f"max_attempts_per_task must be between 1 and {MAX_TASK_ATTEMPTS}")
-        if deadline_seconds is not None and not 0 < deadline_seconds <= MAX_DEADLINE_SECONDS:
+        if deadline_seconds is None:
+            deadline_seconds = DEFAULT_DEADLINE_SECONDS
+        if not 0 < deadline_seconds <= MAX_DEADLINE_SECONDS:
             raise ValueError(f"deadline_seconds must be between 1 and {MAX_DEADLINE_SECONDS}")
-        deadline = (datetime.now(timezone.utc) + timedelta(seconds=deadline_seconds)
-                    if deadline_seconds else None)
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT id, state FROM nexus_goals WHERE id=%s AND project_id=%s FOR UPDATE",
@@ -124,10 +136,10 @@ class LabStore:
             cur.execute(
                 "INSERT INTO nexus_runs(project_id, goal_id, max_iterations, "
                 "max_attempts_per_task, deadline_at, created_by) "
-                "VALUES (%s,%s,%s,%s,%s,%s) RETURNING *",
+                "VALUES (%s,%s,%s,%s, now() + %s * interval '1 second', %s) RETURNING *",
                 (project_id, goal_id, max_iterations, max_attempts_per_task,
-                 deadline, principal))
-            run = dict(cur.fetchone())
+                 deadline_seconds, principal))
+            run = self._run_view(cur.fetchone())
             cur.execute("UPDATE nexus_goals SET state='running', active_run_id=%s, updated_at=now() "
                         "WHERE id=%s", (run["id"], goal_id))
             for position, task in enumerate(plan or []):
@@ -150,7 +162,34 @@ class LabStore:
             cur.execute("SELECT * FROM nexus_runs WHERE goal_id=%s AND project_id=%s "
                         "AND state = ANY(%s)", (goal_id, project_id, list(ACTIVE_RUN_STATES)))
             row = cur.fetchone()
-            return dict(row) if row else None
+            return self._run_view(row) if row else None
+
+    @staticmethod
+    def _run_view(row: Any) -> dict:
+        """A run as callers see it: always with the deadline it is held to."""
+        run = dict(row)
+        if run.get("deadline_at") is None and run.get("created_at") is not None:
+            run["deadline_at"] = run["created_at"] + timedelta(seconds=DEFAULT_DEADLINE_SECONDS)
+        return run
+
+    def budget_spent(self, run_id: str) -> str | None:
+        """Which of the run's limits stops new work, if any.
+
+        Read on the database's clock - the one ``claim_task`` uses - so the
+        scheduler's reason and the claim's refusal can never disagree.
+        """
+        with self.store._tx() as cur:
+            cur.execute(f"SELECT iteration, max_iterations, {_DEADLINE_SQL} <= now() AS late "
+                        "FROM nexus_runs WHERE id=%s", (run_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        if row["iteration"] >= row["max_iterations"]:
+            return (f"iteration budget used: {row['iteration']} of "
+                    f"{row['max_iterations']} task starts")
+        if row["late"]:
+            return "deadline passed"
+        return None
 
     def run_row(self, run_id: str) -> dict | None:
         """The run as the scheduler sees it. No membership check: the worker is
@@ -158,7 +197,7 @@ class LabStore:
         with self.store._tx() as cur:
             cur.execute("SELECT * FROM nexus_runs WHERE id=%s", (run_id,))
             row = cur.fetchone()
-            return dict(row) if row else None
+            return self._run_view(row) if row else None
 
     def get_run(self, principal: str, project_id: str, run_id: str) -> dict:
         with self.store._tx() as cur:
@@ -168,14 +207,14 @@ class LabStore:
             row = cur.fetchone()
             if row is None:
                 raise NotFound("run not found")
-            return dict(row)
+            return self._run_view(row)
 
     def list_runs(self, principal: str, project_id: str, *, limit: int = 50) -> list[dict]:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT * FROM nexus_runs WHERE project_id=%s "
                         "ORDER BY created_at DESC, id LIMIT %s", (project_id, limit))
-            return [dict(r) for r in cur.fetchall()]
+            return [self._run_view(r) for r in cur.fetchall()]
 
     def set_run_state(self, principal: str, project_id: str, run_id: str, state: str,
                       *, last_error: str | None = None) -> dict:
@@ -223,7 +262,7 @@ class LabStore:
             raise NotFound("run not found")
         current = row["state"]
         if current == state:
-            return dict(row)
+            return self._run_view(row)
         if current not in _RUN_ENTERED_FROM[state]:
             if not strict:
                 return None
@@ -251,7 +290,7 @@ class LabStore:
         else:
             cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
                         "updated_at=now() WHERE id=%s RETURNING *", (state, last_error, run_id))
-        run = dict(cur.fetchone())
+        run = self._run_view(cur.fetchone())
         # Mirror terminal states onto the goal so the goal is not left
         # "running" after its only run finished.
         if state in TERMINAL_RUN_STATES:
@@ -368,7 +407,7 @@ class LabStore:
             cur.execute(
                 "SELECT id FROM nexus_runs WHERE id=%s AND state='running' "
                 "AND iteration < max_iterations "
-                "AND (deadline_at IS NULL OR deadline_at > now()) FOR UPDATE", (run_id,))
+                f"AND {_DEADLINE_SQL} > now() FOR UPDATE", (run_id,))
             if cur.fetchone() is None:
                 return None
             cur.execute(
@@ -449,13 +488,22 @@ class LabStore:
             return task
 
     def release_task(self, task_id: str, *, error: str, requeue: bool) -> dict:
-        """Return a claimed task to ``pending`` (requeue) or mark it ``failed``."""
+        """Return a claimed task to ``pending`` (requeue) or mark it ``failed``.
+
+        Only a task that is still ``dispatched`` is released. One that was
+        settled while its start was failing (the run was cancelled) keeps the
+        state it was given.
+        """
         state = "pending" if requeue else "failed"
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, last_error=%s, "
-                "updated_at=now() WHERE id=%s RETURNING *", (state, error, task_id))
+                "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
+                (state, error, task_id))
             row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
             return self._task_row(row)
