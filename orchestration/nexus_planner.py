@@ -24,11 +24,16 @@ from .providers import ProviderCascade
 _TASK_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
 
-def validate_tasks(payload: Any) -> list[dict[str, Any]]:
-    """Validate a plan's task list and return it normalized, in input order."""
+def validate_tasks(payload: Any, *, max_tasks: int = 50,
+                   keep: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    """Validate a plan's task list and return it normalized, in input order.
+
+    *keep* names extra task fields to carry over untouched. Everything else a
+    model adds to a task is dropped.
+    """
     tasks = payload.get("tasks") if isinstance(payload, dict) else payload
-    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 50:
-        raise ValueError("plan must contain between 1 and 50 tasks")
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= max_tasks:
+        raise ValueError(f"plan must contain between 1 and {max_tasks} tasks")
     normalized: list[dict[str, Any]] = []
     keys: set[str] = set()
     for i, task in enumerate(tasks):
@@ -60,6 +65,7 @@ def validate_tasks(payload: Any) -> list[dict[str, Any]]:
             if isinstance(task.get("description"), str) else "",
             "acceptance": [a[:1000] for a in acceptance][:20],
             "dependencies": deps[:20],
+            **{name: task[name] for name in keep if name in task},
         })
     # Cycle + unknown-dependency check.
     outgoing: dict[str, list[str]] = {t["id"]: [] for t in normalized}

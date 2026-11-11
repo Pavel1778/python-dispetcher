@@ -149,7 +149,8 @@ class LabStore:
                     acceptance=task.get("acceptance") or [],
                     dependencies=task.get("dependencies") or [],
                     repository=repository, branch=branch,
-                    max_attempts=max_attempts_per_task, position=position)
+                    max_attempts=max_attempts_per_task, position=position,
+                    spec_ref=task.get("spec_ref"))
             ProjectService._event(cur, project_id, principal, "run.started", run["id"])
             self._notify(cur, project_id, "goal_started", "Цель запущена", run["id"])
             return run
@@ -337,19 +338,24 @@ class LabStore:
                      title: str, description: str = "", acceptance: list[str],
                      dependencies: list[str], repository: str = "", branch: str = "",
                      timeout_seconds: int = 1800, max_attempts: int = 3,
-                     executor: str = "openhands", position: int = 0) -> dict:
+                     executor: str = "openhands", position: int = 0,
+                     spec_ref: dict | None = None) -> dict:
         # Tasks are listed and claimed in ``created_at`` order, and ``now()`` is
         # the same instant for every row of one transaction. *position* keeps a
         # plan stored in one go in the order it was written.
+        #
+        # *spec_ref* says which part of the goal's specification the task
+        # covers (see migration 0021); the executor uses it to hand the agent
+        # the original text.
         cur.execute(
             "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title, description, "
             "acceptance, dependencies, repository, branch, timeout_seconds, max_attempts, "
-            "executor, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
+            "executor, spec_ref, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
             "        now() + %s * interval '1 microsecond') RETURNING *",
             (run_id, project_id, task_key, title, description, _jsonb(acceptance),
              _jsonb(dependencies), repository, branch, timeout_seconds,
-             max_attempts, executor, position))
+             max_attempts, executor, _jsonb(spec_ref) if spec_ref else None, position))
         return self._task_row(cur.fetchone())
 
     def list_tasks(self, principal: str, project_id: str, run_id: str) -> list[dict]:
@@ -376,6 +382,7 @@ class LabStore:
         out["dependencies"] = _loads(out.get("dependencies")) or []
         out["evidence"] = _loads(out.get("evidence")) or []
         out["verification"] = _loads(out.get("verification"))
+        out["spec_ref"] = _loads(out.get("spec_ref"))
         return out
 
     def dependency_states(self, cur: Any, task: dict) -> dict[str, str]:
