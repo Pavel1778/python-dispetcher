@@ -7,13 +7,13 @@ on:
 
 jobs:
   test:
-    # TEMPORARY (diagnosis): the same job on both images that `ubuntu-latest`
-    # currently resolves to.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, ubuntu-26.04]
-    runs-on: ${{ matrix.os }}
+    # A named image, not `ubuntu-latest`. While that label migrates it resolves
+    # to either 24.04 or 26.04, and the two are not interchangeable here: the
+    # backup/restore drill dumps the PostgreSQL 17 service below with the
+    # image's own client tools, and pg_dump refuses a server newer than itself.
+    # 24.04 ships pg_dump 16 (the drill fails with "server version mismatch"),
+    # 26.04 ships 18. Both were run side by side on 2026-11-11 to establish this.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     # The Cloud integration tests run against a real PostgreSQL server and skip
@@ -71,9 +71,10 @@ jobs:
       # Chromium for the browser E2E (playwright is in requirements-dev). Only
       # the browser is downloaded here. Its system libraries are *not* installed
       # up front: the runner image already has them, and `install --with-deps`
-      # runs `apt-get update` first, which made every run depend on the package
-      # mirrors (on 2026-11-11 that step hung for 7-10 minutes and failed five
-      # runs in a row on both images while everything else was healthy).
+      # goes through apt first, which made every run depend on the package
+      # mirrors (on 2026-11-11 that part hung for 7-10 minutes and failed three
+      # attempts on main, then ran into its limit on both images, while the
+      # Python packages installed in seconds).
       - name: Download Chromium
         timeout-minutes: 6
         run: |
