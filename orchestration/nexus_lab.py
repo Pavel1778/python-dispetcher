@@ -9,8 +9,10 @@ tested without a live OpenHands:
 * :class:`GitVerifier` — checks the *actual* repository state (branch, commit,
   changed files) through the read-only GitHub client. An agent's summary is an
   input to verification, never a substitute for it.
-* :class:`LabScheduler` — one tick = reclaim → claim → dispatch → poll →
-  verify → record → decide. This is the only place that moves a run forward.
+* :class:`LabScheduler` — one tick = reclaim → poll → verify → record →
+  claim → authorize → dispatch → decide. This is the only place that moves a
+  run forward, and it does so only while the run is ``running``, inside its
+  budgets, and only against a repository the project is allowed to use.
 
 The core rule the whole module enforces: a task is `completed_verified` only
 when the verifier observed the required state. Otherwise it is
@@ -22,11 +24,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from .cloud_client import CloudError, CloudNotFound
 from .github_client import GitHubClient, GitHubError
-from .nexus_lab_store import LabStore
+from .nexus_binding import AuthorizationError, authorize_run_task
+from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
 
 log = logging.getLogger("nexus_lab")
 
@@ -254,16 +258,30 @@ class TickResult:
     verified: str | None = None
     verdict: str | None = None
     finished: bool = False
+    #: The run is alive but ticking cannot move it: it is paused, blocked or
+    #: waiting, and nothing of it is in flight. A person has to act first.
+    idle: bool = False
     note: str = ""
 
 
 class LabScheduler:
     """Drive one run forward by one step per tick.
 
-    One tick = reclaim expired leases → claim one claimable task → dispatch it →
-    poll → verify → record → decide (complete the run, or keep going). All state
-    lives in PostgreSQL, so the loop can run in a separate worker process and
-    survive a restart.
+    One tick = reclaim expired leases → poll what is in flight → verify and
+    record → claim one claimable task → authorize → dispatch → decide (complete
+    the run, or keep going). All state lives in PostgreSQL, so the loop can run
+    in a separate worker process and survive a restart.
+
+    What a tick may do depends on the run:
+
+    * a **terminal** run (completed, failed, cancelled) is not touched at all;
+    * a run that is alive but **not running** (paused, blocked, waiting) has the
+      results of work already in flight collected - that work was started and
+      paid for, and leaving it unread would lose the answer - and nothing new is
+      started;
+    * only a **running** run starts tasks, and only while it has iterations left
+      and its deadline has not passed. The store checks that again inside the
+      claim itself, so a pause or cancel is never overtaken.
     """
 
     def __init__(self, store: LabStore, executor: Executor, verifier: Verifier, *,
@@ -278,17 +296,38 @@ class LabScheduler:
 
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
+        run = self.store.run_row(run_id)
+        if run is None:
+            result.finished = True
+            result.note = "run not found"
+            return result
+        if run["state"] in TERMINAL_RUN_STATES:
+            result.finished = True
+            result.note = f"run is {run['state']}"
+            return result
         result.reclaimed = len(self.store.reclaim_expired(run_id))
 
-        # 1. Poll any task already dispatched, so a slow conversation advances.
-        for task in self._in_flight(run_id):
+        # 1. Poll every task already dispatched, so a slow conversation advances.
+        in_flight = 0
+        for task in self.store.in_flight_tasks(run_id):
             conv = task.get("conversation_id")
             if not conv:
+                in_flight += 1
                 continue
             report = self.executor.poll(task, conv)
             if report.state == "running":
-                continue
-            verdict = self.verifier.verify(task, report)
+                if task["running_seconds"] <= task["timeout_seconds"]:
+                    in_flight += 1
+                    continue
+                # The task's own time limit. The conversation is left as it is
+                # (its transcript is the explanation); the task is over, and it
+                # is not started a second time behind the first one's back.
+                verdict = Verification(
+                    "failed",
+                    f"timed out after {task['timeout_seconds']} s; the conversation was left running",
+                    {"state": "running", "conversation_id": conv})
+            else:
+                verdict = self.verifier.verify(task, report)
             self.store.record_verification(
                 task["id"], verdict=verdict.verdict,
                 evidence={"reason": verdict.reason, **verdict.evidence},
@@ -296,10 +335,34 @@ class LabScheduler:
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
 
-        # 2. Claim and dispatch the next claimable task.
+        if run["state"] != "running":
+            result.idle = in_flight == 0
+            result.note = f"run is {run['state']}: nothing new is started"
+            return result
+
+        # 2. Claim and dispatch the next claimable task. The claim refuses by
+        #    itself when the run stopped running or is out of budget.
         task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds)
         if task is not None:
             result.claimed = task["task_key"]
+            try:
+                # The gate every other path to a conversation goes through. It
+                # ran when the run was started; the link or the allowlist may
+                # have changed since.
+                authorize_run_task(self.store.store, project_id=str(task["project_id"]),
+                                   repository=task.get("repository") or "",
+                                   branch=task.get("branch") or "")
+            except AuthorizationError as e:
+                reason = f"not authorized: {e}"
+                self.store.record_verification(
+                    task["id"], verdict="blocked", evidence={"reason": reason},
+                    detail={"verdict": "blocked", "reason": reason})
+                applied = self.store.set_run_state_internal(
+                    run_id, "blocked",
+                    last_error=f"task {task['task_key']} was not started: {e}")
+                result.finished = applied is not None
+                result.note = "blocked: dispatch not authorized"
+                return result
             try:
                 conversation_id = self.executor.dispatch(task)
             except (CloudError, GitHubError) as e:
@@ -314,33 +377,56 @@ class LabScheduler:
             result.dispatched = True
 
         # 3. Decide the run's fate.
-        if self.store.all_verified(run_id):
-            self.store.set_run_state_internal(run_id, "completed")
-            result.finished = True
-        elif not self.store.has_pending(run_id):
+        outcome = self._decide(run_id)
+        if outcome is not None:
+            state, last_error, note = outcome
+            applied = self.store.set_run_state_internal(run_id, state, last_error=last_error)
+            result.finished = applied is not None
+            if applied is not None and note:
+                result.note = result.note or note
+        return result
+
+    def _decide(self, run_id: str) -> tuple[str, str | None, str] | None:
+        """The state the run should move to now, or ``None`` to keep going."""
+        counts = self.store.count_tasks(run_id)
+        total = sum(counts.values())
+        if total == 0:
+            # A run with nothing in it has not achieved its goal.
+            return ("failed", "the run has no tasks", "failed: no tasks")
+        if counts.get("completed_verified", 0) == total:
+            return ("completed", None, "")
+        unfinished = sum(counts.get(state, 0) for state in UNFINISHED_TASK_STATES)
+        if unfinished == 0:
             # Nothing left to do and not all verified: the run is blocked, not
-            # complete. A human or a replan step must resolve it.
-            self.store.set_run_state_internal(
-                run_id, "blocked",
-                last_error="no claimable tasks; some tasks not verified")
-            result.finished = True
-            result.note = result.note or "blocked: tasks remain unverified"
-        elif not self.store.has_in_flight(run_id) and not self.store.has_claimable(run_id):
+            # complete. A person resumes it (retry) or cancels it.
+            return ("blocked", "no claimable tasks; some tasks not verified",
+                    "blocked: tasks remain unverified")
+        if unfinished - counts.get("pending", 0) > 0:
+            return None                     # work is in flight; wait for it
+        spent = self._budget_spent(run_id)
+        if spent:
+            # Tasks are waiting and the run may not start them any more.
+            return ("failed", spent, f"failed: {spent}")
+        if not self.store.has_claimable(run_id):
             # A pending task exists but can never be claimed: a dependency ended
             # unverified/failed/blocked. That is a deadlock, not progress, so the
             # run is blocked rather than left spinning.
-            self.store.set_run_state_internal(
-                run_id, "blocked",
-                last_error="dependency graph deadlocked: a dependency is not verified")
-            result.finished = True
-            result.note = result.note or "blocked: dependency not verified"
-        return result
+            return ("blocked", "dependency graph deadlocked: a dependency is not verified",
+                    "blocked: dependency not verified")
+        return None
 
-    def _in_flight(self, run_id: str) -> list[dict]:
-        with self.store.store._tx() as cur:
-            cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s "
-                        "AND state IN ('dispatched','running')", (run_id,))
-            return [self.store._task_row(r) for r in cur.fetchall()]
+    def _budget_spent(self, run_id: str) -> str | None:
+        """Which of the run's limits stops new work, if any."""
+        run = self.store.run_row(run_id)
+        if run is None:
+            return None
+        if run["iteration"] >= run["max_iterations"]:
+            return (f"iteration budget used: {run['iteration']} of "
+                    f"{run['max_iterations']} task starts")
+        deadline = run.get("deadline_at")
+        if deadline is not None and deadline <= datetime.now(timezone.utc):
+            return "deadline passed"
+        return None
 
     def _project_of(self, run_id: str) -> str:
         with self.store.store._tx() as cur:
@@ -354,7 +440,7 @@ class LabScheduler:
         last = TickResult()
         for _ in range(max_ticks):
             last = self.tick(run_id)
-            if last.finished:
+            if last.finished or last.idle:
                 return last
             if sleep:
                 time.sleep(sleep)

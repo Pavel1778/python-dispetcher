@@ -13,8 +13,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from orchestration.cloud_store import NotFound, PostgresStore  # noqa: E402
-from orchestration.nexus_lab_store import LabStore  # noqa: E402
+from orchestration.cloud_store import InvalidTransition, NotFound, PostgresStore  # noqa: E402
+from orchestration.nexus_lab_store import _RUN_ENTERED_FROM, LabStore  # noqa: E402
 from orchestration.nexus_projects import ProjectService  # noqa: E402
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL")
@@ -179,3 +179,78 @@ def test_notifications_are_recorded_and_scoped(lab):
     lab["svc"].create("user:bob", "O")  # bob is a real principal with no access
     with pytest.raises(NotFound):
         lab["lab"].notifications("user:bob", lab["project"])
+
+
+# ------------------------------------------------------------- run state machine
+RUN_STATES = sorted(_RUN_ENTERED_FROM)
+
+
+@pytest.mark.parametrize("source", RUN_STATES)
+def test_a_run_moves_only_along_the_table(lab, source):
+    """Every (from, to) pair: either the table allows it, or nothing changes.
+
+    Before the table existed any state could follow any other. A cancelled run
+    could be "resumed" - and with another run of the same goal alive that broke
+    the one-active-run index instead of being refused.
+    """
+    for target in RUN_STATES:
+        with lab["store"]._tx() as cur:
+            cur.execute("DELETE FROM nexus_runs")
+        run = lab["lab"].start_run("user:alice", lab["project"], lab["goal"])
+        task = lab["lab"].add_task("user:alice", lab["project"], run["id"],
+                                   task_key="a", title="A")
+        with lab["store"]._tx() as cur:
+            # A blocked run needs something a resume could retry.
+            cur.execute("UPDATE nexus_run_tasks SET state='failed', attempt=1 WHERE id=%s",
+                        (task["id"],))
+            cur.execute("UPDATE nexus_runs SET state=%s WHERE id=%s", (source, run["id"]))
+        allowed = target == source or source in _RUN_ENTERED_FROM[target]
+        if allowed:
+            moved = lab["lab"].set_run_state("user:alice", lab["project"], run["id"], target)
+            assert moved["state"] == target, (source, target)
+        else:
+            with pytest.raises(InvalidTransition):
+                lab["lab"].set_run_state("user:alice", lab["project"], run["id"], target)
+            assert lab["lab"].set_run_state_internal(run["id"], target) is None
+            assert lab["lab"].get_run("user:alice", lab["project"], run["id"])["state"] == source
+
+
+def test_the_table_has_no_way_out_of_a_finished_run():
+    for target, sources in _RUN_ENTERED_FROM.items():
+        assert not sources & {"completed", "failed", "cancelled"}, target
+
+
+def test_a_run_and_its_plan_are_stored_together_or_not_at_all(lab):
+    plan = [{"id": "a", "title": "A", "acceptance": ["x"], "dependencies": []},
+            {"id": "b", "title": "B" * 201, "acceptance": [], "dependencies": ["a"]}]   # too long
+    with pytest.raises(Exception, match="nexus_run_tasks_title_check"):
+        lab["lab"].start_run("user:alice", lab["project"], lab["goal"], plan=plan)
+    assert lab["lab"].list_runs("user:alice", lab["project"]) == []
+    with lab["store"]._tx() as cur:
+        cur.execute("SELECT state, active_run_id FROM nexus_goals WHERE id=%s", (lab["goal"],))
+        goal = cur.fetchone()
+    assert goal["state"] == "draft" and goal["active_run_id"] is None
+
+
+def test_a_plan_stored_in_one_go_keeps_its_order(lab):
+    """One transaction means one ``now()`` for every row; the order must not
+    fall back to the random task id."""
+    keys = [f"t{i:02d}" for i in range(15)]
+    plan = [{"id": key, "title": key, "acceptance": [], "dependencies": []} for key in keys]
+    run = lab["lab"].start_run("user:alice", lab["project"], lab["goal"], plan=plan,
+                               repository="acme/repo", branch="main", max_attempts_per_task=2)
+    tasks = lab["lab"].list_tasks("user:alice", lab["project"], run["id"])
+    assert [t["task_key"] for t in tasks] == keys
+    assert {(t["repository"], t["branch"], t["max_attempts"]) for t in tasks} == {
+        ("acme/repo", "main", 2)}
+    assert [lab["lab"].claim_task(run["id"], "w")["task_key"] for _ in range(3)] == keys[:3]
+
+
+@pytest.mark.parametrize("options", [{"max_iterations": 0}, {"max_iterations": 501},
+                                     {"max_attempts_per_task": 0}, {"max_attempts_per_task": 11},
+                                     {"deadline_seconds": -1}, {"deadline_seconds": 10 ** 9}])
+def test_budgets_outside_their_bounds_are_refused(lab, options):
+    with pytest.raises(ValueError):
+        lab["lab"].start_run("user:alice", lab["project"], lab["goal"], **options)
+    assert lab["lab"].list_runs("user:alice", lab["project"]) == []
+

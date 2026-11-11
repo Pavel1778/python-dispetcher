@@ -536,6 +536,33 @@ def test_an_autonomous_turn_plans_and_starts_a_run_for_the_asker(studio):
     assert studio.api.get(base)[1]["conversation"]["run_id"] == run
 
 
+def test_an_autonomous_turn_is_refused_once_the_repository_is_switched_off(studio):
+    """The repository was fine when it was connected; that is not permission for ever.
+
+    The chat passes the project's bound repository to the lab, and the lab used
+    to start work on it without asking again. Now the turn is refused before a
+    plan is requested, and the reason is what the person reads.
+    """
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository", {"full_name": REPO})[0] == 200
+    with studio.app.store._tx() as cur:
+        cur.execute("UPDATE repositories SET enabled=false WHERE full_name=%s", (REPO,))
+    conversation = studio.conversation(project, mode="autonomous")
+    base = f"/api/v1/projects/{project}/conversations/{conversation}"
+    studio.answers(json.dumps({"tasks": [{"id": "a", "title": "A", "acceptance": [],
+                                          "dependencies": []}]}))
+
+    status, body = studio.api.post(f"{base}/messages", {"text": "Цель: навести порядок",
+                                                        "mode": "autonomous"})
+    assert status == 502, body
+    assert body["error"] == (
+        f"could not start the autonomous run: repository {REPO} is disabled")
+    assert [m["role"] for m in body["messages"]] == ["user", "system"]
+    assert studio.llm.calls == [], "a plan was requested for work that may not run"
+    assert studio.api.get(f"/api/v1/projects/{project}/runs")[1]["runs"] == []
+    assert studio.api.get(f"/api/v1/projects/{project}/goals")[1]["goals"] == []
+
+
 def test_archiving_hides_a_conversation_and_restoring_brings_it_back(studio):
     project = studio.project()
     kept = studio.conversation(project, title="Остаётся")

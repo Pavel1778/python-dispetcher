@@ -90,13 +90,12 @@ from .github_client import (
 from .github_confirmations import Confirmations
 from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
-from .nexus_binding import ProjectBindingError
+from .nexus_binding import AuthorizationError, ProjectBindingError, authorize_run_task
 from .nexus_chat import ChatError
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
-from .nexus_planner import store_plan
 from .providers import ProviderCascade
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
@@ -568,22 +567,26 @@ class App:
         stored; a provider outage raises, so the chat records a failure instead
         of a fabricated plan. The durable worker advances the run.
         """
-        from .nexus_planner import store_plan
-
         principal = request["principal"]
         project_id = request["project_id"]
+        repository = request.get("repository") or ""
+        branch = request.get("branch") or ""
         project = self.projects.get(principal, project_id)
+        # Refuse before a planning call is spent, and before anything is stored.
+        authorize_run_task(self.store, project_id=project_id,
+                           repository=repository, branch=branch)
         goal, _created = self.projects.create_goal(principal, project_id, request["goal"])
+        if self.lab.active_run_for_goal(principal, project_id, str(goal["id"])) is not None:
+            raise ValueError("this goal already has an active run")
         context = self.context.current(principal, project_id)
         memory = self.memory.retrieve(principal, project_id, limit=30)
         tasks, _meta = self.planner.plan(
             goal=goal["text"], project_name=project["name"],
             context=(context or {}).get("summary") or {}, memory=memory)
-        run = self.lab.start_run(principal, project_id, str(goal["id"]))
-        stored = store_plan(self.lab, principal, project_id, str(run["id"]),
-                            tasks=tasks, repository=request.get("repository") or "",
-                            branch=request.get("branch") or "")
-        return {"run_id": str(run["id"]), "tasks": stored}
+        run = self.lab.start_run(principal, project_id, str(goal["id"]),
+                                 plan=tasks, repository=repository, branch=branch)
+        return {"run_id": str(run["id"]),
+                "tasks": self.lab.list_tasks(principal, project_id, str(run["id"]))}
 
     def studio_status(self) -> dict[str, Any]:
         """What the studio needs in order to explain itself: what is configured.
@@ -1677,8 +1680,38 @@ class Handler(BaseHTTPRequestHandler):
         The plan is validated by the application; a provider outage is a 503,
         not a fabricated plan. Starting the run does not dispatch: the durable
         worker advances it, so closing the browser cannot stop it.
+
+        Everything that can refuse the request is checked before the planning
+        call is made: the body, the repository (the same gate the scheduler
+        applies again before each conversation), and whether the goal already
+        has a live run. The run and its plan are then stored in one transaction.
         """
+        from .nexus_lab_store import MAX_DEADLINE_SECONDS, MAX_RUN_ITERATIONS, MAX_TASK_ATTEMPTS
         from .providers import AllProvidersFailed, ProviderError
+
+        def whole(name: str, default: int | None, most: int) -> int | None:
+            value = body.get(name)
+            if value is None:
+                return default
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= most:
+                raise ValueError(f"{name} must be a whole number between 1 and {most}")
+            return value
+
+        try:
+            max_iterations = whole("max_iterations", 50, MAX_RUN_ITERATIONS)
+            max_attempts = whole("max_attempts_per_task", 3, MAX_TASK_ATTEMPTS)
+            deadline_seconds = whole("deadline_seconds", None, MAX_DEADLINE_SECONDS)
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
+            return
+        repository, branch = body.get("repository") or "", body.get("branch") or ""
+        if not isinstance(repository, str) or not isinstance(branch, str):
+            self._json(400, {"error": "repository and branch must be strings"})
+            return
+        repository, branch = repository.strip(), branch.strip()
+        if repository and not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+            self._json(400, {"error": "repository must be owner/name"})
+            return
 
         # Membership + goal existence are checked by start_run; read the goal
         # text and project name for the prompt first.
@@ -1691,6 +1724,15 @@ class Handler(BaseHTTPRequestHandler):
         goal = next((g for g in goals if str(g["id"]) == goal_id), None)
         if goal is None:
             self._json(404, {"error": "goal not found"})
+            return
+        try:
+            authorize_run_task(self.app.store, project_id=project_id,
+                               repository=repository, branch=branch)
+        except AuthorizationError as e:
+            self._json(409, {"error": str(e)})
+            return
+        if self.app.lab.active_run_for_goal(principal, project_id, goal_id) is not None:
+            self._json(409, {"error": "goal already has an active run"})
             return
         context = self.app.context.current(principal, project_id)
         memory = self.app.memory.retrieve(principal, project_id, limit=30)
@@ -1708,19 +1750,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             self._json(502, {"error": f"provider returned an invalid plan: {e}"})
             return
-        repository = (body.get("repository") or "").strip()
-        branch = (body.get("branch") or "").strip()
         try:
             run = self.app.lab.start_run(
                 principal, project_id, goal_id,
-                max_iterations=int(body.get("max_iterations") or 50),
-                max_attempts_per_task=int(body.get("max_attempts_per_task") or 3),
-                deadline_seconds=int(body["deadline_seconds"]) if body.get("deadline_seconds") else None)
+                max_iterations=max_iterations, max_attempts_per_task=max_attempts,
+                deadline_seconds=deadline_seconds,
+                plan=tasks, repository=repository, branch=branch)
         except ValueError as e:
             self._json(409, {"error": str(e)})
             return
-        stored = store_plan(self.app.lab, principal, project_id, str(run["id"]),
-                            tasks=tasks, repository=repository, branch=branch)
+        stored = self.app.lab.list_tasks(principal, project_id, str(run["id"]))
         self._json(201, {"run": run, "tasks": stored, "plan": meta})
 
     def _chat_turn(self, principal: str, project_id: str, conversation_id: str,
