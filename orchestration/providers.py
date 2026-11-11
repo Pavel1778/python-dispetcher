@@ -110,12 +110,42 @@ def estimate_tokens(text: str) -> int:
 
 
 class AllProvidersFailed(ProviderError):
-    """Every provider in the cascade failed. Carries each provider's reason."""
+    """Every provider in the cascade failed. Carries each provider's reason.
 
-    def __init__(self, failures: list[tuple[str, str]]):
+    *kinds* says, per failure, what sort it was, for a caller that can act on
+    the difference: ``too_large`` (the request does not fit the model - a
+    smaller request may), ``auth`` (no key, or the key was refused - retrying
+    cannot help), ``unavailable`` (transport, 5xx, 429 - a later attempt may
+    work) and ``rejected`` (the request or the answer was wrong, including an
+    answer that is not a valid plan).
+    """
+
+    def __init__(self, failures: list[tuple[str, str]], kinds: list[str] | None = None):
         self.failures = failures
+        self.kinds = list(kinds or [])
         detail = "; ".join(f"{name}: {reason}" for name, reason in failures) or "no providers configured"
         super().__init__(f"all providers failed ({detail})")
+
+    @property
+    def too_large(self) -> bool:
+        """At least one provider refused the request for its size."""
+        return "too_large" in self.kinds
+
+    @property
+    def permanent(self) -> bool:
+        """No provider could ever answer this: none has a usable key."""
+        return not self.failures or (bool(self.kinds) and all(k == "auth" for k in self.kinds))
+
+
+def failure_kind(error: Exception) -> str:
+    """The sort of failure *error* is, as :class:`AllProvidersFailed` names them."""
+    if isinstance(error, ProviderTooLarge):
+        return "too_large"
+    if isinstance(error, ProviderAuthError):
+        return "auth"
+    if isinstance(error, ProviderUnavailable):
+        return "unavailable"
+    return "rejected"
 
 
 # ------------------------------------------------------------- http plumbing

@@ -30,6 +30,7 @@ Membership is checked in the same query that touches a row.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -106,13 +107,19 @@ class LabStore:
                   max_iterations: int = 50, max_attempts_per_task: int = 3,
                   deadline_seconds: int | None = None,
                   plan: list[dict[str, Any]] | None = None,
-                  repository: str = "", branch: str = "") -> dict:
+                  repository: str = "", branch: str = "",
+                  also: Callable[[Any, dict], None] | None = None) -> dict:
         """Create the single active run for a goal. Refuses a second one.
 
         With *plan* (validated tasks from ``nexus_planner``) the tasks are stored
         in the same transaction as the run, so a run never exists with half of
         its plan - or with none, which would look like a run with nothing left
         to do.
+
+        *also* is called with the cursor and the new run before the transaction
+        commits, for what must become true together with the run (the
+        specification it was planned from is marked planned; the chat is told).
+        If it raises, the run is not created.
         """
         if not 0 < max_iterations <= MAX_RUN_ITERATIONS:
             raise ValueError(f"max_iterations must be between 1 and {MAX_RUN_ITERATIONS}")
@@ -153,6 +160,8 @@ class LabStore:
                     spec_ref=task.get("spec_ref"))
             ProjectService._event(cur, project_id, principal, "run.started", run["id"])
             self._notify(cur, project_id, "goal_started", "Цель запущена", run["id"])
+            if also is not None:
+                also(cur, run)
             return run
 
     def active_run_for_goal(self, principal: str, project_id: str, goal_id: str) -> dict | None:
@@ -162,6 +171,14 @@ class LabStore:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT * FROM nexus_runs WHERE goal_id=%s AND project_id=%s "
                         "AND state = ANY(%s)", (goal_id, project_id, list(ACTIVE_RUN_STATES)))
+            row = cur.fetchone()
+            return self._run_view(row) if row else None
+
+    def active_run_internal(self, goal_id: str) -> dict | None:
+        """The goal's live run, for the planning loop (not a project member)."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_runs WHERE goal_id=%s AND state = ANY(%s)",
+                        (goal_id, list(ACTIVE_RUN_STATES)))
             row = cur.fetchone()
             return self._run_view(row) if row else None
 

@@ -286,6 +286,21 @@ _NORMATIVE = re.compile(
     re.IGNORECASE)
 _IMPERATIVE = re.compile(
     r"^[\s\-*+•–—\d.)\[\]xX]*(?:не[ \t]+)?[А-ЯЁа-яё]{2,}(?:ть|ться|ти|тись|чь|чься)\b")
+#: Orders, the way a brief is usually written ("Проведи аудит", "Исправь", "Не
+#: останавливайся"). A list of stems, not a rule about endings: "Если" and
+#: "Цель" end like an imperative and are not one. A wrong match only widens
+#: what the plan is checked against, so the list errs towards more.
+_ORDER = re.compile(
+    r"^[\s\-*+•–—\d.)\[\]xX]*(?:не[ \t]+)?(?:(?:"
+    r"сдела|исправ|добав|реализу|напиш|провер|убеди|обеспеч|созда[йв]|удал[ия]|провед|установ|"
+    r"найд|запус|покро|обнов|перепиш|внедр|настро|подключ|протестир|опиш|выполн|сохран|верн|"
+    r"использу|примен|замен|перенес|состав|предостав|докаж|покаж|подготов|разработа|постро|"
+    r"собер|убер|почин|изуч|проанализир|задокументир|зафиксир|отправ|вывед|учти|учит|соблюда|"
+    r"останавлива|продолж|довед|закрой|открой|оформ|раздел[ия]|объедин|сравн|измер"
+    r")[а-яё]*|(?:"
+    r"fix|add|implement|create|remove|delete|write|run|make|ensure|verify|check|update|"
+    r"replace|refactor|test|document|deploy|build|prove|keep|use"
+    r"))(?![\w-])", re.IGNORECASE)
 _REFERENCE = re.compile(
     r"(?:раздел[а-яё]{0,3}|пункт[а-яё]{0,3}|пп?\.|глав[а-яё]{0,2}|§|этап[а-яё]{0,2}|"
     r"шаг[а-яё]{0,2}|приложени[а-яё]{1,2}|section|sec\.|clause|chapter|step|stage|phase|"
@@ -471,7 +486,8 @@ def build_index(text: str) -> SpecIndex:
     for ordinal, (section_ordinal, first, last, kind) in enumerate(pieces):
         body = text[starts[first]:starts[last]]
         normative = kind in ("item", "row") or (
-            kind == "paragraph" and bool(_NORMATIVE.search(body) or _IMPERATIVE.match(body)))
+            kind == "paragraph" and bool(_NORMATIVE.search(body) or _IMPERATIVE.match(body)
+                                         or _ORDER.match(body)))
         requirements.append(Requirement(
             ordinal=ordinal, key=f"R-{ordinal + 1:0{width}d}", section=section_ordinal,
             kind=kind, normative=normative, start=starts[first], end=starts[last],
@@ -916,6 +932,18 @@ class SpecService:
                 "ORDER BY ordinal", (spec_id, begin, end, end))
             return [dict(r) for r in cur.fetchall()]
 
+    def pieces_internal(self, spec_id: str, ordinals: list[int]) -> list[dict]:
+        """The pieces with these ordinals, in document order."""
+        if not ordinals:
+            return []
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT ordinal, key, section, kind, normative, start_char, end_char, "
+                "start_line, end_line, excerpt FROM nexus_spec_requirements "
+                "WHERE spec_id=%s AND ordinal = ANY(%s) ORDER BY ordinal",
+                (spec_id, list(ordinals)))
+            return [dict(r) for r in cur.fetchall()]
+
     def links_internal(self, spec_id: str) -> list[dict]:
         with self.store._tx() as cur:
             cur.execute("SELECT ordinal, requirement, target_section, reference "
@@ -964,7 +992,7 @@ class SpecService:
     # leaves nothing but a lease that runs out.
 
     def decide_start(self, spec_id: str, goal_id: str, *, stages: list[dict], budget: int,
-                     options: dict) -> dict:
+                     options: dict, owner: str, lease_seconds: int = 90) -> dict:
         """What a request to run this specification amounts to, decided once.
 
         Under a lock on the specification row, so two identical requests arriving
@@ -973,8 +1001,14 @@ class SpecService:
         * ``existing`` - the goal already has a live run (``run_id``);
         * ``planning`` - planning is already under way;
         * ``ready``    - every stage was planned before (an earlier run of the
-          same text has ended); the plan is reused;
-        * ``begin``    - planning starts now: the stages are queued.
+          same text has ended); the plan is reused. The state is left as it
+          is: the caller creates the run at once (:meth:`reuse_in`), and the
+          planning loop, which finishes whatever is in ``planning``, must not
+          get there first;
+        * ``begin``    - planning starts now: the stages are queued. When there
+          is exactly one, it is handed to *owner* already claimed (``claimed``
+          is the stage row), in this same transaction, so the request that
+          asked plans it itself and nothing else can take it first.
         """
         from .nexus_lab_store import ACTIVE_RUN_STATES
 
@@ -995,7 +1029,9 @@ class SpecService:
             have = cur.fetchone()
             decision = "begin"
             if have["n"] and have["n"] == have["done"]:
-                decision = "ready"
+                cur.execute("UPDATE nexus_specs SET plan_options=%s, updated_at=now() "
+                            "WHERE id=%s", (_json(options), spec_id))
+                return {"decision": "ready", "claimed": None, **self._progress(cur, spec_id)}
             elif have["n"]:
                 # A failed attempt left stages behind. What was planned is kept;
                 # the rest is tried again from scratch.
@@ -1007,7 +1043,18 @@ class SpecService:
             cur.execute("UPDATE nexus_specs SET state='planning', stage_budget=%s, "
                         "plan_options=%s, last_error=NULL, updated_at=now() WHERE id=%s",
                         (budget, _json(options), spec_id))
-            return {"decision": decision, **self._progress(cur, spec_id)}
+            claimed = None
+            progress = self._progress(cur, spec_id)
+            if decision == "begin" and progress["total"] == 1:
+                cur.execute(
+                    "UPDATE nexus_spec_stages SET state='planning', attempts=attempts+1, "
+                    "lease_owner=%s, lease_expires=now() + %s * interval '1 second', "
+                    "updated_at=now() WHERE spec_id=%s AND state='pending' RETURNING *",
+                    (owner, lease_seconds, spec_id))
+                row = cur.fetchone()
+                claimed = dict(row) if row else None
+                progress = self._progress(cur, spec_id)
+            return {"decision": decision, "claimed": claimed, **progress}
 
     @staticmethod
     def _insert_stages(cur: Any, spec_id: str, stages: list[dict], *, first_ordinal: int) -> None:
@@ -1024,12 +1071,18 @@ class SpecService:
              [s["end_line"] for s in stages], [s["start_byte"] for s in stages],
              [s["end_byte"] for s in stages], [s["token_estimate"] for s in stages]))
 
-    def claim_stage(self, owner: str, *, lease_seconds: int = 300,
+    def claim_stage(self, owner: str, *, lease_seconds: int = 90,
                     spec_id: str | None = None) -> dict | None:
         """Take the next stage that needs planning, or ``None``.
 
         A stage is free when it is pending (and any retry delay has passed) or
         when whoever was planning it let the lease run out.
+
+        Within one specification stages are planned strictly in document order:
+        only the first stage without a plan can be taken. Each stage is planned
+        knowing the tasks of the stages before it, and the stages that have a
+        plan always form the beginning of the document. Between specifications
+        the one served longest ago goes first.
         """
         with self.store._tx() as cur:
             cur.execute(
@@ -1038,7 +1091,9 @@ class SpecService:
                 "WHERE sp.state='planning' AND (%s::uuid IS NULL OR sp.id=%s) "
                 "AND st.state IN ('pending', 'planning') "
                 "AND (st.lease_expires IS NULL OR st.lease_expires < now()) "
-                "ORDER BY sp.created_at, st.start_char LIMIT 1 FOR UPDATE OF st SKIP LOCKED",
+                "AND NOT EXISTS (SELECT 1 FROM nexus_spec_stages e WHERE e.spec_id = st.spec_id "
+                "                AND e.start_char < st.start_char AND e.state <> 'planned') "
+                "ORDER BY sp.updated_at, sp.id LIMIT 1 FOR UPDATE OF st SKIP LOCKED",
                 (spec_id, spec_id))
             row = cur.fetchone()
             if row is None:
@@ -1048,7 +1103,24 @@ class SpecService:
                 "lease_owner=%s, lease_expires=now() + %s * interval '1 second', updated_at=now() "
                 "WHERE spec_id=%s AND ordinal=%s RETURNING *",
                 (owner, lease_seconds, row["spec_id"], row["ordinal"]))
-            return dict(cur.fetchone())
+            stage = dict(cur.fetchone())
+            cur.execute("UPDATE nexus_specs SET updated_at=now() WHERE id=%s", (row["spec_id"],))
+            return stage
+
+    def renew_stage(self, spec_id: str, ordinal: int, owner: str, *,
+                    lease_seconds: int = 90) -> bool:
+        """Extend the lease on a stage that is still being planned by *owner*.
+
+        Leases are short so that a process that dies gives its stage back
+        within a minute or two; whoever is planning keeps the lease alive while
+        the model is thinking. False when the stage is no longer *owner*'s.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_spec_stages SET lease_expires=now() + %s * interval '1 second' "
+                "WHERE spec_id=%s AND ordinal=%s AND state='planning' AND lease_owner=%s",
+                (lease_seconds, spec_id, ordinal, owner))
+            return cur.rowcount == 1
 
     def stage_internal(self, spec_id: str, ordinal: int) -> dict | None:
         with self.store._tx() as cur:
@@ -1057,16 +1129,26 @@ class SpecService:
             row = cur.fetchone()
             return dict(row) if row else None
 
-    def stage_planned(self, spec_id: str, ordinal: int, owner: str, *, plan: list[dict],
+    def stage_planned(self, spec_id: str, ordinal: int, owner: str, *, plan: dict,
                       provider: str) -> bool:
         """Record a stage's plan. False when the lease was lost in the meantime."""
         with self.store._tx() as cur:
-            cur.execute(
-                "UPDATE nexus_spec_stages SET state='planned', plan=%s, provider=%s, "
-                "lease_owner=NULL, lease_expires=NULL, last_error=NULL, updated_at=now() "
-                "WHERE spec_id=%s AND ordinal=%s AND state='planning' AND lease_owner=%s",
-                (_json(plan), provider, spec_id, ordinal, owner))
-            return cur.rowcount == 1
+            return self.stage_planned_in(cur, spec_id, ordinal, owner, plan=plan,
+                                         provider=provider)
+
+    @staticmethod
+    def stage_planned_in(cur: Any, spec_id: str, ordinal: int, owner: str, *, plan: dict,
+                         provider: str) -> bool:
+        cur.execute(
+            "UPDATE nexus_spec_stages SET state='planned', plan=%s, provider=%s, "
+            "lease_owner=NULL, lease_expires=NULL, last_error=NULL, updated_at=now() "
+            "WHERE spec_id=%s AND ordinal=%s AND state='planning' AND lease_owner=%s",
+            (_json(plan), provider, spec_id, ordinal, owner))
+        return cur.rowcount == 1
+
+    def progress_internal(self, spec_id: str) -> dict:
+        with self.store._tx() as cur:
+            return self._progress(cur, spec_id)
 
     def stage_retry(self, spec_id: str, ordinal: int, owner: str, *, error: str,
                     delay_seconds: int) -> bool:
@@ -1141,16 +1223,83 @@ class SpecService:
     def finish(self, spec_id: str, run_id: str) -> bool:
         """Planning is over and the run exists. True for exactly one caller."""
         with self.store._tx() as cur:
-            cur.execute("UPDATE nexus_specs SET state='planned', run_id=%s, last_error=NULL, "
-                        "updated_at=now() WHERE id=%s AND state='planning'", (run_id, spec_id))
-            return cur.rowcount == 1
+            return self.finish_in(cur, spec_id, run_id)
 
-    def fail(self, spec_id: str, error: str) -> bool:
-        """Planning stopped. True for exactly one caller."""
+    @staticmethod
+    def finish_in(cur: Any, spec_id: str, run_id: Any) -> bool:
+        """:meth:`finish` inside the caller's transaction - the one that creates
+        the run, so the run and "this specification has its run" are one fact."""
+        cur.execute("UPDATE nexus_specs SET state='planned', run_id=%s, last_error=NULL, "
+                    "updated_at=now() WHERE id=%s AND state='planning'", (run_id, spec_id))
+        return cur.rowcount == 1
+
+    @staticmethod
+    def reuse_in(cur: Any, spec_id: str, run_id: Any) -> bool:
+        """A specification planned earlier gets a new run from the same plan."""
+        cur.execute("UPDATE nexus_specs SET state='planned', run_id=%s, last_error=NULL, "
+                    "updated_at=now() WHERE id=%s AND state IN ('planned', 'failed')",
+                    (run_id, spec_id))
+        return cur.rowcount == 1
+
+    def fail(self, spec_id: str, error: str, *, discard_plans: bool = False,
+             while_in: tuple[str, ...] = ("planning",)) -> bool:
+        """Planning stopped. True for exactly one caller.
+
+        Stage plans that exist are kept, so sending the text again continues
+        from them. *discard_plans* is for a failure of the plans themselves
+        (together they do not make a run): the next attempt plans afresh.
+        """
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_specs SET state='failed', last_error=%s, updated_at=now() "
-                        "WHERE id=%s AND state='planning'", (error[:2000], spec_id))
-            return cur.rowcount == 1
+                        "WHERE id=%s AND state = ANY(%s)",
+                        (error[:2000], spec_id, list(while_in)))
+            failed = cur.rowcount == 1
+            if failed and discard_plans:
+                cur.execute("UPDATE nexus_spec_stages SET state='failed', plan=NULL, "
+                            "lease_owner=NULL, lease_expires=NULL, updated_at=now() "
+                            "WHERE spec_id=%s", (spec_id,))
+            return failed
+
+    def goal_for(self, principal: str, project_id: str, spec_id: str) -> tuple[dict, dict, bool]:
+        """``(goal, spec, created)``: the goal of a stored specification.
+
+        A chat message is stored as a specification as soon as it arrives; the
+        goal is created only once the run may start. One specification has one
+        goal, so asking again returns the same row.
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute(f"SELECT {_META}, content FROM nexus_specs WHERE id=%s AND project_id=%s "
+                        "FOR UPDATE", (spec_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("specification not found")
+            spec, text = self._checked(row)
+            cur.execute(f"SELECT {_GOAL} FROM nexus_goals WHERE spec_id=%s", (spec_id,))
+            goal = cur.fetchone()
+            if goal is not None:
+                return self._goal_view(goal), spec, False
+            cur.execute(
+                "INSERT INTO nexus_goals(project_id, text, created_by, spec_id) "
+                f"VALUES (%s,%s,%s,%s) RETURNING {_GOAL}",
+                (project_id, goal_label(text), principal, spec_id))
+            goal = cur.fetchone()
+            ProjectService._event(cur, project_id, principal, "goal.created", goal["id"])
+            return self._goal_view(goal), spec, True
+
+    def coverage_internal(self, spec_id: str) -> dict:
+        """How the pieces of a specification are accounted for by its plan so far."""
+        totals = {"pieces": 0, "in_tasks": 0, "declared_context": 0, "implicit_context": 0,
+                  "in_verification_tasks": 0, "tasks": 0}
+        for stage in self.stages_internal(spec_id):
+            plan = stage.get("plan") if isinstance(stage.get("plan"), dict) else None
+            if stage["state"] != "planned" or plan is None:
+                continue
+            for key in ("pieces", "in_tasks", "declared_context", "implicit_context",
+                        "in_verification_tasks"):
+                totals[key] += int((plan.get("coverage") or {}).get(key, 0))
+            totals["tasks"] += len(plan.get("tasks") or [])
+        return totals
 
 
 def _json(value: Any) -> str:

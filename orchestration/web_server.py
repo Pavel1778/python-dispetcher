@@ -96,6 +96,15 @@ from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
+from .nexus_spec_planner import PlanningFailed, SpecPlanner
+from .nexus_specs import (
+    SpecCorrupted,
+    SpecService,
+    SpecTooLarge,
+    inline_chars,
+    max_spec_chars,
+    preview,
+)
 from .providers import ProviderCascade
 from .sr_runtime import SrRuntime
 from .sr_tools import SrTools
@@ -188,6 +197,33 @@ def _task_brief(task: Any) -> dict[str, Any]:
         "branch": task.selected_branch,
         "updated_at": task.updated_at,
     }
+
+
+class BodyTooLarge(ValueError):
+    """The request body is larger than its route accepts. Answered with 413."""
+
+
+#: JSON bodies under ``/api/v1/projects`` unless the route carries a task text.
+_PROJECT_BODY_BYTES = 4 * 1024 * 1024
+_TEXT_ROUTE = re.compile(
+    r"/api/v1/projects/[^/]+/(?:goals|conversations/[^/]+/messages)\Z")
+
+
+def _json_body_cap(path: str) -> int | None:
+    """How many bytes of JSON a POST to *path* may carry.
+
+    The two routes that take a task text accept NEXUS_SPEC_MAX_CHARS characters
+    of it, however the client encoded them: JSON may write any character as
+    ``\\uXXXX`` (six bytes) and a character outside the basic plane as two of
+    those, so the byte limit is twelve per character plus room for the rest of
+    the body. The limit on the text itself is checked on the decoded text, in
+    characters (``nexus_specs.check_text``); this one only bounds what is read.
+    """
+    if not path.startswith("/api/v1/projects"):
+        return None
+    if _TEXT_ROUTE.fullmatch(path):
+        return max(_PROJECT_BODY_BYTES, max_spec_chars() * 12 + 64 * 1024)
+    return _PROJECT_BODY_BYTES
 
 
 def _flag_env(name: str) -> bool:
@@ -389,6 +425,18 @@ class App:
             dispatch_code=self._chat_dispatch_code,
             start_autonomous=self._chat_start_autonomous,
         )
+        # A task text of any size up to NEXUS_SPEC_MAX_CHARS: stored exactly as
+        # it was sent, indexed, and planned in parts that fit the planning
+        # model. A text that is one part is planned inside the request; a
+        # longer one by ``_run_planning``, which always runs in this process -
+        # it is the process that accepted the text, and the only one a
+        # one-service deployment has. The planner reads ``self.planner.cascade``
+        # at the moment of use, so replacing the planner replaces its providers.
+        self.specs = SpecService(self.store)
+        self.spec_planner = SpecPlanner(
+            self.specs, self.lab, cascade=lambda: self.planner.cascade,
+            describe=self._describe_project, conversations=self.conversations,
+            owner=f"{worker_id}-planner")
         # The Cloud transport. "direct" (default) provisions a sandbox and talks
         # to its agent-server -- the only path that yields a running conversation
         # on the live service; "app" keeps the legacy app-conversation client.
@@ -433,8 +481,10 @@ class App:
         self._stop = threading.Event()
         self._loop: threading.Thread | None = None
         self._lab_loop: threading.Thread | None = None
+        self._plan_loop: threading.Thread | None = None
         self.last_tick: dict[str, Any] = {}
         self.last_lab_tick: dict[str, Any] = {}
+        self.last_plan_tick: dict[str, Any] = {}
         # Sweep expired sessions and stale rate-limit rows occasionally, not
         # every tick: they are housekeeping, not dispatch work.
         self._sweep_every = 60
@@ -444,16 +494,46 @@ class App:
     def start(self) -> None:
         self._loop = threading.Thread(target=self._run, daemon=True)
         self._loop.start()
+        self._plan_loop = threading.Thread(target=self._run_planning, daemon=True)
+        self._plan_loop.start()
         if self.lab_inline:
             self._lab_loop = threading.Thread(target=self._run_lab, daemon=True)
             self._lab_loop.start()
 
     def stop(self) -> None:
         self._stop.set()
-        for loop in (self._loop, self._lab_loop):
+        self.spec_planner.wake()
+        for loop in (self._loop, self._lab_loop, self._plan_loop):
             if loop:
                 loop.join(timeout=5)
         self.store.close()
+
+    def _run_planning(self) -> None:
+        """Build the plans of long specifications, one part per pass.
+
+        A text that does not fit one planning request is accepted at once and
+        planned here. Every part is a row in PostgreSQL claimed with a short
+        lease, and every finished part keeps its plan, so a restart continues
+        with the first part that has none; nothing is planned twice and nothing
+        about a plan lives in this thread. When the last part is planned the run
+        is created and the conversation is told, in one transaction.
+        """
+        while not self._stop.is_set():
+            try:
+                self.last_plan_tick = {"at": time.time(), **self.spec_planner.tick()}
+            except Exception as e:  # noqa: BLE001 - the loop must survive
+                log.exception("planning pass failed")
+                self.last_plan_tick = {"at": time.time(),
+                                       "errors": [f"{type(e).__name__}: {e}"]}
+            self.spec_planner.wait(self.poll_interval)
+
+    def _describe_project(self, principal: str, project_id: str) -> dict[str, Any]:
+        """What a planning request says about the project besides the task."""
+        project = self.projects.get(principal, project_id)
+        context = self.context.current(principal, project_id)
+        return {"name": project["name"],
+                "context": (context or {}).get("summary") or {},
+                "memory": self.memory.retrieve(principal, project_id, limit=30)}
 
     def _run_lab(self) -> None:
         """Advance autonomous runs from inside this process.
@@ -600,32 +680,50 @@ class App:
         )
 
     def _chat_start_autonomous(self, request: dict) -> dict[str, Any]:
-        """Chat "Autonomous" mode: plan the goal and start a real Lab run.
+        """Chat "Autonomous" mode: plan the task and start a real Lab run.
+
+        The task is the specification the turn's text was stored as
+        (``request["spec_id"]``): exact, of any size the server accepts. The
+        goal row keeps a label of at most 20 000 characters and points at it.
 
         The plan comes from the provider cascade and is validated before it is
         stored; a provider outage raises, so the chat records a failure instead
         of a fabricated plan. The durable worker advances the run.
+
+        Returns ``{"status": ...}``: ``started`` with ``run_id`` and ``tasks``;
+        ``planning`` when the text is planned in parts in the background; or
+        ``existing`` with the ``run_id`` of the run this same text already has
+        in this conversation. The same text is the same specification and the
+        same goal, so a repeated send - a retry after a timeout, a double
+        click - never starts a second run.
         """
         principal = request["principal"]
         project_id = request["project_id"]
         repository = request.get("repository") or ""
         branch = request.get("branch") or ""
-        project = self.projects.get(principal, project_id)
-        # Refuse before a planning call is spent, and before anything is stored.
+        self.projects.get(principal, project_id)
+        # Refuse before a planning call is spent, and before a goal is stored.
         authorize_run_task(self.store, project_id=project_id,
                            repository=repository, branch=branch)
-        goal, _created = self.projects.create_goal(principal, project_id, request["goal"])
-        if self.lab.active_run_for_goal(principal, project_id, str(goal["id"])) is not None:
-            raise ValueError("this goal already has an active run")
-        context = self.context.current(principal, project_id)
-        memory = self.memory.retrieve(principal, project_id, limit=30)
-        tasks, _meta = self.planner.plan(
-            goal=goal["text"], project_name=project["name"],
-            context=(context or {}).get("summary") or {}, memory=memory)
-        run = self.lab.start_run(principal, project_id, str(goal["id"]),
-                                 plan=tasks, repository=repository, branch=branch)
-        return {"run_id": str(run["id"]),
-                "tasks": self.lab.list_tasks(principal, project_id, str(run["id"]))}
+        if request.get("spec_id"):
+            goal, spec, _created = self.specs.goal_for(principal, project_id,
+                                                       request["spec_id"])
+        else:
+            goal, spec, _created = self.specs.create_with_goal(
+                principal, project_id, request["goal"], source="chat",
+                conversation_id=request.get("conversation_id"))
+        outcome = self.spec_planner.start(
+            principal=principal, project_id=project_id, goal_id=str(goal["id"]),
+            spec_id=spec["id"], repository=repository, branch=branch)
+        summary = SpecService.summary(spec)
+        if outcome["status"] == "started":
+            run_id = str(outcome["run"]["id"])
+            return {"status": "started", "run_id": run_id, "spec": summary,
+                    "plan": outcome["plan"],
+                    "tasks": self.lab.list_tasks(principal, project_id, run_id)}
+        if outcome["status"] == "existing":
+            return {"status": "existing", "run_id": outcome["run_id"], "spec": summary}
+        return {"status": "planning", "spec": summary, "stages": outcome["stages"]}
 
     def studio_status(self) -> dict[str, Any]:
         """What the studio needs in order to explain itself: what is configured.
@@ -1033,8 +1131,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self, max_bytes: int | None = None) -> dict[str, Any]:
         n = int(self.headers.get("Content-Length", 0))
-        if n < 0 or (max_bytes is not None and n > max_bytes):
+        if n < 0:
             raise ValueError("invalid or oversized request body")
+        if max_bytes is not None and n > max_bytes:
+            raise BodyTooLarge(
+                f"the request body is {n} bytes; this route accepts up to {max_bytes}")
         if not n:
             return {}
         try:
@@ -1276,6 +1377,9 @@ class Handler(BaseHTTPRequestHandler):
             run = self.app.lab.get_run(principal, project_id, rest[1])
             tasks = self.app.lab.list_tasks(principal, project_id, rest[1])
             return (200, {"run": run, "tasks": tasks}, None)
+        # GET /api/v1/projects/{id}/specs/{spec_id}[/content|sections|requirements|stages]
+        if rest and rest[0] == "specs" and len(rest) in (2, 3) and UUID_RE.fullmatch(rest[1]):
+            return self._get_spec(principal, project_id, rest[1], rest[2] if len(rest) == 3 else "")
         # GET /api/v1/projects/{id}/context          (current project context)
         if rest == ["context"]:
             return (200, {"context": self.app.context.current(principal, project_id)}, None)
@@ -1329,6 +1433,49 @@ class Handler(BaseHTTPRequestHandler):
                 # The bound account is revoked or was rejected by GitHub.
                 return (400, {"error": f"github account: {e}"}, None)
             return self._get_github(principal, rest, client)
+        return None
+
+    def _get_spec(self, principal: str, project_id: str, spec_id: str, part: str):
+        """A stored task text ("specification") and what was derived from it.
+
+        * ``""``             - sizes, SHA-256, planning state and progress, how
+          the pieces of the text are accounted for by the plan, the run;
+        * ``content``        - the text itself, byte for byte as it was sent
+          (UTF-8). It is checked against its SHA-256 before it is served;
+        * ``sections``       - the outline;
+        * ``requirements``   - the addressable pieces (``?offset=&limit=&section=``);
+        * ``stages``         - the parts it is planned in, each with its state
+          and, once planned, its tasks.
+        """
+        specs = self.app.specs
+        if part == "":
+            spec = specs.get(principal, project_id, spec_id)
+            spec["coverage"] = specs.coverage_internal(spec_id)
+            return (200, {"spec": spec}, None)
+        if part == "content":
+            try:
+                spec, text = specs.content(principal, project_id, spec_id)
+            except SpecCorrupted as e:
+                return (500, {"error": str(e)}, None)
+            return (200, None, (text.encode("utf-8"), "text/plain; charset=utf-8",
+                                f"spec-{spec['sha256'][:12]}.md"))
+        if part == "sections":
+            return (200, {"sections": specs.sections(principal, project_id, spec_id)}, None)
+        if part == "stages":
+            return (200, {"stages": specs.stages(principal, project_id, spec_id)}, None)
+        if part == "requirements":
+            params = urllib.parse.parse_qs(urlparse(self.path).query)
+            try:
+                offset = int((params.get("offset") or ["0"])[0])
+                limit = int((params.get("limit") or ["500"])[0])
+                section = params.get("section")
+                rows = specs.requirements(
+                    principal, project_id, spec_id, offset=offset, limit=limit,
+                    section=int(section[0]) if section else None)
+            except ValueError as e:
+                return (400, {"error": str(e) if "must be" in str(e)
+                              else "offset, limit and section must be whole numbers"}, None)
+            return (200, {"requirements": rows, "offset": offset}, None)
         return None
 
     def _github_account_get(self, path: str):
@@ -1743,7 +1890,9 @@ class Handler(BaseHTTPRequestHandler):
             return value
 
         try:
-            max_iterations = whole("max_iterations", 50, MAX_RUN_ITERATIONS)
+            # Unset budgets are chosen for the size of the plan (never less than
+            # they used to be): a plan of 120 tasks cannot run in 50 task starts.
+            max_iterations = whole("max_iterations", None, MAX_RUN_ITERATIONS)
             max_attempts = whole("max_attempts_per_task", 3, MAX_TASK_ATTEMPTS)
             deadline_seconds = whole("deadline_seconds", None, MAX_DEADLINE_SECONDS)
         except ValueError as e:
@@ -1758,16 +1907,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "repository must be owner/name"})
             return
 
-        # Membership + goal existence are checked by start_run; read the goal
-        # text and project name for the prompt first.
+        # Membership first, then the goal itself - looked up by id, not found by
+        # scanning the list of goals, which shows only the 200 newest.
         try:
-            project = self.app.projects.get(principal, project_id)
-            goals = self.app.projects.list_goals(principal, project_id)
+            self.app.projects.get(principal, project_id)
         except NotFound:
             self._json(404, {"error": "not found"})
             return
-        goal = next((g for g in goals if str(g["id"]) == goal_id), None)
-        if goal is None:
+        try:
+            self.app.projects.get_goal(principal, project_id, goal_id)
+        except NotFound:
             self._json(404, {"error": "goal not found"})
             return
         try:
@@ -1779,12 +1928,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.app.lab.active_run_for_goal(principal, project_id, goal_id) is not None:
             self._json(409, {"error": "goal already has an active run"})
             return
-        context = self.app.context.current(principal, project_id)
-        memory = self.app.memory.retrieve(principal, project_id, limit=30)
+        options = {name: value for name, value in (
+            ("max_iterations", max_iterations), ("max_attempts_per_task", max_attempts),
+            ("deadline_seconds", deadline_seconds)) if value is not None}
         try:
-            tasks, meta = self.app.planner.plan(
-                goal=goal["text"], project_name=project["name"],
-                context=(context or {}).get("summary") or {}, memory=memory)
+            # The goal's task is its specification. A goal from before
+            # specifications existed gets one now, from its text.
+            _goal, spec = self.app.specs.ensure_for_goal(principal, project_id, goal_id)
+            outcome = self.app.spec_planner.start(
+                principal=principal, project_id=project_id, goal_id=goal_id,
+                spec_id=spec["id"], repository=repository, branch=branch, options=options)
         except AllProvidersFailed as e:
             self._json(503, {"error": "no orchestrator provider succeeded",
                              "failures": e.failures})
@@ -1792,20 +1945,26 @@ class Handler(BaseHTTPRequestHandler):
         except ProviderError as e:
             self._json(503, {"error": str(e)})
             return
-        except ValueError as e:
-            self._json(502, {"error": f"provider returned an invalid plan: {e}"})
+        except PlanningFailed as e:
+            self._json(422, {"error": f"the goal cannot be planned: {e}"})
             return
-        try:
-            run = self.app.lab.start_run(
-                principal, project_id, goal_id,
-                max_iterations=max_iterations, max_attempts_per_task=max_attempts,
-                deadline_seconds=deadline_seconds,
-                plan=tasks, repository=repository, branch=branch)
-        except ValueError as e:
-            self._json(409, {"error": str(e)})
+        summary = SpecService.summary(spec)
+        if outcome["status"] == "existing":
+            self._json(409, {"error": "goal already has an active run",
+                             "run_id": outcome["run_id"]})
             return
+        if outcome["status"] == "planning":
+            # Too long for one planning request: the plan is built in parts by
+            # the planning loop and the run starts when it is complete. Asking
+            # again returns the progress, not a second plan. Follow it at
+            # GET .../specs/{id}: ``state`` becomes "planned" and ``run_id`` is set.
+            self._json(202, {"status": "planning", "spec": summary,
+                             "planning": outcome["stages"]})
+            return
+        run = outcome["run"]
         stored = self.app.lab.list_tasks(principal, project_id, str(run["id"]))
-        self._json(201, {"run": run, "tasks": stored, "plan": meta})
+        self._json(201, {"run": run, "tasks": stored, "plan": outcome["plan"],
+                         "spec": summary})
 
     def _chat_turn(self, principal: str, project_id: str, conversation_id: str,
                    body: dict) -> None:
@@ -1820,7 +1979,11 @@ class Handler(BaseHTTPRequestHandler):
         the transport here is a stdlib HTTP server; the client renders a typing
         indicator until the body arrives).
         """
-        text = (body.get("text") or "").strip()
+        sent = body.get("text")
+        if sent is not None and not isinstance(sent, str):
+            self._json(400, {"error": "text must be a string"})
+            return
+        text = (sent or "").strip()
         if not text:
             self._json(400, {"error": "text is required"})
             return
@@ -1837,9 +2000,26 @@ class Handler(BaseHTTPRequestHandler):
             # the user chose is never replaced.
             self.app.conversations.rename(
                 principal, project_id, conversation_id, title_from_message(text))
+        # An autonomous turn's text is the task. It is stored first, exactly as
+        # it was sent - not trimmed, any size the server accepts - with its
+        # SHA-256, as a specification; planning and the agents work from that
+        # copy. The same text in the same conversation is the same row, which is
+        # what lets a repeated send be recognised.
+        spec = None
+        shown, user_meta = text, None
+        if conversation["mode"] == "autonomous":
+            spec, _new = self.app.specs.create(
+                principal, project_id, sent, source="chat", conversation_id=conversation_id)
+            user_meta = {"spec": SpecService.summary(spec)}
+            if spec["char_count"] > inline_chars():
+                # The transcript shows the beginning; the message says so and
+                # points at the whole text. Nothing downstream reads this copy.
+                shown = preview(sent)
+                user_meta["spec"]["preview"] = True
         # Persist the user turn first: it must not be lost to an assistant failure.
         user_msg = self.app.conversations.add_message(
-            principal, project_id, conversation_id, role="user", content=text)
+            principal, project_id, conversation_id, role="user", content=shown,
+            meta=user_meta)
         history = self.app.conversations.list_messages(principal, project_id, conversation_id)
         appended: list[dict] = [user_msg]
         self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
@@ -1853,7 +2033,9 @@ class Handler(BaseHTTPRequestHandler):
                 history=history,
                 # The work a turn starts belongs to this conversation's project
                 # and to the person who asked for it.
-                project_id=project_id, principal=principal)
+                project_id=project_id, principal=principal,
+                conversation_id=conversation_id,
+                spec_id=spec["id"] if spec else None)
         except ChatError as e:
             self.app.conversations.set_state(principal, project_id, conversation_id, "error")
             err = self.app.conversations.add_message(
@@ -2520,7 +2702,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(503, {"error": str(e) + "; check GitHub before retrying"})
                 except GitHubError as e:
                     return self._json(502, {"error": str(e) + "; check GitHub before retrying"})
-            body = self._body(max_bytes=4 * 1024 * 1024 if path.startswith("/api/v1/projects") else None)
+            body = self._body(max_bytes=_json_body_cap(path))
             if path == "/api/v1/projects" or path.startswith("/api/v1/projects/"):
                 if not isinstance(body, dict):
                     return self._json(400, {"error": "body must be a JSON object"})
@@ -2558,9 +2740,13 @@ class Handler(BaseHTTPRequestHandler):
                     if self._post_project_resource(path, principal, body):
                         return
                     return self._json(404, {"error": "not found"})
-                goal, created = self.app.projects.create_goal(
-                    principal, parsed[0], body.get("text"), self.headers.get("Idempotency-Key"))
-                return self._json(201 if created else 200, {"goal": goal, "created": created})
+                # The text is kept exactly as sent, as a specification; the goal
+                # row carries a label of at most 20 000 characters and points at it.
+                goal, spec, created = self.app.specs.create_with_goal(
+                    principal, parsed[0], body.get("text"), source="api",
+                    key=self.headers.get("Idempotency-Key"))
+                return self._json(201 if created else 200, {
+                    "goal": goal, "created": created, "spec": SpecService.summary(spec)})
             if path == "/api/github/accounts":
                 try:
                     account = self.app.github_accounts.add(
@@ -2683,10 +2869,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(502, {"error": f"github: {e}"})
         except MultipartError as e:
             return self._json(400, {"error": str(e)})
+        except (BodyTooLarge, SpecTooLarge) as e:
+            # Too much to accept is its own answer, with both numbers in it.
+            return self._json(413, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except InvalidTransition as e:
             return self._json(409, {"error": str(e)})
+        except SpecCorrupted as e:
+            return self._json(500, {"error": str(e)})
         except CloudError as e:
             return self._json(502, {"error": f"cloud: {e}"})
         except StoreUnavailable:

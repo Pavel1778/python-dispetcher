@@ -31,10 +31,12 @@ from typing import Any
 
 from .cloud_client import FILES_DIR_TOKEN, DeliveryError, SandboxFile
 from .cloud_store import NotFound
-from .nexus_specs import SpecCorrupted, SpecService, inline_chars, section_key
+from .nexus_specs import SpecCorrupted, SpecService, expand_keys, inline_chars, section_key
 
 #: Sections listed in the message itself. The index file has all of them.
 OUTLINE_LINES = 60
+#: Pieces of a task named in the message with their lines and first words.
+PIECE_LINES = 40
 
 
 @dataclass
@@ -136,6 +138,29 @@ def _outline(sections: list[dict], first_line: int, last_line: int,
     return lines, len(sections) - len(keep)
 
 
+def _pieces(specs: SpecService, spec: dict, ref: dict) -> list[str]:
+    """The pieces a task covers, each with its lines and how it begins.
+
+    The ids (``R-0012``) are the plan's, not the author's: they are not written
+    in the text, so each is shown with where it is and its first words.
+    """
+    ordinals, _unknown = expand_keys(ref.get("requirements"), spec["requirement_count"])
+    if not ordinals:
+        return []
+    wanted = sorted(ordinals)
+    rows = specs.pieces_internal(str(spec["id"]), wanted[:PIECE_LINES])
+    kind = "must carry out or confirm" if ref.get("verification") else "covers"
+    lines = [f"The pieces of the text this step {kind} ({len(wanted)}):"]
+    for row in rows:
+        where = (f"line {row['start_line']}" if row["start_line"] == row["end_line"]
+                 else f"lines {row['start_line']}-{row['end_line']}")
+        lines.append(f"  {row['key']}  {where}: {' '.join(str(row['excerpt']).split())[:90]}")
+    if len(wanted) > len(rows):
+        lines.append(f"  ... and {len(wanted) - len(rows)} more, "
+                     f"{rows[-1]['key'] if rows else ''} onwards")
+    return lines
+
+
 def _part(ref: dict, spec: dict) -> tuple[int, int, int, int, int, int]:
     """``(part, parts, first line, last line, first byte, end byte)`` of a task."""
     lines = ref.get("lines") or [1, spec["line_count"]]
@@ -168,6 +193,7 @@ def prepare(specs: SpecService, task: dict) -> Delivery | None:
     part, parts, first_line, last_line, first_byte, end_byte = _part(ref, spec)
     whole = parts == 1 and first_line == 1 and last_line == spec["line_count"]
 
+    pieces = _pieces(specs, spec, ref)
     if spec["char_count"] <= inline_chars():
         opening, closing = markers(sha)
         where = "" if whole else (f" This step is part {part} of {parts}; its part of the "
@@ -176,8 +202,9 @@ def prepare(specs: SpecService, task: dict) -> Delivery | None:
             "The task above is one step of a plan. The plan was made from the text below: "
             f"the request exactly as its author wrote it ({spec['char_count']} characters, "
             f"SHA-256 {sha}). It is the source of truth - where the step and this text "
-            f"disagree, this text is right.{where}\n\n"
-            f"{opening}\n{text}\n{closing}"
+            f"disagree, this text is right.{where}\n"
+            + ("\n" + "\n".join(pieces) + "\n" if pieces else "")
+            + f"\n{opening}\n{text}\n{closing}"
         )
         if extract_inline(block, sha) != text:
             # Unreachable unless the text contains its own fingerprint; checked
@@ -218,11 +245,9 @@ def prepare(specs: SpecService, task: dict) -> Delivery | None:
         f"  bytes {first_byte}-{end_byte}:  tail -c +{first_byte + 1} {path} | "
         f"head -c {end_byte - first_byte}    (exact; use it when lines are very long)",
     ]
-    named = [key for key in (ref.get("requirements") or []) if isinstance(key, str)]
-    if named:
-        lines.append("Pieces this step covers: " + ", ".join(named[:60])
-                     + (f", and {len(named) - 60} more ranges" if len(named) > 60 else "")
-                     + f". A piece's lines: grep -P '^R-0001\\t' {index_path}")
+    if pieces:
+        lines += ["", *pieces,
+                  f"  (every piece and its lines: grep -P '^R-' {index_path})"]
     if see:
         lines.append("This part refers to: " + "; ".join(
             f"{s['section']} {' '.join(str(s.get('title') or '').split())[:80]} "
