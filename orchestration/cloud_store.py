@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import select
 import threading
 import time
 import uuid
@@ -45,6 +46,15 @@ except ImportError:  # pragma: no cover - surfaced with a clear message below
 
 class StoreError(RuntimeError):
     """Base class for store failures."""
+
+
+class StoreUnavailable(StoreError):
+    """The database cannot be reached right now.
+
+    Raised instead of the driver's own error when a lost connection could not be
+    replaced, so a caller can answer "unavailable, try again" without echoing a
+    host name or a socket error to whoever asked.
+    """
 
 
 class NotFound(StoreError):
@@ -189,6 +199,20 @@ def _legal_path(frm: TaskState, to: TaskState) -> list[TaskState] | None:
     return None
 
 
+def _has_pending_input(fd: int) -> bool:
+    """Whether a socket has something to read (data, end-of-file, an error).
+
+    ``poll`` where the platform has it: ``select`` cannot watch a descriptor
+    numbered 1024 or above, and a busy threaded server gets there.
+    """
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(0))
+    readable, _, _ = select.select([fd], [], [], 0)
+    return bool(readable)
+
+
 class PostgresStore:
     """Durable task store on PostgreSQL / Supabase."""
 
@@ -235,6 +259,9 @@ class PostgresStore:
             "prepare_threshold": prepare_threshold,
         }
         self.prepare_threshold = prepare_threshold
+        # Kept so a lost connection is replaced by one opened the same way.
+        self._connect_kwargs = connect_kwargs
+        self._reconnect_failed_at = 0.0
         self._conn = psycopg.connect(self.dsn, **connect_kwargs)
         # psycopg connections are not thread-safe, but the web server answers
         # each request on its own thread while sharing this one connection.
@@ -376,17 +403,80 @@ class PostgresStore:
         return missing
 
     # ---------------------------------------------------------------- infra
+    #: After a failed reconnect, how long to refuse further attempts. Every
+    #: caller waits on the same lock, so without this a database outage turns
+    #: into a queue of requests that each spend the whole connect timeout.
+    RECONNECT_BACKOFF_SECONDS = 2.0
+
+    def _connection_is_dead(self, conn: Any) -> bool:
+        """Whether the shared connection is positively known to be unusable.
+
+        The process holds one connection for its whole life. When the server
+        end goes away (a database restart, a pooler recycling its clients, a
+        network reset) nothing tells the client until it next speaks, and the
+        driver never reconnects by itself: before this check existed every call
+        after such a drop failed with ``the connection is lost`` until the
+        process was restarted, while ``/healthz`` kept answering 200.
+
+        A healthy idle connection has nothing waiting to be read. A dropped one
+        does (the server's goodbye, or end-of-file), so one ``poll`` with no
+        timeout separates the two without a round trip; only when something is
+        waiting is the connection actually asked.
+
+        The answer is ``True`` only on evidence: the driver already marked the
+        connection broken, or it failed to answer. When the check itself cannot
+        be made the connection is used as before, so this can add a reconnect
+        but never take away a working connection.
+        """
+        if conn.closed:
+            return True
+        try:
+            if not _has_pending_input(conn.fileno()):
+                return False
+        except psycopg.Error:
+            return True          # no socket: the driver has lost it
+        except (OSError, ValueError):
+            return False         # cannot tell; behave as before
+        try:
+            if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+                conn.rollback()
+            conn.execute("SELECT 1").fetchone()
+        except psycopg.Error:
+            return True
+        return False
+
+    def _reconnect(self) -> Any:
+        """Replace the shared connection. Raises :class:`StoreUnavailable`."""
+        since_failure = time.monotonic() - self._reconnect_failed_at
+        if self._reconnect_failed_at and since_failure < self.RECONNECT_BACKOFF_SECONDS:
+            raise StoreUnavailable("database unavailable")
+        try:
+            self._conn.close()
+        except Exception:  # noqa: BLE001 - it is already gone; nothing to save
+            pass
+        try:
+            self._conn = psycopg.connect(self.dsn, **self._connect_kwargs)
+        except psycopg.Error as e:
+            self._reconnect_failed_at = time.monotonic()
+            raise StoreUnavailable("database unavailable") from e
+        self._reconnect_failed_at = 0.0
+        return self._conn
+
     @contextmanager
     def _tx(self) -> Iterator[Any]:
         """Yield a cursor inside a transaction, committing or rolling back.
 
         The lock makes the shared connection safe under the threaded server.
-        The rollback on entry recovers from a transaction that was already
-        aborted (e.g. by a previous failure) instead of propagating
-        ``InFailedSqlTransaction`` into an unrelated caller.
+        A connection the server dropped is replaced before the transaction
+        starts, so the drop costs nothing to the caller. The rollback on entry
+        recovers from a transaction that was already aborted (e.g. by a previous
+        failure) instead of propagating ``InFailedSqlTransaction`` into an
+        unrelated caller.
         """
         with self._lock:
             conn = self._conn
+            if self._connection_is_dead(conn):
+                conn = self._reconnect()
             if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
                 conn.rollback()
             try:
@@ -394,7 +484,12 @@ class PostgresStore:
                     yield cur
                 conn.commit()
             except BaseException:
-                conn.rollback()
+                # A connection that died mid-transaction cannot roll back; the
+                # caller must see why its statement failed, not that.
+                try:
+                    conn.rollback()
+                except psycopg.Error:
+                    pass
                 raise
 
     def _event(
