@@ -295,6 +295,21 @@ class CloudDirectClient:
     #: agent-server create call. Callers (and the UI diagnostics) read this.
     supports_repository_selection = False
 
+    @property
+    def base_url(self) -> str:
+        """The Cloud account URL, as the app transport exposes it.
+
+        ``/api/system`` and ``/api/config`` report ``client.base_url`` so an
+        operator can see which Cloud the service is pointed at. This class
+        *composes* a :class:`~orchestration.cloud_client.CloudClient` instead of
+        subclassing it, so before this property existed both endpoints raised
+        ``AttributeError`` and answered 500 — on the default transport, the one
+        that is actually running. Delegating keeps one source of truth for the
+        URL (the inner client's validated value) rather than a second copy that
+        could drift.
+        """
+        return self.cloud.base_url
+
     def _apply_repository_mode(self, message: str, repository: str | None,
                                branch: str | None) -> str:
         """Handle repository selection for a sandbox conversation.

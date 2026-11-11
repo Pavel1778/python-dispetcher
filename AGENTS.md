@@ -832,3 +832,114 @@ There are no dashboards, section tabs or forms outside that.
 - **Not verified.** A live OpenHands account, a real GitHub token and a real LLM
   provider: every test uses the local fake servers. Safari and Firefox were not
   run; only Chromium was.
+
+## After the studio merge: CI, the database connection, and what is still open (2026-11-11)
+
+This section records one working session. The "still open" list at its end is
+the part to read first: those defects were reproduced and are **not fixed**.
+
+### CI (`.github/workflows/tests.yml`)
+
+- **The job runs on `ubuntu-26.04`, not `ubuntu-latest`.** While that label
+  migrates it resolves to either 24.04 or 26.04, and they are not
+  interchangeable here: the backup/restore drill dumps the PostgreSQL 17 service
+  with the image's own client tools, and `pg_dump` refuses a server newer than
+  itself. 24.04 ships `pg_dump` 16 (`test_backup_restore` fails with "server
+  version mismatch"), 26.04 ships 18. Both were run side by side: 26.04 gave
+  732 passed / 4 skipped, 24.04 gave that one failure.
+- **No system packages are installed up front.** `playwright install
+  --with-deps` installs Chromium's libraries through apt before it downloads the
+  browser, which made every run depend on the package mirrors. On 2026-11-11
+  that part did not finish: three attempts on `main` right after PR #25 was
+  merged failed after 7-10 minutes, and when the step was split, `playwright
+  install-deps` ran into its 8-minute limit on both images while the Python
+  packages had installed in 7 seconds. Which apt command hung was not
+  established (the log could not be read). The images already have the
+  libraries, so the job downloads Chromium, starts it once
+  (`tools/ci_browser_probe.py`, the same launch options as
+  `tests/test_browser_e2e.py`) and falls back to `playwright install-deps` only
+  if the browser did not start. That fallback is the old command and was not
+  exercised: the browser started on both images.
+- **One command per step, each with a time limit**, so the step list says which
+  command failed.
+- **The outcome is written as annotations**: the runner image, the Chromium
+  build, pytest's summary line, failed test ids, and the reasons for skips. The
+  log of a run is not always retrievable (it expires; from a sandbox the log
+  host may be unreachable), the annotations are:
+  `gh api repos/<owner>/<repo>/check-runs/<job id>/annotations`.
+
+### The store replaces a dropped connection (`orchestration/cloud_store.py`)
+
+- `PostgresStore` holds **one** connection for the life of the process, and the
+  driver never reconnects by itself. Before this change, once the server end
+  went away (a database restart, a pooler recycling its clients, a network
+  reset) every call failed with `the connection is lost` until the process was
+  restarted, while `/healthz` kept answering 200.
+- `_tx()` now checks the connection before each transaction. A healthy idle
+  connection has nothing waiting to be read, a dropped one does, so the check is
+  one `poll` and no round trip; only when input is waiting is the connection
+  asked (`SELECT 1`). A dead connection is replaced with one opened with the
+  same arguments (row factory, prepared-statement policy).
+- The check replaces a connection **only on evidence**. If it cannot be made, the
+  connection is used as before. It can add a reconnect; it must never take a
+  working connection away (`tests/test_store_reconnect.py` holds both
+  directions, including a notification arriving on a healthy connection).
+- A call that is **in flight** when the connection dies still fails, once; the
+  next call reconnects. Nothing is retried on the caller's behalf: a statement
+  that may already have run must not be run twice.
+- When the database cannot be reached the store raises `StoreUnavailable`, the
+  HTTP layer answers `503 {"error": "database unavailable"}` (never the driver's
+  text, which names hosts and ports), and further attempts are refused for
+  `RECONNECT_BACKOFF_SECONDS` (2 s). Every caller waits on the same lock, so
+  without the back-off an outage becomes a queue of requests each spending the
+  whole connect timeout.
+
+### Two smaller fixes
+
+- `PostgresStore.transition()` returns **the row it wrote** (`UPDATE ...
+  RETURNING *`). It used to read the task again after committing, which answers
+  "what is it now?": with the dispatcher loop running, a retry reported
+  `assigned` instead of `queued` about one time in seven, and that was the
+  intermittent failure of `test_workflow_actions.py::test_retry_route`.
+- `CloudDirectClient.base_url` exists. `/api/system` and `/api/config` read
+  `client.base_url`; the direct transport (the default) had no such attribute,
+  so both answered 500. (The same commit is in PR #23.)
+
+### Still open - reproduced, not fixed
+
+1. **An autonomous run may target a repository nobody allowed.**
+   `POST /api/v1/projects/{id}/goals/{goal}/run` takes `repository` and `branch`
+   from the request body and stores them on the run tasks; `LabScheduler` /
+   `OpenHandsExecutor.dispatch` start the conversation without
+   `authorize_dispatch`. Reproduced: a run for `someone-else/private-thing`,
+   branch `prod`, with an **empty** allowlist and no project link, was accepted
+   (201) and its first task reached the Cloud start call. The chat's
+   "autonomous" mode passes the project's bound repository, which was checked
+   when it was connected; by the code it is not checked again at dispatch, so a
+   repository disabled afterwards would still be used (not reproduced). The
+   dispatcher path (`cloud_dispatcher.py`, `mcp_server.py`) does call
+   `authorize_dispatch`; the lab path has to as well.
+2. **Pausing a run does not pause it.** `LabScheduler.tick` never reads the
+   run's state. Reproduced: after `.../runs/{id}/pause` the next tick claimed and
+   dispatched a task, and the "paused" run went on to `completed`. By the code, a
+   cancelled run differs only in that the worker no longer selects it
+   (`ACTIVE_RUN_STATES`); a conversation already started is not stopped.
+3. **Run budgets are stored and never enforced.** `max_iterations`,
+   `deadline_at`: nothing reads them, and `bump_iteration` has no caller (the UI
+   shows "итерация 0 из 50" for ever). Reproduced: `max_iterations=1` with a
+   deadline one second in the past ran every task to the end.
+4. **Any run state can be set from any other.** `pause` / `resume` / `cancel`
+   write the state unconditionally: a cancelled run can be resumed (`cancelled`
+   -> `running`), and its goal has already been marked cancelled.
+5. **`render.yaml` starts only the web server.** Autonomous runs advance only
+   under `python -m orchestration.lab_worker`, so on the deployed service a run
+   stays queued. `DEPLOY.md` describes the second service; the blueprint does
+   not define it.
+6. **`tests/test_auth.py::test_global_ceiling_holds_when_the_ip_is_untrustworthy`
+   is load-sensitive.** It needs 120 failed logins inside one 60 s window; on a
+   busy machine the loop takes longer and the test fails. Same on `main` before
+   any of this.
+7. **Documents that still describe the interface removed by PR #25:**
+   `README.md` ("Quick start", "What is ready today"), `docs/AUTONOMOUS-LAB.md`,
+   `docs/NEXUS-AUDIT.md`, `docs/NEXUS-SPEC.md`, `docs/MASTER_COMPLETION_AUDIT.md`,
+   `docs/MASTER_COMPLETION_ROADMAP.md`. They were not rewritten in this session.

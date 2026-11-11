@@ -76,6 +76,7 @@ from .cloud_store import (
     NotFound,
     PostgresStore,
     StoreError,
+    StoreUnavailable,
 )
 from .file_lab import FileLabService, max_upload_bytes
 from .github_client import (
@@ -2364,6 +2365,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except StoreUnavailable:
+            # The database could not be reached and the connection could not be
+            # replaced. Say so plainly; the driver's text names hosts and ports.
+            return self._json(503, {"error": "database unavailable"})
         except Exception as e:  # noqa: BLE001
             log.exception("GET %s failed", path)
             error = "internal error" if path.startswith("/api/v1/projects") else f"{type(e).__name__}: {e}"
@@ -2600,6 +2605,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(409, {"error": str(e)})
         except CloudError as e:
             return self._json(502, {"error": f"cloud: {e}"})
+        except StoreUnavailable:
+            # The database could not be reached and the connection could not be
+            # replaced. Say so plainly; the driver's text names hosts and ports.
+            return self._json(503, {"error": "database unavailable"})
         except Exception as e:  # noqa: BLE001
             log.exception("POST %s failed", path)
             error = "internal error" if path.startswith("/api/v1/projects") else f"{type(e).__name__}: {e}"
@@ -2643,6 +2652,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
+        except StoreUnavailable:
+            # The database could not be reached and the connection could not be
+            # replaced. Say so plainly; the driver's text names hosts and ports.
+            return self._json(503, {"error": "database unavailable"})
         except Exception:  # noqa: BLE001
             log.exception("DELETE %s failed", path)
             return self._json(500, {"error": "internal error"})
@@ -2690,6 +2703,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
+        except StoreUnavailable:
+            # The database could not be reached and the connection could not be
+            # replaced. Say so plainly; the driver's text names hosts and ports.
+            return self._json(503, {"error": "database unavailable"})
         except Exception:  # noqa: BLE001
             log.exception("PATCH %s failed", path)
             return self._json(500, {"error": "internal error"})

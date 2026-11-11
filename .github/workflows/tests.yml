@@ -7,7 +7,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # A named image, not `ubuntu-latest`. While that label migrates it resolves
+    # to either 24.04 or 26.04, and the two are not interchangeable here: the
+    # backup/restore drill dumps the PostgreSQL 17 service below with the
+    # image's own client tools, and pg_dump refuses a server newer than itself.
+    # 24.04 ships pg_dump 16 (the drill fails with "server version mismatch"),
+    # 26.04 ships 18. Both were run side by side on 2026-11-11 to establish this.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
 
     # The Cloud integration tests run against a real PostgreSQL server and skip
     # cleanly when it is absent, so the service is only here to keep them
@@ -44,16 +51,74 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      # One command per step, each with its own limit, and the facts a reader
+      # needs written as annotations. The step list and the annotations are
+      # what the API still shows when a log has expired or cannot be fetched,
+      # so they have to say which command failed, on which image, and how many
+      # tests ran.
+      - name: Runner image
+        run: |
+          . /etc/os-release
+          echo "::notice title=Runner image::$PRETTY_NAME (image ${ImageOS:-?} ${ImageVersion:-?}); $(pg_dump --version 2>&1 | head -n 1)"
+
+      - name: Install Python packages
+        timeout-minutes: 6
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
-          # Chromium for the browser E2E (playwright is in requirements-dev).
-          # The backup/restore drill uses the runner's own postgresql-client.
-          python -m playwright install --with-deps chromium
+          echo "::notice title=Playwright::$(python -m playwright --version)"
+
+      # Chromium for the browser E2E (playwright is in requirements-dev). Only
+      # the browser is downloaded here. Its system libraries are *not* installed
+      # up front: the runner image already has them, and `install --with-deps`
+      # goes through apt first, which made every run depend on the package
+      # mirrors (on 2026-11-11 that part hung for 7-10 minutes and failed three
+      # attempts on main, then ran into its limit on both images, while the
+      # Python packages installed in seconds).
+      - name: Download Chromium
+        timeout-minutes: 6
+        run: |
+          if ! timeout 240 python -m playwright install chromium > /tmp/step.log 2>&1; then
+            tail -n 6 /tmp/step.log | while IFS= read -r line; do echo "::warning title=playwright install chromium::$line"; done
+            chrome="$(command -v google-chrome || command -v chromium || true)"
+            if [ -z "$chrome" ]; then
+              echo "::error title=Chromium::the download failed and the image has no browser of its own"
+              exit 1
+            fi
+            echo "::warning title=Chromium::download failed; using the image's own $chrome"
+            echo "E2E_CHROMIUM_EXECUTABLE=$chrome" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start Chromium once
+        id: probe
+        continue-on-error: true
+        timeout-minutes: 3
+        run: python tools/ci_browser_probe.py
+
+      - name: Install Chromium system libraries (only when it did not start)
+        if: steps.probe.outcome == 'failure'
+        timeout-minutes: 10
+        run: |
+          if ! timeout 420 python -m playwright install-deps chromium > /tmp/step.log 2>&1; then
+            tail -n 8 /tmp/step.log | while IFS= read -r line; do echo "::error title=playwright install-deps::$line"; done
+            exit 1
+          fi
+          python tools/ci_browser_probe.py
 
       - name: Lint
         run: ruff check .
 
       - name: Test
-        run: pytest -q -p no:cacheprovider
+        run: |
+          set -o pipefail
+          pytest -q -p no:cacheprovider -rfEs 2>&1 | tee /tmp/pytest.log
+
+      - name: Test report
+        if: always()
+        run: |
+          [ -f /tmp/pytest.log ] || exit 0
+          echo "::notice title=pytest::$(tail -n 1 /tmp/pytest.log)"
+          grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -n 10 | cut -c1-300 \
+            | while IFS= read -r line; do echo "::error title=test::$line"; done
+          grep -E '^SKIPPED ' /tmp/pytest.log | sed -E 's/^SKIPPED \[[0-9]+\] [^ ]+: //' | sort | uniq -c \
+            | head -n 8 | cut -c1-300 | while IFS= read -r line; do echo "::notice title=skipped::$line"; done
