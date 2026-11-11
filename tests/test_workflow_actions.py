@@ -273,6 +273,35 @@ def test_retry_route(app, fake, base):
     assert out["state"] == "queued"
 
 
+def test_retry_reports_the_state_it_produced_even_if_the_task_is_claimed_at_once(app, fake):
+    """The answer to "retry" is what the retry did, not what happened next.
+
+    The dispatcher loop may claim the task the instant it is queued. The store
+    used to read the task again after committing, so the answer could already be
+    the next state: the route above reported ``assigned`` about one time in
+    seven. Here the claim is made to happen at exactly that moment, every time.
+    """
+    wid, _ = _make_workflow(app, fake)
+    t = app.store.submit_task("blocked", workflow_id=wid)
+    app.store.transition(t.id, TaskState.BLOCKED)
+
+    read = app.store.get_task
+
+    def read_too_late(task_id):
+        # Stand in for the dispatcher: by the time anyone looks at a queued
+        # task again, another worker has claimed it.
+        if read(task_id).state is TaskState.QUEUED:
+            assert app.store.claim_task("another-worker", task_id=task_id) is not None
+        return read(task_id)
+
+    app.store.get_task = read_too_late
+    try:
+        out = app.retry_task(t.id)
+    finally:
+        del app.store.get_task
+    assert out == {"task_id": t.id, "state": "queued"}
+
+
 def test_retry_unknown_task_is_404(app, fake, base):
     status, _ = _req("POST", base,
                      "/api/tasks/00000000-0000-0000-0000-000000000000/retry", {})

@@ -982,13 +982,20 @@ class PostgresStore:
                        attempt=%s, result=COALESCE(%s, result),
                        evidence=%s, updated_at=now()
                  WHERE id=%s
+                RETURNING *
                 """,
                 (to.value, new_owner, clear_lease, attempt, result,
                  json.dumps(new_evidence), task_id),
             )
+            # The row as this transition wrote it. Reading the task again after
+            # the commit answered a different question - "what is it now?" - and
+            # with the dispatcher loop running that could already be the next
+            # state: a retry reported ``assigned`` instead of ``queued`` about
+            # one time in seven.
+            moved = _row_to_task(cur.fetchone())
             self._event(cur, "task_transition", task_id=task_id, session_id=new_owner,
                         detail={"from": task.state.value, "to": to.value})
-        return self.get_task(task_id)
+        return moved
 
     def bind_conversation(self, task_id: str, external_conversation_id: str | None,
                           *, start_task_id: str | None = None,
