@@ -31,7 +31,14 @@ from typing import Any
 
 from .cloud_client import FILES_DIR_TOKEN, DeliveryError, SandboxFile
 from .cloud_store import NotFound
-from .nexus_specs import SpecCorrupted, SpecService, expand_keys, inline_chars, section_key
+from .nexus_specs import (
+    SpecCorrupted,
+    SpecService,
+    expand_keys,
+    inline_chars,
+    requirement_key,
+    section_key,
+)
 
 #: Sections listed in the message itself. The index file has all of them.
 OUTLINE_LINES = 60
@@ -156,8 +163,9 @@ def _pieces(specs: SpecService, spec: dict, ref: dict) -> list[str]:
                  else f"lines {row['start_line']}-{row['end_line']}")
         lines.append(f"  {row['key']}  {where}: {' '.join(str(row['excerpt']).split())[:90]}")
     if len(wanted) > len(rows):
-        lines.append(f"  ... and {len(wanted) - len(rows)} more, "
-                     f"{rows[-1]['key'] if rows else ''} onwards")
+        last = requirement_key(wanted[-1], spec["requirement_count"])
+        after = f" after {rows[-1]['key']}" if rows else ""
+        lines.append(f"  ... and {len(wanted) - len(rows)} more{after}, up to {last}")
     return lines
 
 
@@ -186,9 +194,9 @@ def prepare(specs: SpecService, task: dict) -> Delivery | None:
     except NotFound:
         raise DeliveryError(
             f"the task's original text (specification {spec_id}) no longer exists; "
-            "the agent cannot be given the task") from None
+            "the agent cannot be given the task", permanent=True) from None
     except SpecCorrupted as e:
-        raise DeliveryError(str(e)) from None
+        raise DeliveryError(str(e), permanent=True) from None
     sha = spec["sha256"]
     part, parts, first_line, last_line, first_byte, end_byte = _part(ref, spec)
     whole = parts == 1 and first_line == 1 and last_line == spec["line_count"]
@@ -209,14 +217,16 @@ def prepare(specs: SpecService, task: dict) -> Delivery | None:
         if extract_inline(block, sha) != text:
             # Unreachable unless the text contains its own fingerprint; checked
             # because the alternative is an agent with a damaged task.
-            raise DeliveryError("the original text could not be embedded in the message intact")
+            raise DeliveryError("the original text could not be embedded in the message intact",
+                                permanent=True)
         return Delivery("inline", block, [], {
             "mode": "inline", "spec_id": spec_id, "sha256": sha,
             "chars": spec["char_count"], "bytes": spec["byte_count"]})
 
     data = text.encode("utf-8")
     if len(data) != spec["byte_count"] or hashlib.sha256(data).hexdigest() != sha:
-        raise DeliveryError(f"specification {spec_id} does not match its fingerprint")
+        raise DeliveryError(f"specification {spec_id} does not match its fingerprint",
+                            permanent=True)
     sections = specs.sections_internal(spec_id)
     index_data = index_file(spec, sections, specs.requirements_internal(spec_id),
                             specs.links_internal(spec_id)).encode("utf-8")

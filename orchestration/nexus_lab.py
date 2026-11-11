@@ -163,14 +163,15 @@ class OpenHandsExecutor:
         if self.specs is None:
             raise DeliveryError(
                 "the task was planned from a specification, and this executor was built "
-                "without access to specifications; the agent would not get the task")
+                "without access to specifications; the agent would not get the task",
+                permanent=True)
         delivery = prepare(self.specs, task)
         if delivery is not None and delivery.files and not getattr(
                 self.client, "supports_files", False):
             raise DeliveryError(
                 f"the task's original text is {delivery.proof['chars']} characters and has to "
                 "reach the agent as a file, and this OpenHands transport cannot place a file "
-                "in the sandbox. Use OPENHANDS_TRANSPORT=direct")
+                "in the sandbox. Use OPENHANDS_TRANSPORT=direct", permanent=True)
         return delivery
 
     def dispatch(self, task: dict) -> str:
@@ -491,9 +492,12 @@ class LabScheduler:
             except (CloudError, GitHubError) as e:
                 # A dispatch failure is a provider/transport problem: release the
                 # task so another attempt (or worker) can try, and keep the lease
-                # short so recovery is fast.
+                # short so recovery is fast. A failure that another attempt
+                # would only repeat ends the task now, with its reason.
+                again = (task["attempt"] < task["max_attempts"]
+                         and not getattr(e, "permanent", False))
                 self.store.release_task(task["id"], error=f"{type(e).__name__}: {e}",
-                                        requeue=task["attempt"] < task["max_attempts"])
+                                        requeue=again)
                 result.note = f"dispatch failed: {type(e).__name__}"
                 return result
             self.store.mark_running(task["id"], conversation_id=conversation_id or None,
@@ -523,7 +527,7 @@ class LabScheduler:
         if unfinished == 0:
             # Nothing left to do and not all verified: the run is blocked, not
             # complete. A person resumes it (retry) or cancels it.
-            return ("blocked", "no claimable tasks; some tasks not verified",
+            return ("blocked", "no claimable tasks; some tasks not verified" + self._why(run_id),
                     "blocked: tasks remain unverified")
         if unfinished - counts.get("pending", 0) > 0:
             return None                     # work is in flight; wait for it
@@ -535,9 +539,21 @@ class LabScheduler:
             # A pending task exists but can never be claimed: a dependency ended
             # unverified/failed/blocked. That is a deadlock, not progress, so the
             # run is blocked rather than left spinning.
-            return ("blocked", "dependency graph deadlocked: a dependency is not verified",
-                    "blocked: dependency not verified")
+            return ("blocked", "dependency graph deadlocked: a dependency is not verified"
+                    + self._why(run_id), "blocked: dependency not verified")
         return None
+
+    def _why(self, run_id: str) -> str:
+        """The first task that could not be started, and why, for the run's error.
+
+        "Blocked" alone sends a person to look through the tasks. When a task
+        never started - the specification could not be put in the sandbox, the
+        Cloud refused - that reason is the run's reason, and it is said here.
+        """
+        failed = self.store.first_start_failure(run_id)
+        if failed is None:
+            return ""
+        return f". Task {failed['task_key']} was not started: {failed['last_error']}"
 
     def _project_of(self, run_id: str) -> str:
         with self.store.store._tx() as cur:

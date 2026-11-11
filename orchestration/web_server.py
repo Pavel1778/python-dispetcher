@@ -56,10 +56,12 @@ Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -101,6 +103,8 @@ from .nexus_specs import (
     SpecCorrupted,
     SpecService,
     SpecTooLarge,
+    check_message,
+    check_text,
     inline_chars,
     max_spec_chars,
     preview,
@@ -1134,6 +1138,9 @@ class Handler(BaseHTTPRequestHandler):
         if n < 0:
             raise ValueError("invalid or oversized request body")
         if max_bytes is not None and n > max_bytes:
+            # Refused unread. What the client is still sending is dealt with
+            # after the answer has gone out (see ``_linger``).
+            self._unread = n if n <= 4 * max_bytes else 0
             raise BodyTooLarge(
                 f"the request body is {n} bytes; this route accepts up to {max_bytes}")
         if not n:
@@ -1142,6 +1149,41 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(n))
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise ValueError("body is not valid JSON")
+
+    #: How long a refused body is still read after the answer: in all, and
+    #: while nothing arrives.
+    LINGER_SECONDS = 15.0
+    LINGER_IDLE_SECONDS = 2.0
+
+    def _linger(self) -> None:
+        """Let the client finish sending a body that was refused unread.
+
+        The answer is already written. Closing the socket while the rest of
+        the body is still arriving resets the connection, and the client then
+        reports a network failure instead of the answer it was sent - a browser
+        shows "network error" where it should say why the text was refused. So
+        the answer is ended first (the client is not kept waiting for it), and
+        then what the client goes on sending is read and dropped: in small
+        pieces, kept nowhere, for a bounded time, and not at all for a body
+        several times over the limit. The connection is closed either way.
+        """
+        left = getattr(self, "_unread", 0)
+        self._unread = 0
+        self.close_connection = True
+        if left <= 0:
+            return
+        deadline = time.monotonic() + self.LINGER_SECONDS
+        try:
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)       # the answer is complete
+            self.connection.settimeout(self.LINGER_IDLE_SECONDS)
+            while left > 0 and time.monotonic() < deadline:
+                chunk = self.rfile.read1(min(left, 64 * 1024))
+                if not chunk:
+                    return
+                left -= len(chunk)
+        except (OSError, ValueError):
+            return
 
     def _raw_body(self, max_bytes: int) -> bytes:
         """Read the request body as raw bytes, capped at *max_bytes*.
@@ -1199,7 +1241,11 @@ class Handler(BaseHTTPRequestHandler):
         token = getattr(self.app, "token", None)
         if not token:
             return False
-        return self.headers.get("Authorization", "") == f"Bearer {token}"
+        # Compared in constant time: how long a mismatch takes must say nothing
+        # about how much of the token was right.
+        return hmac.compare_digest(
+            self.headers.get("Authorization", "").encode("utf-8", "replace"),
+            f"Bearer {token}".encode("utf-8", "replace"))
 
     def _require_read(self) -> bool:
         """Reads need either a browser session or a valid bearer token."""
@@ -1925,8 +1971,10 @@ class Handler(BaseHTTPRequestHandler):
         except AuthorizationError as e:
             self._json(409, {"error": str(e)})
             return
-        if self.app.lab.active_run_for_goal(principal, project_id, goal_id) is not None:
-            self._json(409, {"error": "goal already has an active run"})
+        live = self.app.lab.active_run_for_goal(principal, project_id, goal_id)
+        if live is not None:
+            self._json(409, {"error": "goal already has an active run",
+                             "run_id": str(live["id"])})
             return
         options = {name: value for name, value in (
             ("max_iterations", max_iterations), ("max_attempts_per_task", max_attempts),
@@ -1989,6 +2037,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         mode = body.get("mode")
         conversation = self.app.conversations.get(principal, project_id, conversation_id)
+        # Everything that can refuse the message is checked before anything is
+        # written, so a refused message leaves no trace: not a new mode, not a
+        # title made of words that were never accepted. The raised errors are
+        # answered 400, or 413 for a text that is too long.
+        if mode:
+            self.app.conversations.check_mode(mode)
+        if (mode or conversation["mode"]) == "autonomous":
+            check_text(sent)
+        else:
+            check_message(sent, mode or conversation["mode"])
         if mode:
             self.app.conversations.set_mode(principal, project_id, conversation_id, mode)
             # Re-read so the joined repository/branch fields are present; set_mode
@@ -2020,7 +2078,10 @@ class Handler(BaseHTTPRequestHandler):
         user_msg = self.app.conversations.add_message(
             principal, project_id, conversation_id, role="user", content=shown,
             meta=user_meta)
-        history = self.app.conversations.list_messages(principal, project_id, conversation_id)
+        # What was said before this turn. The turn's own text is the request
+        # and is not repeated as history.
+        history = [m for m in self.app.conversations.list_messages(
+            principal, project_id, conversation_id) if str(m["id"]) != str(user_msg["id"])]
         appended: list[dict] = [user_msg]
         self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
         context = self.app.context.current(principal, project_id)
@@ -2871,7 +2932,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         except (BodyTooLarge, SpecTooLarge) as e:
             # Too much to accept is its own answer, with both numbers in it.
-            return self._json(413, {"error": str(e)})
+            self._json(413, {"error": str(e)})
+            return self._linger()
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except InvalidTransition as e:
