@@ -610,6 +610,11 @@ def test_a_phone_gets_one_column_and_nothing_wider_than_the_screen(stack, chromi
         # The history is a drawer: off the screen until asked for.
         assert page.get_attribute("#app", "data-sidebar") == "closed"
         assert page.locator("#sidebar").bounding_box()["x"] < -200
+        # ...and it leaves nothing behind. Its shadow is wide enough to reach back
+        # onto the screen from there (a grey smear down the left edge, visible in
+        # the light theme only), so a closed drawer casts none.
+        shadow = "() => getComputedStyle(document.getElementById('sidebar')).boxShadow"
+        assert page.evaluate(shadow) == "none"
         # The composer is on screen without scrolling, and usable by touch.
         box = page.locator("#composer").bounding_box()
         assert box["y"] > 0 and box["y"] + box["height"] <= 844
@@ -630,6 +635,7 @@ def test_a_phone_gets_one_column_and_nothing_wider_than_the_screen(stack, chromi
         page.tap("#open-sidebar")
         expect(page.locator("#scrim")).to_be_visible()
         assert page.locator("#sidebar").bounding_box()["x"] == 0
+        assert page.evaluate(shadow) != "none", "the open drawer is lifted off the page"
         # Without hover the per-chat menu has to be visible to be reachable.
         assert page.evaluate("() => getComputedStyle(document.querySelector('.sb-item .icon-btn')).opacity") == "1"
         assert _overflow(page) <= 0

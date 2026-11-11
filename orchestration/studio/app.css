@@ -699,8 +699,10 @@ body.auth { display: grid; place-items: center; overflow: auto; padding: 24px; m
 
 /* Phones and narrow tablets: one column, the sidebar is a drawer. */
 @media (max-width: 860px) {
-  .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 40; width: min(320px, 86vw); margin-left: 0 !important; transform: translateX(-102%); box-shadow: var(--shadow); padding-top: env(safe-area-inset-top, 0px); }
-  .app[data-sidebar="open"] .sidebar { transform: none; }
+  .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 40; width: min(320px, 86vw); margin-left: 0 !important; transform: translateX(-102%); padding-top: env(safe-area-inset-top, 0px); }
+  /* The shadow belongs to the open drawer only: a closed one sits just past the
+     edge, and its 48px blur would smear the first centimetre of the screen. */
+  .app[data-sidebar="open"] .sidebar { transform: none; box-shadow: var(--shadow); }
   .app[data-sidebar="open"] #open-sidebar { display: inline-grid; }
   .workspace { inset: 0; width: 100vw; border-left: 0; }
   .topbar { height: 52px; padding: 0 8px; padding-top: env(safe-area-inset-top, 0px); height: calc(52px + env(safe-area-inset-top, 0px)); }
