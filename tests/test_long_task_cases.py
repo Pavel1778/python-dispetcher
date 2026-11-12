@@ -364,7 +364,10 @@ def test_after_the_run_has_ended_the_same_text_runs_again_from_the_same_plan(lab
     assert [(t["task_key"], t["title"]) for t in lab.run(second)["tasks"]] == tasks
     assert len(lab.model.prompts) == asked, "a finished plan was asked for again"
     assert len(lab.goals()) == 1
-    assert sorted(r["state"] for r in lab.runs()) == ["cancelled", "running"]
+    # The cancelled run has left the list (the interface shows what is at work)
+    # and is still there to be read by its id, with everything it recorded.
+    assert [r["state"] for r in lab.runs()] == ["running"]
+    assert lab.run(run_id)["run"]["state"] == "cancelled"
     assert lab.spec(spec_of(first))["run_id"] == second
 
 
