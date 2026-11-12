@@ -78,6 +78,12 @@ class FakeCloud:
         self.events_sort = "honoured"
         #: Every events search as it was asked: (conversation, sort_order, page).
         self.event_searches: list[tuple[str, str, str]] = []
+        #: Bearer keys this server rejects with 401, as the live service rejects
+        #: a wrong or revoked key. Empty means every Bearer key is accepted.
+        self.rejected_keys: set[str] = set()
+        #: Seconds to sleep before answering any request, so a test can drive a
+        #: real timeout with a short client timeout. 0 means answer at once.
+        self.delay: float = 0.0
         self.calls: list[tuple[str, str]] = []
         # Sandboxes (``/api/v1/sandboxes``), for the direct transport: a sandbox
         # is provisioned here and then spoken to at its own agent-server URL.
@@ -156,10 +162,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _auth_ok(self) -> bool:
         header = self.headers.get("Authorization", "")
-        if header.startswith("Bearer "):
-            self.cloud.keys.append(header[len("Bearer "):])
-            return True
-        return False
+        if not header.startswith("Bearer "):
+            return False
+        key = header[len("Bearer "):]
+        self.cloud.keys.append(key)
+        return key not in self.cloud.rejected_keys
+
+    def _pause(self) -> None:
+        """Honour ``cloud.delay`` before answering, for a real timeout test."""
+        if self.cloud.delay:
+            import time
+
+            time.sleep(self.cloud.delay)
 
     def _json(self, code: int, payload) -> None:
         body = json.dumps(payload).encode()
@@ -167,7 +181,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The caller timed out and hung up (a real timeout test). Nothing to
+            # answer; the socket is gone, which is the client's problem, not an
+            # error in this server.
+            pass
 
     def _read_body(self) -> dict:
         n = int(self.headers.get("Content-Length", 0))
@@ -175,6 +195,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ GET
     def do_GET(self):
+        self._pause()
         if not self._auth_ok():
             return self._json(401, {"detail": "unauthorized"})
         path = self.path.split("?")[0]
@@ -278,6 +299,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- POST
     def do_POST(self):
+        self._pause()
         if not self._auth_ok():
             return self._json(401, {"detail": "unauthorized"})
         path = self.path.split("?")[0]
@@ -378,6 +400,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- PATCH
     def do_PATCH(self):
+        self._pause()
         if not self._auth_ok():
             return self._json(401, {"detail": "unauthorized"})
         path = self.path.split("?")[0]
@@ -397,6 +420,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------------- DELETE
     def do_DELETE(self):
+        self._pause()
         if not self._auth_ok():
             return self._json(401, {"detail": "unauthorized"})
         path = self.path.split("?")[0]

@@ -1766,3 +1766,37 @@ credentials for either. The Cloud's sandbox pause, `/interrupt` on an
 agent-server and the events query used for the stall check are taken from the
 OpenHands source and its OpenAPI description, and exercised only against the
 stand-in servers in `tests/`.
+
+## The acceptance suite, sections A-G (this session)
+
+The request's "Создай полноценный набор тестов" is delivered as two files that
+follow its own lettering. Keep them honest: every assertion is on a real effect,
+and a case that cannot run here says so rather than simulating.
+
+- `tests/test_connectivity.py` (section A) is the one place the *client's own*
+  connectivity is asserted over real sockets: `health()` true/false, a good key
+  accepted, a rejected key -> `CloudAuthError` (never a silent success), an
+  unreachable endpoint and a timeout -> `CloudUnavailable`, and recovery
+  (`check_connection` false then true). This was the real gap: `ping()`/`health()`
+  were only exercised by the e2e scripts, not by the suite.
+- `tests/test_comprehensive_suite.py` covers B-G: pool (1/2/3 accounts, disable,
+  primary->reserve, manual, load balancing), context hand-off (start on #1, move
+  to #2, no repeated stage, unfinished work continues), the worker (a separate
+  `lab_worker` process finishes a run with no client connected), recovery (expired
+  lease reclaimed, no duplicate start, lost connection fails over), and the
+  end-to-end failover (a real task moves #1 -> #2 and the **real** `GitVerifier`
+  reads the branch head on GitHub and accepts the named commit).
+- Section F (a real development task through NEXUS) is **BLOCKED** here: this
+  environment has no working OpenHands key (see "Environment note" above), so the
+  test is skipped with that reason and the honest half is asserted instead - the
+  diagnostics report `BLOCKED`, not `VERIFIED`, with no account/key. Do not
+  "fix" this by simulating the switch; the request forbids exactly that.
+- The transport fakes in `test_comprehensive_suite.py` follow
+  `test_openhands_failover.py`: small, honest fakes of the executor's client
+  surface, while the scheduler, pool, store, router and verifier are the real
+  code. Do not replace the store or scheduler with a mock.
+- `tests/fake_cloud.py` gained two controls (used only by the new tests, no
+  behaviour change for the existing ones): `rejected_keys` (a listed Bearer key
+  is answered `401`) and `delay` (a real slow response for a real timeout test).
+  A caller that times out and hangs up no longer prints a broken-pipe traceback
+  from the server thread.
