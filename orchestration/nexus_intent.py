@@ -181,6 +181,16 @@ class Intent:
         return self.intent == AUTONOMOUS and not self.ambiguous
 
 
+#: A message longer than this is a document (a specification, a brief), not a
+#: remark to be asked about: a long text that mixes verbs is read, not
+#: intercepted with a clarifying question.
+_SHORT_CHARS = 600
+
+
+def _short(text: str) -> bool:
+    return len(text) <= _SHORT_CHARS
+
+
 def _looks_like_question(text: str) -> bool:
     if _QUESTION_MARK.search(text):
         return True
@@ -281,7 +291,7 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     if question and not explicit_order:
         if analysis or (why and state):
             return Intent(ANALYSIS, question=True, reason="question about real state")
-        if order and not discuss:
+        if order and not discuss and _short(raw):
             return Intent(CHAT, ambiguous=True, question=True, reason="question with a buried order")
         return Intent(CHAT, question=True, reason="question")
 
@@ -292,8 +302,10 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     # 7. A read-only request ("проанализируй", "найди причину") is analysis.
     if analysis and not order:
         return Intent(ANALYSIS, reason="read-only request")
-    if analysis and order and not explicit_order:
+    if analysis and order and not explicit_order and _short(raw):
         # "проверь и исправь?" - an order hidden in a read-only phrase: ask.
+        # A *long* text that mixes read-only and order verbs is a specification,
+        # not an ambiguous remark: it is read (analysis), never intercepted.
         return Intent(ANALYSIS, ambiguous=True, reason="mixed read-only and order")
 
     # 8. An order to do work.
