@@ -611,6 +611,45 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
 - Tests: `tests/test_providers.py` (real local HTTP server per provider shape),
   `tests/test_plan_draft.py` (real web server + PostgreSQL).
 
+## Provider fallback diagnostics (this session)
+
+The cascade above had no runtime *diagnostic*: `openhands_diagnostics` verified
+OpenHands accounts, the pool, Cloud, queues and the worker, but nothing checked
+the Gemini/Groq/OpenRouter/OpenHands-orchestrator providers. Section 8 of the
+acceptance text asks for exactly that, so it was added. Keep these invariants:
+
+- **`Provider.probe()` is the one real check.** It makes a *read-only* request
+  (`_models_path()` — `/models` for Gemini/Groq/OpenRouter, the conversation
+  *count* for the OpenHands orchestrator) and returns a `ProbeResult`, never
+  raising: `ok` (key accepted, and the configured model is in the key's list
+  when the endpoint lists models), `auth` (401/403), `unavailable` (transport,
+  5xx, 429), `rejected` (400/422 or the model is not available), `blocked` (no
+  key — nothing was proved). `ProviderCascade.probe_all()` probes every provider
+  in cascade order. **Never send a prompt from a probe**: it costs tokens and
+  could be mistaken for a plan.
+- **Two checks, two claims.** `check_providers` reports *configuration* by
+  presence only (names + order, no call, no key) — `VERIFIED` there means
+  "configured", which is all it claims. `check_provider_probe` is the earned
+  one: opt-in with `live=True`, `UNVERIFIED` otherwise, and it maps each
+  `ProbeResult.kind` to `VERIFIED`/`FAILED`(auth, rejected)/`BLOCKED`
+  (unavailable). A provider is **never** reported connected without this real
+  call — the request's "do not declare a provider connected without a real
+  check".
+- **Model switching ≠ account switching.** The provider cascade is a different
+  mechanism from the OpenHands account pool; the checks are separate and the
+  detail text says which is which. Do not fold them together.
+- **No key ever leaves.** `ProbeResult` and the report carry the provider name,
+  model and a non-secret detail; the `/api/providers` route and `nexus
+  providers` never return a key (asserted in the tests).
+- Surface: `GET /api/providers[?live=1]` (`App.provider_status`) and the CLI
+  `nexus providers [--live]` (exit 6 when a key was refused or a model is
+  missing). The checks are also part of the `POST /api/openhands/diagnostics`
+  report.
+- Tests: `tests/test_provider_diagnostics.py` (25 cases over real local HTTP
+  servers: config presence, key/model checks, timeouts, switching, context
+  preservation, return to primary, the two diagnostic checks, no key leak) and
+  the provider block in `tests/test_openhands_pool_http.py`.
+
 ## Autonomous lab (context, memory, runs, worker)
 
 - `orchestration/nexus_context.py` — versioned project-context snapshots and the

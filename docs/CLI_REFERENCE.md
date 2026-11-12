@@ -49,6 +49,7 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | `nexus version` | package version |
 | `nexus doctor` | `GET /healthz`, `GET /api/system` (component status) |
 | `nexus status` | `GET /api/dashboard`, `GET /api/health` |
+| `nexus providers [--live]` | `GET /api/providers` (LLM orchestrator cascade; `--live` probes each configured provider, exit 6 if a key was refused or a model is missing) |
 
 ### Projects
 
