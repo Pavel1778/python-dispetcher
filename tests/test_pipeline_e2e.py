@@ -180,8 +180,11 @@ def test_the_full_pipeline_runs_every_stage_in_order(monkeypatch):
         assert audit["evidence"][-1]["remote_sha"] == HEAD
 
         # EVIDENCE stage: a signed, re-verifiable record now exists for the task.
-        ev = _evidence_for_task(studio, project, audit["id"])
-        assert ev is not None, "the EVIDENCE stage wrote no signed record"
+        # The verdict and the evidence record are written in two transactions
+        # (record_verification commits, then the record is signed), so under load
+        # the verdict can be visible a moment before the record. Wait for it.
+        ev = _until(lambda: _evidence_for_task(studio, project, audit["id"]),
+                    what="the EVIDENCE stage to write the signed record")
         assert ev["verdict"] == "VERIFIED"
         assert ev["commit_sha"] == HEAD and ev["branch"] == "main"
 
@@ -240,8 +243,9 @@ def test_a_text_answer_is_never_proof_of_work(monkeypatch):
         # The unverified result is still signed into evidence: the record binds
         # the commit the verifier *observed* on the branch, not a claim by the
         # agent, and the task's own verdict is what says it did not verify.
-        ev = _evidence_for_task(studio, project, tasks["audit"]["id"])
-        assert ev is not None and ev["verdict"] == "VERIFIED"
+        ev = _until(lambda: _evidence_for_task(studio, project, tasks["audit"]["id"]),
+                    what="the EVIDENCE stage to write the signed record")
+        assert ev["verdict"] == "VERIFIED"
         assert ev["commit_sha"] == HEAD, "the record must bind the observed branch head"
         assert ev["body"]["detail"]["verdict"] == "completed_unverified"
 
@@ -328,8 +332,8 @@ def test_evidence_records_are_re_verifiable_with_the_trust_engine(monkeypatch, e
         audit = _until(lambda: (lambda d: (lambda t: t if t["state"] == "completed_verified"
                                            else None)({x["task_key"]: x for x in d["tasks"]}["audit"]))(
             _detail(studio, project, run)), what="the first task to verify")
-        ev = _evidence_for_task(studio, project, audit["id"])
-        assert ev is not None
+        ev = _until(lambda: _evidence_for_task(studio, project, audit["id"]),
+                    what="the EVIDENCE stage to write the signed record")
         # Re-verify through the route: the signature and the chain must hold.
         status, body = studio.api.post(
             f"/api/v1/projects/{project}/evidence/{ev['id']}/verify",
