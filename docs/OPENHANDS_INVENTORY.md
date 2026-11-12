@@ -332,6 +332,17 @@ Sr acts only through **client tools** (`sr_`-prefixed, delivered as
 inside the conversation can call. A tool being *configured* is not proof it
 *ran*; only an observed `ActionEvent` proves exercise.
 
+**Reading the catalog (NEXUS).** `orchestration/openhands_tools.py` normalises
+this catalog (and `/server_info`'s `usable_tools`) into
+`{name: {usable, user_selectable, in_default_set}}`, and each transport exposes
+`tool_catalog()`: `CloudDirectClient` and `LocalCloudClient` read
+`GET /api/tools/catalog` from a real agent-server; the Cloud *app* transport has
+none, so it raises `ToolCatalogUnsupported` (`BLOCKED`, never `FAILED`). The
+diagnostic report adds three checks — `openhands_tools` (the catalog; opt-in
+with `live`), `mcp_configuration` (configured MCP server *names* only) and
+`nexus_tools` (NEXUS's own MCP + `sr_` client tools). Git and testing have no
+built-in and are proved by `terminal`.
+
 **MCP.** The account's Cloud settings reported **20 configured MCP servers**
 live (`browser_mcp`, `cloudflare-bindings`, `cloudflare-browser-rendering`,
 `cloudflare-builds`, `cloudflare-docs`, `cloudflare-observability`, `deepwiki`,

@@ -120,6 +120,11 @@ class OpenHandsDiagnostics:
         #: process transport (``build_cloud_client``), which needs a real key.
         self._live_factory = live_client_factory
         self.worker_max_age = worker_max_age
+        #: MCP server names seen by :meth:`check_accounts` (per account id).
+        #: The MCP check reuses this so it needs no second round trip on a
+        #: non-live report; only a named account the list did not cover falls
+        #: back to a real ``get_settings()`` call.
+        self._mcp_by_account: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------- helpers
     def _cloud_client(self) -> Any:
@@ -142,6 +147,11 @@ class OpenHandsDiagnostics:
         self.check_worker(report)
         self.check_providers(report)
         self.check_provider_probe(report, live=live)
+        self.check_openhands_tools(report, principal, live=live,
+                                   account_id=account_id, project_id=project_id)
+        self.check_mcp_configuration(report, principal, account_id=account_id,
+                                     project_id=project_id)
+        self.check_nexus_tools(report)
         self.check_live_conversation(report, principal, live=live,
                                      account_id=account_id, project_id=project_id)
         return report
@@ -202,7 +212,11 @@ class OpenHandsDiagnostics:
                 caps = client.account_capabilities()
                 row["auth"] = "ok"
                 row["llm_key_set"] = bool(caps.get("llm_api_key_set"))
-                row["mcp_servers"] = len(caps.get("mcp_servers") or [])
+                names = caps.get("mcp_servers") or []
+                row["mcp_servers"] = len(names)
+                # Kept so the MCP check can report the same names without a
+                # second network call (a non-live report must not add one).
+                self._mcp_by_account[str(account["id"])] = list(names)
             except CloudAuthError as e:
                 row["auth"] = f"rejected: {e}"
                 worst = FAILED
@@ -396,7 +410,220 @@ class OpenHandsDiagnostics:
             detail = "; ".join(f"{r.provider}: {r.detail}" for r in probed)
         report.add("provider_probe", worst, detail, {"providers": rows})
 
-    # -- 7. worker heartbeat ----------------------------------------------
+    # -- 8. agent tools, MCP and NEXUS tools ------------------------------
+    def check_openhands_tools(self, report: Report, principal: str, *,
+                              live: bool, account_id: str | None,
+                              project_id: str | None) -> None:
+        """Which tools the *agent inside a conversation* actually has.
+
+        The request separates the tools the OpenHands agent can call from the
+        tools NEXUS exposes, and forbids calling a tool available on faith. So
+        this reads the **agent-server's own tool catalog** and reports what it
+        says, then maps the request's capability groups (terminal, workspace
+        file system, Git, testing, browser) onto it:
+
+        * ``VERIFIED``   — the catalog was read and every required capability is
+                           available (Git and testing are proved by the terminal,
+                           which is how an agent runs ``git``/``pytest``);
+        * ``FAILED``     — the catalog was read and a required capability is
+                           missing;
+        * ``BLOCKED``    — no catalog could be read: the transport has no
+                           agent-server (the Cloud *app* transport), no account or
+                           no resource. Nothing is claimed;
+        * ``UNVERIFIED`` — not requested. Reading the catalog on the direct
+                           transport may provision a sandbox, so it is opt-in
+                           with ``live`` exactly like the conversation probe.
+
+        MCP servers are *configured* for the account and checked separately
+        (:meth:`check_mcp_configuration`); a configured MCP server is not proof
+        its tools are available.
+        """
+        if not live:
+            report.add("openhands_tools", UNVERIFIED,
+                       "not requested (pass live=true to read the agent-server tool catalog)")
+            return
+        from .openhands_tools import (
+            ToolCatalogUnsupported,
+            capability_report,
+            missing_capabilities,
+            usable_tool_names,
+        )
+
+        try:
+            account, client = self._tools_client(principal, account_id, project_id)
+        except PoolError as e:
+            report.add("openhands_tools", BLOCKED, str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            report.add("openhands_tools", FAILED, f"{type(e).__name__}: {e}")
+            return
+        evidence: dict[str, Any] = {"account": (account or {}).get("label", "process transport")}
+        try:
+            catalog = client.tool_catalog()
+        except ToolCatalogUnsupported as e:
+            report.add("openhands_tools", BLOCKED, str(e), evidence)
+            return
+        except CloudAuthError as e:
+            # A credential that is absent or rejected means the catalog could
+            # not be read at all: BLOCKED, not FAILED. The account check is the
+            # one that reports a rejected key as a failure.
+            report.add("openhands_tools", BLOCKED, f"auth rejected: {e}", evidence)
+            return
+        except (CloudUnavailable, CloudError) as e:
+            report.add("openhands_tools", BLOCKED, f"{type(e).__name__}: {e}", evidence)
+            return
+        except Exception as e:  # noqa: BLE001
+            report.add("openhands_tools", FAILED, f"{type(e).__name__}: {e}", evidence)
+            return
+
+        tools = catalog.get("tools") or {}
+        coverage = capability_report(tools)
+        missing = missing_capabilities(coverage)
+        evidence.update({
+            "tools_usable": usable_tool_names(tools),
+            "capabilities": {k: v["available"] for k, v in coverage.items()},
+            "capability_evidence": coverage,
+            "missing_required": missing,
+        })
+        if missing:
+            report.add("openhands_tools", FAILED,
+                       "required capabilities missing: " + ", ".join(missing), evidence)
+        else:
+            report.add("openhands_tools", VERIFIED,
+                       f"{len(tools)} tool(s) reported; terminal, workspace, git "
+                       f"and testing available", evidence)
+
+    def check_mcp_configuration(self, report: Report, principal: str, *,
+                                account_id: str | None,
+                                project_id: str | None) -> None:
+        """The MCP servers *configured* for the account — names, never bodies.
+
+        This is the configuration half of the MCP question. ``VERIFIED`` here
+        means the account reports MCP servers configured, which is exactly what
+        this check claims; it does **not** claim a tool was exercised (only an
+        observed ``ActionEvent`` proves that). A secret value inside an MCP
+        server's configuration is never read: only the server *names* are
+        returned.
+
+        The names come from :meth:`check_accounts`, which already probed each
+        account with ``account_capabilities()``; reusing them keeps a non-live
+        report from making a second network call. A named account the list did
+        not cover (a different principal, or one skipped as inactive) is read
+        directly — that is the only case that adds a request.
+        """
+        from .openhands_tools import mcp_server_names
+
+        try:
+            account = self._pick_account(principal, account_id, project_id)
+        except PoolError:
+            account = None
+        except Exception as e:  # noqa: BLE001
+            report.add("mcp_configuration", FAILED, f"{type(e).__name__}: {e}")
+            return
+
+        if account is not None:
+            cached = self._mcp_by_account.get(str(account["id"]))
+            if cached is not None:
+                self._report_mcp(report, account["label"], cached)
+                return
+            # The list did not cover this account: read it directly, once.
+            try:
+                client = self._live_client(principal, account)
+                settings = client.get_settings()
+            except CloudAuthError as e:
+                report.add("mcp_configuration", BLOCKED, f"auth rejected: {e}",
+                           {"account": account["label"]})
+                return
+            except (CloudUnavailable, CloudError) as e:
+                report.add("mcp_configuration", BLOCKED, f"{type(e).__name__}: {e}",
+                           {"account": account["label"]})
+                return
+            except Exception as e:  # noqa: BLE001
+                report.add("mcp_configuration", FAILED, f"{type(e).__name__}: {e}",
+                           {"account": account["label"]})
+                return
+            names = mcp_server_names(settings if isinstance(settings, dict) else {})
+            self._report_mcp(report, account["label"], names)
+            return
+
+        # No stored account: use the client the caller already injected (the one
+        # every other check uses), so a single-key deployment still gets an
+        # answer. Never build a fresh client from the environment here — a
+        # non-live report must not reach a host nobody configured for it.
+        if self._cloud is None:
+            report.add("mcp_configuration", BLOCKED,
+                       "no account is configured and no process client was supplied")
+            return
+        try:
+            settings = self._cloud.get_settings()
+        except CloudAuthError as e:
+            report.add("mcp_configuration", BLOCKED, f"auth rejected: {e}")
+            return
+        except (CloudUnavailable, CloudError) as e:
+            report.add("mcp_configuration", BLOCKED, f"{type(e).__name__}: {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            report.add("mcp_configuration", BLOCKED, f"{type(e).__name__}: {e}")
+            return
+        names = mcp_server_names(settings if isinstance(settings, dict) else {})
+        self._report_mcp(report, "process transport", names)
+
+    @staticmethod
+    def _report_mcp(report: Report, label: str, names: list[str]) -> None:
+        evidence = {"account": label, "mcp_servers": names}
+        if names:
+            report.add("mcp_configuration", VERIFIED,
+                       f"{len(names)} MCP server(s) configured (configuration only, "
+                       f"not exercised)", evidence)
+        else:
+            report.add("mcp_configuration", BLOCKED,
+                       "no MCP server is configured for this account", evidence)
+
+    def check_nexus_tools(self, report: Report) -> None:
+        """The tools **NEXUS** exposes — separate from the agent's own tools.
+
+        Two surfaces, both real and both read from the code that serves them:
+
+        * ``mcp`` — NEXUS's own MCP server tools (stdio and ``POST /mcp``);
+        * ``client_tools`` — the ``sr_`` bridge delivered into a conversation as
+          ``ClientToolSpec`` and answered over the event stream.
+
+        Neither is an agent-server built-in, and the agent's built-ins are not
+        NEXUS tools. Reporting them together would be exactly the conflation the
+        request warns against, so this check is local and names each surface.
+        """
+        from .openhands_tools import nexus_tool_names
+
+        try:
+            names = nexus_tool_names()
+        except Exception as e:  # noqa: BLE001
+            report.add("nexus_tools", FAILED, f"{type(e).__name__}: {e}")
+            return
+        evidence = {"mcp": names["mcp"], "client_tools": names["client_tools"]}
+        report.add("nexus_tools", VERIFIED,
+                   f"NEXUS exposes {len(names['mcp'])} MCP tool(s) and "
+                   f"{len(names['client_tools'])} client tool(s) to agents",
+                   evidence)
+
+    def _tools_client(self, principal: str, account_id: str | None,
+                      project_id: str | None) -> tuple[dict | None, Any]:
+        """``(account, client)`` for the tool/MCP checks.
+
+        Prefers the named (or pool-selected) account's execution client so the
+        catalog is the one that account's agent would see; falls back to the
+        process-wide transport when no account is configured, so a single-key
+        deployment still gets an answer. ``account`` is ``None`` for the
+        process transport.
+        """
+        try:
+            account = self._pick_account(principal, account_id, project_id)
+        except PoolError:
+            if account_id is not None:
+                raise
+            return None, self._cloud_client()
+        return account, self._live_client(principal, account)
+
+    # -- 9. worker heartbeat ----------------------------------------------
     def check_worker(self, report: Report) -> None:
         try:
             live = self.lab.live_workers(max_age_seconds=self.worker_max_age)

@@ -688,6 +688,29 @@ class CloudDirectClient:
     def get_settings(self) -> dict[str, Any]:
         return self.cloud.get_settings()
 
+    def tool_catalog(self) -> dict[str, Any]:
+        """The agent-server's own tool catalog, read from a real sandbox.
+
+        Reuses a running sandbox when one is recorded (cheap), otherwise
+        provisions one — the same policy the live conversation probe uses. The
+        catalog comes from the sandbox the agent would actually run in, so it is
+        the tools that agent has, not a list this client assumed.
+
+        A 404 means the server predates the catalog route; that is
+        ``ToolCatalogUnsupported`` (``BLOCKED``), not a failure — the sandbox
+        answered, it just does not publish its tools. Any other non-200 is a
+        real error and is raised.
+        """
+        from .openhands_tools import ToolCatalogUnsupported, normalize_catalog
+
+        route = self._new_sandbox()
+        status, payload = self._send(route, "GET", "/api/tools/catalog")
+        if status == 404:
+            raise ToolCatalogUnsupported("the sandbox exposes no /api/tools/catalog")
+        if status != 200 or not isinstance(payload, dict):
+            raise CloudUnavailable(f"tool catalog -> {status}")
+        return {"tools": normalize_catalog(payload), "raw": payload}
+
     def account_capabilities(self) -> dict[str, Any]:
         return self.cloud.account_capabilities()
 

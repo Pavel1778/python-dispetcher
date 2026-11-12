@@ -67,7 +67,8 @@ class McpServer:
         }
 
     # -------------------------------------------------------------- schemas
-    def tool_schemas(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def tool_schemas() -> list[dict[str, Any]]:
         return [
             _tool("list_projects", "List projects the caller is a member of.", {}),
             _tool("get_project", "Get one project by id.", {"project_id": _s("string")},

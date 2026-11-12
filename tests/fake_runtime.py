@@ -111,6 +111,25 @@ class FakeRuntime:
     #: When > 0, the next N downloads answer this status.
     download_status: int = 0
     download_status_times: int = 0
+    #: The agent-server's tool catalog (``GET /api/tools/catalog``). Mirrors the
+    #: live shape: a list of descriptors carrying ``user_selectable`` /
+    #: ``in_default_set`` / ``usable``. ``tool_catalog_status`` forces a status
+    #: (e.g. 404 for a server that predates the route).
+    tool_catalog: dict[str, Any] = field(default_factory=lambda: {"tools": [
+        {"name": "terminal", "user_selectable": True, "in_default_set": True, "usable": True},
+        {"name": "file_editor", "user_selectable": True, "in_default_set": True, "usable": True},
+        {"name": "task_tracker", "user_selectable": True, "in_default_set": True, "usable": True},
+        {"name": "browser_tool_set", "user_selectable": True, "in_default_set": True,
+         "usable": True},
+        {"name": "switch_llm", "user_selectable": True, "in_default_set": True, "usable": True},
+        {"name": "glob", "user_selectable": True, "in_default_set": False, "usable": True},
+        {"name": "grep", "user_selectable": True, "in_default_set": False, "usable": True},
+        {"name": "read_file", "user_selectable": False, "in_default_set": False, "usable": True},
+        {"name": "write_file", "user_selectable": False, "in_default_set": False, "usable": True},
+        {"name": "list_directory", "user_selectable": False, "in_default_set": False,
+         "usable": True},
+    ]})
+    tool_catalog_status: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def finish(self, conversation_id: str, response: str | None) -> None:
@@ -182,6 +201,16 @@ class _Handler(BaseHTTPRequestHandler):
         if parts == ["api", "settings"]:
             with self.runtime.lock:
                 self._json(200, json.loads(json.dumps(self.runtime.settings)))
+            return
+
+        # /api/tools/catalog -> the agent-server's own tool set (and /api/tools/).
+        if parts in (["api", "tools", "catalog"], ["api", "tools"]):
+            with self.runtime.lock:
+                if self.runtime.tool_catalog_status:
+                    self._json(self.runtime.tool_catalog_status,
+                               {"detail": "Not Found"})
+                    return
+                self._json(200, json.loads(json.dumps(self.runtime.tool_catalog)))
             return
 
         # /api/file/download?path=<absolute path>
