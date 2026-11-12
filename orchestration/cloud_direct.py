@@ -649,6 +649,10 @@ class CloudDirectClient:
             return False
         return True
 
+    #: The sandbox agent-server has a conversation-scoped pause, so a stop here
+    #: is real; the branch can be held until it succeeds.
+    supports_conversation_stop = True
+
     def pause(self, conversation_id: str) -> None:
         route = self._route_for(conversation_id)
         status, _ = self._send(

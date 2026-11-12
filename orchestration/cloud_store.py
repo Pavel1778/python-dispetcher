@@ -374,7 +374,8 @@ class PostgresStore:
         "nexus_run_tasks": ("id", "run_id", "project_id", "task_key", "state",
                             "attempt", "max_attempts", "conversation_id",
                             "openhands_account_id", "tried_accounts",
-                            "preferred_account_id", "lease_owner", "lease_token"),
+                            "preferred_account_id", "lease_owner", "lease_token",
+                            "abandoned"),
     }
 
     def verify_schema(self) -> list[str]:

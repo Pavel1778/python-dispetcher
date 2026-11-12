@@ -517,6 +517,12 @@ class CloudClient:
         """
         return False
 
+    #: Whether ``stop_conversation`` can really stop a conversation on this
+    #: transport. The app-conversation surface cannot (its pause is
+    #: sandbox-scoped), so a caller must not hold a branch forever waiting for a
+    #: stop that will never come - see ``LabScheduler._stop_abandoned``.
+    supports_conversation_stop = False
+
     def update_conversation(self, conversation_id: str, *,
                             title: str | None = None) -> bool:
         """``PATCH /api/v1/app-conversations/{id}`` (title only, here).

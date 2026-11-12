@@ -259,6 +259,10 @@ class LocalCloudClient(OpenHandsClient):
         )
         return status in (200, 201, 204)
 
+    #: The local agent-server exposes the same conversation-scoped pause as the
+    #: direct transport, so a stop here is real.
+    supports_conversation_stop = True
+
     def health(self) -> bool:
         return super().health()
 

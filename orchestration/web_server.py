@@ -969,6 +969,13 @@ class App:
         from_account = task.get("openhands_account_id")
         updated = self.lab.switch_task_executor(task_id, target_account_id=account_id)
         stopped = self._stop_abandoned_conversation(principal, from_account, abandoned)
+        # The store also recorded the conversation in the task's ``abandoned``
+        # list, which holds the branch until it is stopped. This path stopped it
+        # here, so drop the entry too; when it did not stop (the app transport
+        # cannot), leave the entry and let the worker try (it will report the
+        # transport cannot stop, and release the branch).
+        if stopped and abandoned:
+            self.lab.mark_abandoned_stopped(task_id, abandoned)
         return {"task": updated, "target_account": {"id": account_id,
                                                     "label": account["label"]},
                 "abandoned_conversation": abandoned, "stopped": stopped}

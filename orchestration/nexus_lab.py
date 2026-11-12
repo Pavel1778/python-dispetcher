@@ -283,6 +283,42 @@ class OpenHandsExecutor:
             return self.client
         return self._client_for_account(str(account_id), task)
 
+    def stop(self, account_id: str | None, conversation_id: str,
+             project_id: str | None = None) -> bool:
+        """Stop an abandoned conversation for real, on the account that owns it.
+
+        Called when a switch or a failover left a conversation behind: it may
+        still be running in its sandbox, editing the task's checkout, and it must
+        not go on changing the working copy beside the new executor. The client's
+        ``stop_conversation`` pauses the agent-server's run loop and keeps the
+        transcript.
+
+        Returns whether the caller may treat the conversation as stopped. On a
+        transport that cannot stop a conversation at all
+        (``supports_conversation_stop`` is ``False``: the Cloud V1
+        app-conversation surface pauses only a whole sandbox) there is nothing to
+        wait for, so this returns ``True`` - holding the branch forever for a
+        stop that can never happen would strand the task. Where a stop is
+        possible, ``False`` (the pause failed) leaves the entry in the task's
+        ``abandoned`` list so the branch stays held and the caller retries.
+        """
+        if self.router is not None and account_id:
+            client = self._client_for_account(
+                str(account_id), {"project_id": project_id} if project_id else None)
+        else:
+            client = self.client
+        if not getattr(client, "supports_conversation_stop", False):
+            # No conversation-scoped stop on this transport; nothing was stopped
+            # and nothing can be. The branch lock is the guarantee, as before.
+            return True
+        stop = getattr(client, "stop_conversation", None)
+        if not callable(stop):
+            return True
+        try:
+            return bool(stop(conversation_id))
+        except CloudError:
+            return False
+
     def dispatch(self, task: dict) -> str:
         client, account_id = self._dispatch_client(task)
         try:
@@ -666,6 +702,39 @@ class LabScheduler:
                    f"(this is not counted as an attempt). {why}"),
             lease_token=task.get("lease_token"))
 
+    def _stop_abandoned(self, run_id: str) -> None:
+        """Stop every conversation a switch or failover left behind.
+
+        A switch records the old conversation in the task's ``abandoned`` list.
+        Until each is stopped, ``claim_task`` holds the task's branch, so a new
+        executor cannot start beside the old writer. This stops them one by one
+        and drops each from the list only once the executor reports it stopped;
+        a transport that cannot stop a conversation reports success at once (so
+        the branch is not held forever), a failure leaves the entry for the next
+        tick and keeps the branch held.
+        """
+        stop = getattr(self.executor, "stop", None)
+        for entry in self.store.pending_stops(run_id):
+            conversation_id = entry["conversation_id"]
+            if not callable(stop):
+                # An executor that cannot stop a conversation (a test double, a
+                # transport with no stop) - drop the entry so the branch is not
+                # held by something that can never be stopped.
+                self.store.mark_abandoned_stopped(entry["task_id"], conversation_id)
+                continue
+            try:
+                stopped = stop(entry.get("account_id"), conversation_id,
+                               entry.get("project_id"))
+            except Exception as e:  # noqa: BLE001 - one bad stop must not stop the tick
+                log.warning("could not stop abandoned conversation %s: %s",
+                            conversation_id, type(e).__name__)
+                continue
+            if stopped:
+                self.store.mark_abandoned_stopped(entry["task_id"], conversation_id)
+            else:
+                log.info("abandoned conversation %s could not be stopped; branch stays held",
+                         conversation_id)
+
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
         run = self.store.run_row(run_id)
@@ -678,6 +747,11 @@ class LabScheduler:
             result.note = f"run is {run['state']}"
             return result
         result.reclaimed = len(self.store.reclaim_expired(run_id))
+
+        # 0. Stop every conversation a switch or failover left behind, so a task
+        #    cannot have two writers on its branch at once. The branch stays held
+        #    (``_BRANCH_FREE``) until this succeeds.
+        self._stop_abandoned(run_id)
 
         # 1. Poll every task already dispatched, so a slow conversation advances.
         in_flight = 0
@@ -734,7 +808,10 @@ class LabScheduler:
             return result
 
         # 2. Claim and dispatch the next claimable task. The claim refuses by
-        #    itself when the run stopped running or is out of budget.
+        #    itself when the run stopped running or is out of budget. Any
+        #    conversation the poll above just abandoned is stopped first, so a
+        #    failover in this same tick is not held back by the branch lock.
+        self._stop_abandoned(run_id)
         task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds)
         if task is not None:
             result.claimed = task["task_key"]

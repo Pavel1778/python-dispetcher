@@ -24,6 +24,11 @@ writes run/task state, so the invariants live in one spot:
   late never overwrites what a person just asked for.
 * **A started conversation is never abandoned for a second one.** Only a task
   that has no conversation bound is requeued when its lease runs out.
+* **A switched executor's old conversation is stopped, not forgotten.** A switch
+  or a failover records the conversation it leaves behind in the task's
+  ``abandoned`` list; the worker stops each for real (``pending_stops`` /
+  ``mark_abandoned_stopped``), and until then ``_BRANCH_FREE`` holds the task's
+  branch so no second writer starts on the same checkout.
 
 Membership is checked in the same query that touches a row.
 """
@@ -73,11 +78,22 @@ UNFINISHED_TASK_STATES = ("pending", "dispatched", "running", "verifying")
 #: (``GitVerifier``); two agents pushing to one branch move that head under
 #: each other, and whichever is read second is "not the branch head" though it
 #: did its work. A task with no repository pushes nowhere and is not held.
+#
+#: A branch is also held while any task has an *abandoned* conversation on it:
+#: an executor switch starts a new conversation while the old one may still be
+#: running in its sandbox, editing the same checkout. Until the worker has
+#: really stopped the old conversation (``abandoned`` drained), nobody starts a
+#: second writer there. A repository-less task is never held.
 _BRANCH_FREE = (
-    "(t.repository = '' OR NOT EXISTS ("
-    "  SELECT 1 FROM nexus_run_tasks o "
-    "  WHERE o.repository = t.repository AND o.branch = t.branch AND o.id <> t.id "
-    "    AND o.state IN ('dispatched','running','verifying'))) ")
+    "(t.repository = '' OR ("
+    "  NOT EXISTS ("
+    "    SELECT 1 FROM nexus_run_tasks o "
+    "    WHERE o.repository = t.repository AND o.branch = t.branch AND o.id <> t.id "
+    "      AND o.state IN ('dispatched','running','verifying')) "
+    "  AND NOT EXISTS ("
+    "    SELECT 1 FROM nexus_run_tasks a "
+    "    WHERE a.repository = t.repository AND a.branch = t.branch "
+    "      AND jsonb_array_length(a.abandoned) > 0))) ")
 
 #: Task states a person's "resume" may send back to the queue.
 _RETRYABLE_TASK_STATES = ("completed_unverified", "partial", "failed", "blocked")
@@ -444,6 +460,10 @@ class LabStore:
         # caller that read the task carries it back; an out-of-date token means
         # the task was taken away in the meantime and the write must not land.
         out["lease_token"] = int(out.get("lease_token") or 0)
+        # Conversations this task left behind (a switch or a failover) that the
+        # worker still has to stop for real; while the list is non-empty the
+        # task's branch is held so no second writer starts there.
+        out["abandoned"] = _loads(out.get("abandoned")) or []
         return out
 
     def dependency_states(self, cur: Any, task: dict) -> dict[str, str]:
@@ -748,6 +768,10 @@ class LabStore:
                 "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, "
                 "lease_owner=NULL, lease_token=lease_token+1, "
                 "conversation_id=NULL, last_error=%s, "
+                "abandoned = CASE WHEN conversation_id IS NULL THEN abandoned "
+                "  ELSE abandoned || jsonb_build_array(jsonb_build_object("
+                "    'conversation_id', conversation_id, "
+                "    'account_id', openhands_account_id, 'at', now())) END, "
                 "tried_accounts = CASE WHEN tried_accounts ? %s::text THEN tried_accounts "
                 "  ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "updated_at=now() "
@@ -784,6 +808,42 @@ class LabStore:
                         (task_id, lease_token))
             return cur.fetchone() is not None
 
+    def pending_stops(self, run_id: str) -> list[dict]:
+        """The conversations a run still has to stop, task by task.
+
+        A switch records the conversation it leaves behind in the task's
+        ``abandoned`` list; the worker stops each for real (``stop``) and drops
+        it with ``mark_abandoned_stopped``. Until the list is empty the task's
+        branch is held (``_BRANCH_FREE``), so an interrupted stop is retried
+        rather than lost.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT id, task_key, project_id, abandoned FROM nexus_run_tasks "
+                "WHERE run_id=%s AND jsonb_array_length(abandoned) > 0 "
+                "ORDER BY created_at, id", (run_id,))
+            out = []
+            for row in cur.fetchall():
+                for entry in (row["abandoned"] or []):
+                    if isinstance(entry, dict) and entry.get("conversation_id"):
+                        out.append({"task_id": str(row["id"]), "task_key": row["task_key"],
+                                    "project_id": str(row["project_id"]), **entry})
+            return out
+
+    def mark_abandoned_stopped(self, task_id: str, conversation_id: str) -> None:
+        """Drop one stopped conversation from a task's ``abandoned`` list.
+
+        Idempotent: a conversation already gone is a no-op, so a retried stop is
+        safe. When the list empties, the task's branch is free again.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_run_tasks SET abandoned = COALESCE(("
+                "  SELECT jsonb_agg(e) FROM jsonb_array_elements(abandoned) e "
+                "  WHERE e->>'conversation_id' <> %s), '[]'::jsonb), updated_at=now() "
+                "WHERE id=%s",
+                (str(conversation_id), task_id))
+
     def tried_accounts(self, task_id: str) -> list[str]:
         with self.store._tx() as cur:
             cur.execute("SELECT tried_accounts FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -814,6 +874,12 @@ class LabStore:
         binding alone is not enough to stop an agent already running - the
         conversation goes on in the Cloud - so the switch is a *hand-off plus a
         stop*, and the two must not be separated.
+
+        The same conversation is also added to the task's ``abandoned`` list: the
+        worker stops it for real, and until then the task's branch is held
+        (``_BRANCH_FREE``) so no second writer starts on the same checkout. The
+        evidence copy is the human record; the ``abandoned`` list is what the
+        loop acts on, so the two are not redundant.
         """
         with self.store._tx() as cur:
             cur.execute("SELECT state, openhands_account_id, conversation_id, attempt "
@@ -833,6 +899,10 @@ class LabStore:
                 "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
                 "lease_owner=NULL, lease_token=lease_token+1, "
                 "conversation_id=NULL, openhands_account_id=NULL, "
+                "abandoned = CASE WHEN %s::text IS NULL THEN abandoned "
+                "  ELSE abandoned || jsonb_build_array(jsonb_build_object("
+                "    'conversation_id', %s::text, 'account_id', %s::text, "
+                "    'at', now())) END, "
                 "evidence = CASE WHEN %s::text IS NULL THEN evidence "
                 "  ELSE evidence || jsonb_build_array(jsonb_build_object("
                 "    'abandoned', 'switch', 'attempt', %s, "
@@ -842,7 +912,8 @@ class LabStore:
                 "  WHEN tried_accounts ? %s::text THEN tried_accounts "
                 "  ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "updated_at=now() WHERE id=%s RETURNING *",
-                (abandoned, row["attempt"], abandoned,
+                (abandoned, abandoned, str(current) if current else None,
+                 abandoned, row["attempt"], abandoned,
                  target_account_id,
                  str(current) if current else None,
                  str(current) if current else None,
