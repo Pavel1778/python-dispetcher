@@ -1446,3 +1446,38 @@ transports pause the conversation
 the Cloud V1 surface only pauses at the *sandbox* level. A caller must not treat
 a `False` as "stopped" — the branch lock remains the guarantee that two
 executors do not push to one branch at once.
+
+## The lab worker is a separate process and must outlive the database (this session)
+
+The autonomous lab is advanced by a loop that runs in two places: the web
+server's own thread (unless `NEXUS_LAB_INLINE` says no) and a separate
+`python -m orchestration.lab_worker` process. Three launch paths start the
+separate process: `docker-compose.yml` (the `worker` service),
+`render.yaml` (the `python-dispetcher-lab-worker` worker service), and the
+systemd unit now shipped at `packaging/systemd/nexus-lab-worker.service`.
+All three run the same module with the same `SUPABASE_DB_URL`, so the API and
+the worker agree on configuration and share one PostgreSQL.
+
+- **The worker loop must survive a transient database error.** `PostgresStore`
+  raises `StoreUnavailable` while it reconnects, and the driver never
+  reconnects by itself. `LabWorker.run_forever` used to let that propagate out
+  of the loop, so one blip (a database restart, a pooler recycling its clients,
+  a network reset) killed the only thing advancing the runs; the web server's
+  inline loop already caught it, so the two paths disagreed. The loop now
+  catches the error, logs it, and retries on the next pass; registration is
+  retried until it sticks and the final deregistration is best effort. Do not
+  "simplify" this back to a bare `tick_once()` in the loop.
+- **The worker is judged by what it changes, not by its log.** `tests/test_lab_worker_process.py`
+  starts the real child process against real PostgreSQL and the fake OpenHands
+  Cloud/GitHub (the web server runs with `NEXUS_LAB_INLINE=0`, so the worker is
+  the only actor): it must register as kind `worker` (a fresh heartbeat in
+  `nexus_lab_workers`), pass the `lab_worker` diagnostic as `VERIFIED`, claim and
+  dispatch, reach `completed`, survive a `SIGKILL` (a second process continues
+  the run without starting a second conversation), and keep working with no
+  client connected. `tests/test_planner_worker.py::test_the_worker_loop_outlives_a_transient_database_error`
+  is the load-bearing resilience case (removing the fix makes it fail).
+- **`tests/test_worker_setup.py`** checks the launch artifacts without starting
+  anything: the systemd unit parses and runs the worker module, Compose and
+  Render define a worker service on the same database, and `docs/WORKER_SETUP.md`
+  documents every mechanism. Keep the three launch paths pointing at the same
+  module.

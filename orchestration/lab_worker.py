@@ -131,15 +131,41 @@ class LabWorker:
         return summary
 
     def run_forever(self) -> None:
-        self.lab.register_worker(self.worker_id, kind="worker")
+        # The loop outlives the database. A pass that fails because the store
+        # is briefly unreachable (a restart, a pooler recycling its clients, a
+        # network reset) is logged and retried on the next pass, exactly as the
+        # web server's own loop does; before this, one transient
+        # ``StoreUnavailable`` ended the process, and with it every run the
+        # worker was the only one advancing. Registration is retried until it
+        # sticks, and the final deregistration is best effort: a worker that
+        # cannot reach the database on the way out must still exit.
+        registered = False
         try:
             while not self._stop.is_set():
-                summary = self.tick_once()
+                if not registered:
+                    try:
+                        self.lab.register_worker(self.worker_id, kind="worker")
+                        registered = True
+                    except Exception:  # noqa: BLE001 - retried next pass
+                        log.exception("could not register worker %s; will retry", self.worker_id)
+                if registered:
+                    try:
+                        summary = self.tick_once()
+                    except Exception as e:  # noqa: BLE001 - a database blip must not stop the worker
+                        log.exception("lab pass failed")
+                        summary = {"runs": 0, "advanced": 0,
+                                   "errors": [f"{type(e).__name__}: {e}"]}
+                else:
+                    summary = {"runs": 0, "advanced": 0, "errors": []}
                 if summary["advanced"] or summary["errors"]:
                     log.info("tick: %s", summary)
                 self._stop.wait(self.poll_interval)
         finally:
-            self.lab.stop_worker(self.worker_id)
+            try:
+                self.lab.stop_worker(self.worker_id)
+            except Exception:  # noqa: BLE001 - the process is stopping; best effort
+                log.debug("could not record that worker %s stopped", self.worker_id,
+                          exc_info=True)
 
     def stop(self) -> None:
         self._stop.set()

@@ -56,23 +56,24 @@ processes agree on configuration.
 (`python-dispetcher-lab-worker`) beside the web service. Both run
 `python -m orchestration.lab_worker` / `web_server` against the same database.
 
-**systemd** — a unit that runs the worker as a long-lived service:
+**systemd** — a ready unit ships in the repository
+(`packaging/systemd/nexus-lab-worker.service`). Install it on a host that runs
+the web server and shares its PostgreSQL:
 
-```ini
-[Unit]
-Description=NEXUS autonomous lab worker
-After=network-online.target
-
-[Service]
-WorkingDirectory=/opt/nexus
-EnvironmentFile=/opt/nexus/.env
-ExecStart=/opt/nexus/.venv/bin/python -m orchestration.lab_worker --worker-id systemd-1
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo install -m 0644 packaging/systemd/nexus-lab-worker.service \
+    /etc/systemd/system/nexus-lab-worker.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now nexus-lab-worker
+systemctl status nexus-lab-worker
+journalctl -u nexus-lab-worker -f
 ```
+
+It reads the same `EnvironmentFile` as the web server (so both agree on
+`SUPABASE_DB_URL`, `OPENHANDS_*`, `GITHUB_TOKEN`, `NEXUS_SECRET_KEY`), runs
+`python -m orchestration.lab_worker --worker-id systemd-1`, restarts on failure
+(`Restart=always`) and stops gracefully on `SIGTERM`. Adjust `WorkingDirectory`
+and the interpreter path in the unit to the deployment.
 
 ## The web server's own loop
 
@@ -91,5 +92,16 @@ marked `failed` if it has exhausted its attempts. A task whose conversation was
 already started is simply followed by whichever worker ticks next — polling is
 stateless. Nothing is dispatched twice.
 
+The loop also outlives the database. A pass that fails because the store is
+briefly unreachable (a database restart, a pooler recycling its clients, a
+network reset) is logged and retried on the next pass — the worker process does
+not exit, and registration is retried until it sticks. Without that, one
+transient error would kill the only thing advancing the runs.
+
 `tests/test_lab_store.py` covers lease reclaim, attempt budgets and the
 heartbeat. `tests/test_lab_loop.py` covers the full tick ordering.
+`tests/test_planner_worker.py` covers the loop surviving a failing run and a
+transient database error. `tests/test_lab_worker_process.py` starts the real
+`python -m orchestration.lab_worker` child process, against real PostgreSQL and
+the fake OpenHands Cloud/GitHub, and proves it registers, heartbeats, claims,
+dispatches, survives a hard kill and continues with no client connected.
