@@ -22,6 +22,25 @@ class FakeCloud:
     """Mutable state backing the fake server."""
 
     def __init__(self):
+        # Stop signals: the sandboxes asked to pause, in order; sandboxes
+        # that take the call and go on all the same; a status to refuse the
+        # call with; and one to refuse a follow-up message with.
+        # A status to answer the account's settings with instead of the
+        # settings: 401 is a rejected key, 503 a service that is down.
+        self.settings_status = 0
+        # The key every request carried, in order: which key a service was
+        # shown is what says two connections are kept apart.
+        self.keys: list[str] = []
+        self.paused: list[str] = []
+        self.pause_ignored: set[str] = set()
+        self.pause_status = 0
+        self.send_message_status = 0
+        # What /openapi.json says (read-only discovery): the version, and the
+        # paths. ``None`` for the version means "publishes no description"
+        # (404); ``api_paths_missing`` takes paths out of the description, the
+        # way an older or different service would lack them.
+        self.api_version: str | None = "1.50.1"
+        self.api_paths_missing: set[str] = set()
         self.start_tasks: dict[str, dict] = {}
         self.conversations: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}
@@ -136,7 +155,11 @@ class _Handler(BaseHTTPRequestHandler):
         return self.server.cloud  # type: ignore[attr-defined]
 
     def _auth_ok(self) -> bool:
-        return self.headers.get("Authorization", "").startswith("Bearer ")
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            self.cloud.keys.append(header[len("Bearer "):])
+            return True
+        return False
 
     def _json(self, code: int, payload) -> None:
         body = json.dumps(payload).encode()
@@ -160,6 +183,28 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/app-conversations/count":
             return self._json(200, {"count": len(self.cloud.conversations)})
 
+        if path == "/openapi.json":
+            # The live service serves this; the version and the paths are read
+            # from it. The parameter names differ from the client's on purpose:
+            # only the shape of a path may matter.
+            if self.cloud.api_version is None:
+                return self._json(404, {"detail": "Not Found"})
+            paths = [
+                "/api/v1/app-conversations",
+                "/api/v1/app-conversations/start-tasks",
+                "/api/v1/app-conversations/search",
+                "/api/v1/app-conversations/count",
+                "/api/v1/app-conversations/{conversation_id}/send-message",
+                "/api/v1/conversation/{conversation_id}/events/search",
+                "/api/v1/sandboxes",
+                "/api/v1/sandboxes/{sandbox_id}/pause",
+                "/api/v1/settings",
+            ]
+            return self._json(200, {
+                "openapi": "3.1.0",
+                "info": {"title": "OpenHands", "version": self.cloud.api_version},
+                "paths": {p: {} for p in paths if p not in self.cloud.api_paths_missing}})
+
         if path == "/api/v1/app-conversations":
             ids = self._query("ids")
             out = [self.cloud.conversations.get(i) for i in ids.split(",") if i]
@@ -176,6 +221,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"items": items, "next_page_id": None})
 
         if path == "/api/v1/settings":
+            if self.cloud.settings_status:
+                # The service is down (5xx) or the key is rejected (401).
+                return self._json(self.cloud.settings_status, {"detail": "refused"})
             return self._json(200, self.cloud.settings)
 
         if path == "/api/agent-profiles":
@@ -290,10 +338,41 @@ class _Handler(BaseHTTPRequestHandler):
         if path.endswith("/send-message"):
             cid = path.split("/")[4]
             body = self._read_body()
+            if cid not in self.cloud.conversations:
+                return self._json(404, {"detail": "conversation not found"})
+            if self.cloud.send_message_status:
+                return self._json(self.cloud.send_message_status, {"detail": "refused"})
             text = "".join(c.get("text", "") for c in (body.get("content") or []))
             self.cloud.messages.setdefault(cid, []).append(text)
+            # A message with ``run`` wakes the agent: the conversation is at
+            # work again, as on the live service.
+            if body.get("run"):
+                self.cloud.conversations[cid]["execution_status"] = "running"
+                self.cloud.conversations[cid]["sandbox_status"] = "RUNNING"
             return self._json(200, {"success": True, "sandbox_status": "RUNNING",
                                     "message": None})
+
+        # POST /api/v1/sandboxes/{sandbox_id}/pause - how a cloud conversation
+        # is stopped: the sandbox that runs it is paused. A conversation whose
+        # sandbox is not running reports no execution status at all.
+        if path.startswith("/api/v1/sandboxes/") and path.endswith("/pause"):
+            self._read_body()
+            sid = path.split("/")[4]
+            if self.cloud.pause_status:
+                return self._json(self.cloud.pause_status, {"detail": "pause refused"})
+            known = sid in self.cloud.sandboxes
+            for conversation in self.cloud.conversations.values():
+                if conversation.get("sandbox_id") == sid:
+                    known = True
+                    if sid not in self.cloud.pause_ignored:
+                        conversation["sandbox_status"] = "PAUSED"
+                        conversation["execution_status"] = None
+            if not known:
+                return self._json(404, {"detail": "sandbox not found"})
+            if sid in self.cloud.sandboxes and sid not in self.cloud.pause_ignored:
+                self.cloud.sandboxes[sid]["status"] = "PAUSED"
+            self.cloud.paused.append(sid)
+            return self._json(200, {"success": True})
 
         return self._json(404, {"detail": "not found"})
 

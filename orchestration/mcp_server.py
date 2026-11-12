@@ -76,6 +76,11 @@ class McpServer:
             "get_execution_status": self._get_execution_status,
             "list_evidence": self._list_evidence,
             "verify_evidence": self._verify_evidence,
+            "list_runs": self._list_runs,
+            "get_run": self._get_run,
+            "cancel_run": self._cancel_run,
+            "list_project_executors": self._list_project_executors,
+            "assign_project_executor": self._assign_project_executor,
         }
 
     # -------------------------------------------------------------- schemas
@@ -105,6 +110,21 @@ class McpServer:
                   {"project_id": _s("string"), "evidence_id": _s("string"),
                    "expected_commit": _s("string")},
                   ["project_id", "evidence_id"]),
+            _tool("list_runs", "List a project's autonomous runs (cancelled ones are hidden).",
+                  {"project_id": _s("string")}, ["project_id"]),
+            _tool("get_run", "Get one autonomous run with its tasks and its report.",
+                  {"project_id": _s("string"), "run_id": _s("string")},
+                  ["project_id", "run_id"]),
+            _tool("cancel_run", "Stop an autonomous run for good (terminal, idempotent).",
+                  {"project_id": _s("string"), "run_id": _s("string")},
+                  ["project_id", "run_id"]),
+            _tool("list_project_executors",
+                  "List the OpenHands executors assigned to a project.",
+                  {"project_id": _s("string")}, ["project_id"]),
+            _tool("assign_project_executor",
+                  "Assign an OpenHands account to a project (primary or fallback).",
+                  {"project_id": _s("string"), "account_id": _s("string"),
+                   "role": _s("string")}, ["project_id", "account_id"]),
         ]
 
     # ---------------------------------------------------------------- tools
@@ -186,6 +206,57 @@ class McpServer:
             "openhands_configured": bool(os.environ.get("OPENHANDS_API_KEY")),
             "github_configured": bool(os.environ.get("GITHUB_TOKEN")),
         }
+
+    def _list_runs(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)
+        from .nexus_lab_store import LabStore
+        return {"runs": LabStore(self.store).list_runs(self.principal, pid)}
+
+    def _get_run(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)
+        from .nexus_lab_store import LabStore
+        from .nexus_reports import ReportService
+        lab = LabStore(self.store)
+        run = lab.get_run(self.principal, pid, args["run_id"])
+        return {"run": run, "tasks": lab.list_tasks(self.principal, pid, args["run_id"]),
+                "report": ReportService(self.store).for_run(args["run_id"])}
+
+    def _cancel_run(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)
+        from .nexus_lab_store import LabStore
+        # Settles the run, hides it and leaves a stop signal for every
+        # conversation at work for it; a second cancel changes nothing.
+        run = LabStore(self.store).set_run_state(self.principal, pid, args["run_id"],
+                                                 "cancelled")
+        return {"run": run}
+
+    def _list_project_executors(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)
+        return self._executors().get(self.principal, pid)
+
+    def _assign_project_executor(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)  # membership; the service re-checks ownership
+        role = args.get("role") or "fallback"
+        if role not in ("primary", "fallback", "backup"):
+            raise McpError(-32602, "role must be 'primary' or 'fallback'")
+        service = self._executors()
+        if role == "primary":
+            return service.make_primary(self.principal, pid, args["account_id"])
+        current = service.get(self.principal, pid)
+        entries = [{"account_id": e["account_id"], "enabled": e["enabled"]}
+                   for e in current["executors"] if e["account_id"] != args["account_id"]]
+        entries.append({"account_id": args["account_id"], "enabled": True})
+        return service.set(self.principal, pid, executors=entries)
+
+    def _executors(self):
+        from .nexus_executors import ProjectExecutorService
+        from .nexus_openhands_accounts import OpenHandsAccountService
+        return ProjectExecutorService(self.store, OpenHandsAccountService(self.store))
 
     def _list_evidence(self, args: dict) -> Any:
         pid = args["project_id"]

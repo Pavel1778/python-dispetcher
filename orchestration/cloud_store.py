@@ -375,7 +375,20 @@ class PostgresStore:
                             "attempt", "max_attempts", "conversation_id",
                             "openhands_account_id", "tried_accounts",
                             "preferred_account_id", "lease_owner", "lease_token",
-                            "abandoned"),
+                            "abandoned",
+                            "cycle", "retry_at", "wait_reason", "started_at"),
+        "nexus_runs": ("id", "project_id", "goal_id", "state", "iteration",
+                       "policy", "cycle", "resume_at", "conversation_id",
+                       "hidden_at", "total_iterations"),
+        "nexus_run_reports": ("run_id", "project_id", "conversation_id", "state",
+                              "body", "attempts", "next_attempt_at"),
+        "nexus_executor_stops": ("id", "run_id", "task_id", "conversation_id",
+                                 "state", "attempts", "next_attempt_at"),
+        "nexus_task_executions": ("id", "run_id", "task_id", "kind",
+                                  "executor_label", "conversation_id"),
+        "nexus_project_executors": ("project_id", "account_id", "position", "enabled"),
+        "nexus_project_repositories": ("project_id", "repository_id",
+                                       "github_account_id", "is_primary"),
     }
 
     def verify_schema(self) -> list[str]:
@@ -1093,30 +1106,53 @@ class PostgresStore:
         agent_server_url: str,
         session_api_key: str,
         status: str = "RUNNING",
+        owner: str = "",
+        workspace: str = "",
     ) -> None:
-        """Record a started sandbox so a later dispatch can reuse it."""
+        """Record a started sandbox so a later dispatch can reuse it.
+
+        *owner* is whose sandbox it is: the id of the OpenHands connection that
+        started it, or ``""`` for the server's own key. A sandbox is only ever
+        offered back to its owner.
+
+        *workspace* is what its working directory holds: ``owner/name#branch``
+        of the repository it was started for, or ``""`` for work that names
+        none. A sandbox is reused only for the same workspace, so two tasks on
+        different repositories or branches never share a checkout.
+        """
         with self._tx() as cur:
             cur.execute(
                 """
                 INSERT INTO cloud_sandboxes(sandbox_id, agent_server_url,
-                                            session_api_key, status)
-                VALUES (%s,%s,%s,%s)
+                                            session_api_key, status, owner, workspace)
+                VALUES (%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (sandbox_id) DO UPDATE
                    SET agent_server_url = EXCLUDED.agent_server_url,
                        session_api_key = EXCLUDED.session_api_key,
                        status = EXCLUDED.status,
+                       owner = EXCLUDED.owner,
+                       workspace = EXCLUDED.workspace,
                        updated_at = now()
                 """,
-                (sandbox_id, agent_server_url, session_api_key, status),
+                (sandbox_id, agent_server_url, session_api_key, status, owner, workspace),
             )
 
-    def running_sandbox(self) -> dict[str, Any] | None:
-        """The most recently seen running sandbox, if any."""
+    def running_sandbox(self, owner: str = "", workspace: str = "") -> dict[str, Any] | None:
+        """The most recently seen running sandbox of *owner* that holds
+        *workspace*, if any.
+
+        Sandboxes are not shared between OpenHands connections: one started
+        with a connection's key holds that connection's work, and another
+        connection's key cannot even ask the service about it. Nor between
+        workspaces: every conversation of a sandbox works in one directory, so
+        a sandbox that holds a checkout of one repository and branch is not
+        given to a task on another.
+        """
         with self._tx() as cur:
             cur.execute(
                 "SELECT sandbox_id, agent_server_url, session_api_key, status "
-                "FROM cloud_sandboxes WHERE status='RUNNING' "
-                "ORDER BY updated_at DESC LIMIT 1"
+                "FROM cloud_sandboxes WHERE status='RUNNING' AND owner=%s AND workspace=%s "
+                "ORDER BY updated_at DESC LIMIT 1", (owner, workspace)
             )
             return cur.fetchone()
 
@@ -1127,13 +1163,16 @@ class PostgresStore:
                 (status, sandbox_id),
             )
 
-    def list_sandboxes(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        """Sandboxes this application knows about, most recent first."""
+    def list_sandboxes(self, *, limit: int = 20, owner: str | None = None
+                       ) -> list[dict[str, Any]]:
+        """Sandboxes this application knows about, most recent first; with
+        *owner*, only that connection's (``""`` is the server's own key)."""
         with self._tx() as cur:
             cur.execute(
                 "SELECT sandbox_id, agent_server_url, session_api_key, status "
-                "FROM cloud_sandboxes ORDER BY updated_at DESC LIMIT %s",
-                (limit,),
+                "FROM cloud_sandboxes WHERE (%s::text IS NULL OR owner=%s) "
+                "ORDER BY updated_at DESC LIMIT %s",
+                (owner, owner, limit),
             )
             return cur.fetchall()
 

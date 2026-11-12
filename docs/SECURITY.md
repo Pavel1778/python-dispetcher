@@ -26,14 +26,22 @@ all consult the same rules:
   cloud-metadata target. Private targets are allowed only when the operator sets
   `NEXUS_ALLOW_PRIVATE_TARGETS` (a test session does, because its fakes listen on
   127.0.0.1; a production deployment does not). A metadata address is refused
-  even then. The guard is enforced at every operator-supplied base URL:
+  even then. One host can be permitted by itself, without opening every private
+  address: `NEXUS_OPENHANDS_ALLOWED_HOSTS=host[,host:port…]` (a self-hosted
+  OpenHands). The URL of a connection a person adds through the API is checked
+  further by `net_guard` under the same settings: the host is looked up, every
+  address it has must pass, and the address is checked again when a socket is
+  opened (DNS rebinding). The guard is enforced at every operator-supplied base URL:
   `OPENHANDS_CLOUD_URL`, the sandbox agent-server URL, `GITHUB_API_URL` and each
   provider's `<NAME>_BASE_URL`.
 - **Secret redaction.** `install_log_redaction` attaches a `logging.Filter`
   that replaces credential-looking substrings (known env secrets, `ghp_…`,
   `github_pat_…`, `sk-…`, `Bearer …`, `user:password@`) with a placeholder, so a
   stray key in a log message or a traceback never reaches a log file. It is
-  installed by the web server, the worker and the MCP server at startup.
+  installed by the web server, the worker and the MCP server at startup - on
+  the root logger *and its handlers*: a logger's own filters do not see the
+  records of the named loggers below it, and those are nearly all the records
+  there are.
 - **No shell.** `safe_argv` documents and checks the rule that the one external
   program NEXUS runs (`git`, from the restore-point module) is always an
   argument list, never a shell string. A test scans the source for `shell=True`.

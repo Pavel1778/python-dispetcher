@@ -136,12 +136,94 @@ def test_the_server_alone_takes_a_run_from_the_chat_to_completed(monkeypatch):
         assert studio.app.last_lab_tick.get("errors") == []
 
 
-def test_a_report_that_names_no_commit_stops_the_run_and_resume_tries_again(monkeypatch):
+def _messages(studio, project):
+    """The chat the run was asked for in, as the studio reads it."""
+    status, listing = studio.api.get(f"/api/v1/projects/{project}/conversations")
+    assert status == 200, listing
+    conversation = listing["conversations"][0]["id"]
+    status, body = studio.api.get(
+        f"/api/v1/projects/{project}/conversations/{conversation}/messages")
+    assert status == 200, body
+    return body["messages"]
+
+
+def _told(studio, cid):
+    """What NEXUS said to a conversation after its first message."""
+    return list(studio.cloud.cloud.messages.get(cid, []))
+
+
+def test_a_report_that_names_no_commit_is_put_right_and_the_run_goes_on(monkeypatch):
+    """A result that does not verify is not the end of a run from the chat.
+
+    The agent finished and named no commit. Nobody presses anything: the
+    conversation that did the work is told what is missing, delivers it, the
+    next task runs, the run completes - and its report arrives in the chat it
+    was asked for in, with nobody watching."""
     with studio_stack(monkeypatch, lab_inline=True) as studio:
         project, run = _start_run(studio)
         first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
         _finish(studio, first, "Всё сделал, поверьте на слово.")
 
+        told = _until(lambda: _told(studio, first), what="the agent to be told what is missing")
+        assert "cannot accept it yet" in told[0] and "names no commit" in told[0]
+        assert "Push your work" in told[0] and "do not start over" in told[0]
+        detail = _detail(studio, project, run)
+        assert detail["run"]["state"] == "running" and detail["run"]["policy"] == "durable"
+        tasks = {t["task_key"]: t for t in detail["tasks"]}
+        assert (tasks["audit"]["state"], tasks["audit"]["attempt"]) == ("running", 2)
+        assert tasks["change"]["state"] == "pending", "a task ran on an unverified dependency"
+        assert len(_starts(studio)) == 1, "no second conversation: the first still has the work"
+        assert detail["report"] is None
+
+        _finish(studio, first, f"Отправил. Коммит {HEAD}")
+        second = _until(lambda: _task_conversation(studio, "change"),
+                        what="the second task to start")
+        _finish(studio, second, f"Коммит {HEAD}. Тесты: 14 passed.")
+        done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
+            _detail(studio, project, run)), what="the run to finish")
+        assert done["run"]["state"] == "completed"
+        assert {t["task_key"]: t["attempt"] for t in done["tasks"]} == {"audit": 2, "change": 1}
+        assert [(e["task_key"], e["kind"]) for e in done["executions"]] == [
+            ("audit", "start"), ("audit", "continue"), ("change", "start")]
+
+        # The report: in the run's record, and in the chat - once.
+        report = _until(lambda: (lambda d: d["report"] if d["report"]
+                                 and d["report"]["state"] == "delivered" else None)(
+            _detail(studio, project, run)), what="the report to be delivered")
+        reports = [m for m in _messages(studio, project) if (m.get("meta") or {}).get("report")]
+        assert len(reports) == 1 and reports[0]["content"] == report["body"]
+        assert reports[0]["meta"]["run_id"] == run
+        text = report["body"]
+        assert "> Цель: покрыть модуль тестами" in text
+        assert f"коммит `{HEAD[:10]}`" in text and "Тесты: 14 passed." in text
+        assert "1 из 2 задач потребовали повторных запусков" in text
+        time.sleep(0.5)                      # further passes of the loop add nothing
+        assert len([m for m in _messages(studio, project)
+                    if (m.get("meta") or {}).get("report")]) == 1
+
+
+def test_a_run_given_a_budget_stops_when_it_is_spent_and_resume_tries_again(monkeypatch):
+    """A run started over REST with an explicit budget keeps the behaviour it
+    always had: a task that does not verify stops it, and «Продолжить» sends
+    the task back with the attempts it has left."""
+    with studio_stack(monkeypatch, lab_inline=True) as studio:
+        project = studio.project()
+        assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                               {"full_name": REPO})[0] == 200
+        studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+        studio.answers(json.dumps(PLAN))
+        status, goal = studio.api.post(f"/api/v1/projects/{project}/goals",
+                                       {"text": "Цель: покрыть модуль тестами"})
+        assert status == 201, goal
+        status, started = studio.api.post(
+            f"/api/v1/projects/{project}/goals/{goal['goal']['id']}/run",
+            {"repository": REPO, "branch": "main", "max_iterations": 10})
+        assert status == 201, started
+        run = started["run"]["id"]
+        assert started["run"]["policy"] == "bounded"
+
+        first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
+        _finish(studio, first, "Всё сделал, поверьте на слово.")
         blocked = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
             _detail(studio, project, run)), what="the run to stop")
         assert blocked["run"]["state"] == "blocked"
@@ -150,7 +232,7 @@ def test_a_report_that_names_no_commit_stops_the_run_and_resume_tries_again(monk
         assert tasks["audit"]["verification"]["reason"] == (
             "no verifiable commit reported by the agent")
         assert tasks["change"]["state"] == "pending", "a task ran on an unverified dependency"
-        assert len(_starts(studio)) == 1
+        assert len(_starts(studio)) == 1 and _told(studio, first) == []
 
         # «Продолжить» sends the unverified task back; it gets a new conversation.
         status, body = studio.api.post(f"/api/v1/projects/{project}/runs/{run}/resume")
@@ -167,6 +249,58 @@ def test_a_report_that_names_no_commit_stops_the_run_and_resume_tries_again(monk
             _detail(studio, project, run)), what="the run to finish")
         assert done["run"]["state"] == "completed"
         assert {t["task_key"]: t["attempt"] for t in done["tasks"]} == {"audit": 2, "change": 1}
+
+
+def test_cancel_tells_openhands_to_stop_and_the_run_leaves_the_list(monkeypatch):
+    """«Отменить» in the studio: the run is settled and out of the list at
+    once, the conversation at work is really told to stop (the sandbox that
+    runs it is paused), and everything the run recorded can still be read."""
+    with studio_stack(monkeypatch, lab_inline=True) as studio:
+        project, run = _start_run(studio)
+        first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
+        sandbox = studio.cloud.cloud.conversations[first]["sandbox_id"]
+        _until(lambda: _detail(studio, project, run)["tasks"][0]["state"] == "running",
+               what="the task to be at work")
+
+        status, body = studio.api.post(f"/api/v1/projects/{project}/runs/{run}/cancel")
+        assert status == 200 and body["run"]["state"] == "cancelled", body
+        assert body["run"]["hidden"] is True
+        assert studio.api.get(f"/api/v1/projects/{project}/runs")[1]["runs"] == []
+
+        _until(lambda: sandbox in studio.cloud.cloud.paused, what="OpenHands to be told to stop")
+        stopped = _until(lambda: (lambda d: d if d["stops"] and d["stops"][0]["state"]
+                                  == "confirmed" else None)(_detail(studio, project, run)),
+                         what="the stop to be confirmed")
+        assert stopped["stops"][0]["conversation_id"] == first
+        assert stopped["stops"][0]["reason"] == "run cancelled"
+        assert studio.cloud.cloud.conversations[first]["sandbox_status"] == "PAUSED"
+        # Still there to be read: the run, its plan, who ran what.
+        assert stopped["run"]["state"] == "cancelled" and len(stopped["tasks"]) == 2
+        assert [e["outcome"] for e in stopped["executions"]] == ["cancelled"]
+        assert stopped["report"] is None
+
+        # The agent's late answer changes nothing, and nothing new is started.
+        _finish(studio, first, f"Коммит {HEAD}")
+        time.sleep(0.6)
+        assert _task_conversation(studio, "change") is None and len(_starts(studio)) == 1
+        assert studio.cloud.cloud.paused.count(sandbox) == 1, "told once, not on every pass"
+        # A second cancel is the same as the first.
+        status, again = studio.api.post(f"/api/v1/projects/{project}/runs/{run}/cancel")
+        assert status == 200 and again["run"]["cancelled_at"] == body["run"]["cancelled_at"]
+
+        # The same task can be asked for again at once.
+        studio.answers(json.dumps(PLAN))
+        conversation = studio.api.get(
+            f"/api/v1/projects/{project}/conversations")[1]["conversations"][0]["id"]
+        status, reply = studio.api.post(
+            f"/api/v1/projects/{project}/conversations/{conversation}/messages",
+            {"text": "Цель: покрыть модуль тестами", "mode": "autonomous"})
+        assert status == 200, reply
+        new_run = next(m["meta"]["run_id"] for m in reply["messages"]
+                       if (m.get("meta") or {}).get("run_id"))
+        assert new_run != run
+        assert [r["id"] for r in studio.api.get(
+            f"/api/v1/projects/{project}/runs")[1]["runs"]] == [new_run]
 
 
 def test_cancelling_from_the_studio_stops_the_server_starting_more(monkeypatch):

@@ -364,7 +364,10 @@ def test_after_the_run_has_ended_the_same_text_runs_again_from_the_same_plan(lab
     assert [(t["task_key"], t["title"]) for t in lab.run(second)["tasks"]] == tasks
     assert len(lab.model.prompts) == asked, "a finished plan was asked for again"
     assert len(lab.goals()) == 1
-    assert sorted(r["state"] for r in lab.runs()) == ["cancelled", "running"]
+    # The cancelled run has left the list (the interface shows what is at work)
+    # and is still there to be read by its id, with everything it recorded.
+    assert [r["state"] for r in lab.runs()] == ["running"]
+    assert lab.run(run_id)["run"]["state"] == "cancelled"
     assert lab.spec(spec_of(first))["run_id"] == second
 
 
@@ -853,11 +856,12 @@ def test_a_model_that_plans_nothing_still_leaves_no_requirement_unowned(lab):
 
 # ------------------------------------------------ the sandbox and the file
 def first_task(lab, run_id: str, *, timeout: float = 40.0) -> dict:
-    """The run's first task once it has been started, or the run has stopped."""
+    """The run's first task once it has been started, has been put to wait
+    for its next cycle, or the run has stopped."""
     def settled():
         detail = lab.run(run_id)
         first = detail["tasks"][0]
-        if detail["run"]["state"] != "running" or first["state"] == "running":
+        if detail["run"]["state"] != "running" or first["state"] in ("running", "waiting"):
             return {**first, "run": detail["run"]}
         return None
     return until(settled, timeout=timeout, what="the first task to be started or given up")
@@ -901,18 +905,21 @@ def test_no_agent_is_started_on_a_text_that_did_not_arrive_whole(lab, fault):
 
     task = first_task(lab, run_id)
     assert box.conversations == {}, "an agent was started without the whole text"
-    assert (task["state"], task["attempt"], task["conversation_id"]) == ("failed", 3, None)
-    assert task["last_error"].startswith("DeliveryError: ")
+    # Three starts were refused by the check: the attempts of this cycle are
+    # used, and the task waits for the next one. It is not given up - another
+    # sandbox may take the file - and the reason it waits is on its line.
+    assert (task["state"], task["cycle"], task["attempt"], task["conversation_id"]) == (
+        "waiting", 1, 0, None)
+    reason = task["wait_reason"]
+    assert reason.startswith("DeliveryError: ") and "Следующая попытка через" in reason
     if fault == "nowhere-to-write":
-        assert "Permission denied" in task["last_error"]
+        assert "Permission denied" in reason
     else:
         size = len(text.encode("utf-8"))
         held = {"cut-short": f"holds {size - 1} bytes", "one-byte-changed": f"holds {size} bytes",
                 "one-byte-added": f"holds more than {size + 1} bytes"}[fault]
-        assert held in task["last_error"] and f"{size} bytes were sent" in task["last_error"]
-    # The run stops and its own error says why - nobody has to open the task.
-    assert task["run"]["state"] == "blocked"
-    assert f"Task {task['task_key']} was not started: DeliveryError" in task["run"]["last_error"]
+        assert held in reason and f"{size} bytes were sent" in reason
+    assert task["run"]["state"] == "running" and task["retry_at"] is not None
     time.sleep(0.6)                                    # more passes of the lab loop
     assert box.conversations == {}
 

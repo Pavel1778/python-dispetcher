@@ -181,3 +181,26 @@ def test_add_requires_a_secret_key(store, clouds, monkeypatch):
         CloudClient(base_url=base_url, api_key=api_key, timeout=5.0))
     with pytest.raises(SecretsError):
         svc.add("user:alice", label="x", api_key="sk-x", base_url=a.base_url)
+
+
+def test_verify_records_the_api_version(service, clouds):
+    """The API version is read from the service and stored, for the UI to show."""
+    a, _b = clouds
+    view = service.add("user:alice", label="personal", api_key=KEY_A, base_url=a.base_url)
+    assert view["api_version"] == "1.50.1"
+    again = service.verify("user:alice", view["id"])
+    assert again["api_version"] == "1.50.1"
+
+
+def test_rename_changes_only_the_label(service, store, clouds):
+    a, _b = clouds
+    view = service.add("user:alice", label="before", api_key=KEY_A, base_url=a.base_url)
+    renamed = service.edit("user:alice", view["id"], label="after")
+    assert renamed["label"] == "after"
+    # The key and the URL are untouched.
+    with store._tx() as cur:
+        cur.execute("SELECT base_url, api_key_encrypted FROM nexus_openhands_accounts "
+                    "WHERE id=%s", (view["id"],))
+        row = cur.fetchone()
+    assert row["base_url"] == a.base_url
+    assert KEY_A.encode() not in bytes(row["api_key_encrypted"])

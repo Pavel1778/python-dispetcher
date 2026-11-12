@@ -19,7 +19,8 @@ Two rules from the task text are enforced throughout:
 
 * "Не считай текстовый ответ OpenHands доказательством выполнения." — a task is
   ``completed_verified`` only when the head of its branch on GitHub is a commit
-  the report names. A glowing report that names no commit stops the run.
+  the report names. A glowing report that names no commit is not accepted:
+  the task goes back to work (a run with explicit budgets stops instead).
 * "NEXUS должен контролировать каждый этап." — each stage has its own assertion,
   and the stages are asserted to be causally ordered (no task before its
   dependency; no evidence before a verdict; no notification before the run ends).
@@ -220,8 +221,13 @@ def test_a_text_answer_is_never_proof_of_work(monkeypatch):
     доказательством выполнения."
 
     A conversation that finishes with a confident report but names no commit is
-    ``completed_unverified``; its dependent task is never started and the run is
-    blocked, not completed.
+    not accepted: its dependent task is never started and the run does not
+    complete. A run started from the chat is durable, so it does not stop there
+    either ("ошибка проверки приводит к повторной работе, а не к ложному
+    завершению"): the agent is told what is missing, in the conversation that
+    did the work, and the task is at work again. A run with explicit budgets
+    still stops at this point, as it always did
+    (``tests/test_lab_inline.py::test_a_run_given_a_budget_stops_when_it_is_spent_and_resume_tries_again``).
     """
     with studio_stack(monkeypatch, lab_inline=True) as studio:
         project, run = _start_run(studio)
@@ -229,25 +235,45 @@ def test_a_text_answer_is_never_proof_of_work(monkeypatch):
                        what="the first task to start")
         _finish(studio, first, "Всё готово, поверьте на слово.")
 
-        blocked = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
-            _detail(studio, project, run)), what="the run to stop on an unverified task")
-        assert blocked["run"]["state"] == "blocked"
-        tasks = {t["task_key"]: t for t in blocked["tasks"]}
-        assert tasks["audit"]["state"] == "completed_unverified"
+        # Not accepted, and said so where the work was done.
+        told = _until(lambda: studio.cloud.cloud.messages.get(first),
+                      what="the agent to be told what is missing")
+        assert len(told) == 1 and "names no commit" in told[0]
+
+        def _back_at_work():
+            d = _detail(studio, project, run)
+            t = {x["task_key"]: x for x in d["tasks"]}["audit"]
+            return d if t["state"] == "running" and t["attempt"] == 2 else None
+
+        detail = _until(_back_at_work, what="the task to be at work again")
+        assert detail["run"]["state"] == "running", "the run neither stopped nor completed"
+        tasks = {t["task_key"]: t for t in detail["tasks"]}
+        assert tasks["audit"]["conversation_id"] == first
         assert tasks["audit"]["verification"]["reason"] == (
             "no verifiable commit reported by the agent")
         # The dependency was not trusted, so nothing downstream ran.
         assert tasks["change"]["state"] == "pending"
         assert len(_starts(studio)) == 1
 
-        # The unverified result is still signed into evidence: the record binds
-        # the commit the verifier *observed* on the branch, not a claim by the
-        # agent, and the task's own verdict is what says it did not verify.
+        # The attempt that was not accepted is still signed into evidence: the
+        # record binds the commit the verifier *observed* on the branch, not a
+        # claim by the agent, and the verdict in it says it did not verify.
         ev = _until(lambda: _evidence_for_task(studio, project, tasks["audit"]["id"]),
                     what="the EVIDENCE stage to write the signed record")
         assert ev["verdict"] == "VERIFIED"
         assert ev["commit_sha"] == HEAD, "the record must bind the observed branch head"
         assert ev["body"]["detail"]["verdict"] == "completed_unverified"
+
+        # Told what was missing, the agent names the commit; now it counts.
+        _finish(studio, first, f"Коммит {HEAD}")
+        second = _until(lambda: _conversation_for(studio, "change"),
+                        what="the dependent task to start once its dependency verified")
+        _finish(studio, second, f"Коммит {HEAD}")
+        done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
+            _detail(studio, project, run)), what="the run to finish")
+        assert done["run"]["state"] == "completed"
+        assert {t["task_key"]: (t["state"], t["attempt"]) for t in done["tasks"]} == {
+            "audit": ("completed_verified", 2), "change": ("completed_verified", 1)}
 
 
 def test_the_loop_is_advanced_by_the_separate_worker_not_the_server(monkeypatch):

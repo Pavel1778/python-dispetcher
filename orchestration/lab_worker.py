@@ -37,6 +37,7 @@ from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
 from .nexus_policy import install_log_redaction
+from .nexus_reports import ReportService
 from .nexus_specs import SpecService
 
 log = logging.getLogger("lab_worker")
@@ -80,7 +81,7 @@ class LabWorker:
                  github: GitHubClient | None = None,
                  github_accounts: GitHubAccountService | None = None,
                  heartbeat_seconds: int = 60, account_router: Any | None = None,
-                 evidence: Any | None = None):
+                 evidence: Any | None = None, discover_router: bool = True):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
@@ -90,6 +91,11 @@ class LabWorker:
         # switched out for another with a context hand-off. Without it the
         # process-wide client runs every task, as before.
         self.account_router = account_router
+        #: Whether a worker that has no router asks, on every pass, whether
+        #: the deployment has gained a stored connection since (see
+        #: ``_find_router``). Off for a caller that wants the server's own key
+        #: used whatever is stored.
+        self.discover_router = discover_router
         # The EVIDENCE stage: when given, every settled task result is signed
         # into the Evidence Trust Engine (``nexus_evidence``). Built from the
         # environment by ``main`` (a signer only when the key is configured),
@@ -100,6 +106,9 @@ class LabWorker:
         self.executor = OpenHandsExecutor(
             self.client, specs=SpecService(store), router=account_router,
             client_factory=self._client_for_account if account_router else None)
+        # A completed run's report: written with the completion, delivered to
+        # the chat the run was started from.
+        self.reports = ReportService(store)
         # A branch is read with the GitHub account its project is bound to, as
         # the studio reads it; the server token only where no account is bound.
         self.verifier = GitVerifier(self.github, client_for=project_github(
@@ -123,20 +132,44 @@ class LabWorker:
         """
         from .nexus_openhands_accounts import OpenHandsAccountService
 
-        service = OpenHandsAccountService(self.store)
-        principal = (self.account_router.principal_for_task(task)
-                     if self.account_router and task
-                     else (self.account_router.principal if self.account_router
-                           else "machine:default"))
-        return service.execution_client_for_account(principal, account_id)
+        # Which account a task may use was decided by the router; the worker
+        # owns none of them, so the connection is read by its id.
+        return OpenHandsAccountService(self.store).execution_client_internal(account_id)
 
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
-                            router=self.account_router, evidence=self.evidence)
+                            router=self.account_router, reports=self.reports,
+                            evidence=self.evidence)
+
+    def _find_router(self) -> None:
+        """Start using stored connections once the deployment has any.
+
+        ``build_account_router`` answers "none" for a deployment with no
+        stored connection, and the worker then runs everything under the
+        server's own key. That answer used to be final for the life of the
+        process: a connection added in the studio an hour later was not used
+        until a restart. It is asked again here, cheaply, on every pass.
+        """
+        if self.account_router is not None or not self.discover_router:
+            return
+        from .openhands_router import build_account_router
+
+        try:
+            router = build_account_router(self.store)
+        except Exception:  # noqa: BLE001 - asked again on the next pass
+            log.debug("could not look for stored OpenHands connections", exc_info=True)
+            return
+        if router is None:
+            return
+        log.info("stored OpenHands connections found: tasks are routed through them")
+        self.account_router = router
+        self.executor.router = router
+        self.executor._client_factory = self._client_for_account
 
     def tick_once(self) -> dict[str, Any]:
         """One pass over every active run. Returns a small summary for logs."""
+        self._find_router()
         sched = self.scheduler()
         summary: dict[str, Any] = {"runs": 0, "advanced": 0, "errors": []}
         for run_id in active_run_ids(self.store):
@@ -148,11 +181,31 @@ class LabWorker:
             except Exception as e:  # noqa: BLE001 - one bad run must not stop the loop
                 log.exception("run %s tick failed", run_id)
                 summary["errors"].append(f"{run_id}: {type(e).__name__}: {e}")
+        # What is owed whatever the runs are doing, and survives a restart
+        # because it is rows: stop signals to conversations that must not go
+        # on (a cancelled run's, among others), reports that are written and
+        # not yet in their chat, and a look at executors that were written off.
+        for name, step in (("stops", sched.deliver_stops),
+                           ("reports", self.reports.deliver_due),
+                           ("executors", self._reprobe)):
+            try:
+                done = step()
+                if done and any(done.values() if isinstance(done, dict) else [done]):
+                    summary[name] = done
+            except Exception as e:  # noqa: BLE001 - the pass goes on
+                log.exception("%s step failed", name)
+                summary["errors"].append(f"{name}: {type(e).__name__}: {e}")
         # The heartbeat is written even when nothing advanced, so an idle worker
         # still reads as alive (a lease alone cannot tell idle from dead).
         last_error = summary["errors"][-1] if summary["errors"] else None
         self.lab.heartbeat(self.worker_id, error=last_error)
         return summary
+
+    def _reprobe(self) -> int:
+        """Ask connections marked unavailable whether they answer again."""
+        if self.account_router is None:
+            return 0
+        return len([item for item in self.account_router.reprobe() if item["healthy"]])
 
     def run_forever(self) -> None:
         # The loop outlives the database. A pass that fails because the store

@@ -60,6 +60,7 @@
     blocked: ['заблокировано', 'warn'], failed: ['ошибка', 'bad'],
     cancelled: ['отменено', 'idle'], dead_letter: ['остановлено после ошибок', 'bad'],
     paused: ['на паузе', 'warn'], waiting_for_approval: ['ждёт подтверждения', 'warn'],
+    waiting: ['ждёт повтора', 'warn'],
     pending: ['ожидает', 'idle'], dispatched: ['отправлена', 'run'],
     completed_verified: ['готово, проверено', 'ok'],
     completed_unverified: ['готово, без проверки', 'warn'],
@@ -68,7 +69,7 @@
   };
   var TOOLS = { start_workflow: 'Запуск задачи OpenHands', start_run: 'Запуск автономного прогона' };
   // States that change on their own, so they are worth polling.
-  var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1 };
+  var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1, waiting: 1 };
 
   function stateLabel(state) { return (STATES[state] || [state || 'неизвестно'])[0]; }
   function stateTone(state) { return (STATES[state] || ['', 'idle'])[1]; }
@@ -85,8 +86,9 @@
     mode: 'ask', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
-    work: { items: [], data: {}, timer: null },
-    accounts: { github: null, openhands: null }
+    work: { items: [], data: {}, timer: null, hidden: {} },
+    accounts: { github: null, openhands: null },
+    projectSettings: null
   };
   var routeSeq = 0;
 
@@ -198,20 +200,36 @@
     if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few;
     return many;
   }
+  // One way to copy, for every button that copies: the Clipboard API where
+  // the browser offers it, the old selection command where it does not (an
+  // http:// origin, an embedded web view) or where the API refuses - a
+  // permission that was denied is an error of the API, not of the text. The
+  // promise is rejected only when both ways have failed; ``copied`` then
+  // shows the text for copying by hand, so the text is never out of reach.
+  function copyLegacy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.className = 'sr-only';
+    document.body.appendChild(area);
+    area.select();
+    area.setSelectionRange(0, text.length);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    area.remove();
+    return ok;
+  }
+
   function copyText(text) {
-    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
-    return new Promise(function (resolve, reject) {
-      var area = document.createElement('textarea');
-      area.value = text;
-      area.setAttribute('readonly', '');
-      area.className = 'sr-only';
-      document.body.appendChild(area);
-      area.select();
-      var ok = false;
-      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-      area.remove();
-      if (ok) resolve(); else reject(new Error('copy failed'));
-    });
+    text = String(text == null ? '' : text);
+    var legacy = function () {
+      return copyLegacy(text) ? Promise.resolve() : Promise.reject(new Error('copy failed'));
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+      try { return navigator.clipboard.writeText(text).then(null, legacy); }
+      catch (e) { return legacy(); }
+    }
+    return legacy();
   }
 
   function toast(text, kind) {
@@ -550,9 +568,25 @@
         : meta.run_id ? { kind: 'run', id: String(meta.run_id) } : null;
       if (!entry) return;
       entry.key = entry.kind + ':' + entry.id;
-      if (!seen[entry.key]) { seen[entry.key] = true; items.push(entry); }
+      if (!seen[entry.key] && !S.work.hidden[entry.key]) {
+        seen[entry.key] = true;
+        items.push(entry);
+      }
     });
     return items.reverse();   // newest first
+  }
+
+  // A cancelled run is gone from the interface. The card is dropped from the
+  // in-memory list and the record is marked hidden, so a later refresh that
+  // re-reads the run (a reload, a poll) does not bring it back. The row is not
+  // deleted anywhere: the history, tasks and report stay on the server.
+  function dropWork(key) {
+    S.work.hidden[key] = true;
+    S.work.items = S.work.items.filter(function (item) { return item.key !== key; });
+    delete S.work.data[key];
+    renderWorkBadges();
+    patchWorkChips();
+    if (S.ws.open && S.ws.tab === 'agent') renderAgent();
   }
 
   function openConversation(convId) {
@@ -598,11 +632,22 @@
       icon('chevron-right', 'icon-sm') + '</button>';
   }
 
+  // One copy button, used by every message that has one. The same handler
+  // (``copy-message``) and the same ``copyText`` fallback serve the assistant's
+  // reply and the user's own message; the report uses ``copy-report``.
+  function copyButton(id, label) {
+    return '<button class="icon-btn sm" type="button" data-action="copy-message" data-id="' + id +
+      '" aria-label="' + esc(label) + '" title="Скопировать">' + icon('copy', 'icon-sm') + '</button>';
+  }
+
   function messageHtml(message) {
     var meta = message.meta || {};
     var id = esc(message.id || '');
     if (message.role === 'user') {
-      return '<article class="msg user" data-id="' + id + '"><div class="bubble">' + esc(message.content) + '</div></article>';
+      // A copy button on the user's own message: the task text is often long
+      // and worth reusing. The full text is copied, never the rendered bubble.
+      return '<article class="msg user" data-id="' + id + '"><div class="bubble">' + esc(message.content) + '</div>' +
+        '<div class="msg-actions">' + copyButton(id, 'Скопировать сообщение') + '</div></article>';
     }
     if (message.role === 'tool') {
       var ref = meta.workflow_id || meta.run_id;
@@ -631,7 +676,7 @@
       (entry ? workChip(entry) : '') +
       '<div class="msg-meta">' + (label ? '<span class="msg-model">' + esc(label) + '</span>' : '') +
       '<span title="' + esc(fullTime(message.created_at)) + '">' + esc(clock(message.created_at)) + '</span>' +
-      '<button class="icon-btn sm" type="button" data-action="copy-message" data-id="' + id + '" aria-label="Скопировать ответ" title="Скопировать">' + icon('copy', 'icon-sm') + '</button>' +
+      copyButton(id, meta.report ? 'Скопировать отчёт' : 'Скопировать ответ') +
       '</div></div></article>';
   }
 
@@ -862,8 +907,21 @@
       request = api(projectUrl('/runs/' + enc(entry.id)))
         .then(function (data) { return { state: data.run.state, detail: data }; });
     }
-    return request.then(function (record) { S.work.data[entry.key] = record; },
-                        function (error) { S.work.data[entry.key] = { state: null, error: error.message }; });
+    return request.then(function (record) {
+      // Work that was cancelled or stopped is gone from the interface, even
+      // when the chat still carries a chip for it (it was stopped on another
+      // device, or before a reload) - and so is a run that was hidden. Its
+      // history stays on the server; only the view drops it.
+      var run = entry.kind === 'run' && record.detail && record.detail.run;
+      if (record.state === 'cancelled' || (run && run.hidden)) {
+        dropWork(entry.key);
+        return null;
+      }
+      S.work.data[entry.key] = record;
+      return null;
+    }, function (error) {
+      S.work.data[entry.key] = { state: null, error: error.message };
+    });
   }
 
   function movingWork() {
@@ -883,9 +941,18 @@
 
   function patchWorkChips() {
     $$('.work-chip').forEach(function (chip) {
-      var record = S.work.data[chip.getAttribute('data-key')];
-      if (!record) return;
+      var key = chip.getAttribute('data-key');
+      var record = S.work.data[key];
       var dot = $('.dot', chip), state = $('.work-chip-state', chip);
+      if (S.work.hidden[key]) {
+        // Stopped by a person: the chip in the transcript says so and leads
+        // nowhere, because there is nothing left to open.
+        dot.className = 'dot is-idle';
+        state.textContent = 'остановлено';
+        chip.disabled = true;
+        return;
+      }
+      if (!record) return;
       if (record.state) {
         dot.className = 'dot is-' + stateTone(record.state);
         state.textContent = stateLabel(record.state);
@@ -896,10 +963,56 @@
     });
   }
 
+  // A plan that is still being built in the background: the chat was told
+  // "planning", and the message that names the run has not arrived yet.
+  function planningPending() {
+    for (var i = S.messages.length - 1; i >= 0; i--) {
+      var meta = S.messages[i].meta || {};
+      if (meta.run_id || meta.error) return false;
+      if (meta.planning) return true;
+      if (S.messages[i].role === 'user') return false;
+    }
+    return false;
+  }
+
+  // A report the server has put in this chat and the page has not shown yet.
+  function reportMissing() {
+    var known = {};
+    S.messages.forEach(function (message) { known[String(message.id)] = true; });
+    return S.work.items.some(function (entry) {
+      var record = S.work.data[entry.key];
+      var report = record && record.detail && record.detail.report;
+      return report && report.state === 'delivered' && report.message_id && !known[String(report.message_id)];
+    });
+  }
+
+  // The server writes into a chat with nobody asking: the report of a run that
+  // completed, the announcement of a run whose plan was built in the
+  // background. The transcript is read again when one of those is due, so it
+  // appears in the open chat by itself. A thread the reader has scrolled up
+  // stays where it is.
+  function syncThread() {
+    if (!S.convId || S.sending || !(reportMissing() || planningPending())) return Promise.resolve();
+    var convId = S.convId;
+    return api(projectUrl('/conversations/' + enc(convId) + '/messages')).then(function (data) {
+      var fresh = data.messages || [];
+      if (convId !== S.convId || S.sending || fresh.length <= S.messages.length) return null;
+      var thread = $('#thread'), pinned = threadPinned, top = thread.scrollTop;
+      S.messages = fresh;
+      var before = S.work.items.length;
+      S.work.items = workFromMessages();
+      renderThread();
+      if (!pinned) { thread.scrollTop = top; threadPinned = false; }
+      patchWorkChips();
+      // A run that was just announced is loaded like any other.
+      return S.work.items.length !== before ? refreshWork() : null;
+    }, function () { return null; });
+  }
+
   function scheduleWorkPoll() {
     clearTimeout(S.work.timer);
     S.work.timer = null;
-    if (!movingWork() || document.visibilityState !== 'visible') return;
+    if (!(movingWork() || planningPending()) || document.visibilityState !== 'visible') return;
     S.work.timer = setTimeout(refreshWork, 5000);
   }
 
@@ -907,13 +1020,15 @@
     clearTimeout(S.work.timer);
     S.work.timer = null;
     var convId = S.convId;
-    if (!S.work.items.length) { renderWorkBadges(); return Promise.resolve(); }
+    if (!S.work.items.length && !planningPending()) { renderWorkBadges(); return Promise.resolve(); }
     return Promise.all(S.work.items.map(loadWork)).then(function () {
-      if (convId !== S.convId) return;
+      if (convId !== S.convId) return null;
       patchWorkChips();
       renderWorkBadges();
       if (S.ws.open && S.ws.tab === 'agent') renderAgent();
-      scheduleWorkPoll();
+      return syncThread();
+    }).then(function () {
+      if (convId === S.convId) scheduleWorkPoll();
     });
   }
 
@@ -979,52 +1094,123 @@
       '<div class="work-foot">' + actions + '<span class="muted">Старший агент: ' + esc(wf.sr_status ? stateLabel(wf.sr_status) : 'не запущен') + '</span></div></section>';
   }
 
+  // When something that is waiting will be looked at again, in a few words.
+  function untilText(value) {
+    if (!value) return '';
+    var left = new Date(value).getTime() - Date.now();
+    if (isNaN(left)) return '';
+    if (left <= 0) return 'с минуты на минуту';
+    var minutes = Math.round(left / 60000);
+    if (minutes < 1) return 'меньше чем через минуту';
+    if (minutes < 90) return 'через ' + minutes + ' ' + plural(minutes, 'минуту', 'минуты', 'минут');
+    var hours = Math.round(minutes / 60);
+    return 'через ' + hours + ' ' + plural(hours, 'час', 'часа', 'часов');
+  }
+
+  // Which OpenHands a task is (or was last) run by: the newest line of its
+  // history. An empty label is the server's own key.
+  function taskExecutor(executions, taskId) {
+    var last = null, count = 0;
+    (executions || []).forEach(function (item) {
+      if (String(item.task_id) === String(taskId)) { last = item; count += 1; }
+    });
+    if (!last) return null;
+    return { label: last.executor_label || 'ключ сервера', starts: count, kind: last.kind };
+  }
+
   function runCard(entry, detail) {
-    var run = detail.run, tasks = detail.tasks || [];
+    var run = detail.run, tasks = detail.tasks || [], report = detail.report;
+    var executions = detail.executions || [], stops = detail.stops || [];
     // "Will be taken in a few seconds" is said only of a run nothing has happened to
     // yet. A task that waits out a refused start says why on its own line.
     var waiting = tasks.length && run.state === 'running' &&
       tasks.every(function (task) { return task.state === 'pending' && !task.last_error; });
     var inline = !!(S.status && S.status.lab && S.status.lab.inline);
     var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state];
+    var durable = run.policy === 'durable';
     var budget = 'запусков ' + esc(run.iteration) + ' из ' + esc(run.max_iterations) +
+      (run.cycle ? ' · цикл ' + esc(run.cycle + 1) : '') +
       (live && run.deadline_at ? ' · до ' + esc(fullTime(run.deadline_at)) : '');
+    // A durable run that is between two tries says so, and when it goes on.
+    var pause = run.state === 'running' && run.resume_at && run.wait_reason
+      ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
     var steps = tasks.length ? '<ul class="steps">' + tasks.map(function (task) {
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
+      if (task.cycle) sub.push('цикл ' + (task.cycle + 1));
       if (verdict) sub.push('проверка: ' + verdict);
+      var who = taskExecutor(executions, task.id);
+      if (who) sub.push('исполнитель: ' + who.label + (who.starts > 1 ? ' (запусков: ' + who.starts + ')' : ''));
+      if (task.repository) sub.push(task.repository + (task.branch ? ' · ' + task.branch : ''));
       // Why it did not verify - without it "не подтверждено" sends a person to the database.
       var reason = task.verification && task.verification.reason;
       var settled = { completed_unverified: 1, partial: 1, failed: 1, blocked: 1 }[task.state];
+      // A task that waits says what for and until when; it will go on by itself.
+      var wait = (task.state === 'waiting' || (task.state === 'running' && task.retry_at)) && task.wait_reason
+        ? '<div class="step-sub">' + esc(clip(task.wait_reason, 320)) +
+          (task.retry_at ? ' · повтор ' + esc(untilText(task.retry_at)) : '') + '</div>' : '';
       return '<li class="step-row"><span class="dot is-' + stateTone(task.state) + '" title="' + esc(stateLabel(task.state)) + '"></span>' +
         '<div><div class="step-title">' + esc(clip(task.title || task.task_key, 260)) + '</div>' +
-        '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' +
+        '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' + wait +
         (settled && reason ? '<div class="step-sub">' + esc(clip(reason, 320)) + '</div>' : '') +
-        (task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div><span></span></li>';
+        (!wait && task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div><span></span></li>';
     }).join('') + '</ul>' : '<p class="step-sub">В плане нет задач.</p>';
     var actions = '';
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
     if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
-    if ({ running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state]) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
-    return '<section class="work"><div class="work-head">' + pill(run.state) +
+    if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    // The report is the run's own record: the same text delivered to the chat.
+    // It is copied in full, never the truncated view.
+    var reportSection = report && report.body
+      ? '<div class="work-section"><p class="work-section-title">Итоговый отчёт</p>' +
+        '<div class="md">' + MD.render(report.body) + '</div>' +
+        '<div class="work-foot">' +
+        '<button class="btn btn-sm" type="button" data-action="copy-report" data-id="' + esc(entry.id) + '">' +
+        icon('copy', 'icon-sm') + 'Скопировать отчёт</button>' +
+        '<span class="muted">' + esc(report.state === 'delivered' ? 'отправлен в чат'
+          : report.state === 'undeliverable' ? 'чата у прогона нет — отчёт хранится здесь'
+          : 'ожидает отправки в чат') + '</span></div></div>'
+      : '';
+    var owed = stops.filter(function (stop) { return stop.state === 'requested'; }).length;
+    return '<section class="work" data-run="' + esc(entry.id) + '"><div class="work-head">' + pill(run.state) +
       '<span class="work-kind">Автономный прогон</span><span class="work-id">' + esc(shortId(entry.id)) + '</span>' +
-      '<span class="topbar-spacer"></span><span class="work-id" title="Сколько раз прогон запускал задачи и до какого времени он может их запускать">' + budget + '</span></div>' +
-      (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') +
+      '<span class="topbar-spacer"></span><span class="work-id" title="' +
+      (durable ? 'Сколько раз прогон запускал задачи в этом цикле. Когда запуски цикла кончаются, прогон делает паузу и продолжает сам.'
+               : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
+      (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
+      (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
       '<div class="work-section"><p class="work-section-title">План · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач') + '</p>' + steps +
       (waiting ? '<p class="step-sub">' + (inline
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
         : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
+      reportSection +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
+  }
+
+  // The list of runs is redrawn every few seconds while something is at work.
+  // Three things keep that from fighting the person who is reading it:
+  //   * when nothing changed, nothing is touched - the nodes, the scroll
+  //     position and a scroll that is under way all stay as they are;
+  //   * while a finger is on the list, or it is still moving, the redraw waits
+  //     (replacing the nodes under a touch ends the gesture);
+  //   * when it is redrawn, it is put back where it was scrolled to.
+  // Without this the list jumped back to its top on every poll, and on a
+  // phone the last runs could not be reached while a run was at work.
+  var agentScroll = { touching: false, at: 0, timer: null };
+
+  function agentListBusy() {
+    return agentScroll.touching || Date.now() - agentScroll.at < 400;
   }
 
   function renderAgent() {
     var body = $('#ws-body');
+    clearTimeout(agentScroll.timer);
     if (!S.work.items.length) {
       body.innerHTML = emptyHtml('bot', 'Агент ещё не запускался',
         'Отправьте задачу в режиме «Код» или «Автономно» — здесь появятся шаги, статусы и ссылка на сессию OpenHands.');
       return;
     }
-    body.innerHTML = '<div class="work-list">' + S.work.items.map(function (entry) {
+    var html = S.work.items.map(function (entry) {
       var record = S.work.data[entry.key];
       if (!record) return '<section class="work">' + SKELETON + '</section>';
       if (record.error || !record.detail) {
@@ -1035,7 +1221,25 @@
           '<div class="work-foot"><button class="btn btn-sm" type="button" data-action="refresh-work">Обновить</button></div></section>';
       }
       return entry.kind === 'workflow' ? workflowCard(entry, record.detail) : runCard(entry, record.detail);
-    }).join('') + '</div>';
+    }).join('');
+    var list = $('.work-list', body);
+    if (list && list.__html === html) return;
+    if (list && agentListBusy()) {
+      agentScroll.timer = setTimeout(function () {
+        if (S.ws.open && S.ws.tab === 'agent') renderAgent();
+      }, 450);
+      return;
+    }
+    var top = list ? list.scrollTop : 0;
+    if (list) {
+      list.innerHTML = html;
+    } else {
+      body.innerHTML = '<div class="work-list"></div>';
+      list = $('.work-list', body);
+      list.innerHTML = html;
+    }
+    list.__html = html;
+    if (top) list.scrollTop = top;
   }
 
   function workAction(button, request, done) {
@@ -1247,12 +1451,15 @@
     });
   }
 
-  function openRepoDialog() {
-    repoState = { source: '', repos: null, error: '', query: '', selected: null, branches: null, branch: '' };
+  function openRepoDialog(additional) {
+    repoState = { source: '', repos: null, error: '', query: '', selected: null, branches: null, branch: '',
+                  additional: !!additional };
     openDialog({
-      title: 'Репозиторий проекта',
+      title: additional ? 'Ещё один репозиторий проекта' : 'Репозиторий проекта',
       body:
-        '<p class="lead">Выберите репозиторий и ветку. В них будет работать агент, а вкладка «Файлы» покажет их содержимое.</p>' +
+        '<p class="lead">' + (additional
+          ? 'Репозиторий добавится к проекту рядом с основным и будет читаться выбранным здесь аккаунтом — он может быть другим, чем у основного. Планировщик сможет отдавать ему задачи.'
+          : 'Выберите репозиторий и ветку. В них будет работать агент, а вкладка «Файлы» покажет их содержимое.') + '</p>' +
         '<div class="field"><span class="field-label">Аккаунт GitHub</span>' +
         '<select class="select" id="repo-source" aria-label="Аккаунт GitHub"></select></div>' +
         '<details class="add" id="repo-add"><summary>' + icon('plus', 'icon-sm') + 'Подключить аккаунт GitHub</summary>' +
@@ -1262,8 +1469,11 @@
         '<div class="picker-list" id="repo-list" role="listbox" aria-label="Репозитории"></div></div>' +
         '<label class="field"><span class="field-label">Ветка</span>' +
         '<select class="select" id="repo-branch" disabled><option value="">Сначала выберите репозиторий</option></select></label>' +
-        '<label class="checkbox"><input type="checkbox" id="repo-analyze" checked>' +
-        '<span>Изучить репозиторий после подключения, чтобы ассистент знал структуру проекта</span></label>',
+        (additional
+          ? '<label class="field"><span class="field-label">Для чего этот репозиторий</span>' +
+            '<input class="input" id="repo-note" maxlength="500" placeholder="Например: сайт, показывает данные сервиса"></label>'
+          : '<label class="checkbox"><input type="checkbox" id="repo-analyze" checked>' +
+            '<span>Изучить репозиторий после подключения, чтобы ассистент знал структуру проекта</span></label>'),
       foot: '<p class="form-msg" id="repo-msg" role="status"></p>' +
         '<button class="btn btn-ghost" type="button" data-action="close-dialog">Отмена</button>' +
         '<button class="btn btn-primary" type="button" id="repo-connect" data-action="repo-connect" disabled>Подключить</button>',
@@ -1401,7 +1611,12 @@
     // server's own GITHUB_TOKEN.
     var body = { full_name: fullName, branch: branch,
                  account_id: repoState.source === 'server' ? null : repoState.source };
-    var analyze = $('#repo-analyze').checked;
+    var additional = repoState.additional;
+    if (additional) {
+      body.additional = true;
+      body.role_note = $('#repo-note').value.trim();
+    }
+    var analyze = !additional && $('#repo-analyze').checked;
     message.className = 'form-msg';
     message.textContent = 'Проверяем репозиторий в GitHub…';
     setBusy(button, true);
@@ -1410,6 +1625,17 @@
     ensureProject().then(function () {
       return api(projectUrl('/repository'), { method: 'POST', body: body, timeout: 60000 });
     }).then(function (data) {
+      if (additional) {
+        // One more repository beside the main one: back to the project's
+        // settings, where it is now listed.
+        closeDialog();
+        toast('Добавлен ' + fullName + ' · ' + branch);
+        return api(projectUrl('/binding')).then(function (bound) {
+          S.binding = bound.binding;
+          renderAll();
+          openSettings('project');
+        });
+      }
       S.binding = data.binding;
       S.ws.treeKey = '';
       closeDialog();
@@ -1494,16 +1720,62 @@
     if (!pane.firstChild || pane.getAttribute('data-tab') !== tab) pane.innerHTML = SKELETON;
     pane.setAttribute('data-tab', tab);
     var load = tab === 'project'
-      ? (S.projectId ? api(projectUrl('/context')).then(function (data) { return data.context; }, function () { return null; })
-                     : Promise.resolve(null))
+      ? (S.projectId
+         ? Promise.all([
+             api(projectUrl('/context')).then(function (data) { return data.context; },
+                                             function () { return null; }),
+             api(projectUrl('/executors')).then(null, function () { return {}; }),
+             api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
+                                                   function () { return []; }),
+             loadGithubAccounts().then(null, function () { S.accounts.github = []; })
+           ]).then(function (parts) {
+             return { context: parts[0], executors: parts[1], repositories: parts[2] };
+           })
+         : Promise.resolve(null))
       : Promise.all([
           loadGithubAccounts().catch(function () { S.accounts.github = []; }),
+          loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
           api('/api/studio').then(function (data) { S.status = data; }, function () {})
         ]);
     return load.then(function (result) {
       if (settingsTab !== tab || !document.contains(pane)) return;
-      pane.innerHTML = tab === 'project' ? projectSettingsHtml(result) : connectionsHtml();
+      if (tab === 'project') {
+        S.projectSettings = result || null;
+        pane.innerHTML = projectSettingsHtml(result);
+      } else {
+        pane.innerHTML = connectionsHtml();
+      }
     });
+  }
+
+  function loadOpenhandsAccounts() {
+    return api('/api/openhands/accounts').then(function (data) {
+      S.accounts.openhands = data.accounts || [];
+    });
+  }
+
+  function submitOpenhandsForm(form) {
+    var message = $('.form-msg', form), button = $('button[type=submit]', form);
+    message.className = 'form-msg';
+    message.textContent = 'Проверяем ключ в OpenHands…';
+    setBusy(button, true);
+    api('/api/openhands/accounts', { method: 'POST', timeout: 60000,
+        body: { label: form.elements.label.value.trim(),
+                api_key: form.elements.api_key.value,
+                base_url: form.elements.base_url.value.trim() || undefined,
+                transport: form.elements.transport.value,
+                default_model: form.elements.default_model.value.trim() || undefined } })
+      .then(function (data) {
+        setBusy(button, false);
+        form.reset();
+        message.textContent = '';
+        toast('OpenHands «' + data.account.label + '» подключён.');
+        return loadOpenhandsAccounts().then(refreshSettings);
+      }, function (error) {
+        setBusy(button, false);
+        message.className = 'form-msg is-bad';
+        message.textContent = explain(error.message).text;
+      });
   }
 
   function accountCard(account) {
@@ -1516,9 +1788,62 @@
       pill(account.state) + '<div class="card-actions">' + actions + '</div></div>';
   }
 
+  // What the last check of a connection found, in the words of the card.
+  function openhandsStanding(account) {
+    var health = { healthy: 'работает', degraded: 'нестабилен', unavailable: 'недоступен' }[account.health] || 'не проверялся';
+    var parts = ['доступность: ' + health];
+    if (account.api_version) parts.push('API ' + account.api_version);
+    if (account.compatibility === 'compatible') parts.push('совместим');
+    else if (account.compatibility === 'incompatible') parts.push('несовместим');
+    if (account.is_default) parts.push('по умолчанию');
+    if (account.max_concurrent_tasks) parts.push('не более ' + account.max_concurrent_tasks + ' задач сразу');
+    return parts.join(' · ');
+  }
+
+  function openhandsCard(account) {
+    var id = esc(account.id);
+    var on = account.enabled !== false;
+    var actions = account.state === 'revoked'
+      ? '<button class="btn btn-sm" type="button" data-action="openhands-edit" data-id="' + id + '">Вернуть (новый ключ)</button>' +
+        '<button class="btn btn-sm btn-danger" type="button" data-action="openhands-remove" data-id="' + id + '">Удалить</button>'
+      : '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="verify" data-id="' + id + '">Проверить</button>' +
+        '<button class="btn btn-sm" type="button" data-action="openhands-edit" data-id="' + id + '">Изменить</button>' +
+        '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="' + (on ? 'disable' : 'enable') + '" data-id="' + id + '">' +
+        (on ? 'Выключить' : 'Включить') + '</button>' +
+        '<button class="btn btn-sm btn-danger" type="button" data-action="openhands-remove" data-id="' + id + '">Удалить</button>';
+    return '<div class="card" data-openhands="' + id + '"><div class="card-main"><b>' + esc(account.label) + '</b>' +
+      '<small>' + esc(account.base_url || '') + ' · ' + esc(account.transport || '') +
+      (account.default_model ? ' · ' + esc(account.default_model) : '') +
+      (account.api_key_hint ? ' · ключ ' + esc(account.api_key_hint) : '') + '</small>' +
+      '<small>' + esc(openhandsStanding(account)) + '</small>' +
+      (account.compatibility === 'incompatible' && account.compatibility_detail
+        ? '<small class="is-bad">' + esc(account.compatibility_detail) + '</small>' : '') +
+      (account.last_error ? '<small class="is-bad">' + esc(account.last_error) + '</small>' : '') + '</div>' +
+      pill(account.state === 'active' ? (on ? 'active' : 'revoked') : account.state) +
+      '<div class="card-actions">' + actions + '</div></div>';
+  }
+
+  function openhandsFormHtml() {
+    return '<form class="account-form openhands-form" autocomplete="off">' +
+      '<div class="grid-2"><label class="field"><span class="field-label">Название</span>' +
+      '<input class="input" name="label" required maxlength="120" placeholder="Например: основной"></label>' +
+      '<label class="field"><span class="field-label">API URL</span>' +
+      '<input class="input" name="base_url" type="url" placeholder="https://app.all-hands.dev"></label></div>' +
+      '<div class="grid-2"><label class="field"><span class="field-label">API key</span>' +
+      '<input class="input" name="api_key" type="password" required autocomplete="off" placeholder="Ключ OpenHands"></label>' +
+      '<label class="field"><span class="field-label">Транспорт</span>' +
+      '<select class="input" name="transport"><option value="direct">direct — свой sandbox</option>' +
+      '<option value="app">app — app-conversation</option></select></label></div>' +
+      '<label class="field"><span class="field-label">Модель по умолчанию (необязательно)</span>' +
+      '<input class="input" name="default_model" placeholder="openhands/deepseek-v4.1-flash"></label>' +
+      '<p class="field-hint">Ключ проверяется в OpenHands, шифруется (NEXUS_SECRET_KEY) и никогда не возвращается в интерфейс или API. Несколько подключений позволяют переключаться между исполнителями.</p>' +
+      '<div class="row"><button class="btn btn-primary btn-sm" type="submit">Подключить</button><p class="form-msg" role="status"></p></div></form>';
+  }
+
   function connectionsHtml() {
     var status = S.status || {};
     var accounts = S.accounts.github || [];
+    var ohAccounts = S.accounts.openhands || [];
     var providers = (status.providers || []).filter(function (name) { return name !== 'openhands'; });
     var openhands = status.openhands || {}, github = status.github || {}, crypto = status.accounts || {};
     var lab = status.lab || {};
@@ -1529,6 +1854,10 @@
       '<p class="section-note">Аккаунт даёт список репозиториев и чтение файлов проекта. Токен хранится зашифрованным и не возвращается ни в интерфейс, ни в API.</p>' +
       (accounts.length ? '<div class="cards">' + accounts.map(accountCard).join('') + '</div>' : '') +
       '<details class="add"' + (accounts.length ? '' : ' open') + '><summary>' + icon('plus', 'icon-sm') + 'Подключить аккаунт GitHub</summary>' + githubFormHtml() + '</details></div>' +
+      '<div class="section"><h3 class="section-title">' + icon('bot', 'icon-sm') + 'OpenHands</h3>' +
+      '<p class="section-note">Подключения OpenHands, на которых выполняются задачи. Ключ хранится зашифрованным и не показывается. Несколько подключений дают переключение при недоступности одного из них.</p>' +
+      (ohAccounts.length ? '<div class="cards">' + ohAccounts.map(openhandsCard).join('') + '</div>' : '') +
+      '<details class="add"' + (ohAccounts.length ? '' : ' open') + '><summary>' + icon('plus', 'icon-sm') + 'Подключить OpenHands</summary>' + openhandsFormHtml() + '</details></div>' +
       '<div class="section"><h3 class="section-title">' + icon('info', 'icon-sm') + 'Сервер</h3>' +
       '<p class="section-note">Задаётся переменными окружения сервера. Здесь видно только, что настроено: сами значения в браузер не передаются.</p>' +
       '<dl class="kv is-status">' +
@@ -1545,31 +1874,116 @@
       '<dt>Версия</dt><dd>' + esc(status.version || '—') + '</dd></dl></div>';
   }
 
-  function projectSettingsHtml(context) {
+  function projectSettingsHtml(data) {
     var current = project();
     if (!current) {
       return emptyHtml('layers', 'Проекта ещё нет', 'Он создастся с первым сообщением. Можно создать и сейчас.',
         '<button class="btn btn-primary" type="button" data-action="new-project">Новый проект</button>');
     }
+    data = data || {};
+    var context = data.context;
     var revision = context && context.revision ? String(context.revision).slice(0, 7) : '';
     return '<div class="section"><h3 class="section-title">' + icon('layers', 'icon-sm') + 'Название</h3>' +
       '<form class="row row-fill" id="project-rename"><input class="input" name="name" required maxlength="120" value="' + esc(current.name) + '" aria-label="Название проекта">' +
       '<button class="btn btn-primary" type="submit">Сохранить</button></form><p class="form-msg" id="project-msg" role="status"></p></div>' +
-      '<div class="section"><h3 class="section-title">' + icon('branch', 'icon-sm') + 'Репозиторий</h3>' +
-      '<p class="section-note">Репозиторий и ветка, в которых работает агент. Меняются только здесь, явным действием.</p>' +
-      (repoName()
-        ? '<dl class="kv"><dt>Репозиторий</dt><dd class="mono">' + esc(repoName()) + '</dd><dt>Ветка</dt><dd class="mono">' + esc(branchName()) + '</dd>' +
-          '<dt>Доступ</dt><dd>' + (S.binding.github_account_id ? 'аккаунт GitHub, привязанный к проекту' : 'токен сервера') + '</dd></dl>'
-        : '') +
-      '<button class="btn" type="button" data-action="open-repo">' + (repoName() ? 'Сменить репозиторий или ветку' : 'Подключить репозиторий') + '</button></div>' +
+      projectRepositoriesHtml(data.repositories) +
       '<div class="section"><h3 class="section-title">' + icon('eye', 'icon-sm') + 'Контекст для ассистента</h3>' +
-      '<p class="section-note">Сводка структуры репозитория, которую ассистент получает вместе с вопросом.</p>' +
+      '<p class="section-note">Сводка структуры основного репозитория, которую ассистент получает вместе с вопросом.</p>' +
       (context
         ? '<dl class="kv"><dt>Репозиторий</dt><dd class="mono">' + esc(context.repository || '—') + '</dd>' +
           '<dt>Ревизия</dt><dd class="mono">' + esc(revision || '—') + '</dd><dt>Собран</dt><dd>' + esc(fullTime(context.created_at)) + '</dd></dl>'
         : '<p class="section-note">Контекст ещё не собран.</p>') +
       '<button class="btn" type="button" data-action="refresh-context"' + (repoName() ? '' : ' disabled') + '>' + icon('refresh', 'icon-sm') +
-      (context ? 'Изучить заново' : 'Изучить репозиторий') + '</button></div>';
+      (context ? 'Изучить заново' : 'Изучить репозиторий') + '</button></div>' +
+      projectExecutorsHtml(data.executors);
+  }
+
+  // What the last access check of a repository found, in a line.
+  function repoAccessText(link) {
+    var access = link.access;
+    if (!access) return 'доступ не проверялся';
+    if (!access.readable) return 'нет доступа: ' + (access.error || 'причина не указана');
+    var parts = [access.private ? 'приватный' : 'публичный', access.push ? 'запись разрешена' : 'только чтение'];
+    if (access.branch_exists === false) parts.push('ветки ' + (access.branch || '') + ' нет');
+    return parts.join(' · ');
+  }
+
+  // The project's repositories: several, each read with its own account.
+  function projectRepositoriesHtml(repositories) {
+    var rows = repositories || [];
+    var body = rows.length
+      ? '<div class="cards">' + rows.map(function (link) {
+          var name = esc(link.full_name);
+          var who = link.identity === 'account' ? 'аккаунт ' + (link.account_label || link.account_login || '')
+            : link.identity === 'project_account' ? 'аккаунт проекта' : 'токен сервера';
+          var bad = (link.access && !link.access.readable) || link.account_state === 'revoked' || link.account_state === 'invalid';
+          var actions =
+            (link.is_primary ? '' : '<button class="btn btn-sm" type="button" data-action="repo-op" data-op="primary" data-name="' + name + '"' + (link.usable ? '' : ' disabled') + '>Сделать основным</button>') +
+            '<button class="btn btn-sm" type="button" data-action="repo-op" data-op="check" data-name="' + name + '">Проверить доступ</button>' +
+            '<button class="btn btn-sm" type="button" data-action="repo-edit" data-name="' + name + '">Изменить</button>' +
+            (link.is_primary ? '' : '<button class="btn btn-sm" type="button" data-action="repo-op" data-op="' + (link.enabled ? 'disable' : 'enable') + '" data-name="' + name + '">' + (link.enabled ? 'Выключить' : 'Включить') + '</button>') +
+            (link.is_primary && rows.length > 1 ? '' : '<button class="btn btn-sm btn-danger" type="button" data-action="repo-remove" data-name="' + name + '">Убрать</button>');
+          return '<div class="card" data-repo="' + name + '"><div class="card-main"><b>' + name + '</b>' +
+            '<small>' + (link.is_primary ? 'основной · ' : '') + 'ветка ' + esc(link.working_branch) + ' · ' + esc(who) + '</small>' +
+            (link.role_note ? '<small>' + esc(link.role_note) + '</small>' : '') +
+            '<small' + (bad ? ' class="is-bad"' : '') + '>' + esc(repoAccessText(link)) +
+            (link.account_state === 'revoked' ? ' · аккаунт отключён' : '') + '</small></div>' +
+            pill(!link.usable ? 'revoked' : bad ? 'invalid' : 'active') +
+            '<div class="card-actions">' + actions + '</div></div>';
+        }).join('') + '</div>'
+      : '<p class="section-note">Репозитории ещё не подключены.</p>';
+    return '<div class="section" id="project-repositories"><h3 class="section-title">' + icon('branch', 'icon-sm') + 'Репозитории проекта</h3>' +
+      '<p class="section-note">Проект может работать с несколькими репозиториями, в том числе из разных аккаунтов GitHub. Основной — тот, в котором работают задачи без указанного репозитория; его файлы показывает вкладка «Файлы». Описание «для чего» получают планировщик и агенты.</p>' +
+      body +
+      '<div class="row">' +
+      '<button class="btn" type="button" data-action="open-repo">' + (rows.length ? 'Сменить основной репозиторий или ветку' : 'Подключить репозиторий') + '</button>' +
+      (rows.length ? '<button class="btn" type="button" data-action="open-repo" data-additional="1">' + icon('plus', 'icon-sm') + 'Добавить ещё репозиторий</button>' +
+        '<button class="btn" type="button" data-action="repos-check">Проверить все</button>' : '') +
+      '</div></div>';
+  }
+
+  // The project's OpenHands executors: the primary first, backups in order.
+  function projectExecutorsHtml(data) {
+    data = data || {};
+    var assigned = data.executors || [], available = data.available || [];
+    var canEdit = data.can_edit !== false;
+    var health = { healthy: 'работает', degraded: 'нестабилен', unavailable: 'недоступен' };
+    var body = assigned.length
+      ? '<div class="cards">' + assigned.map(function (e) {
+          var id = esc(e.account_id);
+          var role = e.role === 'primary' ? 'основной' : 'резервный ' + e.position;
+          var state = !e.enabled ? 'выключен для проекта'
+            : !e.connection_enabled ? 'подключение выключено'
+            : e.state !== 'active' ? 'подключение ' + stateLabel(e.state)
+            : (health[e.health] || 'не проверялся');
+          var actions = !canEdit ? ''
+            : '<button class="btn btn-sm" type="button" data-action="executor-op" data-op="primary" data-id="' + id + '"' + (e.role === 'primary' ? ' disabled' : '') + '>Сделать основным</button>' +
+              '<button class="btn btn-sm" type="button" data-action="executor-op" data-op="' + (e.enabled ? 'disable' : 'enable') + '" data-id="' + id + '">' + (e.enabled ? 'Выключить' : 'Включить') + '</button>' +
+              '<button class="btn btn-sm btn-danger" type="button" data-action="executor-op" data-op="remove" data-id="' + id + '">Убрать</button>';
+          return '<div class="card" data-executor="' + id + '"><div class="card-main"><b>' + esc(e.label) + '</b>' +
+            '<small>' + esc(role) + ' · ' + esc(state) + (e.api_version ? ' · API ' + esc(e.api_version) : '') + '</small>' +
+            (e.last_error && !e.usable ? '<small class="is-bad">' + esc(e.last_error) + '</small>' : '') + '</div>' +
+            pill(e.usable ? 'active' : e.enabled ? 'invalid' : 'revoked') +
+            '<div class="card-actions">' + actions + '</div></div>';
+        }).join('') + '</div>'
+      : '<p class="section-note">Список пуст: проект использует правило по умолчанию — подключения владельца проекта, а если их нет, ключ сервера.</p>';
+    var add = !canEdit ? ''
+      : available.length
+        ? '<form class="row row-fill" id="executor-add"><select class="select" name="account_id" aria-label="Добавить исполнителя">' +
+          available.filter(function (a) { return a.state !== 'revoked'; }).map(function (a) { return '<option value="' + esc(a.account_id) + '">' + esc(a.label) + '</option>'; }).join('') +
+          '</select><button class="btn" type="submit">Добавить</button></form>'
+        : (assigned.length ? '' : '<p class="section-note">Сначала подключите OpenHands во вкладке «Подключения».</p>');
+    var strategy = !canEdit || assigned.length < 2 ? ''
+      : '<label class="field"><span class="field-label">Как распределять задачи</span>' +
+        '<select class="select" id="executor-strategy" aria-label="Как распределять задачи">' +
+        '<option value="failover"' + (data.strategy !== 'distribute' ? ' selected' : '') + '>По порядку: основной, резервные — только пока он недоступен</option>' +
+        '<option value="distribute"' + (data.strategy === 'distribute' ? ' selected' : '') + '>Поровну: независимые задачи идут на разные подключения</option>' +
+        '</select></label>';
+    return '<div class="section" id="project-executors"><h3 class="section-title">' + icon('bot', 'icon-sm') + 'Исполнители OpenHands</h3>' +
+      '<p class="section-note">Какие подключения OpenHands выполняют задачи этого проекта. Если список задан, проект использует только его: первый — основной, остальные — резервные в этом порядке. Идущая задача остаётся на своём подключении; новые возвращаются на основной, как только он снова доступен.</p>' +
+      body + strategy + add +
+      (assigned.length ? '<div class="row"><button class="btn" type="button" data-action="executors-check">Проверить исполнителей</button></div>' : '') +
+      '</div>';
   }
 
   /* ----------------------------------------------------------------- menus */
@@ -1623,6 +2037,50 @@
         ? '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="0">' + icon('refresh', 'icon-sm') + '<span>Вернуть из архива</span></button>'
         : '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="1">' + icon('archive', 'icon-sm') + '<span>В архив</span></button>'),
       { alignRight: true });
+  }
+
+  // A dialog with several fields: edit a connection, describe a repository.
+  // ``fields``: [{name, label, value, type, placeholder, hint, options}].
+  // ``submit(values)`` returns a promise; a rejection is shown in the dialog.
+  function fieldsDialog(options) {
+    var body = (options.lead ? '<p class="lead">' + esc(options.lead) + '</p>' : '') + '<form id="fields-form" autocomplete="off">' +
+      options.fields.map(function (field) {
+        var control;
+        if (field.options) {
+          control = '<select class="select" name="' + esc(field.name) + '">' + field.options.map(function (option) {
+            return '<option value="' + esc(option[0]) + '"' + (String(option[0]) === String(field.value == null ? '' : field.value) ? ' selected' : '') + '>' + esc(option[1]) + '</option>';
+          }).join('') + '</select>';
+        } else {
+          control = '<input class="input" name="' + esc(field.name) + '" type="' + esc(field.type || 'text') + '"' +
+            (field.max ? ' maxlength="' + field.max + '"' : '') +
+            (field.type === 'password' ? ' autocomplete="new-password"' : '') +
+            ' value="' + esc(field.value == null ? '' : field.value) + '"' +
+            (field.placeholder ? ' placeholder="' + esc(field.placeholder) + '"' : '') + '>';
+        }
+        return '<label class="field"><span class="field-label">' + esc(field.label) + '</span>' + control +
+          (field.hint ? '<span class="field-hint">' + esc(field.hint) + '</span>' : '') + '</label>';
+      }).join('') + '</form>';
+    openDialog({
+      title: options.title, body: body,
+      foot: '<p class="form-msg" id="fields-msg" role="status"></p><button class="btn btn-ghost" type="button" data-action="close-dialog">Отмена</button>' +
+        '<button class="btn btn-primary" type="submit" form="fields-form" id="fields-submit">' + esc(options.ok || 'Сохранить') + '</button>'
+    });
+    var form = $('#fields-form');
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var values = {};
+      options.fields.forEach(function (field) { values[field.name] = form.elements[field.name].value; });
+      var button = $('#fields-submit'), message = $('#fields-msg');
+      setBusy(button, true);
+      message.className = 'form-msg';
+      message.textContent = options.busy || '';
+      options.submit(values).catch(function (error) {
+        setBusy(button, false);
+        if (!document.contains(message)) return;
+        message.className = 'form-msg is-bad';
+        message.textContent = explain(error.message).text;
+      });
+    });
   }
 
   function formDialog(options) {
@@ -1686,8 +2144,23 @@
   }
 
   /* --------------------------------------------------------------- actions */
-  function copied(promise, done) {
-    promise.then(function () { toast(done); }, function () { toast('Не удалось скопировать.', 'bad'); });
+  // What a copy button does with its text: copy it and say so, or - when the
+  // browser lets nothing be copied for it - put the whole text in front of the
+  // person, selected, to be copied by hand.
+  function copyOut(text, done) {
+    return copyText(text).then(function () { toast(done); }, function () {
+      openDialog({
+        title: 'Скопируйте вручную',
+        className: 'is-wide',
+        body: '<p class="lead">Браузер не разрешил записать в буфер обмена. Текст выделен целиком: скопируйте его сочетанием клавиш или через меню.</p>' +
+          '<textarea class="input copy-area" id="copy-area" readonly rows="12" aria-label="Текст для копирования"></textarea>',
+        foot: '<button class="btn btn-primary" type="button" data-action="close-dialog">Готово</button>'
+      });
+      var area = $('#copy-area');
+      area.value = text;
+      area.focus();
+      area.select();
+    });
   }
 
   var ACTIONS = {
@@ -1721,11 +2194,11 @@
       else if (tab) { settingsTab = tab; refreshSettings(); }
     },
     'settings-tab': function (el) { settingsTab = el.getAttribute('data-tab'); refreshSettings(); },
-    'open-repo': function () {
+    'open-repo': function (el) {
       closeMenu();
       if (repoState) return;
       if (settingsTab) closeDialog();
-      openRepoDialog();
+      openRepoDialog(el && el.getAttribute && el.getAttribute('data-additional') === '1');
     },
     'close-dialog': function () { closeDialog(); },
     'theme': function (el) {
@@ -1776,7 +2249,20 @@
     'copy-message': function (el) {
       var id = el.getAttribute('data-id');
       var message = S.messages.filter(function (m) { return String(m.id) === id; })[0];
-      if (message) copied(copyText(message.content), 'Ответ скопирован.');
+      if (!message) return;
+      // The full stored text, never the rendered bubble and nothing but the
+      // text: the same button copies an assistant's reply, a run's report and
+      // the person's own message.
+      copyOut(message.content, message.role === 'user' ? 'Сообщение скопировано.'
+        : (message.meta || {}).report ? 'Отчёт скопирован.' : 'Ответ скопирован.');
+    },
+    'copy-report': function (el) {
+      var id = el.getAttribute('data-id');
+      var record = S.work.data['run:' + id];
+      var content = record && record.detail && record.detail.report
+        ? record.detail.report.body : '';
+      if (!content) { toast('Отчёт ещё не готов.', 'bad'); return; }
+      copyOut(content, 'Отчёт скопирован.');
     },
     'copy-code': function (el) {
       var code = $('code', el.closest('.code'));
@@ -1790,8 +2276,12 @@
     'refresh-work': function () { refreshWork(); },
     'cancel-workflow': function (el) {
       var id = el.getAttribute('data-id');
-      confirmDialog('Остановить задачу?', 'Диспетчер перестанет её вести. Сессия OpenHands сохранится, чтобы было видно, что уже сделано.', 'Остановить', function () {
-        workAction(null, api('/api/workflows/' + enc(id) + '/cancel', { method: 'POST', body: {} }), 'Задача остановлена.');
+      confirmDialog('Остановить задачу?', 'Диспетчер перестанет её вести, и она уйдёт из списка. Сессия OpenHands и история задачи сохранятся.', 'Остановить', function () {
+        api('/api/workflows/' + enc(id) + '/cancel', { method: 'POST', body: {} }).then(function () {
+          dropWork('workflow:' + id);
+          toast('Задача остановлена.');
+          return refreshWork();
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
       }, true);
     },
     'resume-workflow': function (el) {
@@ -1804,11 +2294,19 @@
       var id = el.getAttribute('data-id'), op = el.getAttribute('data-op');
       var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.', cancel: 'Прогон отменён.' }[op];
       if (!done) return;
-      var act = function (button) {
-        workAction(button, api(projectUrl('/runs/' + enc(id) + '/' + op), { method: 'POST', body: {} }), done);
-      };
-      if (op === 'cancel') confirmDialog('Отменить прогон?', 'Незавершённые задачи больше не будут выполняться.', 'Отменить прогон', function () { act(null); }, true);
-      else act(el);
+      if (op !== 'cancel') {
+        workAction(el, api(projectUrl('/runs/' + enc(id) + '/' + op), { method: 'POST', body: {} }), done);
+        return;
+      }
+      confirmDialog('Отменить прогон?', 'Незавершённые задачи больше не будут выполняться, агентам будет отправлен сигнал остановки, а прогон уйдёт из списка. Его история, логи и результаты останутся в базе.', 'Отменить прогон', function () {
+        api(projectUrl('/runs/' + enc(id) + '/cancel'), { method: 'POST', body: {} }).then(function () {
+          // The server has settled the run and taken it out of the lists; the
+          // card leaves with it, now, and a reload will not bring it back.
+          dropWork('run:' + id);
+          toast(done);
+          return refreshWork();
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
+      }, true);
     },
     'toggle-dir': function (el) {
       var path = el.getAttribute('data-path');
@@ -1820,7 +2318,7 @@
     'reload-tree': function () { loadTree(true); },
     'doc-view': function (el) { S.ws.docView = el.getAttribute('data-view') === 'doc'; renderFile(); },
     'copy-file': function () {
-      if (S.ws.file && S.ws.file.content != null) copied(copyText(S.ws.file.content), 'Файл скопирован.');
+      if (S.ws.file && S.ws.file.content != null) copyOut(S.ws.file.content, 'Файл скопирован.');
     },
     'repo-pick': function (el) { pickRepo(el.getAttribute('data-name')); },
     'repo-connect': connectRepo,
@@ -1840,11 +2338,189 @@
         confirmDialog('Отключить аккаунт?', 'Сохранённый токен перестанет использоваться. Проекты, привязанные к этому аккаунту, потеряют доступ к его репозиториям.', 'Отключить', function () { run(null); }, true);
       } else run(el);
     },
+    'openhands-op': function (el) {
+      var op = el.getAttribute('data-op'), id = el.getAttribute('data-id');
+      setBusy(el, true);
+      // "Switch off" is the connection's own switch; the key stays stored.
+      var path = op === 'verify' ? 'verify' : 'enable';
+      var body = op === 'verify' ? {} : { enabled: op === 'enable' };
+      api('/api/openhands/accounts/' + enc(id) + '/' + path, { method: 'POST', body: body, timeout: 60000 }).then(function (data) {
+        var account = data.account || {};
+        if (op !== 'verify') toast(op === 'enable' ? 'Подключение включено.' : 'Подключение выключено: новые задачи на него не пойдут.');
+        else if (account.state === 'active' && account.health !== 'unavailable') {
+          toast('Подключение работает' + (account.api_version ? ' · API ' + account.api_version : '') +
+                (account.compatibility === 'incompatible' ? ' · несовместимо' : '') + '.',
+                account.compatibility === 'incompatible' ? 'bad' : undefined);
+        } else toast('OpenHands: ' + (account.last_error || 'недоступно'), 'bad');
+        return loadOpenhandsAccounts().then(refreshSettings);
+      }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    'openhands-edit': function (el) {
+      var id = el.getAttribute('data-id');
+      var account = (S.accounts.openhands || []).filter(function (a) { return String(a.id) === id; })[0];
+      if (!account) return;
+      fieldsDialog({
+        title: 'Подключение OpenHands',
+        lead: 'Новый адрес и новый ключ проверяются вместе до сохранения: подключение не останется с адресом, который не принимает его ключ.',
+        busy: 'Проверяем подключение…',
+        fields: [
+          { name: 'label', label: 'Название', value: account.label, max: 120 },
+          { name: 'base_url', label: 'API URL', value: account.base_url, type: 'url' },
+          { name: 'api_key', label: 'Новый API key', type: 'password', placeholder: 'оставьте пустым, чтобы не менять',
+            hint: account.api_key_hint ? 'Сейчас сохранён ключ ' + account.api_key_hint + '. Сам ключ не показывается.' : 'Сохранённый ключ не показывается.' },
+          { name: 'transport', label: 'Транспорт', value: account.transport,
+            options: [['direct', 'direct — свой sandbox'], ['app', 'app — app-conversation']] },
+          { name: 'default_model', label: 'Модель по умолчанию', value: account.default_model || '', placeholder: 'не задана' },
+          { name: 'max_concurrent_tasks', label: 'Задач одновременно, не более', value: account.max_concurrent_tasks || '',
+            type: 'number', placeholder: 'без ограничения' }
+        ],
+        submit: function (values) {
+          var body = {};
+          if (values.label.trim() && values.label.trim() !== account.label) body.label = values.label.trim();
+          if (values.base_url.trim() && values.base_url.trim() !== account.base_url) body.base_url = values.base_url.trim();
+          if (values.api_key) body.api_key = values.api_key;
+          if (values.transport !== account.transport) body.transport = values.transport;
+          if ((values.default_model.trim() || null) !== (account.default_model || null)) body.default_model = values.default_model.trim() || null;
+          var limit = values.max_concurrent_tasks === '' ? null : Number(values.max_concurrent_tasks);
+          if (limit !== (account.max_concurrent_tasks || null)) body.max_concurrent_tasks = limit;
+          if (!Object.keys(body).length) { closeDialog(); return Promise.resolve(); }
+          return api('/api/openhands/accounts/' + enc(id) + '/edit', { method: 'POST', body: body, timeout: 60000 }).then(function () {
+            closeDialog();
+            toast('Подключение сохранено.');
+            return loadOpenhandsAccounts().then(refreshSettings);
+          });
+        }
+      });
+    },
+    'openhands-remove': function (el) {
+      var id = el.getAttribute('data-id');
+      var remove = function (force) {
+        return api('/api/openhands/accounts/' + enc(id) + '/remove', { method: 'POST', body: { force: !!force } }).then(function () {
+          toast('Подключение удалено.');
+          return loadOpenhandsAccounts().then(refreshSettings);
+        });
+      };
+      // What still leans on it is asked first and said before anything goes.
+      api('/api/openhands/accounts/' + enc(id) + '/dependencies').then(function (data) {
+        var deps = data.dependencies || {}, lines = [];
+        if (deps.active_tasks) lines.push('на нём сейчас работает задач: ' + deps.active_tasks);
+        if ((deps.projects || []).length) lines.push('оно исполнитель проектов: ' + deps.projects.map(function (p) { return p.name; }).join(', '));
+        if (deps.pending_stops) lines.push('ему ещё нужно остановить разговоров: ' + deps.pending_stops);
+        if (!lines.length) {
+          confirmDialog('Удалить подключение?', 'Ключ будет удалён. История того, какие задачи оно выполняло, сохранится.', 'Удалить', function () {
+            remove(false).catch(function (error) { toast(explain(error.message).text, 'bad'); });
+          }, true);
+        } else {
+          confirmDialog('Подключение используется', 'Удалить его сейчас нельзя без последствий: ' + lines.join('; ') + '. Если удалить всё равно, проекты потеряют этого исполнителя, а его задачи будут запущены заново на другом.', 'Удалить всё равно', function () {
+            remove(true).catch(function (error) { toast(explain(error.message).text, 'bad'); });
+          }, true);
+        }
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'refresh-context': function (el) {
       setBusy(el, true);
       api(projectUrl('/context/refresh'), { method: 'POST', body: { repository: repoName(), branch: branchName() }, timeout: 90000 })
         .then(function () { toast('Контекст обновлён.'); return refreshSettings(); },
               function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    // Project executors: one of them first, switched on or off, taken off.
+    'executor-op': function (el) {
+      var id = el.getAttribute('data-id'), op = el.getAttribute('data-op');
+      var done = { primary: 'Исполнитель назначен основным.', enable: 'Исполнитель включён для проекта.',
+                   disable: 'Исполнитель выключен для проекта.', remove: 'Исполнитель убран из проекта.' }[op];
+      if (!done) return;
+      setBusy(el, true);
+      api(projectUrl('/executors/' + enc(id) + '/' + op), { method: 'POST', body: {} })
+        .then(function () { toast(done); return refreshSettings(); },
+              function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    'executors-check': function (el) {
+      setBusy(el, true);
+      api(projectUrl('/executors/check'), { method: 'POST', body: {}, timeout: 90000 }).then(function (data) {
+        var all = data.executors || [];
+        var ready = all.filter(function (e) { return e.usable; }).length;
+        toast('Готовы к работе: ' + ready + ' из ' + all.length + '.', ready ? undefined : 'bad');
+        return refreshSettings();
+      }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    // Project repositories.
+    'repo-op': function (el) {
+      var name = el.getAttribute('data-name'), op = el.getAttribute('data-op');
+      setBusy(el, true);
+      api(projectUrl('/repositories/' + name.split('/').map(enc).join('/') + '/' + op),
+          { method: 'POST', body: {}, timeout: 60000 }).then(function (data) {
+        var link = data.repository || {};
+        if (op === 'primary') {
+          toast('Основной репозиторий: ' + name + '.');
+          // The project is bound to its main repository: the rest of the page follows.
+          return api(projectUrl('/binding')).then(function (bound) {
+            S.binding = bound.binding;
+            S.ws.treeKey = '';
+            renderAll();
+            return refreshSettings();
+          });
+        }
+        if (op === 'check') {
+          var access = link.access || {};
+          toast(name + ': ' + repoAccessText(link) + '.', access.readable ? undefined : 'bad');
+        } else toast(op === 'enable' ? 'Репозиторий включён.' : 'Репозиторий выключен: задачи в нём не запускаются.');
+        return refreshSettings();
+      }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    'repos-check': function (el) {
+      setBusy(el, true);
+      api(projectUrl('/repositories/check'), { method: 'POST', body: {}, timeout: 90000 }).then(function (data) {
+        var all = data.repositories || [];
+        var ok = all.filter(function (link) { return link.access && link.access.readable; }).length;
+        toast('Доступны: ' + ok + ' из ' + all.length + '.', ok === all.length ? undefined : 'bad');
+        return refreshSettings();
+      }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    'repo-edit': function (el) {
+      var name = el.getAttribute('data-name');
+      var link = ((S.projectSettings && S.projectSettings.repositories) || []).filter(function (item) { return item.full_name === name; })[0];
+      if (!link) return;
+      var accounts = (S.accounts.github || []).filter(function (a) { return a.state === 'active' || String(a.id) === String(link.github_account_id); });
+      var branches = (link.allowed_branches && link.allowed_branches.length ? link.allowed_branches : [link.default_branch]);
+      fieldsDialog({
+        title: name,
+        lead: 'Чем читается этот репозиторий, в какой ветке работают его задачи и для чего он в проекте.',
+        fields: [
+          { name: 'account_id', label: 'Аккаунт GitHub', value: link.github_account_id || '',
+            options: [['', 'как у проекта (аккаунт проекта или токен сервера)']].concat(accounts.map(function (a) {
+              return [a.id, a.label + (a.login ? ' · ' + a.login : '')];
+            })) },
+          { name: 'branch', label: 'Ветка задач', value: link.branch || link.default_branch,
+            options: branches.map(function (branch) { return [branch, branch + (branch === link.default_branch ? ' (по умолчанию)' : '')]; }),
+            hint: 'Другую ветку можно добавить через «Добавить ещё репозиторий»: она проверяется в GitHub.' },
+          { name: 'role_note', label: 'Для чего этот репозиторий', value: link.role_note || '', max: 500,
+            placeholder: 'Например: сайт, показывает данные сервиса' }
+        ],
+        submit: function (values) {
+          var body = { role_note: values.role_note.trim(), branch: values.branch === link.default_branch ? '' : values.branch };
+          if ((values.account_id || null) !== (link.github_account_id || null)) body.account_id = values.account_id || null;
+          return api(projectUrl('/repositories/' + name.split('/').map(enc).join('/') + '/update'),
+                     { method: 'POST', body: body }).then(function () {
+            closeDialog();
+            toast('Сохранено.');
+            return refreshSettings();
+          });
+        }
+      });
+    },
+    'repo-remove': function (el) {
+      var name = el.getAttribute('data-name');
+      confirmDialog('Убрать репозиторий из проекта?', name + ' перестанет быть частью проекта: задачи в нём запускаться не будут. Сам репозиторий и его история в GitHub не меняются.', 'Убрать', function () {
+        api(projectUrl('/repositories/remove'), { method: 'POST', body: { full_name: name } }).then(function () {
+          toast('Репозиторий убран из проекта.');
+          return api(projectUrl('/binding')).then(function (bound) {
+            S.binding = bound.binding;
+            S.ws.treeKey = '';
+            renderAll();
+            return refreshSettings();
+          });
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
+      }, true);
     }
   };
 
@@ -1868,11 +2544,54 @@
       if (handler) handler(target, event);
     });
 
+    // Whether the list of runs is under a finger or still moving: its redraw
+    // waits for that to end (see ``renderAgent``).
+    var onList = function (event) {
+      return event.target && event.target.closest && event.target.closest('.work-list');
+    };
+    document.addEventListener('touchstart', function (event) {
+      if (onList(event)) agentScroll.touching = true;
+    }, { passive: true });
+    ['touchend', 'touchcancel'].forEach(function (name) {
+      document.addEventListener(name, function () {
+        if (agentScroll.touching) { agentScroll.touching = false; agentScroll.at = Date.now(); }
+      }, { passive: true });
+    });
+    document.addEventListener('scroll', function (event) {
+      if (event.target && event.target.classList && event.target.classList.contains('work-list')) {
+        agentScroll.at = Date.now();
+      }
+    }, true);
+
+    document.addEventListener('change', function (event) {
+      if (event.target.id !== 'executor-strategy') return;
+      api(projectUrl('/executors'), { method: 'POST', body: { strategy: event.target.value } })
+        .then(function () { toast('Сохранено.'); return refreshSettings(); },
+              function (error) { toast(explain(error.message).text, 'bad'); refreshSettings(); });
+    });
+
     document.addEventListener('submit', function (event) {
       var form = event.target;
       if (form.id === 'composer') {
         event.preventDefault();
         send($('#prompt').value);
+      } else if (form.classList.contains('openhands-form')) {
+        event.preventDefault();
+        submitOpenhandsForm(form);
+      } else if (form.id === 'executor-add') {
+        event.preventDefault();
+        var accountId = form.elements.account_id.value;
+        if (!accountId) return;
+        // The list is applied whole by the server: what is there, in its
+        // order, and the new one after it (the first one added is the primary).
+        var current = ((S.projectSettings && S.projectSettings.executors) || {}).executors || [];
+        var list = current.map(function (e) { return { account_id: String(e.account_id), enabled: !!e.enabled }; });
+        list.push({ account_id: accountId, enabled: true });
+        var addButton = $('button[type=submit]', form);
+        setBusy(addButton, true);
+        api(projectUrl('/executors'), { method: 'POST', body: { executors: list } })
+          .then(function () { toast('Исполнитель добавлен.'); return refreshSettings(); },
+                function (error) { setBusy(addButton, false); toast(explain(error.message).text, 'bad'); });
       } else if (form.classList.contains('account-form')) {
         event.preventDefault();
         submitAccountForm(form);

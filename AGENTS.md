@@ -1674,3 +1674,95 @@ focused view was added on top of them, without changing their logic.
   (reusing its `_reset`, `clouds`, `app`, `base` helpers) plus the route-auth
   entry. The CLI/route report is asserted to be `UNVERIFIED` for the agent
   catalog when `live` is not requested.
+
+## Durable runs, reports, stop signals, project executors, several repositories (2026-11-12)
+
+Full description: `docs/DURABLE-RUNS.md`. What a future change has to know:
+
+- **A run has a `policy`.** `durable` (the chat, or REST without budgets) does
+  not give a task up; `bounded` (REST with `max_iterations`/`deadline_seconds`,
+  or `"policy": "bounded"`; also the default of `LabStore.start_run`) stops
+  where a run always stopped. Every rule below that says "waits" or "is tried
+  again" is the durable one; a test that builds a run through the store gets
+  the bounded behaviour unless it asks.
+- **Task state `waiting`** (+ `retry_at`, `wait_reason`, `cycle`). Attempts are
+  per work cycle; when they are used up the task waits
+  (`nexus_retry.cycle_wait`: a minute doubling to an hour) and starts the next
+  cycle. `nexus_retry` is the whole policy, as pure functions. A 429 is never
+  an attempt (`postpone_task`). `NEXUS_RETRY_MAX_CYCLES` (0 = none) is the
+  operator's ceiling.
+- **A result that does not verify is reworked** (`LabScheduler._retry`,
+  `LabStore.retry_task`): first in the same conversation
+  (`Verification.retry = followup`, `Dispatched.kind = "continue"`), then in a
+  new one, with the old one told to stop. `reverify` holds the result when
+  GitHub cannot be asked. An attempt that was not accepted is signed into
+  evidence as well.
+- **Completion is checked once more and reported in one transaction.**
+  `LabScheduler._complete` asks GitHub whether every accepted commit is still
+  in its branch (`GitVerifier.confirm`); a commit that left reopens its task
+  (`reopen_task`), and a GitHub that does not answer postpones completion. `ReportService.on_completed` is the `also` hook of
+  `set_run_state_internal(..., "completed")`: the report row exists exactly
+  when the run completed. `deliver_due` appends the chat message and marks the
+  row delivered in one transaction, on a locked row.
+- **Cancel = `cancelled` + `hidden_at` + stop signals, one transaction**
+  (`LabStore._apply_run_state`). Nothing is deleted; `list_runs` leaves hidden
+  runs out.
+- **Stopping a conversation.** Clients: `stop_conversation(id) -> bool` and
+  `supports_conversation_stop`. The `app` transport pauses the conversation's
+  own sandbox - it is how the Cloud's own client stops one, and a conversation
+  started here never shares a sandbox. `OpenHandsExecutor.stop(account,
+  conversation, project)` is the only way the loop stops one; a conversation
+  that is gone or already stopped counts as stopped. Two records of what is
+  owed: `nexus_run_tasks.abandoned` (a switch or failover of a live task;
+  drained by the run's pass, and by `deliver_stops` for a run that has ended)
+  and `nexus_executor_stops` (everything else; confirmed by looking at the
+  conversation, re-sent with a growing pause, given up after
+  `MAX_STOP_ATTEMPTS`). `_BRANCH_FREE` holds the branch for both.
+- **The fencing token covers the new transitions**: `retry_task`, `wait_task`
+  take `lease_token`; they and `reopen_task` move it on.
+- **`LabWorker.tick_once`** = runs, then stops, reports, and a re-probe of
+  connections written off. The web server's inline loop uses the same method.
+  A worker with no router looks for stored connections on every pass
+  (`_find_router`).
+- **Connections.** `net_guard` checks a URL a person supplied (public addresses
+  only, again at connect time). It has no switch of its own: what is permitted
+  is read from `nexus_policy` (`NEXUS_ALLOW_PRIVATE_TARGETS`, and
+  `NEXUS_OPENHANDS_ALLOWED_HOSTS` for one host), which
+  `check_outbound_url` obeys too - never add a second opt-in. A new MCP tool
+  needs an entry in `MCP_TOOL_SCOPES`. `edit()` is the one way to change a
+  connection and also takes a new key; `remove` is refused while something
+  depends on it; `verify` records `api_version` and `compatibility`.
+- **Project executors.** `nexus_project_executors` (position 0 = primary) and
+  `nexus_projects.executor_strategy` (`failover` | `distribute`);
+  `AccountRouter.select_for_task` uses only the project's list when it has one.
+- **Project repositories.** A link carries `github_account_id`, `is_primary`,
+  `working_branch`, `role_note`, `enabled`. `ProjectRepositoryService.context`
+  is what the planner and the agents are told; `account_for_repository` is what
+  the verifier and the report read with.
+- **Migrations** `0030_durable_runs.sql`, `0031_openhands_connections.sql`,
+  `0032_project_repositories.sql`. They also convert a database that carries
+  the draft schema of PR #29 (`0026_durable_autonomy.sql`), which was never
+  merged.
+- **What was reused.** PR #29 (draft, the same task, written by an agent run):
+  its studio interface (copy buttons, the mobile scroll fix, the settings
+  sections), routes, CLI/MCP additions and `nexus_binding` changes are merged
+  here; its scheduler, migration and executor module were not (this branch's
+  were further along and tested), and the migrations accept its schema.
+- **A test of `main` changed on purpose**:
+  `tests/test_pipeline_e2e.py::test_a_text_answer_is_never_proof_of_work`
+  expected a chat-started run to end `blocked` on the first unverified answer.
+  The rule stands (not accepted, the dependent not started, the attempt in the
+  evidence); the run now goes on. The bounded behaviour is in
+  `tests/test_lab_inline.py`.
+
+Tests: `tests/test_durable_runs.py`, `test_run_reports.py`,
+`test_durable_migrations.py`, `test_project_repositories.py`,
+`test_openhands_connections.py` (connections and project executors), the HTTP cases in
+`test_lab_inline.py`, and the studio journeys in `test_browser_e2e.py`.
+
+Not verified against the live services: nothing here was run against a real
+OpenHands Cloud account or a real GitHub repository - this was written without
+credentials for either. The Cloud's sandbox pause, `/interrupt` on an
+agent-server and the events query used for the stall check are taken from the
+OpenHands source and its OpenAPI description, and exercised only against the
+stand-in servers in `tests/`.

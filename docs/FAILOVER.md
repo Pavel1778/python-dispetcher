@@ -97,9 +97,15 @@ at the named branch first.
   account is gone is never polled again.
 - **Completed work is not repeated.** The hand-off names the verified tasks.
 - **No infinite loop.** When the pool has nothing left for a task (every account
-  tried or unusable), the run is **blocked** with the reason as evidence — never
-  spun. A refused start (above) is not that case: it waits, at the pace the
-  service asked for, until the run's deadline.
+  tried or unusable), a run with explicit budgets is **blocked** with the reason
+  as evidence — never spun. A durable run (one started from the chat) does not
+  stop: the connections that were written off are probed again, the task waits
+  — each time longer, up to an hour — and is offered to every executor again
+  (`docs/DURABLE-RUNS.md`). A refused start (above) is not either case: it
+  waits at the pace the service asked for.
+- **Only the project's own executors.** A project that was given a list of
+  connections (a primary and backups) fails over inside that list and nowhere
+  else; work returns to the primary once it is usable again.
 - **A failed start does not increment `attempt` against the pool.** It is a
   transport problem, so the task is requeued for another account; the attempt
   budget still bounds the total.

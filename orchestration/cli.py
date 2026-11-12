@@ -573,6 +573,78 @@ def cmd_openhands_account_action(args: argparse.Namespace) -> int:
     raise CliError(f"unknown action {action}", EXIT["usage"])
 
 
+def cmd_run_show(args: argparse.Namespace) -> int:
+    """Show an autonomous run with its tasks and its report, if any."""
+    client = _client(args)
+    data = client.get(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}")
+    run = data["run"]
+    lines = [f"{run['id']}  {run['state']}  {run.get('policy', 'bounded')}  "
+             f"cycle {run.get('cycle', 0)}  starts {run.get('total_iterations', 0)}"]
+    if run.get("wait_reason"):
+        lines.append(f"waiting: {run['wait_reason']}")
+    if run.get("last_error"):
+        lines.append(f"reason: {run['last_error']}")
+    for task in data.get("tasks", []):
+        lines.append(f"  {task['task_key']:>8}  {task['state']}  "
+                     f"attempt {task['attempt']}/{task['max_attempts']}  cycle {task.get('cycle', 0)}")
+    report = data.get("report")
+    if report and report.get("body"):
+        lines.append("")
+        lines.append(f"report: {report['state']} ({report.get('outcome')})")
+        lines.append(report["body"])
+    _emit(args, data, human="\n".join(lines))
+    return EXIT["ok"]
+
+
+def cmd_run_cancel(args: argparse.Namespace) -> int:
+    """Stop a run for good (terminal and idempotent)."""
+    client = _client(args)
+    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/cancel", {})
+    _emit(args, result, human=f"run {result['run']['id']} -> {result['run']['state']}")
+    return EXIT["ok"]
+
+
+def cmd_run_hide(args: argparse.Namespace) -> int:
+    """Hide a terminal run from the active lists without deleting it."""
+    client = _client(args)
+    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/hide", {})
+    _emit(args, result, human=f"run {result['run']['id']} hidden")
+    return EXIT["ok"]
+
+
+def cmd_project_executors_show(args: argparse.Namespace) -> int:
+    client = _client(args)
+    data = client.get(f"/api/v1/projects/{args.project_id}/executors")
+    human = "\n".join(
+        f"{e['account_id']}  {e['role']:<8}  {e['label']}"
+        f"{'' if e.get('enabled', True) else '  DISABLED'}"
+        f"{'' if e.get('usable', True) else '  (cannot take work now)'}"
+        for e in data["executors"]) \
+        or "(no executors assigned: the project uses the default rule)"
+    _emit(args, data, human=human)
+    return EXIT["ok"]
+
+
+def cmd_project_executors_set(args: argparse.Namespace) -> int:
+    """Set the whole executor assignment: one primary, ordered fallbacks."""
+    client = _client(args)
+    primary = args.primary or None
+    fallbacks = [x for x in (args.fallbacks or "").split(",") if x]
+    result = client.post(f"/api/v1/projects/{args.project_id}/executors",
+                         {"primary": primary, "fallbacks": fallbacks})
+    _emit(args, result, human=f"{len(result['executors'])} executor(s) assigned")
+    return EXIT["ok"]
+
+
+def cmd_project_repos_primary(args: argparse.Namespace) -> int:
+    client = _client(args)
+    owner, name = args.full_name.split("/", 1)
+    result = client.post(
+        f"/api/v1/projects/{args.project_id}/repositories/{owner}/{name}/primary", {})
+    _emit(args, result, human=f"{result['repository']['full_name']} is now primary")
+    return EXIT["ok"]
+
+
 def cmd_qa_verify(args: argparse.Namespace) -> int:
     """Verify the evidence hash chain for a project."""
     client = _client(args)
@@ -704,6 +776,40 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("project_id")
     rr.add_argument("full_name")
     rr.set_defaults(func=cmd_project_repo_remove)
+    rp = repo.add_parser("primary", parents=[common],
+                         help="make one linked repository the project's primary")
+    rp.add_argument("full_name")
+    rp.add_argument("--project", dest="project_id", required=True)
+    rp.set_defaults(func=cmd_project_repos_primary)
+
+    execs = project.add_parser("executors", parents=[common],
+                               help="assign OpenHands executors to a project").add_subparsers(
+        dest="action", required=True)
+    es = execs.add_parser("show", parents=[common], help="show the project's executors")
+    es.add_argument("--project", dest="project_id", required=True)
+    es.set_defaults(func=cmd_project_executors_show)
+    eset = execs.add_parser("set", parents=[common],
+                            help="set the whole assignment (one primary, ordered fallbacks)")
+    eset.add_argument("--project", dest="project_id", required=True)
+    eset.add_argument("--primary", default=None, help="account id used first")
+    eset.add_argument("--fallbacks", default=None, help="comma-separated account ids, in order")
+    eset.set_defaults(func=cmd_project_executors_set)
+
+    run = sub.add_parser("run", parents=[common],
+                         help="inspect and control autonomous runs").add_subparsers(
+        dest="sub", required=True)
+    rs = run.add_parser("show", parents=[common], help="show a run, its tasks and its report")
+    rs.add_argument("run_id")
+    rs.add_argument("--project", dest="project_id", required=True)
+    rs.set_defaults(func=cmd_run_show)
+    rc = run.add_parser("cancel", parents=[common], help="stop a run for good")
+    rc.add_argument("run_id")
+    rc.add_argument("--project", dest="project_id", required=True)
+    rc.set_defaults(func=cmd_run_cancel)
+    rh = run.add_parser("hide", parents=[common], help="hide a terminal run from the lists")
+    rh.add_argument("run_id")
+    rh.add_argument("--project", dest="project_id", required=True)
+    rh.set_defaults(func=cmd_run_hide)
 
     task = sub.add_parser("task", parents=[common], help="manage tasks").add_subparsers(dest="sub", required=True)
     tl = task.add_parser("list", parents=[common], help="list tasks")
