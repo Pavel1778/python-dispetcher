@@ -40,7 +40,12 @@ from orchestration.cloud_client import (  # noqa: E402
 )
 from orchestration.cloud_store import InvalidTransition, PostgresStore  # noqa: E402
 from orchestration.nexus_binding import ProjectRepositoryService  # noqa: E402
-from orchestration.nexus_lab import LabScheduler, TaskReport, Verification  # noqa: E402
+from orchestration.nexus_lab import (  # noqa: E402
+    MAX_STOP_ATTEMPTS,
+    LabScheduler,
+    TaskReport,
+    Verification,
+)
 from orchestration.nexus_lab_store import LabStore  # noqa: E402
 from orchestration.nexus_projects import ProjectService  # noqa: E402
 
@@ -830,6 +835,50 @@ def test_a_cancelled_run_does_not_hold_its_goal_or_its_branch(env):
     assert executor.stop_calls == [old, old]
     sched.tick(again)
     assert len(executor.of("build")) == 2
+
+
+def test_an_agent_that_goes_on_after_the_signal_keeps_its_branch_for_hours(env):
+    """An agent in the middle of a long step takes the signal and lets go only
+    when the step ends. Its branch is not given to another agent after a few
+    looks: the looks get rarer, and giving the stop up - which is what frees
+    the branch - takes hours and says what was seen."""
+    run_id = start(env, [{"task_key": "build", "title": "Build"}], repository=REPO)
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    sched.tick(run_id)
+    old = executor.of("build")[0]
+    executor.deaf.add(old)
+    env["lab"].set_run_state(ALICE, env["project"], run_id, "cancelled")
+    again = start(env, [{"task_key": "build", "title": "Build"}], repository=REPO)
+
+    waits = []
+    for _ in range(MAX_STOP_ATTEMPTS - 1):
+        assert sched.deliver_stops() == {"confirmed": 0, "pending": 1, "abandoned": 0}
+        waits.append(round(float(sql(
+            env, "SELECT extract(epoch FROM next_attempt_at - now()) AS s "
+                 "FROM nexus_executor_stops WHERE run_id=%s", run_id)[0]["s"])))
+        time_passes(env, run_id)
+    # A pause usually takes seconds, so the first looks are close together...
+    assert waits[:6] == [5] * 6
+    # ...then rarer, and never further apart than ten minutes.
+    assert waits[6:13] == [10, 20, 40, 80, 160, 320, 600] and set(waits[13:]) == {600}
+    assert sum(waits) > 4 * 3600, "given up within hours, not minutes"
+
+    stop = env["lab"].stops(run_id)[0]
+    assert stop["state"] == "requested" and stop["signalled"] is True
+    sched.tick(again)
+    assert executor.of("build") == [old], "the branch is still held"
+
+    # The last look. The stop is given up, says why, and the branch is free.
+    assert sched.deliver_stops() == {"confirmed": 0, "pending": 0, "abandoned": 1}
+    stop = env["lab"].stops(run_id)[0]
+    assert stop["state"] == "abandoned" and stop["observed"] == "running"
+    assert "still reports running" in stop["last_error"]
+    assert sched.deliver_stops() == {"confirmed": 0, "pending": 0, "abandoned": 0}
+    sched.tick(again)
+    assert len(executor.of("build")) == 2
+    # Nothing of the cancelled run was removed for it.
+    assert env["lab"].get_run(ALICE, env["project"], run_id)["state"] == "cancelled"
 
 
 def test_a_stop_that_cannot_be_delivered_is_owed_until_it_is(env):

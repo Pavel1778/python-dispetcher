@@ -130,7 +130,11 @@ Two records say what is still owed, for two situations:
   worker that had lost the task. Delivered by the worker loop whatever the run
   is doing; **confirmed** only when the executor reports the conversation in a
   state in which it does nothing more (or gone). Until then the signal is sent
-  again with a growing pause; after 40 tries it is given up and says why.
+  again with a growing pause. After 40 tries it is given up (`abandoned`) and
+  says why; that takes hours, both for a signal that cannot be sent (about six)
+  and for one that was taken while the conversation still reports itself at
+  work (about five: an agent in the middle of a long step lets go when the step
+  ends). A stop that is given up no longer holds the branch.
 
 While either record holds a conversation, its repository and branch are given
 to no other task.
@@ -147,9 +151,10 @@ returned, logged or shown; views carry a masked hint.
 | `POST /api/openhands/accounts` | add: the URL is checked, then the key is verified against the service before anything is stored |
 | `POST …/accounts/<id>/edit` (alias `/rename`) | change the name, URL, model, limits - and, with `api_key`, the key (verified first) |
 | `POST …/accounts/<id>/verify` | is the key accepted; records the API version and whether the routes NEXUS needs exist (`compatibility`) |
-| `POST …/accounts/<id>/probe` | is the endpoint reachable |
-| `POST …/accounts/<id>/enable` / `disable` | switch it on or off |
-| `POST …/accounts/<id>/remove` | remove; refused with the list of dependants while a project uses it or a task is at work on it |
+| `POST …/accounts/<id>/connection` | is the endpoint reachable (an answer, even `401`, is "reachable") |
+| `POST …/accounts/<id>/enable` | switch it on or off: `{"enabled": false}` switches it off, the key stays stored |
+| `POST …/accounts/<id>/remove` | remove; refused (409, with `dependencies`) while a project uses it or a task is at work on it; `{"force": true}` overrides |
+| `GET …/accounts/<id>/dependencies` | what uses the connection: projects, tasks at work |
 
 **The URL is checked against server-side request forgery** (`net_guard`): only
 `http`/`https`, no credentials, query or fragment in the URL, and every address

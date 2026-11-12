@@ -1040,8 +1040,27 @@ REVERIFY_SECONDS = 60.0
 #: unconfirmed; the pause between tries grows from ``STOP_RETRY_SECONDS``.
 MAX_STOP_ATTEMPTS = 40
 STOP_RETRY_SECONDS = 15.0
-#: Once the signal is in, how soon the conversation is looked at again.
+#: Once the signal is in, how soon the conversation is looked at again: this
+#: often for the first ``STOP_OBSERVE_QUICK`` looks (a pause usually takes
+#: seconds), then less and less often, up to ``STOP_WAIT_CEILING``.
 STOP_OBSERVE_SECONDS = 5.0
+STOP_OBSERVE_QUICK = 6
+STOP_WAIT_CEILING = 600.0
+
+
+def stop_observe_wait(attempts: int) -> float:
+    """How long until a conversation that took the stop signal and still
+    reports itself at work is looked at again, after *attempts* tries.
+
+    An agent may be in the middle of a long step when the signal arrives - a
+    test suite, a build - and lets go only when the step ends. A stop that is
+    given up frees the conversation's branch for another agent, so it must not
+    be given up while that is still the likely explanation: with these numbers
+    ``MAX_STOP_ATTEMPTS`` looks take hours, as the tries of a signal that
+    cannot be sent at all do.
+    """
+    return min(STOP_WAIT_CEILING,
+               STOP_OBSERVE_SECONDS * 2 ** max(0, int(attempts) - STOP_OBSERVE_QUICK))
 
 
 def stall_seconds() -> int:
@@ -1828,8 +1847,11 @@ class LabScheduler:
         state in which it does nothing more by itself (paused, finished, error,
         stuck, deleting) or reports that it is gone. Until then the signal is
         sent again, with a pause that grows; after ``MAX_STOP_ATTEMPTS`` tries
-        it is given up as ``abandoned`` and says why. A stop that is neither is
-        still owed after a restart: it is a row, not a thread.
+        - hours, whether the signal could not be sent or was taken and not
+        obeyed - it is given up as ``abandoned`` and says why. Giving it up
+        frees the conversation's branch, which is why it is not done sooner. A
+        stop that is neither is still owed after a restart: it is a row, not a
+        thread.
         """
         summary = {"confirmed": 0, "pending": 0, "abandoned": 0}
         stop = getattr(self.executor, "stop", None)
@@ -1865,7 +1887,8 @@ class LabScheduler:
                 else:
                     self.store.stop_result(
                         item["id"], error=error, signalled=signalled,
-                        retry_seconds=min(600.0, STOP_RETRY_SECONDS * 2 ** min(attempts - 1, 8)))
+                        retry_seconds=min(STOP_WAIT_CEILING,
+                                          STOP_RETRY_SECONDS * 2 ** min(attempts - 1, 8)))
                     summary["pending"] += 1
                 continue
             if state in _STOPPED or state == "missing":
@@ -1879,10 +1902,11 @@ class LabScheduler:
                 summary["abandoned"] += 1
             else:
                 # The signal is in; the conversation has not let go yet. It is
-                # looked at again shortly, and told again if it still goes on.
+                # looked at again shortly, and told again if it still goes on -
+                # less often as time passes (``stop_observe_wait``).
                 self.store.stop_result(
                     item["id"], signalled=signalled, observed=state,
-                    retry_seconds=STOP_OBSERVE_SECONDS,
+                    retry_seconds=stop_observe_wait(attempts),
                     error=f"signal sent; the conversation still reports {state or 'no state'}")
                 summary["pending"] += 1
         # What a switch or a failover left behind in a run that has since ended
