@@ -1320,3 +1320,49 @@ project may use several OpenHands and several GitHub repositories. Migration
   `tests/test_lab_http.py` (routes) and `tests/test_browser_e2e.py` (copy, cancel
   disappearance, report in chat, phone scroll). `tests/test_route_auth.py`
   probes every new endpoint. Full suite: 993 passed / 8 skipped.
+
+## Independent audit of PR #29 (durable autonomy, multi-connection)
+
+This records what an independent audit found and fixed. Read it before changing
+the chat turn, the run report delivery, or the planner's empty-plan path.
+
+- **Chat-first intent routing was missing entirely.** With a conversation's mode
+  set to `autonomous`, *any* message started a run - a question ("почему прогон
+  ломается?") launched agents. `orchestration/nexus_intent.py` is now the one
+  router: it classifies a message as `chat` / `analysis` / `autonomous` from its
+  *shape* (question vs order), not from a keyword, and `effective_mode` turns
+  that into the mode the turn runs in. Migration `0027` adds the `analysis` and
+  `auto` modes and makes `auto` the default; the studio has an "Авто" (default)
+  and a "Разбор" mode. Invariants: a question never starts a run; an ambiguous
+  message is answered with one clarifying question (and does not even call the
+  model); `analysis` mode never starts a run; "продолжи" continues the run the
+  conversation already started (resume, never a second run); a question asked
+  during a run does not change the run's state. `tests/test_intent_router.py`.
+- **A statement is not ambiguous.** Only a message that carries a work signal
+  but whose shape is unclear is flagged ambiguous. A plain "Вопрос без
+  провайдера" or a hostile HTML blob is a normal chat turn (answered, never
+  intercepted) - the browser tests depend on that.
+- **The planner recovered nothing from an empty plan.** "the planner found
+  nothing to do in the specification: the plan has no tasks" was terminal.
+  `SpecPlanner._fallback_plan` now decomposes by the specification's own index -
+  one task per section that holds at least one *normative* piece, chained in
+  document order - each task carrying the `spec_ref` the delivery path needs.
+  It never fabricates work: a text with no obligation still fails honestly, with
+  the reason. `coverage["fallback"]` marks it. `tests/test_long_task_cases.py`.
+- **Report delivery was not idempotent under two workers.** `deliver_pending`
+  read the pending rows and marked each `sent` only *after* posting, so the
+  inline lab loop and a standalone `lab_worker` (which the docs say may run side
+  by side) both posted the same report. Delivery now *claims* each report
+  atomically (`claim_pending_reports`, `FOR UPDATE SKIP LOCKED`, status
+  `sending`; migration `0028` widens the CHECK) and `reclaim_stale_report_sends`
+  returns a dead worker's claim. `tests/test_durable_autonomy.py`.
+- **`is_primary` was a label with no effect.** The docstring promised a
+  repository-less task runs against the project's primary repository, but
+  nothing read the column. `ProjectRepositoryService.primary_repository` now
+  resolves it (and treats a project's *single* linked repository as primary in
+  effect), and both run-start paths use it.
+- **Test-suite flakiness (not a product defect).** Running the whole suite can
+  fail with `psycopg.errors.UndefinedTable` when one module's server (with
+  `lab_inline=True`) still touches the database while the next module resets the
+  schema. Each module passes alone; a clean serial run passes. Do not "fix" this
+  by weakening a test.
