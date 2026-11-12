@@ -370,7 +370,13 @@ class PostgresStore:
         "nexus_run_tasks": ("id", "run_id", "project_id", "task_key", "state",
                             "attempt", "max_attempts", "conversation_id",
                             "openhands_account_id", "tried_accounts",
-                            "preferred_account_id"),
+                            "preferred_account_id", "cycle"),
+        "nexus_run_reports": ("id", "run_id", "project_id", "conversation_id",
+                              "status", "content", "attempts", "next_attempt_at"),
+        "nexus_project_openhands": ("project_id", "account_id", "role", "position",
+                                    "enabled"),
+        "nexus_project_repositories": ("project_id", "repository_id",
+                                       "github_account_id", "is_primary"),
     }
 
     def verify_schema(self) -> list[str]:

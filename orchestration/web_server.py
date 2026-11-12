@@ -435,10 +435,17 @@ class App:
         # OpenHands multi-account: an account is one row, the API key encrypted
         # with NEXUS_SECRET_KEY and never returned. A project may bind one.
         self.openhands_accounts = OpenHandsAccountService(self.store)
+        # The project-scoped executor assignment: which accounts a *project* may
+        # run on, in order. With assignments present the pool for that project is
+        # restricted to them; with none the previous behaviour is kept.
+        from .nexus_project_executors import ProjectExecutorService
+        self.project_executors = ProjectExecutorService(self.store)
         # The account pool: which account runs work, and in what order, under a
-        # selection mode. The policy lives in the service, not the UI.
+        # selection mode. The policy lives in the service, not the UI. The pool
+        # is restricted to a project's assigned executors when it has any.
         from .openhands_pool import AccountPool
-        self.account_pool = AccountPool(self.store, self.openhands_accounts)
+        self.account_pool = AccountPool(self.store, self.openhands_accounts,
+                                        assignments=self.project_executors)
         # The persistent conversational surface. The responder needs the provider
         # cascade for ask/plan and the dispatch hooks for code/autonomous.
         from .nexus_chat import ChatResponder
@@ -1386,12 +1393,15 @@ class Handler(BaseHTTPRequestHandler):
         if not UUID_RE.fullmatch(parts[3]):
             return None
         resource = parts[4]
-        if resource not in ("repositories", "tasks", "workflows", "evidence"):
+        if resource not in ("repositories", "tasks", "workflows", "evidence", "executors"):
             return None
         item = parts[5] if len(parts) == 6 else None
         if item is not None and not UUID_RE.fullmatch(item):
-            # Only the repositories collection accepts a non-uuid action segment.
-            if not (resource == "repositories" and item == "remove"):
+            # The repositories and executors collections accept a non-uuid
+            # action segment (``remove``); anything else must be a uuid.
+            allowed = ((resource == "repositories" and item == "remove")
+                       or (resource == "executors" and item == "remove"))
+            if not allowed:
                 return None
         return parts[3], resource, item
 
@@ -1511,7 +1521,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
             run = self.app.lab.get_run(principal, project_id, rest[1])
             tasks = self.app.lab.list_tasks(principal, project_id, rest[1])
-            return (200, {"run": run, "tasks": tasks}, None)
+            # The report is part of the run's record: the same text that was
+            # delivered to the source chat, so a person reading the run sees it
+            # too. ``None`` until the run verified.
+            report = self.app.lab.report_for_run(rest[1])
+            return (200, {"run": run, "tasks": tasks, "report": report}, None)
         # GET /api/v1/projects/{id}/specs/{spec_id}[/content|sections|requirements|stages]
         if rest and rest[0] == "specs" and len(rest) in (2, 3) and UUID_RE.fullmatch(rest[1]):
             return self._get_spec(principal, project_id, rest[1], rest[2] if len(rest) == 3 else "")
@@ -1887,6 +1901,45 @@ class Handler(BaseHTTPRequestHandler):
                 project_id=project_id)
             self._json(201, {"action": action})
             return True
+        # POST /api/v1/projects/{id}/executors/{account_id}/{enable|disable|remove}
+        if (len(rest) == 3 and rest[0] == "executors" and UUID_RE.fullmatch(rest[1])
+                and rest[2] in ("enable", "disable", "remove")):
+            account_id = rest[1]
+            try:
+                if rest[2] == "remove":
+                    self.app.project_executors.remove(principal, project_id, account_id)
+                    self._json(200, {"removed": account_id})
+                    return True
+                enabled = rest[2] == "enable"
+                self._json(200, {"executor": self.app.project_executors.set_enabled(
+                    principal, project_id, account_id, enabled)})
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+            return True
+        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/primary
+        if (len(rest) == 4 and rest[0] == "repositories" and rest[3] == "primary"):
+            full_name = f"{rest[1]}/{rest[2]}"
+            try:
+                self._json(200, {"repository": self.app.project_repos.set_primary(
+                    principal, project_id, full_name)})
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+            return True
+        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/account
+        #   {"account_id": uuid|null}
+        if (len(rest) == 4 and rest[0] == "repositories" and rest[3] == "account"):
+            full_name = f"{rest[1]}/{rest[2]}"
+            account_id = body.get("account_id")
+            if account_id is not None and not (isinstance(account_id, str)
+                                               and UUID_RE.fullmatch(account_id)):
+                self._json(400, {"error": "account_id must be a uuid or null"})
+                return True
+            try:
+                self._json(200, {"repository": self.app.project_repos.set_account(
+                    principal, project_id, full_name, account_id)})
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+            return True
         # POST /api/v1/projects/{id}/context/refresh  (analyze the repository)
         if rest == ["context", "refresh"]:
             self._lab_refresh_context(principal, project_id, body)
@@ -1896,10 +1949,21 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "run"):
             self._lab_start_run(principal, project_id, rest[1], body)
             return True
-        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel}
+        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel|hide}
+        #   cancel is durable and idempotent: the run is settled and hidden from
+        #   the active lists at once, and the loop signals the executor. A
+        #   second cancel is a no-op, never an error.
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
-                and rest[2] in ("pause", "resume", "cancel")):
-            state = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[rest[2]]
+                and rest[2] in ("pause", "resume", "cancel", "hide")):
+            if rest[2] == "cancel":
+                self._json(200, {"run": self.app.lab.cancel_run(
+                    principal, project_id, rest[1])})
+                return True
+            if rest[2] == "hide":
+                self._json(200, {"run": self.app.lab.hide_run(
+                    principal, project_id, rest[1])})
+                return True
+            state = {"pause": "paused", "resume": "running"}[rest[2]]
             self._json(200, {"run": self.app.lab.set_run_state(
                 principal, project_id, rest[1], state)})
             return True
@@ -2450,6 +2514,10 @@ class Handler(BaseHTTPRequestHandler):
         self.app.projects.get(principal, project_id)  # membership check
         if resource == "repositories":
             return self._json(200, {"repositories": self.app.project_repos.list(principal, project_id)})
+        if resource == "executors":
+            # The project's assigned OpenHands accounts (primary + fallbacks).
+            return self._json(200, {"executors": self.app.project_executors.list(
+                principal, project_id)})
         if resource == "tasks":
             if item_id is None:
                 tasks = self.app.store.list_tasks(project_id=project_id)
@@ -2490,6 +2558,27 @@ class Handler(BaseHTTPRequestHandler):
             if not removed:
                 return self._json(404, {"error": "repository not linked to this project"})
             return self._json(200, {"unlinked": full_name})
+        # POST /api/v1/projects/{id}/executors  — set the whole assignment.
+        #   {"primary": uuid|null, "fallbacks": [uuid, ...]}
+        if resource == "executors" and item_id is None:
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be a JSON object"})
+            primary = body.get("primary")
+            fallbacks = body.get("fallbacks") or []
+            if primary is not None and not (isinstance(primary, str)
+                                            and UUID_RE.fullmatch(primary)):
+                return self._json(400, {"error": "primary must be a uuid or null"})
+            if not isinstance(fallbacks, list) or not all(
+                    isinstance(x, str) and UUID_RE.fullmatch(x) for x in fallbacks):
+                return self._json(400, {"error": "fallbacks must be a list of uuids"})
+            try:
+                assigned = self.app.project_executors.replace_all(
+                    principal, project_id, primary=primary, fallbacks=fallbacks)
+            except NotFound as e:
+                return self._json(404, {"error": str(e) or "not found"})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(200, {"executors": assigned})
         if resource == "tasks" and item_id is None:
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})

@@ -33,9 +33,11 @@ from typing import Any
 from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
 from .github_client import GitHubClient
+from .nexus_conversations import ConversationService
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
+from .nexus_reports import ReportBuilder, ReportDeliverer
 from .nexus_specs import SpecService
 
 log = logging.getLogger("lab_worker")
@@ -86,6 +88,12 @@ class LabWorker:
         #: A worker whose heartbeat is older than this reads as dead in the
         #: diagnostics; it is written on register and every tick.
         self.heartbeat_seconds = heartbeat_seconds
+        #: The report writer and the delivery of finished reports to the chat
+        #: that asked for the run. Both are durable: the report row is written
+        #: when a run completes and delivered by whichever pass sees it pending.
+        self.reports = ReportBuilder(store, self.lab)
+        self.conversations = ConversationService(store)
+        self.deliverer = ReportDeliverer(store, self.lab, self.conversations)
         self._stop = threading.Event()
 
     def _client_for_account(self, account_id: str, task: dict | None = None) -> Any:
@@ -109,10 +117,17 @@ class LabWorker:
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
-                            router=self.account_router)
+                            router=self.account_router, reports=self.reports)
 
     def tick_once(self) -> dict[str, Any]:
-        """One pass over every active run. Returns a small summary for logs."""
+        """One pass over every active run, then deliver any pending report.
+
+        The order matters: a run that completes in this pass writes its report
+        row, and the delivery step at the end sends it in the same pass, so the
+        person sees the result without waiting for the next one. A report left
+        over from a previous pass (a restart, a failed delivery) is sent then
+        too, from whichever process runs the pass.
+        """
         sched = self.scheduler()
         summary: dict[str, Any] = {"runs": 0, "advanced": 0, "errors": []}
         for run_id in active_run_ids(self.store):
@@ -124,11 +139,77 @@ class LabWorker:
             except Exception as e:  # noqa: BLE001 - one bad run must not stop the loop
                 log.exception("run %s tick failed", run_id)
                 summary["errors"].append(f"{run_id}: {type(e).__name__}: {e}")
+        # Signal the executor of every cancelled run whose conversations are
+        # still running. A cancel is durable: the request settles the run at
+        # once and this pass (or the next) asks the service to stop the
+        # conversation, so a cancel never fails because the Cloud is slow.
+        try:
+            signalled = self._signal_cancelled()
+            if signalled:
+                summary["cancelled_signalled"] = signalled
+        except Exception as e:  # noqa: BLE001 - one bad signal must not stop the loop
+            log.exception("cancel signalling failed")
+            summary["errors"].append(f"cancel: {type(e).__name__}: {e}")
+        # Deliver finished reports to their chat. A failure here must not stop
+        # the loop; the report stays pending and is retried.
+        try:
+            delivery = self.deliverer.deliver_pending()
+            if delivery["delivered"] or delivery["failed"]:
+                summary["reports"] = delivery
+                summary["advanced"] += delivery["delivered"]
+        except Exception as e:  # noqa: BLE001 - one bad delivery must not stop the loop
+            log.exception("report delivery failed")
+            summary["errors"].append(f"reports: {type(e).__name__}: {e}")
         # The heartbeat is written even when nothing advanced, so an idle worker
         # still reads as alive (a lease alone cannot tell idle from dead).
         last_error = summary["errors"][-1] if summary["errors"] else None
         self.lab.heartbeat(self.worker_id, error=last_error)
         return summary
+
+    def _signal_cancelled(self) -> int:
+        """Ask the service to stop every in-flight conversation of a cancelled run.
+
+        The signal is the account-aware client's ``pause`` (the agent-server's
+        conversation pause, which stops the loop and keeps the transcript) with
+        ``delete_conversation`` as the fallback where a client has no pause. A
+        task that was signalled is recorded once (``conversation_stopped``), so
+        a retry of the pass does not signal it twice, and a signal that failed
+        is simply attempted again next pass. Returns how many tasks were
+        signalled.
+        """
+        signalled = 0
+        for run_id in self.lab.cancelled_runs_needing_signal():
+            for task in self.lab.conversations_needing_stop(run_id):
+                conversation_id = str(task["conversation_id"])
+                try:
+                    client = self._cancel_client(task)
+                    self._stop_conversation(client, conversation_id)
+                except Exception as e:  # noqa: BLE001 - retried on the next pass
+                    log.warning("could not stop conversation %s: %s", conversation_id, e)
+                    continue
+                self.lab.mark_conversation_stopped(
+                    str(task["id"]), conversation_id=conversation_id,
+                    note="conversation stopped after cancel")
+                signalled += 1
+        return signalled
+
+    def _cancel_client(self, task: dict) -> Any:
+        """The client that started a task's conversation: account-aware, else the
+        process-wide one. A conversation can only be stopped through the account
+        that owns its sandbox."""
+        account_id = task.get("openhands_account_id")
+        if account_id and self.account_router is not None:
+            return self._client_for_account(str(account_id), task)
+        return self.client
+
+    @staticmethod
+    def _stop_conversation(client: Any, conversation_id: str) -> None:
+        """Stop a conversation: ``pause`` where the transport has it, else delete."""
+        pause = getattr(client, "pause", None)
+        if callable(pause):
+            pause(conversation_id)
+            return
+        client.delete_conversation(conversation_id)
 
     def run_forever(self) -> None:
         self.lab.register_worker(self.worker_id, kind="worker")

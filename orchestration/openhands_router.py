@@ -232,6 +232,7 @@ def build_account_router(store: PostgresStore, *,
     through them, so the pool is used without a second flag to remember.
     """
     from .nexus_openhands_accounts import OpenHandsAccountService
+    from .nexus_project_executors import ProjectExecutorService
 
     accounts = OpenHandsAccountService(store)
     try:
@@ -239,5 +240,7 @@ def build_account_router(store: PostgresStore, *,
             return None
     except Exception:  # noqa: BLE001 - a database that is not ready means "no pool"
         return None
-    pool = AccountPool(store, accounts)
+    # The project-scoped assignment service restricts the pool to the executors
+    # a project was assigned; without assignments the pool is unchanged.
+    pool = AccountPool(store, accounts, assignments=ProjectExecutorService(store))
     return AccountRouter(store, pool=pool, lab=LabStore(store), principal=principal)

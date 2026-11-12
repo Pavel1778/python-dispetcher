@@ -149,10 +149,11 @@ def test_linear_chain_completes_in_dependency_order(env):
 
 
 def test_unverified_task_blocks_its_child_and_the_run(env):
+    # No retry cycles, so the cycle end is final and the run blocks for a person.
     run = _run_with_tasks(env, [
         {"task_key": "a", "title": "A"},
         {"task_key": "b", "title": "B", "dependencies": ["a"]},
-    ])
+    ], max_retry_cycles=0)
     executor = FakeExecutor()
     sched = LabScheduler(env["lab"], executor, FakeVerifier({"a": "completed_unverified"}))
     result = sched.run_until_done(run["id"])
@@ -424,8 +425,11 @@ def test_a_decision_made_a_moment_too_late_does_not_overrule_a_person(env):
 def test_resuming_a_blocked_run_retries_what_did_not_verify(env):
     """"Resume" on a blocked run flipped the label and the next tick blocked it
     again: nothing could ever be retried."""
+    # No automatic cycles, so the run blocks and a person's resume is what moves
+    # it. (With cycles it would go on by itself; that is the next test.)
     run = _run_with_tasks(env, [{"task_key": "a", "title": "A"},
-                                {"task_key": "b", "title": "B", "dependencies": ["a"]}])
+                                {"task_key": "b", "title": "B", "dependencies": ["a"]}],
+                          max_retry_cycles=0)
     executor = FakeExecutor()
     verifier = FakeVerifier({"a": "completed_unverified"})
     sched = LabScheduler(env["lab"], executor, verifier)
@@ -450,7 +454,8 @@ def test_resuming_a_blocked_run_retries_what_did_not_verify(env):
 
 
 def test_a_blocked_run_with_nothing_left_to_retry_cannot_be_resumed(env):
-    run = _run_with_tasks(env, [{"task_key": "a", "title": "A", "max_attempts": 1}])
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A", "max_attempts": 1}],
+                          max_retry_cycles=0)
     sched = LabScheduler(env["lab"], FakeExecutor(), FakeVerifier({"a": "failed"}))
     sched.run_until_done(run["id"])
     assert _run(env, run)["state"] == "blocked"
@@ -462,21 +467,23 @@ def test_a_blocked_run_with_nothing_left_to_retry_cannot_be_resumed(env):
 
 # ------------------------------------------------------------------------ budgets
 def test_a_run_starts_no_more_tasks_than_its_iteration_budget(env):
-    """``max_iterations`` was stored and never read; the counter stayed at 0."""
+    """``max_iterations`` was stored and never read; the counter stayed at 0.
+
+    With no retry cycles, the cycle that spends the budget is the last one: the
+    run blocks with the budget as its reason. (With cycles it retries with a
+    fresh budget; see the retry tests.)"""
     run = _run_with_tasks(env, [{"task_key": key, "title": key.upper()} for key in "abc"],
-                          max_iterations=2)
+                          max_iterations=2, max_retry_cycles=0)
     executor = FakeExecutor()
     sched = LabScheduler(env["lab"], executor, FakeVerifier())
     sched.run_until_done(run["id"])
 
     assert executor.dispatched == ["a", "b"]
     over = _run(env, run)
-    assert (over["state"], over["iteration"]) == ("failed", 2)
+    assert (over["state"], over["iteration"]) == ("blocked", 2)
     assert over["last_error"] == "iteration budget used: 2 of 2 task starts"
-    tasks = _tasks(env, run)
     assert _states(env, run) == {"a": "completed_verified", "b": "completed_verified",
-                                 "c": "blocked"}
-    assert tasks["c"]["last_error"] == "run failed: iteration budget used: 2 of 2 task starts"
+                                 "c": "pending"}
 
 
 def test_a_run_inside_its_budget_is_not_failed_by_it(env):
@@ -532,7 +539,8 @@ def test_a_conversation_that_outlives_its_lease_is_not_started_again(env):
 
 def test_a_task_past_its_own_time_limit_is_over_and_is_not_started_again(env):
     """``timeout_seconds`` was stored and never read."""
-    run = _run_with_tasks(env, [{"task_key": "a", "title": "A", "timeout_seconds": 60}])
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A", "timeout_seconds": 60}],
+                          max_retry_cycles=0)
     executor = HeldExecutor()
     sched = LabScheduler(env["lab"], executor, FakeVerifier())
     sched.tick(run["id"])
@@ -887,9 +895,9 @@ def test_what_counts_as_the_final_answer(env):
 
 
 # ------------------------------------------------ one task at a time per branch
-def _second_run(env, tasks):
+def _second_run(env, tasks, **run_options):
     goal = str(env["svc"].create_goal("user:alice", env["project"], "Another goal")[0]["id"])
-    run = env["lab"].start_run("user:alice", env["project"], goal)
+    run = env["lab"].start_run("user:alice", env["project"], goal, **run_options)
     for t in tasks:
         env["lab"].add_task("user:alice", env["project"], run["id"], **t)
     return run
@@ -1045,8 +1053,10 @@ def test_the_migration_lifts_the_limit_of_tasks_that_are_still_to_run(env):
 def test_a_stopped_run_says_which_task_stopped_it_and_why(env):
     """"A dependency is not verified" was all a blocked run said. The task and
     the verifier's reason are known, and are now part of the run's error."""
+    # No cycles, so the run stops and its reason is the one to read.
     run = _run_with_tasks(env, [{"task_key": "a", "title": "A"},
-                                {"task_key": "b", "title": "B", "dependencies": ["a"]}])
+                                {"task_key": "b", "title": "B", "dependencies": ["a"]}],
+                          max_retry_cycles=0)
     sched = LabScheduler(env["lab"], FakeExecutor(),
                          FakeVerifier({"a": "completed_unverified"}))
     sched.run_until_done(run["id"])
@@ -1058,7 +1068,8 @@ def test_a_stopped_run_says_which_task_stopped_it_and_why(env):
 
     # A task that ran out of time is named the same way.
     late = _second_run(env, [{"task_key": "x", "title": "X", "timeout_seconds": 60},
-                             {"task_key": "y", "title": "Y", "dependencies": ["x"]}])
+                             {"task_key": "y", "title": "Y", "dependencies": ["x"]}],
+                       max_retry_cycles=0)
     held = LabScheduler(env["lab"], HeldExecutor(), FakeVerifier())
     held.tick(late["id"])
     _sql(env, "UPDATE nexus_run_tasks SET updated_at = now() - interval '2 minutes' "

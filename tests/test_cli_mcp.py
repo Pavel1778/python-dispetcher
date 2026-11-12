@@ -153,6 +153,8 @@ def test_mcp_initialize_and_tool_list(app):
         "list_projects", "get_project", "list_repositories", "list_tasks",
         "get_task", "create_task", "dispatch_task", "get_execution_status",
         "list_evidence", "verify_evidence",
+        "list_runs", "get_run", "cancel_run",
+        "list_project_executors", "assign_project_executor",
     }
 
 
@@ -203,7 +205,7 @@ def test_mcp_stdio_round_trip(app):
     serve(server, stdin=stdin, stdout=stdout)
     lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nexus"
-    assert len(lines[1]["result"]["tools"]) == 10
+    assert len(lines[1]["result"]["tools"]) == 15
 
 
 def test_mcp_parse_error_is_reported(app):
@@ -241,7 +243,7 @@ def test_mcp_http_initialize_and_tools(base):
     assert status == 200
     assert body["result"]["serverInfo"]["name"] == "nexus"
     status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert len(body["result"]["tools"]) == 10
+    assert len(body["result"]["tools"]) == 15
 
 
 def test_mcp_http_project_isolation(base, app):

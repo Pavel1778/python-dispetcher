@@ -415,20 +415,41 @@ def project_github(store: PostgresStore, fallback: GitHubClient, *,
                    ) -> Callable[[dict], GitHubClient]:
     """``client_for(task)``: the GitHub identity a task's project reads with.
 
-    A project that has a stored GitHub account bound is read with that account,
-    exactly as the studio reads its files; a project without one is read with
-    *fallback* (the server's ``GITHUB_TOKEN``). The bound account is never
-    swapped for another: if it was revoked, or its token cannot be decrypted,
-    the call raises and the task is ``blocked`` - not verified by other means.
+    A project may use **several** repositories from **different** GitHub
+    accounts. The identity is therefore resolved per repository, from the link
+    that owns it (``nexus_project_repositories.github_account_id``): a task on
+    ``account-A/frontend`` is read with account A's token, a task on
+    ``account-B/backend`` with account B's. When the task's repository has no
+    linked account, the project's single bound account is used (the older
+    behaviour); with neither, *fallback* (the server's ``GITHUB_TOKEN``).
+
+    A linked account is never swapped for another: if it was revoked, or its
+    token cannot be decrypted, the call raises and the task is ``blocked`` - not
+    verified by other means. ``None`` means "read with the fallback identity".
     """
     service = accounts or GitHubAccountService(store)
 
     def client_for(task: dict) -> GitHubClient:
+        project_id = task.get("project_id")
+        repository = task.get("repository") or ""
         with store._tx() as cur:
+            # The account that owns this specific repository's link, when there
+            # is one and it is active.
+            if repository:
+                cur.execute(
+                    "SELECT a.id, a.principal FROM nexus_project_repositories pr "
+                    "JOIN repositories r ON r.id = pr.repository_id "
+                    "JOIN nexus_github_accounts a ON a.id = pr.github_account_id "
+                    "WHERE pr.project_id=%s AND r.full_name=%s AND a.state='active'",
+                    (project_id, repository))
+                row = cur.fetchone()
+                if row is not None:
+                    return service.client_for_account(row["principal"], str(row["id"]))
+            # Otherwise the project's single bound account, as before.
             cur.execute(
                 "SELECT a.id, a.principal FROM nexus_projects p "
                 "JOIN nexus_github_accounts a ON a.id = p.github_account_id "
-                "WHERE p.id=%s", (task["project_id"],))
+                "WHERE p.id=%s", (project_id,))
             row = cur.fetchone()
         if row is None:
             return fallback
@@ -593,7 +614,8 @@ class LabScheduler:
     def __init__(self, store: LabStore, executor: Executor, verifier: Verifier, *,
                  principal: str = "machine:default", worker_id: str = "lab",
                  lease_seconds: int = 900, router: AccountRouter | None = None,
-                 start_wait: Callable[[CloudRateLimited], float] | None = None):
+                 start_wait: Callable[[CloudRateLimited], float] | None = None,
+                 reports: Any | None = None):
         self.store = store
         self.executor = executor
         self.verifier = verifier
@@ -605,6 +627,8 @@ class LabScheduler:
         #: When set, a dispatch failure is attributed to the account the task
         #: was bound to, so a failover excludes it on the next attempt.
         self.router = router
+        #: When set, a completed run's report is written here (a ReportBuilder).
+        self.reports = reports
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -666,55 +690,24 @@ class LabScheduler:
             result.finished = True
             result.note = f"run is {run['state']}"
             return result
+        if run["state"] == "retrying":
+            # The run is waiting out its backoff, or the wait is over. Collect
+            # anything in flight (work already started is not abandoned) and, if
+            # the wait has elapsed, begin the next cycle. Nothing else is started
+            # while the run is not ``running``.
+            self._collect_in_flight(run_id, result)
+            started = self.store.start_retry_cycle(run_id)
+            if started is not None:
+                result.note = "retry cycle started"
+                run = started
+            else:
+                result.idle = True
+                result.note = "run is retrying: waiting out the backoff"
+                return result
         result.reclaimed = len(self.store.reclaim_expired(run_id))
 
         # 1. Poll every task already dispatched, so a slow conversation advances.
-        in_flight = 0
-        for task in self.store.in_flight_tasks(run_id):
-            conv = task.get("conversation_id")
-            if not conv:
-                in_flight += 1
-                continue
-            report = self.executor.poll(task, conv)
-            if report.state == "running":
-                if task["running_seconds"] <= task["timeout_seconds"]:
-                    in_flight += 1
-                    continue
-                # The task's own time limit. The conversation is left as it is
-                # (its transcript is the explanation); the task is over, and it
-                # is not started a second time behind the first one's back.
-                verdict = Verification(
-                    "failed",
-                    f"timed out after {task['timeout_seconds']} s; the conversation was left running",
-                    {"state": "running", "conversation_id": conv})
-            elif report.state == "missing" and self.router is not None \
-                    and task.get("openhands_account_id"):
-                # The account that ran this conversation can no longer see it:
-                # the executor is gone. Mark the account failed so the next
-                # attempt fails over to a different one, and put the task back.
-                account_id = str(task["openhands_account_id"])
-                self.router.note_failure(task, account_id=account_id,
-                                         error="conversation missing: executor gone",
-                                         unavailable=True)
-                self.store.requeue_for_failover(
-                    task["id"], failed_account_id=account_id,
-                    error="conversation missing; executor may be gone",
-                    requeue=task["attempt"] < task["max_attempts"])
-                result.note = "executor gone: task requeued for failover"
-                continue
-            else:
-                verdict = self.verifier.verify(task, report)
-            # The account produced a terminal result, so it is working: mark it
-            # healthy again. Without this an account excluded by one transient
-            # failure would never come back into the pool.
-            if self.router is not None and report.state in ("finished", "error", "stuck"):
-                self.router.note_success(task)
-            self.store.record_verification(
-                task["id"], verdict=verdict.verdict,
-                evidence={"reason": verdict.reason, **verdict.evidence},
-                detail=verdict.as_detail())
-            result.verified = task["task_key"]
-            result.verdict = verdict.verdict
+        in_flight = self._collect_in_flight(run_id, result)
 
         if run["state"] != "running":
             result.idle = in_flight == 0
@@ -773,10 +766,11 @@ class LabScheduler:
                 # reason.
                 failed_account = self._failed_account(e, task)
                 unavailable = getattr(e, "unavailable", isinstance(e, CloudAuthError))
-                again = (task["attempt"] < task["max_attempts"]
-                         and not getattr(e, "permanent", False))
+                permanent = bool(getattr(e, "permanent", False))
+                again = task["attempt"] < task["max_attempts"] and not permanent
                 self.store.release_task(task["id"], error=f"{type(e).__name__}: {e}",
-                                        requeue=again, failed_account_id=failed_account)
+                                        requeue=again, failed_account_id=failed_account,
+                                        permanent=permanent and not again)
                 if failed_account and self.router is not None:
                     self.router.note_failure(
                         task, account_id=failed_account,
@@ -809,14 +803,98 @@ class LabScheduler:
         outcome = self._decide(run_id)
         if outcome is not None:
             state, last_error, note = outcome
+            if state == "retrying":
+                # A cycle ended with work left: wait out the backoff and go on
+                # by itself. If the cycles are spent (or the run left a state a
+                # retry may not start from), it is blocked for a person instead.
+                scheduled = self.store.schedule_retry(run_id, reason=last_error or note)
+                if scheduled is not None:
+                    result.note = result.note or note or "retrying"
+                    return result
+                # Every cycle is spent. The run is blocked (not failed) with the
+                # reason it stopped, so a person can resume it after fixing the
+                # cause. A blocked run is never serviced automatically.
+                state = "blocked"
+                note = "blocked: retry cycles spent"
             applied = self.store.set_run_state_internal(run_id, state, last_error=last_error)
             result.finished = applied is not None
             if applied is not None and note:
                 result.note = result.note or note
+            if applied is not None and state == "completed" and self.reports is not None:
+                # The run verified. Write its report now, in the same pass that
+                # settled it, so a restart between the two cannot lose it. The
+                # report is delivered to the source chat by the loop.
+                try:
+                    text, meta = self.reports.build(run_id)
+                    self.store.save_report(run_id, content=text, meta=meta)
+                    result.note = result.note or "completed: report written"
+                except Exception as e:  # noqa: BLE001 - a report must not undo a finish
+                    log.exception("could not write the report for run %s", run_id)
+                    result.note = result.note or f"completed: report failed ({type(e).__name__})"
         return result
 
+    def _collect_in_flight(self, run_id: str, result: TickResult) -> int:
+        """Poll every started task once, record the verdict, return how many are
+        still under way. Work already started is always collected - even for a
+        run that stopped - because it was paid for and leaving its answer unread
+        would lose it. Nothing new is started here."""
+        in_flight = 0
+        for task in self.store.in_flight_tasks(run_id):
+            conv = task.get("conversation_id")
+            if not conv:
+                in_flight += 1
+                continue
+            report = self.executor.poll(task, conv)
+            if report.state == "running":
+                if task["running_seconds"] <= task["timeout_seconds"]:
+                    in_flight += 1
+                    continue
+                # The task's own time limit. The conversation is left as it is
+                # (its transcript is the explanation); the task is over, and it
+                # is not started a second time behind the first one's back.
+                verdict = Verification(
+                    "failed",
+                    f"timed out after {task['timeout_seconds']} s; the conversation was left running",
+                    {"state": "running", "conversation_id": conv})
+            elif report.state == "missing" and self.router is not None \
+                    and task.get("openhands_account_id"):
+                # The account that ran this conversation can no longer see it:
+                # the executor is gone. Mark the account failed so the next
+                # attempt fails over to a different one, and put the task back.
+                account_id = str(task["openhands_account_id"])
+                self.router.note_failure(task, account_id=account_id,
+                                         error="conversation missing: executor gone",
+                                         unavailable=True)
+                self.store.requeue_for_failover(
+                    task["id"], failed_account_id=account_id,
+                    error="conversation missing; executor may be gone",
+                    requeue=task["attempt"] < task["max_attempts"])
+                result.note = "executor gone: task requeued for failover"
+                continue
+            else:
+                verdict = self.verifier.verify(task, report)
+            # The account produced a terminal result, so it is working: mark it
+            # healthy again. Without this an account excluded by one transient
+            # failure would never come back into the pool.
+            if self.router is not None and report.state in ("finished", "error", "stuck"):
+                self.router.note_success(task)
+            self.store.record_verification(
+                task["id"], verdict=verdict.verdict,
+                evidence={"reason": verdict.reason, **verdict.evidence},
+                detail=verdict.as_detail())
+            result.verified = task["task_key"]
+            result.verdict = verdict.verdict
+        return in_flight
+
     def _decide(self, run_id: str) -> tuple[str, str | None, str] | None:
-        """The state the run should move to now, or ``None`` to keep going."""
+        """The state the run should move to now, or ``None`` to keep going.
+
+        A cycle that ended with work left is **not** the end of the run: it
+        returns ``retrying``, and the scheduler waits out a backoff and starts a
+        new cycle. The run stops for good only when its cycles are spent (then
+        it is ``blocked``, so a person can resume it), when its deadline passed,
+        or when it has nothing to do at all.
+        """
         counts = self.store.count_tasks(run_id)
         total = sum(counts.values())
         if total == 0:
@@ -826,22 +904,34 @@ class LabScheduler:
             return ("completed", None, "")
         unfinished = sum(counts.get(state, 0) for state in UNFINISHED_TASK_STATES)
         if unfinished == 0:
-            # Nothing left to do and not all verified: the run is blocked, not
-            # complete. A person resumes it (retry) or cancels it.
-            return ("blocked", "no claimable tasks; some tasks not verified" + self._why(run_id),
-                    "blocked: tasks remain unverified")
+            # Nothing left to do and not all verified: a cycle ended with work
+            # left. If nothing about that can change on a retry - every
+            # unfinished task failed permanently - the run is blocked for a
+            # person rather than retried for ever. Otherwise retry.
+            if not self.store.has_retryable_failure(run_id):
+                return ("blocked",
+                        "no claimable tasks; the remaining tasks failed permanently"
+                        + self._why(run_id),
+                        "blocked: permanent failure")
+            return ("retrying",
+                    "no claimable tasks; some tasks not verified" + self._why(run_id),
+                    "retrying: tasks remain unverified")
         if unfinished - counts.get("pending", 0) > 0:
             return None                     # work is in flight; wait for it
         spent = self.store.budget_spent(run_id)
-        if spent:
-            # Tasks are waiting and the run may not start them any more.
+        if spent == "deadline passed":
+            # A hard limit. Retrying cannot extend it, so the run stops for good.
             return ("failed", spent, f"failed: {spent}")
+        if spent:
+            # The per-cycle start budget is used up. That is a cycle end, not a
+            # failure of the run: retry with a fresh budget.
+            return ("retrying", spent, f"retrying: {spent}")
         if not self.store.has_claimable(run_id):
             # A pending task exists but can never be claimed: a dependency ended
-            # unverified/failed/blocked. That is a deadlock, not progress, so the
-            # run is blocked rather than left spinning.
-            return ("blocked", "dependency graph deadlocked: a dependency is not verified"
-                    + self._why(run_id), "blocked: dependency not verified")
+            # unverified/failed/blocked. A new cycle restarts those tasks, so the
+            # run retries rather than being left spinning.
+            return ("retrying", "dependency graph deadlocked: a dependency is not verified"
+                    + self._why(run_id), "retrying: dependency not verified")
         return None
 
     def _why(self, run_id: str) -> str:

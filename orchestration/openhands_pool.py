@@ -24,7 +24,7 @@ guessed.
 """
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
 from .cloud_store import NotFound, PostgresStore
 from .nexus_openhands_accounts import OpenHandsAccountService
@@ -42,9 +42,30 @@ class PoolError(RuntimeError):
 class AccountPool:
     """Select and track OpenHands accounts for a principal."""
 
-    def __init__(self, store: PostgresStore, accounts: OpenHandsAccountService):
+    def __init__(self, store: PostgresStore, accounts: OpenHandsAccountService,
+                 *, assignments: Any | None = None):
         self.store = store
         self.accounts = accounts
+        #: Optional project-scoped allowlist. When set and a project has
+        #: assignments, the pool selects only from them: a project runs on the
+        #: executors it was assigned, never on another project's. With no
+        #: assignments (or no service), the pre-existing behaviour is kept.
+        self.assignments = assignments
+
+    def _assigned(self, project_id: str | None) -> list[str] | None:
+        """The account ids assigned to *project_id*, or ``None`` if none.
+
+        ``None`` (no assignment) means "not restricted": the caller keeps the
+        old policy. An empty list is impossible here - an assignment that was
+        cleared leaves no rows, which is ``None`` again.
+        """
+        if self.assignments is None or not project_id:
+            return None
+        try:
+            ids = self.assignments.assigned_account_ids(str(project_id))
+        except Exception:  # noqa: BLE001 - a pool must work before the table exists
+            return None
+        return ids or None
 
     # ------------------------------------------------------------- config
     def get_config(self, principal: str) -> dict:
@@ -197,18 +218,31 @@ class AccountPool:
                 and account.get("health", "unknown") in _USABLE_HEALTH
                 and str(account["id"]) not in exclude)
 
-    def candidates(self, principal: str, *, exclude: Iterable[str] = ()) -> list[dict]:
+    def candidates(self, principal: str, *, exclude: Iterable[str] = (),
+                   project_id: str | None = None) -> list[dict]:
         """Every selectable account, in failover order.
 
         The order is the operator's explicit ``fallback_order`` first, then
         ``priority`` (lower first), then age — so the ordering is deterministic
         even when two accounts share a priority.
+
+        With *project_id* and a project that has assignments, the list is
+        restricted to them: a project runs on the executors it was assigned,
+        never on another project's.
         """
         exclude = {str(x) for x in exclude}
+        assigned = self._assigned(project_id)
         order = self.get_config(principal)["fallback_order"]
         ranked = {str(x): i for i, x in enumerate(order)}
         usable = [a for a in self.accounts.list_accounts(principal)
-                  if self._usable(a, exclude)]
+                  if self._usable(a, exclude)
+                  and (assigned is None or str(a["id"]) in assigned)]
+        if assigned is not None:
+            # The project's own order is authoritative for its accounts.
+            rank = {aid: i for i, aid in enumerate(assigned)}
+            usable.sort(key=lambda a: (rank.get(str(a["id"]), len(assigned)),
+                                       a.get("priority", 100), str(a["id"])))
+            return usable
         usable.sort(key=lambda a: (ranked.get(str(a["id"]), len(order)),
                                    a.get("priority", 100), str(a.get("created_at")),
                                    str(a["id"])))
@@ -221,10 +255,19 @@ class AccountPool:
         *project_id*, when given, prefers the project's explicit binding: an
         operator who bound an account meant it. The binding is skipped only when
         it is not usable and the mode allows a fallback.
+
+        When the project has **assignments**, only they are candidates: a bound
+        account or a default that is not assigned to this project is not used.
         """
         exclude = {str(x) for x in exclude}
         mode = self.get_config(principal)["selection_mode"]
         accounts = {str(a["id"]): a for a in self.accounts.list_accounts(principal)}
+        assigned = self._assigned(project_id)
+
+        def allowed(account: dict | None) -> bool:
+            return (account is not None and self._usable(account, exclude)
+                    and (assigned is None or str(account["id"]) in assigned))
+
         bound_id = self._project_account(principal, project_id) if project_id else None
         bound = accounts.get(bound_id) if bound_id else None
         default = self._default(principal)
@@ -232,8 +275,7 @@ class AccountPool:
         if mode == "manual":
             # The operator's explicit choice, and only that. A bound account is
             # explicit; otherwise the default. Manual never falls back.
-            chosen = bound if (bound and self._usable(bound, exclude)) else \
-                (default if (default and self._usable(default, exclude)) else None)
+            chosen = bound if allowed(bound) else (default if allowed(default) else None)
             if chosen is None:
                 raise PoolError(
                     "manual mode: the selected account is not usable and manual "
@@ -244,11 +286,11 @@ class AccountPool:
             # Spread work: the usable account running the fewest active tasks.
             # The bound account is honoured only when it is also a valid choice;
             # the point of this mode is balance, so it is not forced.
-            candidates = self.candidates(principal, exclude=exclude)
+            candidates = self.candidates(principal, exclude=exclude, project_id=project_id)
             if not candidates:
                 raise PoolError("no usable OpenHands account for load balancing")
             live = self._live_load()
-            if bound and self._usable(bound, exclude):
+            if bound and allowed(bound):
                 fewest = min(self._load_of(a, live) for a in candidates)
                 if self._load_of(bound, live) == fewest:
                     return bound
@@ -259,10 +301,13 @@ class AccountPool:
         # auto and failover: the bound account, then the default, then the best
         # candidate. failover differs only in the exclude set the caller passes.
         for preferred in (bound, default):
-            if preferred is not None and self._usable(preferred, exclude):
+            if preferred is not None and allowed(preferred):
                 return preferred
-        candidates = self.candidates(principal, exclude=exclude)
+        candidates = self.candidates(principal, exclude=exclude, project_id=project_id)
         if not candidates:
+            if assigned is not None:
+                raise PoolError("no usable OpenHands account among the project's "
+                                "assigned executors")
             raise PoolError("no usable OpenHands account")
         return candidates[0]
 
