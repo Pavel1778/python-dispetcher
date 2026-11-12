@@ -1366,3 +1366,14 @@ the chat turn, the run report delivery, or the planner's empty-plan path.
   `lab_inline=True`) still touches the database while the next module resets the
   schema. Each module passes alone; a clean serial run passes. Do not "fix" this
   by weakening a test.
+
+## Tasks across repositories and the run card (this increment)
+
+- **A plan task may name its own repository and branch.** `validate_tasks` keeps
+  them (`keep=("requirements", "earlier", "repository", "branch")`), `merge`
+  carries them onto the stored task, and `start_run` uses the task's when it has
+  one and the run's otherwise. So one run can span several repositories of a
+  project; a task with no repository uses the run's, the common case.
+- **The run card names the executor and the retry cycle.** `list_tasks` joins
+  `nexus_openhands_accounts.label` as `account_label` (the key is never
+  selected), and the studio shows `исполнитель: <label>` and `цикл N` per task.

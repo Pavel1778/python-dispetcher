@@ -558,3 +558,37 @@ def test_a_report_left_sending_by_a_dead_worker_is_reclaimed(env):
               "WHERE run_id=%s", run["id"])
     assert env["lab"].reclaim_stale_report_sends(older_than_seconds=300) == 1
     assert env["lab"].report_for_run(run["id"])["status"] == "pending"
+
+
+# --------------------------------------------------- tasks across repositories
+def test_a_plan_can_distribute_tasks_across_repositories(env):
+    """One run spans several repositories: each task names its own repo/branch."""
+    env["store"].add_repository("acme/frontend", default_branch="main")
+    env["store"].add_repository("acme/backend", default_branch="main")
+    repos = ProjectRepositoryService(env["store"])
+    repos.link("user:alice", env["project"], "acme/frontend", make_primary=True)
+    repos.link("user:alice", env["project"], "acme/backend")
+    run = env["lab"].start_run(
+        "user:alice", env["project"], env["goal"],
+        repository="acme/frontend", branch="main",
+        plan=[
+            {"id": "ui", "title": "UI", "repository": "acme/frontend", "branch": "main",
+             "dependencies": []},
+            {"id": "api", "title": "API", "repository": "acme/backend", "branch": "main",
+             "dependencies": ["ui"]},
+        ])
+    tasks = {t["task_key"]: t for t in
+             env["lab"].list_tasks("user:alice", env["project"], run["id"])}
+    assert tasks["ui"]["repository"] == "acme/frontend"
+    assert tasks["api"]["repository"] == "acme/backend"
+
+
+def test_a_task_without_a_repository_uses_the_runs(env):
+    env["store"].add_repository("acme/one", default_branch="main")
+    ProjectRepositoryService(env["store"]).link("user:alice", env["project"], "acme/one")
+    run = env["lab"].start_run(
+        "user:alice", env["project"], env["goal"],
+        repository="acme/one", branch="dev",
+        plan=[{"id": "a", "title": "A", "dependencies": []}])
+    task = env["lab"].list_tasks("user:alice", env["project"], run["id"])[0]
+    assert (task["repository"], task["branch"]) == ("acme/one", "dev")
