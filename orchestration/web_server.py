@@ -415,6 +415,10 @@ class App:
         # OpenHands multi-account: an account is one row, the API key encrypted
         # with NEXUS_SECRET_KEY and never returned. A project may bind one.
         self.openhands_accounts = OpenHandsAccountService(self.store)
+        # The account pool: which account runs work, and in what order, under a
+        # selection mode. The policy lives in the service, not the UI.
+        from .openhands_pool import AccountPool
+        self.account_pool = AccountPool(self.store, self.openhands_accounts)
         # The persistent conversational surface. The responder needs the provider
         # cascade for ask/plan and the dispatch hooks for code/autonomous.
         from .nexus_chat import ChatResponder
@@ -545,9 +549,11 @@ class App:
         separate worker may run beside it.
         """
         from .lab_worker import LabWorker
+        from .openhands_router import build_account_router
         worker = LabWorker(self.store, worker_id=self._lab_worker_id,
                            client=self.client, github=self.github,
-                           github_accounts=self.github_accounts)
+                           github_accounts=self.github_accounts,
+                           account_router=build_account_router(self.store))
         while not self._stop.is_set():
             try:
                 self.last_lab_tick = {"at": time.time(), **worker.tick_once()}
@@ -977,6 +983,23 @@ class App:
                 for e in self.store.events(workflow_id=workflow_id, limit=50)
             ],
         }
+
+    def openhands_diagnostics(self, principal: str, *, live: bool = False,
+                              account_id: str | None = None,
+                              project_id: str | None = None) -> dict[str, Any]:
+        """Run the OpenHands diagnostic checks and return the honest report.
+
+        Every check says VERIFIED, FAILED, BLOCKED or UNVERIFIED; the report
+        never claims a check passed that did not run. ``live`` opts into the
+        end-to-end conversation probe (it creates and deletes one conversation).
+        """
+        from .openhands_diagnostics import OpenHandsDiagnostics
+
+        diagnostics = OpenHandsDiagnostics(
+            self.store, accounts=self.openhands_accounts, pool=self.account_pool,
+            cloud_client=self.client)
+        return diagnostics.run(principal, live=live, account_id=account_id,
+                               project_id=project_id).as_dict()
 
     def system_info(self) -> dict[str, Any]:
         """Safe diagnostics: presence of settings, never their values."""
@@ -1578,7 +1601,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def _openhands_account_post(self, path: str, body: dict):
-        """Actions on an OpenHands account: verify / rotate / revoke / default."""
+        """Actions on an OpenHands account: verify / rotate / revoke / default.
+
+        Pool actions (enable / disable / priority / remove) go through the pool
+        service, so the selection policy and the account controls stay together.
+        """
+        from .openhands_pool import PoolError
+
         parts = path.strip("/").split("/")
         principal = self._project_principal()
         account_id, action = parts[3], (parts[4] if len(parts) > 4 else "")
@@ -1597,8 +1626,20 @@ class Handler(BaseHTTPRequestHandler):
             if action == "default":
                 return self._json(200, {"account": self.app.openhands_accounts.set_default(
                     principal, account_id)})
+            if action == "enable":
+                return self._json(200, {"account": self.app.account_pool.set_enabled(
+                    principal, account_id, bool(body.get("enabled", True)))})
+            if action == "priority":
+                return self._json(200, {"account": self.app.account_pool.set_priority(
+                    principal, account_id, body.get("priority"))})
+            if action == "remove":
+                self.app.account_pool.remove(principal, account_id,
+                                             force=bool(body.get("force")))
+                return self._json(200, {"removed": account_id})
         except NotFound:
             return self._json(404, {"error": "account not found"})
+        except PoolError as e:
+            return self._json(409, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         return self._json(404, {"error": "not found"})
@@ -2520,6 +2561,26 @@ class Handler(BaseHTTPRequestHandler):
                 # API-key-free views only; the key never leaves the server.
                 return self._json(200, {"accounts": self.app.openhands_accounts.list_accounts(
                     self._project_principal())})
+            if path == "/api/openhands/diagnostics":
+                # The diagnostic report: every check VERIFIED/FAILED/BLOCKED/
+                # UNVERIFIED. Read-only unless live=true is passed to the POST.
+                principal = self._project_principal()
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                return self._json(200, self.app.openhands_diagnostics(
+                    principal,
+                    live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes"),
+                    account_id=(query.get("account_id") or [None])[0],
+                    project_id=(query.get("project_id") or [None])[0]))
+            if path == "/api/openhands/pool":
+                principal = self._project_principal()
+                return self._json(200, {
+                    "config": self.app.account_pool.get_config(principal),
+                    "candidates": [
+                        {"id": a["id"], "label": a["label"], "priority": a.get("priority"),
+                         "health": a.get("health"), "active_tasks": a.get("active_tasks", 0),
+                         "enabled": a.get("enabled", True), "is_default": a.get("is_default")}
+                        for a in self.app.account_pool.candidates(principal)],
+                })
             if path.startswith("/api/github/accounts/"):
                 return self._github_account_get(path)
             if path.startswith("/api/openhands/accounts/"):
@@ -2772,6 +2833,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._github_account_post(path, body)
             if path.startswith("/api/openhands/accounts/"):
                 return self._openhands_account_post(path, body)
+            if path == "/api/openhands/pool":
+                principal = self._project_principal()
+                try:
+                    config = self.app.account_pool.set_config(
+                        principal,
+                        selection_mode=body.get("selection_mode"),
+                        fallback_order=body.get("fallback_order"))
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(200, {"config": config})
+            if path == "/api/openhands/diagnostics":
+                # The opt-in live probe: creates and deletes one conversation.
+                return self._json(200, self.app.openhands_diagnostics(
+                    self._project_principal(),
+                    live=bool(body.get("live")),
+                    account_id=body.get("account_id"),
+                    project_id=body.get("project_id")))
             if path == "/api/repositories":
                 name = (body.get("full_name") or "").strip()
                 if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):

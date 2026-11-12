@@ -82,7 +82,7 @@ class OpenHandsAccountService:
                 "  state='active', last_error=NULL, last_checked_at=now(), updated_at=now() "
                 "RETURNING id, principal, label, base_url, transport, default_model, "
                 "  identity, state, is_default, capabilities, last_checked_at, "
-                "  last_error, created_at, updated_at",
+                "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                 (principal, label, base_url, transport, default_model, ciphertext,
                  identity, _json(capabilities)))
             view = self._view(cur.fetchone())
@@ -95,7 +95,7 @@ class OpenHandsAccountService:
         with self.store._tx() as cur:
             cur.execute("SELECT id, principal, label, base_url, transport, default_model, "
                         "identity, state, is_default, capabilities, last_checked_at, "
-                        "last_error, created_at, updated_at "
+                        "last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at "
                         "FROM nexus_openhands_accounts WHERE principal=%s "
                         "ORDER BY is_default DESC, created_at DESC, id", (principal,))
             return [self._view(r) for r in cur.fetchall()]
@@ -125,7 +125,7 @@ class OpenHandsAccountService:
                 "WHERE id=%s AND principal=%s "
                 "RETURNING id, principal, label, base_url, transport, default_model, "
                 "  identity, state, is_default, capabilities, last_checked_at, "
-                "  last_error, created_at, updated_at",
+                "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                 (ciphertext, _json(capabilities), account_id, principal))
             return self._view(cur.fetchone())
 
@@ -136,7 +136,7 @@ class OpenHandsAccountService:
                         "WHERE id=%s AND principal=%s "
                         "RETURNING id, principal, label, base_url, transport, default_model, "
                         "  identity, state, is_default, capabilities, last_checked_at, "
-                        "  last_error, created_at, updated_at",
+                        "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                         (account_id, principal))
             row = cur.fetchone()
             if row is None:
@@ -166,7 +166,7 @@ class OpenHandsAccountService:
                 "updated_at=now() WHERE id=%s AND principal=%s "
                 "RETURNING id, principal, label, base_url, transport, default_model, "
                 "  identity, state, is_default, capabilities, last_checked_at, "
-                "  last_error, created_at, updated_at",
+                "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                 (state, error, _json(capabilities) if capabilities else None,
                  account_id, principal))
             return self._view(cur.fetchone())
@@ -176,7 +176,7 @@ class OpenHandsAccountService:
             self._set_default(cur, principal, account_id)
             cur.execute("SELECT id, principal, label, base_url, transport, default_model, "
                         "identity, state, is_default, capabilities, last_checked_at, "
-                        "last_error, created_at, updated_at "
+                        "last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at "
                         "FROM nexus_openhands_accounts WHERE id=%s", (account_id,))
             return self._view(cur.fetchone())
 

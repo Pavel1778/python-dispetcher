@@ -1,0 +1,214 @@
+"""Account-aware dispatch: pick an executor, fail over, and hand off context.
+
+The lab scheduler dispatches a task through an executor. This module sits
+between them: it chooses *which* OpenHands account runs a task (through the
+pool policy), records the choice on the task, and — when an account fails —
+switches to another one and passes the context the new executor needs to
+continue rather than restart.
+
+Two facts drive the design:
+
+* A Cloud conversation cannot be moved between accounts. A different account is
+  a different sandbox and a different key, so "continue on account B" means
+  *start a new conversation on B* and tell it what has already happened. The
+  hand-off context is that message; it is built from the durable run state, not
+  from anything the old conversation said.
+* The old executor must not keep writing. A conversation whose account is gone
+  is not polled again (the task's ``tried_accounts`` excludes it), and the
+  dispatch is account-scoped, so nothing reattaches to the abandoned sandbox.
+
+Context passed across a hand-off (the list the task text asks for):
+
+  project id, task id, the original goal text, the plan (all task keys and
+  titles), which tasks are already ``completed_verified`` and which remain,
+  the repository and branch, the last observed Git commit, the previous
+  executor's final report, the last error, and the acceptance criteria.
+
+Nothing here is a secret: the context is derived from rows the caller may read.
+"""
+from __future__ import annotations
+
+
+from .cloud_store import PostgresStore
+from .nexus_lab_store import LabStore
+from .openhands_pool import AccountPool, PoolError
+
+
+class NoUsableAccount(RuntimeError):
+    """Every account in the pool is excluded or unusable."""
+
+
+class AccountRouter:
+    """Choose an account for a task and build the failover context."""
+
+    def __init__(self, store: PostgresStore, *, pool: AccountPool,
+                 lab: LabStore, principal: str = "machine:default"):
+        self.store = store
+        self.pool = pool
+        self.lab = lab
+        self.principal = principal
+
+    def _principal_for_project(self, project_id: str | None) -> str:
+        """The principal whose accounts serve this project.
+
+        Accounts are stored per principal, and the worker runs as a machine
+        principal that owns none. The project's owner is the principal whose
+        pool applies, so a project created by ``user:owner`` uses that user's
+        accounts even when the worker is the one dispatching. With no project
+        (or no owner) the configured default principal is used.
+        """
+        if not project_id:
+            return self.principal
+        with self.store._tx() as cur:
+            cur.execute("SELECT principal FROM nexus_project_members "
+                        "WHERE project_id=%s ORDER BY (role='owner') DESC, principal LIMIT 1",
+                        (project_id,))
+            row = cur.fetchone()
+        return row["principal"] if row else self.principal
+
+    def select_for_task(self, task: dict) -> dict:
+        """The account to run *task*, never one it has already tried.
+
+        Raises :class:`NoUsableAccount` when the pool has nothing left for this
+        task, so the caller can dead-letter it with a clear reason instead of
+        looping.
+        """
+        exclude = set(task.get("tried_accounts") or [])
+        if task.get("openhands_account_id"):
+            exclude.add(str(task["openhands_account_id"]))
+        project_id = str(task.get("project_id") or "") or None
+        principal = self._principal_for_project(project_id)
+        try:
+            return self.pool.select(principal, exclude=exclude, project_id=project_id)
+        except PoolError as e:
+            raise NoUsableAccount(str(e)) from e
+
+    def principal_for_task(self, task: dict) -> str:
+        return self._principal_for_project(str(task.get("project_id") or "") or None)
+
+    def handoff_context(self, task: dict, *, previous_report: str = "",
+                        last_error: str = "") -> dict:
+        """The durable context to give a new executor for *task*.
+
+        Built from the run's rows, so it is reproducible after a crash and never
+        depends on the old conversation being reachable.
+        """
+        run_id = str(task["run_id"])
+        with self.store._tx() as cur:
+            cur.execute("SELECT state, iteration, max_iterations FROM nexus_runs "
+                        "WHERE id=%s", (run_id,))
+            run = cur.fetchone() or {}
+            cur.execute(
+                "SELECT task_key, title, state, repository, branch FROM nexus_run_tasks "
+                "WHERE run_id=%s ORDER BY created_at, id", (run_id,))
+            siblings = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT text FROM nexus_goals g JOIN nexus_runs r ON r.goal_id=g.id "
+                        "WHERE r.id=%s", (run_id,))
+            goal = cur.fetchone()
+        plan = [{"task_key": s["task_key"], "title": s["title"], "state": s["state"]}
+                for s in siblings]
+        done = [s["task_key"] for s in siblings if s["state"] == "completed_verified"]
+        remaining = [s["task_key"] for s in siblings
+                     if s["state"] not in ("completed_verified", "failed")]
+        evidence = task.get("evidence") or []
+        last_commit = ""
+        for item in reversed(evidence):
+            if isinstance(item, dict) and item.get("remote_sha"):
+                last_commit = str(item["remote_sha"])
+                break
+        return {
+            "project_id": str(task.get("project_id") or ""),
+            "task_id": str(task.get("id") or ""),
+            "task_key": task.get("task_key"),
+            "run_id": run_id,
+            "original_goal": (goal or {}).get("text", ""),
+            "task_title": task.get("title"),
+            "task_description": task.get("description") or "",
+            "acceptance": task.get("acceptance") or [],
+            "repository": task.get("repository") or "",
+            "branch": task.get("branch") or "",
+            "plan": plan,
+            "completed_tasks": done,
+            "remaining_tasks": remaining,
+            "run_state": run.get("state"),
+            "iteration": run.get("iteration"),
+            "max_iterations": run.get("max_iterations"),
+            "last_commit": last_commit,
+            "previous_report": (previous_report or "")[:4000],
+            "last_error": (last_error or "")[:1000],
+        }
+
+    @staticmethod
+    def handoff_message(context: dict) -> str:
+        """A deterministic first message for the new executor.
+
+        It states plainly that this is a *continuation*: the work already done
+        must not be repeated, and the checkout is fresh (a new sandbox), so the
+        repository has to be cloned at the named branch.
+        """
+        plan_lines = "\n".join(
+            f"  - {t['task_key']}: {t['title']} [{t['state']}]" for t in context.get("plan", []))
+        done = ", ".join(context.get("completed_tasks") or []) or "(none)"
+        remaining = ", ".join(context.get("remaining_tasks") or []) or "(none)"
+        criteria = "\n".join(f"  - {c}" for c in (context.get("acceptance") or [])) or "  - (none)"
+        return (
+            "You are continuing an interrupted task on a new executor. The previous "
+            "OpenHands account is no longer available, so this is a fresh sandbox.\n\n"
+            f"Project: {context.get('project_id')}\n"
+            f"Run: {context.get('run_id')}  Task: {context.get('task_key')}\n"
+            f"Repository: {context.get('repository') or '(none)'}  "
+            f"Branch: {context.get('branch') or '(default)'}\n"
+            f"Last known commit: {context.get('last_commit') or '(unknown)'}\n\n"
+            f"Original goal:\n{context.get('original_goal') or '(none)'}\n\n"
+            f"Plan (all tasks in this run):\n{plan_lines or '  (none)'}\n\n"
+            f"Already completed and verified (do NOT redo these): {done}\n"
+            f"Still to do: {remaining}\n\n"
+            f"This task: {context.get('task_title')}\n{context.get('task_description') or ''}\n\n"
+            f"Acceptance criteria:\n{criteria}\n\n"
+            f"Previous executor's last report:\n{context.get('previous_report') or '(none)'}\n"
+            f"Last error that caused the switch: {context.get('last_error') or '(none)'}\n\n"
+            "Rules:\n"
+            "1. The workspace is empty: clone the repository at the branch above first.\n"
+            "2. Do not repeat work already completed and verified.\n"
+            "3. Continue from the last known commit where possible.\n"
+            "4. Run the relevant tests and report exact commits, files and results.\n"
+            "5. Finish with a short report; do not claim success you did not verify."
+        )
+
+    def record(self, task: dict, *, account_id: str) -> None:
+        """Persist that *task* is now bound to *account_id*."""
+        self.lab.mark_running(task["id"], account_id=account_id)
+
+    def note_failure(self, task: dict, *, account_id: str, error: str,
+                     unavailable: bool) -> None:
+        """Record a failed account on the task and in the pool's health."""
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_run_tasks SET tried_accounts = "
+                "  CASE WHEN tried_accounts ? %s::text THEN tried_accounts "
+                "       ELSE tried_accounts || to_jsonb(%s::text) END, "
+                "  updated_at=now() WHERE id=%s",
+                (account_id, account_id, task["id"]))
+        self.pool.record_failure(self.principal_for_task(task), account_id, error,
+                                 unavailable=unavailable)
+
+
+def build_account_router(store: PostgresStore, *,
+                         principal: str = "machine:default") -> AccountRouter | None:
+    """An account router when the principal has any OpenHands account, else None.
+
+    Returning ``None`` preserves the pre-existing behaviour exactly: a
+    deployment with no stored account runs every task under the process-wide
+    ``OPENHANDS_API_KEY``. A deployment that *has* configured accounts routes
+    through them, so the pool is used without a second flag to remember.
+    """
+    from .nexus_openhands_accounts import OpenHandsAccountService
+
+    accounts = OpenHandsAccountService(store)
+    try:
+        if not accounts.list_accounts(principal):
+            return None
+    except Exception:  # noqa: BLE001 - a database that is not ready means "no pool"
+        return None
+    pool = AccountPool(store, accounts)
+    return AccountRouter(store, pool=pool, lab=LabStore(store), principal=principal)

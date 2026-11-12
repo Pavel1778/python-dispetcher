@@ -83,3 +83,35 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: "3.12.6"
+
+  # The autonomous lab worker: a background worker service that advances runs.
+  # Without it (or NEXUS_LAB_INLINE=1 on the web service) an autonomous run
+  # stays queued. It shares the same database and environment as the web
+  # service, so the two agree on configuration. It serves no HTTP, so it is a
+  # "worker" service, not a "web" one.
+  - type: worker
+    name: python-dispetcher-lab-worker
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m orchestration.lab_worker --worker-id render-lab-1
+    autoDeploy: true
+    envVars:
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: AUTO_MIGRATE
+        value: "true"
+      - key: OPENHANDS_API_KEY
+        sync: false
+      - key: OPENHANDS_TRANSPORT
+        sync: false
+      - key: OPENHANDS_DEFAULT_MODEL
+        sync: false
+      - key: NEXUS_SECRET_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.6"

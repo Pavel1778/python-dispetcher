@@ -352,7 +352,9 @@ class PostgresStore:
                               "transcript"),
         "nexus_openhands_accounts": ("id", "principal", "label", "base_url",
                                      "transport", "api_key_encrypted", "state",
-                                     "is_default"),
+                                     "is_default", "enabled", "priority", "health",
+                                     "active_tasks"),
+        "nexus_openhands_pool": ("principal", "selection_mode", "fallback_order"),
         "nexus_conversations": ("id", "project_id", "title", "mode", "state",
                                 "archived"),
         "nexus_conversation_messages": ("id", "conversation_id", "role", "content",
@@ -362,6 +364,9 @@ class PostgresStore:
         "nexus_agent_sessions": ("id", "project_id", "conversation_id",
                                  "openhands_account_id", "external_conversation_id",
                                  "state"),
+        "nexus_lab_workers": ("worker_id", "kind", "state", "heartbeat_at"),
+        "nexus_task_handoffs": ("id", "run_id", "task_id", "from_account_id",
+                                "to_account_id", "context"),
     }
 
     def verify_schema(self) -> list[str]:

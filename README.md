@@ -65,16 +65,21 @@ are manual and need a live LLM):
   step. A task is completed only when independently verified.
 - **GitHub multi-account**: several accounts with encrypted PATs and an explicit
   per-project binding.
+- **OpenHands multi-account and failover**: any number of accounts with encrypted
+  API keys, a selection pool (manual / auto / failover / load-balancing), health
+  tracking, and an end-to-end failover that switches a failed task to another
+  account with a context hand-off (see `docs/FAILOVER.md`). A **diagnostics**
+  report (`python -m orchestration.cli openhands diagnostics`) checks every
+  integration point and marks each VERIFIED / FAILED / BLOCKED / UNVERIFIED.
 - A **CLI** (`nexus`), an **MCP** surface (stdio + Streamable HTTP), an
   installable **PWA**, and native client packages: Debian `.deb`, Android
   `.apk`, Windows `.exe`.
 
 Not ready (see `docs/AUTONOMOUS-LAB.md` for the per-item status): there is no
 LLM-driven *replanner* that authors corrective tasks after a failed verification
-(a failed dependency blocks the run for a human), no push notifications, no
-multi-account OpenHands routing, and no native iOS app. A legacy `completed`
-status means the Dispatcher's own rules were met — it is **not** verified QA
-evidence.
+(a failed dependency blocks the run for a human), no push notifications, and no
+native iOS app. A legacy `completed` status means the Dispatcher's own rules were
+met — it is **not** verified QA evidence.
 
 ## Quick start (clean environment)
 
@@ -177,6 +182,32 @@ API uses. Streamable HTTP is not implemented in this MVP.
 The dashboard installs as a PWA on supported Android, Windows and Linux browsers
 after deployment over HTTPS. It is an online web client, not an APK. Install,
 security and known blockers are in [docs/CLIENTS.md](docs/CLIENTS.md).
+
+## OpenHands integration
+
+NEXUS drives OpenHands conversations to execute work, verifies the result
+independently, and can route work across several accounts. Start here:
+
+- [docs/OPENHANDS_SETUP.md](docs/OPENHANDS_SETUP.md) — the two transports, the
+  required environment (including the `OPENHANDS_DEFAULT_MODEL` trap), and how
+  to verify a real conversation runs.
+- [docs/OPENHANDS_ACCOUNTS.md](docs/OPENHANDS_ACCOUNTS.md) — the account pool,
+  the four selection modes, and the per-account controls.
+- [docs/FAILOVER.md](docs/FAILOVER.md) — what happens when an account fails and
+  how the context is handed to the next one.
+- [docs/WORKER_SETUP.md](docs/WORKER_SETUP.md) — running the autonomous worker
+  as a separate process, and the heartbeat that proves it is alive.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first fixes.
+- [docs/TESTING.md](docs/TESTING.md) — what is real in each test layer.
+
+One command checks every integration point:
+
+```bash
+NEXUS_URL=https://nexus.example NEXUS_TOKEN="$WEB_AUTH_TOKEN" \
+  python -m orchestration.cli openhands diagnostics          # structural checks
+NEXUS_URL=... NEXUS_TOKEN=... \
+  python -m orchestration.cli openhands diagnostics --live    # + a real conversation
+```
 
 ## Deployment
 

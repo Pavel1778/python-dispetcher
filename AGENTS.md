@@ -943,3 +943,64 @@ the part to read first: those defects were reproduced and are **not fixed**.
    `README.md` ("Quick start", "What is ready today"), `docs/AUTONOMOUS-LAB.md`,
    `docs/NEXUS-AUDIT.md`, `docs/NEXUS-SPEC.md`, `docs/MASTER_COMPLETION_AUDIT.md`,
    `docs/MASTER_COMPLETION_ROADMAP.md`. They were not rewritten in this session.
+
+## OpenHands account pool, failover and diagnostics (this session)
+
+Added to make NEXUS drive several OpenHands accounts, switch executors on
+failure, and prove the integration with one command. The invariants to keep:
+
+- **`orchestration/openhands_pool.py`** is the selection policy and the only
+  place the four modes live (`manual`, `auto`, `failover`, `load_balancing`).
+  "Usable" = `state='active'` AND `enabled` AND health not `unavailable`; a
+  `degraded` account stays selectable. `manual` never falls back. Health and
+  `active_tasks` are written by the callers that make real calls — observed, not
+  guessed. Migration `0022` adds the columns and `nexus_openhands_pool`.
+- **`orchestration/openhands_router.py`** chooses an account per task and builds
+  the hand-off context. `tried_accounts` (on the task) is what makes failover
+  terminate: an account that failed is never selected for that task again.
+  `build_account_router` returns `None` when the principal has no stored
+  account, so a single-key deployment keeps its exact previous behaviour.
+- **A Cloud conversation cannot move between accounts.** A switch is a *new*
+  conversation on the new account with the context passed in the first message
+  (`handoff_message`). The old account is never polled again: `poll` uses
+  `_client_for_task`, which is bound to the task's account. Migration `0024`
+  records every switch in `nexus_task_handoffs`.
+- **`OpenHandsExecutor.dispatch` raises `DispatchError`** carrying the account
+  that failed, so the scheduler can exclude it. A failed *start* requeues the
+  task (transport problem); a **vanished** conversation (the executor is gone)
+  requeues via `requeue_for_failover` from `running` too, which
+  `release_task` (dispatched only) could not do. When the pool has nothing left,
+  the run is **blocked** with the reason — never spun.
+- **`orchestration/openhands_diagnostics.py`** is the one diagnostic engine.
+  Four statuses, earned: `VERIFIED` (ran and worked), `FAILED` (ran and failed),
+  `BLOCKED` (could not run: no credential/resource — a 429 is BLOCKED, not
+  FAILED), `UNVERIFIED` (not run — the live probe is opt-in). `report.ok` is
+  true unless something FAILED. The `queues_leases` check does a real
+  claim→release→re-claim on a throwaway project it deletes; the live probe
+  creates and deletes exactly one conversation.
+- **Worker heartbeat (migration `0023`).** `LabWorker` registers and heartbeats
+  every tick (`register_worker`/`heartbeat`/`stop_worker`); `live_workers` is
+  how the diagnostics tell a live worker from a dead one — a lease cannot.
+  `lab_worker: FAILED` means active runs exist with no fresh heartbeat.
+- **`OPENHANDS_DEFAULT_MODEL` is required in practice.** Verified live: a bare
+  sandbox fails with `LLMAuthenticationError` (`classification.kind=auth`,
+  retryable=false); with `openhands/deepseek-v4.1-flash` the same task finishes.
+- **`render.yaml` and `docker-compose.yml` now define the worker service**, so a
+  deployed autonomous run is not left queued (this closes the earlier open item).
+- New endpoints: `GET/POST /api/openhands/diagnostics` (`live` opt-in),
+  `GET/POST /api/openhands/pool`, and per-account `enable`/`priority`/`remove`.
+  CLI: `nexus openhands accounts|pool|diagnostics [--live]`.
+- Tests: `tests/test_openhands_pool.py`, `tests/test_openhands_failover.py`
+  (the load-bearing end-to-end failover + hand-off), `tests/test_openhands_pool_http.py`,
+  and the worker-heartbeat cases in `tests/test_lab_store.py`. Docs:
+  `docs/OPENHANDS_SETUP.md`, `OPENHANDS_ACCOUNTS.md`, `FAILOVER.md`,
+  `WORKER_SETUP.md`, `TROUBLESHOOTING.md`, `TESTING.md`.
+- **Live verification (2026-11-11):** against the real key — account capabilities
+  and health VERIFIED; the live conversation probe VERIFIED (create, message,
+  events, a shell command echoed, workspace file upload + SHA-256 read-back) on a
+  reused running sandbox; and a NEXUS run task dispatched through the pool
+  router to real Cloud reached `finished` with the marker echoed. Creating a new
+  sandbox returned `429 daily_sandbox_limit_reached` (account quota), reported
+  BLOCKED. No second OpenHands key is available, so a *two-live-account*
+  failover is BLOCKED; the failover logic is proven end to end against real
+  PostgreSQL with honest transport fakes.

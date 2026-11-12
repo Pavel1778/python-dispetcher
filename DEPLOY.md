@@ -401,6 +401,16 @@ can be restarted or scaled to N workers at any time: claims are leases, and a
 dead worker's task is reclaimed by the next tick. `--once` runs a single pass
 (useful for a cron-style deployment).
 
+`render.yaml` now defines this worker service (`python-dispetcher-lab-worker`)
+alongside the web service, so the blueprint does not leave an autonomous run
+queued. The worker registers a heartbeat (`nexus_lab_workers`), so
+`GET /api/openhands/diagnostics` can tell a live worker from a dead one — a
+lease alone cannot. See [docs/WORKER_SETUP.md](docs/WORKER_SETUP.md).
+
+`NEXUS_LAB_INLINE=1` runs the same loop on a thread inside the web server. It is
+allowed for development, but it must not mask the absence of a separate worker:
+an inline tick still registers a heartbeat (as kind `inline`).
+
 Client packages (`packaging/`): a `.deb` (Debian/Linux), a signed `.apk`
 (Android) and a `.exe` (Windows). All three are thin clients that open the same
 backend URL and store no credential; build them with the scripts in
