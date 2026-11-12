@@ -1088,30 +1088,42 @@ class PostgresStore:
         agent_server_url: str,
         session_api_key: str,
         status: str = "RUNNING",
+        owner: str = "",
     ) -> None:
-        """Record a started sandbox so a later dispatch can reuse it."""
+        """Record a started sandbox so a later dispatch can reuse it.
+
+        *owner* is whose sandbox it is: the id of the OpenHands connection that
+        started it, or ``""`` for the server's own key. A sandbox is only ever
+        offered back to its owner.
+        """
         with self._tx() as cur:
             cur.execute(
                 """
                 INSERT INTO cloud_sandboxes(sandbox_id, agent_server_url,
-                                            session_api_key, status)
-                VALUES (%s,%s,%s,%s)
+                                            session_api_key, status, owner)
+                VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (sandbox_id) DO UPDATE
                    SET agent_server_url = EXCLUDED.agent_server_url,
                        session_api_key = EXCLUDED.session_api_key,
                        status = EXCLUDED.status,
+                       owner = EXCLUDED.owner,
                        updated_at = now()
                 """,
-                (sandbox_id, agent_server_url, session_api_key, status),
+                (sandbox_id, agent_server_url, session_api_key, status, owner),
             )
 
-    def running_sandbox(self) -> dict[str, Any] | None:
-        """The most recently seen running sandbox, if any."""
+    def running_sandbox(self, owner: str = "") -> dict[str, Any] | None:
+        """The most recently seen running sandbox of *owner*, if any.
+
+        Sandboxes are not shared between OpenHands connections: one started
+        with a connection's key holds that connection's work, and another
+        connection's key cannot even ask the service about it.
+        """
         with self._tx() as cur:
             cur.execute(
                 "SELECT sandbox_id, agent_server_url, session_api_key, status "
-                "FROM cloud_sandboxes WHERE status='RUNNING' "
-                "ORDER BY updated_at DESC LIMIT 1"
+                "FROM cloud_sandboxes WHERE status='RUNNING' AND owner=%s "
+                "ORDER BY updated_at DESC LIMIT 1", (owner,)
             )
             return cur.fetchone()
 
@@ -1122,13 +1134,16 @@ class PostgresStore:
                 (status, sandbox_id),
             )
 
-    def list_sandboxes(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        """Sandboxes this application knows about, most recent first."""
+    def list_sandboxes(self, *, limit: int = 20, owner: str | None = None
+                       ) -> list[dict[str, Any]]:
+        """Sandboxes this application knows about, most recent first; with
+        *owner*, only that connection's (``""`` is the server's own key)."""
         with self._tx() as cur:
             cur.execute(
                 "SELECT sandbox_id, agent_server_url, session_api_key, status "
-                "FROM cloud_sandboxes ORDER BY updated_at DESC LIMIT %s",
-                (limit,),
+                "FROM cloud_sandboxes WHERE (%s::text IS NULL OR owner=%s) "
+                "ORDER BY updated_at DESC LIMIT %s",
+                (owner, owner, limit),
             )
             return cur.fetchall()
 

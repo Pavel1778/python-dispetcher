@@ -61,6 +61,7 @@ from .cloud_client import (
     CloudError,
     CloudNotFound,
     CloudRateLimited,
+    CloudRefused,
     CloudUnavailable,
     DeliveryError,
     SandboxFile,
@@ -68,6 +69,7 @@ from .cloud_client import (
     StartTask,
 )
 from .cloud_store import PostgresStore
+from .net_guard import AddressRefused
 from .openhands_client import ApiUnavailable, OpenHandsClient
 
 log = logging.getLogger(__name__)
@@ -107,9 +109,13 @@ class CloudDirectClient:
         wait_interval: float = 5.0,
         llm_model: str | None = None,
         timeout: float = 60.0,
+        scope: str = "",
     ):
         self.cloud = cloud
         self.store = store
+        #: Whose sandboxes this client may reuse: the id of the OpenHands
+        #: connection it was built for, or ``""`` for the server's own key.
+        self.scope = scope
         self.working_dir = working_dir
         self.max_iterations = max_iterations
         # Reusing a running sandbox avoids paying to provision one per task. A
@@ -120,7 +126,11 @@ class CloudDirectClient:
         self.wait_attempts = wait_attempts
         self.wait_interval = wait_interval
         self.llm_model = llm_model
-        self._http = OpenHandsClient("", api_key="", timeout=timeout)
+        # A sandbox's address comes from the service. For a connection a person
+        # added, that service is held to the same rule as the connection's own
+        # URL: it may not name an address inside this server's network.
+        self._http = OpenHandsClient("", api_key="", timeout=timeout,
+                                     address_policy=getattr(cloud, "address_policy", None))
         self._cache: dict[str, SandboxRoute] = {}
 
     #: This transport can place a file in the sandbox before the agent starts
@@ -217,7 +227,7 @@ class CloudDirectClient:
             reuse = self.reuse_sandboxes
         if reuse and not force_new:
             # Each pass either returns or takes one sandbox off the list.
-            while (row := self.store.running_sandbox()) is not None:
+            while (row := self.store.running_sandbox(self.scope)) is not None:
                 if self._still_running(row["sandbox_id"]):
                     return SandboxRoute(
                         sandbox_id=row["sandbox_id"],
@@ -236,7 +246,8 @@ class CloudDirectClient:
         if not url or not key:
             raise CloudError(f"sandbox {sandbox_id} has no agent-server url/key")
         self.store.save_sandbox(
-            sandbox_id, agent_server_url=url, session_api_key=key, status="RUNNING"
+            sandbox_id, agent_server_url=url, session_api_key=key, status="RUNNING",
+            owner=self.scope,
         )
         return SandboxRoute(sandbox_id=sandbox_id, agent_server_url=url, session_api_key=key)
 
@@ -289,6 +300,9 @@ class CloudDirectClient:
             return self._http._request_to(
                 route.agent_server_url, route.session_api_key, method, path, body
             )
+        except AddressRefused as e:
+            # The service named a sandbox address this server does not talk to.
+            raise CloudRefused(f"{method} {path}: {e}") from e
         except ApiUnavailable as e:
             # A 5xx from the agent-server is transient from the caller's view.
             raise CloudUnavailable(str(e)) from e
@@ -515,7 +529,7 @@ class CloudDirectClient:
         because this is only used for recovery, not for listing.
         """
         results: list[CloudConversation] = []
-        for row in self.store.list_sandboxes():
+        for row in self.store.list_sandboxes(owner=self.scope):
             route = SandboxRoute(
                 sandbox_id=row["sandbox_id"],
                 agent_server_url=row["agent_server_url"],
@@ -642,6 +656,48 @@ class CloudDirectClient:
         if status not in (200, 201):
             raise CloudError(f"pause -> {status}")
 
+    #: This transport can tell a conversation's agent to stop.
+    supports_stop = True
+
+    def stop_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Stop the agent of one conversation; the sandbox and every other
+        conversation on it go on.
+
+        Sandboxes are shared here, so the stop is conversation-scoped. The
+        agent-server has two calls for it: ``/interrupt`` cancels a request to
+        the model that is in flight, ``/pause`` stops the loop and keeps the
+        conversation. ``/interrupt`` is newer (the client OpenHands ships calls
+        it; it is not on every server), so it is tried and a refusal of it is
+        not an error; ``/pause`` is what decides.
+
+        Raises :class:`CloudNotFound` when the conversation is gone.
+        """
+        route = self._route_for(conversation_id)
+        interrupted = False
+        try:
+            status, _ = self._send(
+                route, "POST", f"/api/conversations/{conversation_id}/interrupt", {})
+            interrupted = status in (200, 201, 202, 204)
+        except CloudError:
+            interrupted = False
+        status, _ = self._send(route, "POST", f"/api/conversations/{conversation_id}/pause", {})
+        if status == 404:
+            raise CloudNotFound(conversation_id)
+        if status not in (200, 201, 202, 204):
+            raise CloudError(f"pause -> {status}")
+        return {"method": "interrupt+pause" if interrupted else "pause",
+                "sandbox_id": route.sandbox_id}
+
+    def activity_marker(self, conversation_id: str) -> str | None:
+        """A value that changes whenever the conversation produces an event:
+        how many events it has. ``None`` when that cannot be read now."""
+        try:
+            return str(self.event_count(conversation_id))
+        except CloudNotFound:
+            raise
+        except CloudError:
+            return None
+
     def conversation_skills(self, conversation_id: str) -> list[str]:
         try:
             conv = self.get_conversation(conversation_id)
@@ -667,6 +723,10 @@ class CloudDirectClient:
 
     def account_capabilities(self) -> dict[str, Any]:
         return self.cloud.account_capabilities()
+
+    def compatibility(self) -> dict[str, Any]:
+        """What the Cloud account API says of itself (see ``CloudClient``)."""
+        return self.cloud.compatibility()
 
     def web_url(self, conversation_id: str) -> str:
         return self.cloud.web_url(conversation_id)

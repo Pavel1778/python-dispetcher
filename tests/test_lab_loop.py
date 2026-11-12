@@ -539,7 +539,8 @@ def test_a_task_past_its_own_time_limit_is_over_and_is_not_started_again(env):
     sched.tick(run["id"])
     assert _states(env, run) == {"a": "running"}                 # inside the limit
 
-    _sql(env, "UPDATE nexus_run_tasks SET updated_at = now() - interval '61 seconds' "
+    # The limit is counted from the moment the conversation was started.
+    _sql(env, "UPDATE nexus_run_tasks SET started_at = now() - interval '61 seconds' "
               "WHERE run_id=%s", run["id"])
     result = sched.tick(run["id"])
     assert result.verdict == "failed"
@@ -1061,7 +1062,7 @@ def test_a_stopped_run_says_which_task_stopped_it_and_why(env):
                              {"task_key": "y", "title": "Y", "dependencies": ["x"]}])
     held = LabScheduler(env["lab"], HeldExecutor(), FakeVerifier())
     held.tick(late["id"])
-    _sql(env, "UPDATE nexus_run_tasks SET updated_at = now() - interval '2 minutes' "
+    _sql(env, "UPDATE nexus_run_tasks SET started_at = now() - interval '2 minutes' "
               "WHERE run_id=%s AND task_key='x'", late["id"])
     held.tick(late["id"])
     assert _run(env, late)["last_error"] == (

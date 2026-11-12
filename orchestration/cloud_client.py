@@ -30,7 +30,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .net_guard import AddressPolicy, AddressRefused, guarded_handlers
+
 DEFAULT_CLOUD_BASE_URL = "https://app.all-hands.dev"
+
+#: The most a JSON answer may be. A service that sends more is not answering a
+#: question this client asked, and reading it whole is how a process runs out
+#: of memory.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 class CloudError(RuntimeError):
@@ -88,6 +95,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class CloudAuthError(CloudError):
     """401/403. Retrying cannot succeed until the key is fixed."""
+
+
+class CloudRefused(CloudError):
+    """This server would not connect: the address is one it does not talk to
+    (see :mod:`orchestration.net_guard`). Trying again cannot change that."""
+
+    permanent = True
 
 
 class CloudValidationError(CloudError):
@@ -217,12 +231,17 @@ class CloudClient:
         *,
         api_key: str | None = None,
         timeout: float = 30.0,
+        address_policy: AddressPolicy | None = None,
     ):
         self.base_url = validate_base_url(
             base_url or os.environ.get("OPENHANDS_CLOUD_URL") or DEFAULT_CLOUD_BASE_URL
         ).rstrip("/")
         self._api_key = api_key or os.environ.get("OPENHANDS_API_KEY") or ""
         self.timeout = timeout
+        #: Set for a connection a person added through the API: every socket
+        #: this client opens is then checked against it (``net_guard``). The
+        #: server's own client, configured from its environment, has none.
+        self.address_policy = address_policy
 
     def _opener(self) -> urllib.request.OpenerDirector:
         """An opener that never follows a redirect.
@@ -232,7 +251,13 @@ class CloudClient:
         listeners. A redirect therefore leaks the Cloud API key to a host we did
         not choose. The API answers with the resource or an error, never with a
         redirect we should chase, so a ``3xx`` is surfaced as an error instead.
+
+        With an address policy the opener also connects only where the policy
+        allows, and goes through no proxy.
         """
+        if self.address_policy is not None:
+            return urllib.request.build_opener(_NoRedirect,
+                                               *guarded_handlers(self.address_policy))
         return urllib.request.build_opener(_NoRedirect)
 
     # ------------------------------------------------------------------ http
@@ -249,13 +274,21 @@ class CloudClient:
             req.add_header("Content-Type", "application/json")
         try:
             with self._opener().open(req, timeout=self.timeout) as resp:
-                raw = resp.read()
-                return resp.status, (json.loads(raw) if raw else None)
+                raw = resp.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise CloudError(f"{method} {path}: the answer is larger than "
+                                     f"{MAX_RESPONSE_BYTES} bytes")
+                try:
+                    return resp.status, (json.loads(raw) if raw else None)
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    raise CloudError(f"{method} {path}: the answer is not JSON") from e
+        except AddressRefused as e:
+            raise CloudRefused(f"{method} {path}: {e}") from e
         except urllib.error.HTTPError as e:
-            raw = e.read()
+            raw = e.read(1024 * 1024)
             try:
                 payload = json.loads(raw) if raw else None
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 payload = None
             if e.code in (401, 403):
                 raise CloudAuthError(f"{method} {path} -> {e.code}") from e
@@ -417,6 +450,57 @@ class CloudClient:
         """``POST /api/v1/sandboxes/{sandbox_id}/pause``."""
         status, _ = self._request("POST", f"/api/v1/sandboxes/{sandbox_id}/pause")
         return status == 200
+
+    #: This transport can tell a conversation's runtime to stop.
+    supports_stop = True
+
+    def stop_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Stop the runtime that owns a conversation, so that it does no more.
+
+        The Cloud has no conversation-scoped stop. Its own client stops a cloud
+        conversation by pausing the sandbox that runs it
+        (``POST /api/v1/sandboxes/{id}/pause``; OpenHands' ``pauseConversation``,
+        "Cloud mode: Pauses the sandbox"), and that is what is done here. A
+        conversation started through this transport has a sandbox of its own,
+        so nothing else is stopped with it.
+
+        Raises :class:`CloudNotFound` when the conversation is gone - there is
+        then nothing left to stop - and :class:`CloudError` when it names no
+        sandbox or the pause is refused.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if not conversation.sandbox_id:
+            raise CloudError(f"conversation {conversation_id} names no sandbox to pause")
+        if not self.pause_sandbox(conversation.sandbox_id):
+            raise CloudError(f"sandbox {conversation.sandbox_id} was not paused")
+        return {"method": "sandbox_pause", "sandbox_id": conversation.sandbox_id}
+
+    def activity_marker(self, conversation_id: str) -> str | None:
+        """A value that changes whenever the conversation produces an event,
+        or ``None`` when that cannot be told.
+
+        The newest event, asked for with ``sort_order=TIMESTAMP_DESC``. A
+        server that ignores the parameter would answer with the *oldest*
+        events, which never change - and a conversation hard at work would
+        look dead. So the answer is trusted only when two events came back in
+        descending order; anything else is "cannot tell", never "no activity".
+        """
+        try:
+            status, payload = self._request(
+                "GET", f"/api/v1/conversation/{conversation_id}/events/search"
+                       "?limit=2&sort_order=TIMESTAMP_DESC")
+        except (CloudNotFound, CloudAuthError):
+            raise
+        except CloudError:
+            return None
+        items = payload.get("items") if status == 200 and isinstance(payload, dict) else None
+        if not items or len(items) < 2:
+            return None
+        stamps = [e.get("timestamp") for e in items if isinstance(e, dict)]
+        if not all(isinstance(stamp, str) for stamp in stamps) or not stamps[0] > stamps[1]:
+            return None
+        newest = items[0]
+        return f"{newest.get('id') or ''}@{stamps[0]}"
 
     def resume_sandbox(self, sandbox_id: str) -> bool:
         """``POST /api/v1/sandboxes/{sandbox_id}/resume``."""
@@ -668,6 +752,76 @@ class CloudClient:
             return False
         return status == 200
 
+    # ------------------------------------------------- version, compatibility
+    #: The API this client calls, as path templates (a parameter is ``{}``).
+    #: A service that describes itself and lacks one of these cannot run tasks
+    #: through this client.
+    REQUIRED_PATHS = (
+        "/api/v1/app-conversations",
+        "/api/v1/app-conversations/start-tasks",
+        "/api/v1/app-conversations/search",
+        "/api/v1/app-conversations/{}/send-message",
+        "/api/v1/conversation/{}/events/search",
+        "/api/v1/sandboxes",
+        "/api/v1/sandboxes/{}/pause",
+        "/api/v1/settings",
+    )
+
+    def api_info(self) -> dict[str, Any]:
+        """What the service publishes about its API: ``GET /openapi.json``.
+
+        Returns ``{"version", "title", "paths"}`` - the description's own
+        ``info.version`` and ``info.title``, and its paths with every parameter
+        name replaced by ``{}``. Raises :class:`CloudNotFound` when the service
+        publishes no description and :class:`CloudError` when what it publishes
+        cannot be read.
+        """
+        status, payload = self._request("GET", "/openapi.json")
+        if status != 200 or not isinstance(payload, dict):
+            raise CloudError(f"api_info -> {status}")
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
+        version = info.get("version")
+        title = info.get("title")
+        return {
+            "version": str(version)[:60] if isinstance(version, (str, int, float)) else None,
+            "title": str(title)[:120] if isinstance(title, str) else None,
+            "paths": sorted({_template(path) for path in paths if isinstance(path, str)}),
+        }
+
+    def compatibility(self) -> dict[str, Any]:
+        """Whether the service has the API this client calls.
+
+        ``{"api_version", "compatibility", "detail", "missing"}`` where
+        ``compatibility`` is
+
+        * ``compatible``   - the service describes its API and every path in
+          ``REQUIRED_PATHS`` is there;
+        * ``incompatible`` - it describes its API and some are missing
+          (``missing`` lists them);
+        * ``unknown``      - it publishes no description. That is not a
+          verdict: whether the connection works is what the key check shows.
+
+        This is a statement about the *description*. A path that is listed can
+        still behave differently from what this client expects; only a task
+        that ran shows that it does not.
+        """
+        try:
+            info = self.api_info()
+        except CloudNotFound:
+            return {"api_version": None, "compatibility": "unknown", "missing": [],
+                    "detail": "the service does not publish a description of its API "
+                              "(/openapi.json)"}
+        missing = [path for path in self.REQUIRED_PATHS if path not in info["paths"]]
+        if missing:
+            return {"api_version": info["version"], "compatibility": "incompatible",
+                    "missing": missing,
+                    "detail": "the service's API description lacks: " + ", ".join(missing)}
+        return {"api_version": info["version"], "compatibility": "compatible", "missing": [],
+                "detail": (f"{info['title'] or 'API'} {info['version'] or ''}".strip()
+                           + f": all {len(self.REQUIRED_PATHS)} calls this server makes "
+                             "are described")}
+
     # -------------------------------------------------- account capabilities
     # These are read-only. They report what the account *has configured* and
     # what a conversation *has available*; neither is proof that a tool ran.
@@ -747,6 +901,23 @@ class CloudClient:
                 for p in (profiles.get("profiles") or [])
             ],
         }
+
+
+def _template(path: str) -> str:
+    """*path* with every ``{parameter}`` reduced to ``{}``."""
+    out, depth = [], 0
+    for ch in path:
+        if ch == "{":
+            depth += 1
+            if depth == 1:
+                out.append("{}")
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0:
+            out.append(ch)
+    return "".join(out)
 
 
 def _start_task(payload: dict[str, Any]) -> StartTask:

@@ -29,10 +29,29 @@ from .cloud_client import (
     validate_base_url,
 )
 from .cloud_store import NotFound, PostgresStore
+from .net_guard import AddressPolicy, AddressRefused, check_url
 from .nexus_projects import ProjectService, _text
 from .secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret
 
 DEFAULT_BASE_URL = "https://app.all-hands.dev"
+
+#: The columns of an account as callers see it. Never the key.
+_COLUMNS = ("id, principal, label, base_url, transport, default_model, identity, state, "
+            "is_default, capabilities, last_checked_at, last_error, created_at, updated_at, "
+            "enabled, priority, health, active_tasks, last_error_at, api_version, "
+            "compatibility, compatibility_detail, health_checked_at")
+
+
+class ConnectionInUse(RuntimeError):
+    """A connection cannot be removed while something depends on it.
+
+    ``dependencies`` says what: tasks at work on it, projects that list it as
+    an executor, stop signals still owed to its conversations.
+    """
+
+    def __init__(self, message: str, dependencies: dict):
+        super().__init__(message)
+        self.dependencies = dependencies
 
 
 class OpenHandsAccountService:
@@ -40,12 +59,49 @@ class OpenHandsAccountService:
 
     def __init__(self, store: PostgresStore, *, client_factory=None):
         self.store = store
-        #: Injectable so tests can point at the fake Cloud server.
+        #: Injectable so tests can point at the fake Cloud server. The default
+        #: client connects only where the address policy allows: the URL of a
+        #: stored connection was chosen by whoever added it (``net_guard``).
         self._client_factory = client_factory or (
-            lambda base_url, api_key: CloudClient(base_url=base_url, api_key=api_key))
+            lambda base_url, api_key: CloudClient(
+                base_url=base_url, api_key=api_key,
+                address_policy=AddressPolicy.from_env()))
 
     def _client(self, base_url: str, api_key: str) -> CloudClient:
         return self._client_factory(base_url, api_key)
+
+    @staticmethod
+    def _url(base_url: str | None) -> str:
+        """*base_url* when a connection may use it, else ``ValueError``.
+
+        The form of the URL and the addresses it resolves to are checked here,
+        when the connection is saved; the address is checked again every time a
+        socket is opened (``net_guard``).
+        """
+        try:
+            return check_url(validate_base_url(base_url or DEFAULT_BASE_URL)).rstrip("/")
+        except AddressRefused as e:
+            raise ValueError(f"API URL is not allowed: {e}") from e
+        except CloudError as e:
+            raise ValueError(f"API URL is not allowed: {e}") from e
+
+    @staticmethod
+    def _probe(client: Any) -> dict:
+        """What the service says about itself: version and compatibility.
+
+        Never raises: a service that does not publish a description of its API
+        is ``unknown``, not broken - the key check is what decides whether the
+        connection works.
+        """
+        describe = getattr(client, "compatibility", None)
+        if describe is None:
+            return {"api_version": None, "compatibility": "unknown",
+                    "detail": "this client cannot read the service's API description"}
+        try:
+            return describe()
+        except CloudError as e:
+            return {"api_version": None, "compatibility": "unknown",
+                    "detail": f"the API description could not be read: {e}"}
 
     # ------------------------------------------------------------------- add
     def add(self, principal: str, *, label: str, api_key: str,
@@ -56,9 +112,12 @@ class OpenHandsAccountService:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")
         api_key = api_key.strip()
-        base_url = validate_base_url(base_url or DEFAULT_BASE_URL).rstrip("/")
+        base_url = self._url(base_url)
         if transport not in ("direct", "app"):
             raise ValueError("transport must be 'direct' or 'app'")
+        if default_model is not None:
+            default_model = _text(default_model, "default_model", maximum=200,
+                                  required=False) or None
         client = self._client(base_url, api_key)
         try:
             capabilities = client.account_capabilities()
@@ -66,25 +125,29 @@ class OpenHandsAccountService:
             raise ValueError(f"OpenHands rejected the API key: {e}") from e
         except (CloudUnavailable, CloudError) as e:
             raise ValueError(f"OpenHands is unavailable: {e}") from e
+        probe = self._probe(client)
         identity = str(capabilities.get("active_agent_profile_id") or "")
         ciphertext = _encrypt_secret(api_key)
         with self.store._tx() as cur:
             cur.execute(
                 "INSERT INTO nexus_openhands_accounts"
                 "(principal, label, base_url, transport, default_model, api_key_encrypted, "
-                " identity, capabilities, last_checked_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now()) "
+                " identity, capabilities, last_checked_at, health, health_checked_at, "
+                " api_version, compatibility, compatibility_detail) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),'healthy',now(),%s,%s,%s) "
                 "ON CONFLICT (principal, label) DO UPDATE SET "
                 "  base_url=EXCLUDED.base_url, transport=EXCLUDED.transport, "
                 "  default_model=EXCLUDED.default_model, "
                 "  api_key_encrypted=EXCLUDED.api_key_encrypted, "
                 "  identity=EXCLUDED.identity, capabilities=EXCLUDED.capabilities, "
-                "  state='active', last_error=NULL, last_checked_at=now(), updated_at=now() "
-                "RETURNING id, principal, label, base_url, transport, default_model, "
-                "  identity, state, is_default, capabilities, last_checked_at, "
-                "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
+                "  state='active', last_error=NULL, last_checked_at=now(), "
+                "  health='healthy', health_checked_at=now(), "
+                "  api_version=EXCLUDED.api_version, compatibility=EXCLUDED.compatibility, "
+                "  compatibility_detail=EXCLUDED.compatibility_detail, updated_at=now() "
+                f"RETURNING {_COLUMNS}",
                 (principal, label, base_url, transport, default_model, ciphertext,
-                 identity, _json(capabilities)))
+                 identity, _json(capabilities), probe.get("api_version"),
+                 probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500]))
             view = self._view(cur.fetchone())
             if make_default:
                 self._set_default(cur, principal, view["id"])
@@ -93,9 +156,7 @@ class OpenHandsAccountService:
 
     def list_accounts(self, principal: str) -> list[dict]:
         with self.store._tx() as cur:
-            cur.execute("SELECT id, principal, label, base_url, transport, default_model, "
-                        "identity, state, is_default, capabilities, last_checked_at, "
-                        "last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at "
+            cur.execute(f"SELECT {_COLUMNS} "
                         "FROM nexus_openhands_accounts WHERE principal=%s "
                         "ORDER BY is_default DESC, created_at DESC, id", (principal,))
             return [self._view(r) for r in cur.fetchall()]
@@ -123,9 +184,7 @@ class OpenHandsAccountService:
                 "capabilities=%s, state='active', last_error=NULL, "
                 "last_checked_at=now(), updated_at=now() "
                 "WHERE id=%s AND principal=%s "
-                "RETURNING id, principal, label, base_url, transport, default_model, "
-                "  identity, state, is_default, capabilities, last_checked_at, "
-                "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
+                f"RETURNING {_COLUMNS}",
                 (ciphertext, _json(capabilities), account_id, principal))
             return self._view(cur.fetchone())
 
@@ -134,9 +193,7 @@ class OpenHandsAccountService:
             cur.execute("UPDATE nexus_openhands_accounts SET state='revoked', "
                         "is_default=false, updated_at=now() "
                         "WHERE id=%s AND principal=%s "
-                        "RETURNING id, principal, label, base_url, transport, default_model, "
-                        "  identity, state, is_default, capabilities, last_checked_at, "
-                        "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
+                        f"RETURNING {_COLUMNS}",
                         (account_id, principal))
             row = cur.fetchone()
             if row is None:
@@ -144,7 +201,15 @@ class OpenHandsAccountService:
             return self._view(row)
 
     def verify(self, principal: str, account_id: str) -> dict:
-        """Re-check an account against Cloud; mark it invalid if rejected."""
+        """Check a connection now and record what was found.
+
+        Three questions, each answered by a real call with the connection's own
+        key: does the service take the key (``state``: a rejected key makes the
+        connection ``invalid``), can it be reached (``health``), and which API
+        does it speak (``api_version``, ``compatibility``). A service that
+        cannot be reached leaves the key's standing as it was - "unreachable"
+        is not "rejected".
+        """
         with self.store._tx() as cur:
             cur.execute("SELECT base_url FROM nexus_openhands_accounts "
                         "WHERE id=%s AND principal=%s", (account_id, principal))
@@ -152,31 +217,249 @@ class OpenHandsAccountService:
             if row is None:
                 raise NotFound("account not found")
         key = self._decrypt(principal, account_id)
-        state, error, capabilities = "active", None, None
+        state, error, capabilities, health = "active", None, None, "healthy"
+        probe: dict | None = None
         try:
-            capabilities = self._client(row["base_url"], key).account_capabilities()
+            client = self._client(row["base_url"], key)
+            capabilities = client.account_capabilities()
+            probe = self._probe(client)
         except CloudAuthError as e:
-            state, error = "invalid", str(e)
+            state, error, health = "invalid", str(e), "unavailable"
         except (CloudUnavailable, CloudError) as e:
-            state, error = "active", f"unavailable: {e}"
+            state, error, health = "active", f"unavailable: {e}", "unavailable"
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_openhands_accounts SET state=%s, last_error=%s, "
                 "capabilities=COALESCE(%s, capabilities), last_checked_at=now(), "
+                "health=%s, health_checked_at=now(), "
+                "last_error_at = CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, "
+                "api_version = CASE WHEN %s THEN %s ELSE api_version END, "
+                "compatibility = CASE WHEN %s THEN %s ELSE compatibility END, "
+                "compatibility_detail = CASE WHEN %s THEN %s ELSE compatibility_detail END, "
                 "updated_at=now() WHERE id=%s AND principal=%s "
-                "RETURNING id, principal, label, base_url, transport, default_model, "
-                "  identity, state, is_default, capabilities, last_checked_at, "
-                "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
-                (state, error, _json(capabilities) if capabilities else None,
+                f"RETURNING {_COLUMNS}",
+                (state, error, _json(capabilities) if capabilities else None, health, error,
+                 probe is not None, (probe or {}).get("api_version"),
+                 probe is not None, (probe or {}).get("compatibility") or "unknown",
+                 probe is not None, ((probe or {}).get("detail") or "")[:500],
                  account_id, principal))
             return self._view(cur.fetchone())
+
+    #: The same check under the name the connection screens use.
+    check = verify
+
+    def rename(self, principal: str, account_id: str, label: str) -> dict:
+        """Give a connection another name. Names are unique per owner."""
+        label = _text(label, "label", maximum=120)
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_openhands_accounts WHERE principal=%s "
+                        "AND label=%s AND id<>%s", (principal, label, account_id))
+            if cur.fetchone() is not None:
+                raise ValueError(f"another connection is already named {label!r}")
+            cur.execute("UPDATE nexus_openhands_accounts SET label=%s, updated_at=now() "
+                        f"WHERE id=%s AND principal=%s RETURNING {_COLUMNS}",
+                        (label, account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+            return self._view(row)
+
+    def update(self, principal: str, account_id: str, *, base_url: str | None = None,
+               api_key: str | None = None, transport: str | None = None,
+               default_model: str | None = None, clear_model: bool = False) -> dict:
+        """Change where a connection points or what it signs with.
+
+        Nothing is saved unless the service at the (new) URL takes the (new)
+        key: the connection is checked first, with exactly the settings it
+        would have. Whatever is not given stays as it is.
+        """
+        if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
+            raise ValueError("api_key must not be empty")
+        if transport is not None and transport not in ("direct", "app"):
+            raise ValueError("transport must be 'direct' or 'app'")
+        with self.store._tx() as cur:
+            cur.execute("SELECT base_url, transport, default_model, state "
+                        "FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
+                        (account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+        url = self._url(base_url) if base_url is not None else row["base_url"]
+        if api_key is not None:
+            key = api_key.strip()
+        elif row["state"] == "revoked":
+            raise ValueError("the connection is switched off; give a key to bring it back")
+        else:
+            key = _decrypt_secret(self._key_of(principal, account_id))
+        if default_model is not None:
+            default_model = _text(default_model, "default_model", maximum=200,
+                                  required=False) or None
+        client = self._client(url, key)
+        try:
+            capabilities = client.account_capabilities()
+        except CloudAuthError as e:
+            raise ValueError(f"OpenHands rejected the API key: {e}") from e
+        except (CloudUnavailable, CloudError) as e:
+            raise ValueError(f"OpenHands is unavailable: {e}") from e
+        probe = self._probe(client)
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_openhands_accounts SET base_url=%s, api_key_encrypted=%s, "
+                "transport=COALESCE(%s, transport), "
+                "default_model = CASE WHEN %s THEN NULL ELSE COALESCE(%s, default_model) END, "
+                "capabilities=%s, state='active', last_error=NULL, last_error_at=NULL, "
+                "last_checked_at=now(), health='healthy', health_checked_at=now(), "
+                "api_version=%s, compatibility=%s, compatibility_detail=%s, updated_at=now() "
+                f"WHERE id=%s AND principal=%s RETURNING {_COLUMNS}",
+                (url, _encrypt_secret(key), transport, bool(clear_model), default_model,
+                 _json(capabilities), probe.get("api_version"),
+                 probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500],
+                 account_id, principal))
+            return self._view(cur.fetchone())
+
+    def _key_of(self, principal: str, account_id: str) -> bytes:
+        with self.store._tx() as cur:
+            cur.execute("SELECT api_key_encrypted FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+            return row["api_key_encrypted"]
+
+    # ------------------------------------------------------------- removal
+    def dependencies(self, principal: str, account_id: str) -> dict:
+        """What still leans on a connection: tasks at work on it, projects
+        that list it as an executor, stop signals owed to its conversations."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
+                        (account_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("account not found")
+            cur.execute("SELECT count(*) AS n FROM nexus_run_tasks "
+                        "WHERE openhands_account_id=%s "
+                        "AND state IN ('dispatched','running','verifying')", (account_id,))
+            active = int(cur.fetchone()["n"])
+            cur.execute(
+                "SELECT p.id, p.name, e.position FROM nexus_project_executors e "
+                "JOIN nexus_projects p ON p.id = e.project_id "
+                "WHERE e.account_id=%s ORDER BY p.name, p.id", (account_id,))
+            projects = [{"id": str(r["id"]), "name": r["name"],
+                         "role": "primary" if r["position"] == 0 else "backup"}
+                        for r in cur.fetchall()]
+            cur.execute("SELECT count(*) AS n FROM nexus_executor_stops "
+                        "WHERE openhands_account_id=%s AND state='requested'", (account_id,))
+            stops = int(cur.fetchone()["n"])
+        return {"active_tasks": active, "projects": projects, "pending_stops": stops}
+
+    def remove(self, principal: str, account_id: str, *, force: bool = False) -> dict:
+        """Delete a connection and its key.
+
+        Refused (:class:`ConnectionInUse`) while a task is at work on it, a
+        project lists it as an executor, or a stop signal is still owed to one
+        of its conversations - removing it then would leave work nobody can
+        reach. *force* removes it anyway: the projects lose it from their
+        lists, and its tasks are found missing on the next pass and started
+        again elsewhere. Its place in the history of what ran where stays
+        (``nexus_task_executions`` keeps the name).
+        """
+        deps = self.dependencies(principal, account_id)
+        blocking = []
+        if deps["active_tasks"]:
+            blocking.append(f"{deps['active_tasks']} task(s) at work on it")
+        if deps["projects"]:
+            blocking.append("it is an executor of: "
+                            + ", ".join(p["name"] for p in deps["projects"][:5]))
+        if deps["pending_stops"]:
+            blocking.append(f"{deps['pending_stops']} conversation(s) it still has to stop")
+        if blocking and not force:
+            raise ConnectionInUse("the connection is in use: " + "; ".join(blocking), deps)
+        with self.store._tx() as cur:
+            # A project whose primary this was falls back to its next executor.
+            cur.execute("SELECT project_id FROM nexus_project_executors WHERE account_id=%s",
+                        (account_id,))
+            affected = [r["project_id"] for r in cur.fetchall()]
+            cur.execute("DELETE FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
+                        (account_id, principal))
+            if cur.rowcount == 0:
+                raise NotFound("account not found")
+            for project_id in affected:
+                _renumber(cur, project_id)
+        return deps
+
+    # ------------------------------------------------------------ internal
+    def owner_of(self, account_id: str) -> str | None:
+        """Whose connection *account_id* is. For the loop, which is nobody's
+        member: it reads the row by id and acts for the owner."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT principal FROM nexus_openhands_accounts WHERE id=%s",
+                        (account_id,))
+            row = cur.fetchone()
+            return row["principal"] if row else None
+
+    def execution_client_internal(self, account_id: str):
+        """An execution client for a connection named by id alone.
+
+        The loop runs tasks of every project and is not the owner of any
+        connection; which connection a task may use was decided before this
+        (``openhands_router``), so no principal is asked for here.
+        """
+        principal = self.owner_of(account_id)
+        if principal is None:
+            raise NotFound("account not found")
+        return self.execution_client_for_account(principal, account_id)
+
+    def reprobe_unavailable(self, *, min_age_seconds: int = 120, limit: int = 5,
+                            project_id: str | None = None) -> list[dict]:
+        """Ask the connections that were written off whether they are back.
+
+        A connection becomes ``unavailable`` when a start on it fails, and
+        from then on it is given no work - so nothing would ever show that it
+        recovered. This asks it directly (one cheap call each, at most once
+        per *min_age_seconds*) and marks it healthy again when it answers.
+        With *project_id*, only that project's executors and its owner's
+        connections are asked.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT a.id, a.principal, a.base_url FROM nexus_openhands_accounts a "
+                "WHERE a.health='unavailable' AND a.state='active' AND a.enabled "
+                "AND (a.health_checked_at IS NULL "
+                "     OR a.health_checked_at < now() - %s * interval '1 second') "
+                "AND (%s::uuid IS NULL "
+                "     OR a.id IN (SELECT account_id FROM nexus_project_executors "
+                "                 WHERE project_id=%s) "
+                "     OR a.principal IN (SELECT principal FROM nexus_project_members "
+                "                        WHERE project_id=%s AND role='owner')) "
+                "ORDER BY a.health_checked_at NULLS FIRST LIMIT %s",
+                (min_age_seconds, project_id, project_id, project_id, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+        out = []
+        for row in rows:
+            account_id = str(row["id"])
+            healthy, error = False, None
+            try:
+                key = self._decrypt(row["principal"], account_id)
+                client = self._client(row["base_url"], key)
+                healthy = bool(client.health())
+                if not healthy:
+                    error = "the service did not answer the health call"
+            except (CloudError, ValueError, NotFound) as e:
+                error = f"{type(e).__name__}: {e}"
+            with self.store._tx() as cur:
+                cur.execute(
+                    "UPDATE nexus_openhands_accounts SET health=%s, health_checked_at=now(), "
+                    "last_error = CASE WHEN %s THEN NULL ELSE COALESCE(%s, last_error) END, "
+                    "last_error_at = CASE WHEN %s THEN NULL ELSE last_error_at END, "
+                    "updated_at=now() WHERE id=%s",
+                    ("healthy" if healthy else "unavailable", healthy,
+                     (error or None) and error[:1000], healthy, account_id))
+            out.append({"id": account_id, "healthy": healthy, "error": error})
+        return out
 
     def set_default(self, principal: str, account_id: str) -> dict:
         with self.store._tx() as cur:
             self._set_default(cur, principal, account_id)
-            cur.execute("SELECT id, principal, label, base_url, transport, default_model, "
-                        "identity, state, is_default, capabilities, last_checked_at, "
-                        "last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at "
+            cur.execute(f"SELECT {_COLUMNS} "
                         "FROM nexus_openhands_accounts WHERE id=%s", (account_id,))
             return self._view(cur.fetchone())
 
@@ -201,9 +484,23 @@ class OpenHandsAccountService:
                             (account_id, principal))
                 if cur.fetchone() is None:
                     raise NotFound("account not found or not active")
-            cur.execute("UPDATE nexus_projects SET openhands_account_id=%s, updated_at=now() "
-                        "WHERE id=%s RETURNING id, name, openhands_account_id",
-                        (account_id, project_id))
+            # The project's executor list says the same thing: binding one
+            # connection makes it the primary (anything already listed stays
+            # behind it as a backup); unbinding empties the list.
+            if account_id is None:
+                cur.execute("DELETE FROM nexus_project_executors WHERE project_id=%s",
+                            (project_id,))
+            else:
+                cur.execute("UPDATE nexus_project_executors SET position = position + 100000 "
+                            "WHERE project_id=%s", (project_id,))
+                cur.execute(
+                    "INSERT INTO nexus_project_executors(project_id, account_id, position, "
+                    "  created_by) VALUES (%s,%s,0,%s) "
+                    "ON CONFLICT (project_id, account_id) DO UPDATE SET position=0, "
+                    "  enabled=true, updated_at=now()", (project_id, account_id, principal))
+            _renumber(cur, project_id)
+            cur.execute("SELECT id, name, openhands_account_id FROM nexus_projects WHERE id=%s",
+                        (project_id,))
             return dict(cur.fetchone())
 
     def client_for_account(self, principal: str, account_id: str) -> CloudClient:
@@ -238,8 +535,10 @@ class OpenHandsAccountService:
         cloud = self._client(cfg["base_url"], key)
         if cfg["transport"] == "app":
             return cloud
+        # ``scope``: this connection reuses only the sandboxes it started.
         return build_direct_client(self.store, cloud=cloud,
-                                   llm_model=cfg.get("default_model"))
+                                   llm_model=cfg.get("default_model"),
+                                   scope=str(account_id))
 
     def client_for_project(self, principal: str, project_id: str) -> CloudClient:
         """The client for a project's bound account, or raise.
@@ -292,6 +591,23 @@ class OpenHandsAccountService:
         if out.get("id") is not None:
             out["id"] = str(out["id"])
         return out
+
+
+def _renumber(cur: Any, project_id: Any) -> None:
+    """Close the gaps in a project's executor order and keep
+    ``nexus_projects.openhands_account_id`` naming its primary."""
+    cur.execute("SELECT account_id FROM nexus_project_executors WHERE project_id=%s "
+                "ORDER BY position, created_at, account_id FOR UPDATE", (project_id,))
+    ordered = [row["account_id"] for row in cur.fetchall()]
+    # Out of the way first: positions are unique, and two rows cannot swap in place.
+    cur.execute("UPDATE nexus_project_executors SET position = position + 100000 "
+                "WHERE project_id=%s", (project_id,))
+    for position, account_id in enumerate(ordered):
+        cur.execute("UPDATE nexus_project_executors SET position=%s, updated_at=now() "
+                    "WHERE project_id=%s AND account_id=%s",
+                    (position, project_id, account_id))
+    cur.execute("UPDATE nexus_projects SET openhands_account_id=%s, updated_at=now() "
+                "WHERE id=%s", (ordered[0] if ordered else None, project_id))
 
 
 def _json(value: Any) -> str:

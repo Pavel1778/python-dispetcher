@@ -141,12 +141,18 @@ class OpenHandsClient:
         *,
         api_key: str | None = None,
         timeout: float = 30.0,
+        address_policy: Any | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         # Resolved from the environment when not passed explicitly. Never stored
         # in a log line or an exception message.
         self._api_key = api_key or os.environ.get("SESSION_API_KEY") or ""
         self.timeout = timeout
+        #: When set, every socket is opened only where the policy allows
+        #: (``net_guard``). The URLs this client is sent to come from the
+        #: service it talks to; for a connection a person added, that service
+        #: is not trusted to name an address inside this server's network.
+        self.address_policy = address_policy
 
     def _opener(self) -> urllib.request.OpenerDirector:
         """An opener that sends the session key only to the configured origin.
@@ -156,6 +162,11 @@ class OpenHandsClient:
         A same-origin redirect is still followed, because that keeps the key on
         the host it was meant for.
         """
+        if self.address_policy is not None:
+            from .net_guard import guarded_handlers
+
+            return urllib.request.build_opener(_SameOriginRedirect,
+                                               *guarded_handlers(self.address_policy))
         return urllib.request.build_opener(_SameOriginRedirect)
 
     # ------------------------------------------------------------------ http

@@ -36,6 +36,7 @@ from .github_client import GitHubClient
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
+from .nexus_reports import ReportService
 from .nexus_specs import SpecService
 
 log = logging.getLogger("lab_worker")
@@ -76,6 +77,9 @@ class LabWorker:
         self.executor = OpenHandsExecutor(
             self.client, specs=SpecService(store), router=account_router,
             client_factory=self._client_for_account if account_router else None)
+        # A completed run's report: written with the completion, delivered to
+        # the chat the run was started from.
+        self.reports = ReportService(store)
         # A branch is read with the GitHub account its project is bound to, as
         # the studio reads it; the server token only where no account is bound.
         self.verifier = GitVerifier(self.github, client_for=project_github(
@@ -99,17 +103,14 @@ class LabWorker:
         """
         from .nexus_openhands_accounts import OpenHandsAccountService
 
-        service = OpenHandsAccountService(self.store)
-        principal = (self.account_router.principal_for_task(task)
-                     if self.account_router and task
-                     else (self.account_router.principal if self.account_router
-                           else "machine:default"))
-        return service.execution_client_for_account(principal, account_id)
+        # Which account a task may use was decided by the router; the worker
+        # owns none of them, so the connection is read by its id.
+        return OpenHandsAccountService(self.store).execution_client_internal(account_id)
 
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
-                            router=self.account_router)
+                            router=self.account_router, reports=self.reports)
 
     def tick_once(self) -> dict[str, Any]:
         """One pass over every active run. Returns a small summary for logs."""
@@ -124,11 +125,31 @@ class LabWorker:
             except Exception as e:  # noqa: BLE001 - one bad run must not stop the loop
                 log.exception("run %s tick failed", run_id)
                 summary["errors"].append(f"{run_id}: {type(e).__name__}: {e}")
+        # What is owed whatever the runs are doing, and survives a restart
+        # because it is rows: stop signals to conversations that must not go
+        # on (a cancelled run's, among others), reports that are written and
+        # not yet in their chat, and a look at executors that were written off.
+        for name, step in (("stops", sched.deliver_stops),
+                           ("reports", self.reports.deliver_due),
+                           ("executors", self._reprobe)):
+            try:
+                done = step()
+                if done and any(done.values() if isinstance(done, dict) else [done]):
+                    summary[name] = done
+            except Exception as e:  # noqa: BLE001 - the pass goes on
+                log.exception("%s step failed", name)
+                summary["errors"].append(f"{name}: {type(e).__name__}: {e}")
         # The heartbeat is written even when nothing advanced, so an idle worker
         # still reads as alive (a lease alone cannot tell idle from dead).
         last_error = summary["errors"][-1] if summary["errors"] else None
         self.lab.heartbeat(self.worker_id, error=last_error)
         return summary
+
+    def _reprobe(self) -> int:
+        """Ask connections marked unavailable whether they answer again."""
+        if self.account_router is None:
+            return 0
+        return len([item for item in self.account_router.reprobe() if item["healthy"]])
 
     def run_forever(self) -> None:
         self.lab.register_worker(self.worker_id, kind="worker")

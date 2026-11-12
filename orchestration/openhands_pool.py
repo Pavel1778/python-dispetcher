@@ -106,23 +106,21 @@ class AccountPool:
         return self._account(principal, account_id)
 
     def remove(self, principal: str, account_id: str, *, force: bool = False) -> None:
-        """Delete an account. Refuses while it has active tasks, unless forced.
+        """Delete an account. Refuses while something depends on it, unless
+        forced.
 
-        Deleting an account that is running conversations would orphan them, so
-        the count is checked first and the operator has to force it explicitly.
+        What "depends" means is read from the durable rows - tasks at work on
+        the account, projects that list it as an executor, stop signals still
+        owed to its conversations (``OpenHandsAccountService.dependencies``) -
+        not from the ``active_tasks`` counter, which nothing in production
+        maintains. Raises :class:`PoolError` with the reason.
         """
-        with self.store._tx() as cur:
-            cur.execute("SELECT active_tasks FROM nexus_openhands_accounts "
-                        "WHERE id=%s AND principal=%s", (account_id, principal))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("account not found")
-            if row["active_tasks"] > 0 and not force:
-                raise PoolError(
-                    f"account has {row['active_tasks']} active task(s); "
-                    "pass force=true to remove it anyway")
-            cur.execute("DELETE FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
-                        (account_id, principal))
+        from .nexus_openhands_accounts import ConnectionInUse
+
+        try:
+            self.accounts.remove(principal, account_id, force=force)
+        except ConnectionInUse as e:
+            raise PoolError(f"{e}; pass force=true to remove it anyway") from e
 
     # ------------------------------------------------------------- health
     def record_success(self, principal: str, account_id: str) -> None:
