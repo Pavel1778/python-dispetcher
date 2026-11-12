@@ -435,6 +435,15 @@ class App:
         # OpenHands multi-account: an account is one row, the API key encrypted
         # with NEXUS_SECRET_KEY and never returned. A project may bind one.
         self.openhands_accounts = OpenHandsAccountService(self.store)
+        # A project's own list of executors: which connections it may run on,
+        # in order. A project with a list is served from it and nothing else
+        # (``openhands_router``); one without keeps the previous behaviour.
+        from .nexus_executors import ProjectExecutorService
+        self.project_executors = ProjectExecutorService(self.store, self.openhands_accounts)
+        # A completed run's report: written with the completion, delivered to
+        # the chat the run was started from (``nexus_reports``).
+        from .nexus_reports import ReportService
+        self.reports = ReportService(self.store)
         # The account pool: which account runs work, and in what order, under a
         # selection mode. The policy lives in the service, not the UI.
         from .openhands_pool import AccountPool
@@ -1386,12 +1395,15 @@ class Handler(BaseHTTPRequestHandler):
         if not UUID_RE.fullmatch(parts[3]):
             return None
         resource = parts[4]
-        if resource not in ("repositories", "tasks", "workflows", "evidence"):
+        if resource not in ("repositories", "tasks", "workflows", "evidence", "executors"):
             return None
         item = parts[5] if len(parts) == 6 else None
         if item is not None and not UUID_RE.fullmatch(item):
-            # Only the repositories collection accepts a non-uuid action segment.
-            if not (resource == "repositories" and item == "remove"):
+            # The repositories and executors collections accept a non-uuid
+            # action segment (``remove``); anything else must be a uuid.
+            allowed = ((resource == "repositories" and item == "remove")
+                       or (resource == "executors" and item == "remove"))
+            if not allowed:
                 return None
         return parts[3], resource, item
 
@@ -1511,7 +1523,19 @@ class Handler(BaseHTTPRequestHandler):
         if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
             run = self.app.lab.get_run(principal, project_id, rest[1])
             tasks = self.app.lab.list_tasks(principal, project_id, rest[1])
-            return (200, {"run": run, "tasks": tasks}, None)
+            # The report is part of the run's record: the same text that was
+            # delivered to the chat the run came from, so a person reading the
+            # run sees it too. ``None`` until the run has completed. And who
+            # ran what: one line per conversation a task was given.
+            return (200, {"run": run, "tasks": tasks,
+                          "report": self.app.reports.for_run(rest[1]),
+                          "executions": self.app.lab.executions(rest[1]),
+                          "stops": self.app.lab.stops(rest[1])}, None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/report
+        if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "report"):
+            return (200, {"report": self.app.reports.get(principal, project_id, rest[1])},
+                    None)
         # GET /api/v1/projects/{id}/specs/{spec_id}[/content|sections|requirements|stages]
         if rest and rest[0] == "specs" and len(rest) in (2, 3) and UUID_RE.fullmatch(rest[1]):
             return self._get_spec(principal, project_id, rest[1], rest[2] if len(rest) == 3 else "")
@@ -1752,6 +1776,10 @@ class Handler(BaseHTTPRequestHandler):
             if action == "rotate":
                 return self._json(200, {"account": self.app.openhands_accounts.rotate(
                     principal, account_id, api_key=body.get("api_key"))})
+            if action == "rename":
+                # One way to change a connection: a rename is an edit of its name.
+                return self._json(200, {"account": self.app.openhands_accounts.edit(
+                    principal, account_id, label=body.get("label"))})
             if action == "revoke":
                 return self._json(200, {"account": self.app.openhands_accounts.revoke(
                     principal, account_id)})
@@ -1907,6 +1935,56 @@ class Handler(BaseHTTPRequestHandler):
                 project_id=project_id)
             self._json(201, {"action": action})
             return True
+        # POST /api/v1/projects/{id}/executors/check
+        #   Check every executor of the project now, each with its own key.
+        if rest == ["executors", "check"]:
+            self._json(200, self.app.project_executors.check(principal, project_id))
+            return True
+        # POST /api/v1/projects/{id}/executors/{account_id}/{enable|disable|remove|primary}
+        if (len(rest) == 3 and rest[0] == "executors" and UUID_RE.fullmatch(rest[1])
+                and rest[2] in ("enable", "disable", "remove", "primary")):
+            account_id = rest[1]
+            try:
+                if rest[2] == "remove":
+                    out = self.app.project_executors.remove(principal, project_id, account_id)
+                elif rest[2] == "primary":
+                    out = self.app.project_executors.make_primary(
+                        principal, project_id, account_id)
+                else:
+                    out = self.app.project_executors.set_enabled(
+                        principal, project_id, account_id, rest[2] == "enable")
+                out["executor"] = next((item for item in out["executors"]
+                                        if item["account_id"] == account_id), None)
+                self._json(200, out)
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+            return True
+        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/primary
+        if (len(rest) == 4 and rest[0] == "repositories" and rest[3] == "primary"):
+            full_name = f"{rest[1]}/{rest[2]}"
+            try:
+                self._json(200, {"repository": self.app.project_repos.set_primary(
+                    principal, project_id, full_name)})
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+            return True
+        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/account
+        #   {"account_id": uuid|null}
+        if (len(rest) == 4 and rest[0] == "repositories" and rest[3] == "account"):
+            full_name = f"{rest[1]}/{rest[2]}"
+            account_id = body.get("account_id")
+            if account_id is not None and not (isinstance(account_id, str)
+                                               and UUID_RE.fullmatch(account_id)):
+                self._json(400, {"error": "account_id must be a uuid or null"})
+                return True
+            try:
+                self._json(200, {"repository": self.app.project_repos.set_account(
+                    principal, project_id, full_name, account_id)})
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+            return True
         # POST /api/v1/projects/{id}/context/refresh  (analyze the repository)
         if rest == ["context", "refresh"]:
             self._lab_refresh_context(principal, project_id, body)
@@ -1916,10 +1994,22 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "run"):
             self._lab_start_run(principal, project_id, rest[1], body)
             return True
-        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel}
+        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel|hide}
+        #   cancel is durable and idempotent: the run is settled and hidden from
+        #   the active lists at once, and the loop signals the executor. A
+        #   second cancel is a no-op, never an error.
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
-                and rest[2] in ("pause", "resume", "cancel")):
-            state = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[rest[2]]
+                and rest[2] in ("pause", "resume", "cancel", "hide")):
+            if rest[2] == "hide":
+                self._json(200, {"run": self.app.lab.set_hidden(
+                    principal, project_id, rest[1], True)})
+                return True
+            # ``cancelled`` settles the run, takes it out of the lists and
+            # leaves a stop signal for every conversation at work for it - all
+            # in one transaction (``LabStore._apply_run_state``); the loop
+            # delivers the signals. A second cancel changes nothing.
+            state = {"pause": "paused", "resume": "running",
+                     "cancel": "cancelled"}[rest[2]]
             self._json(200, {"run": self.app.lab.set_run_state(
                 principal, project_id, rest[1], state)})
             return True
@@ -2126,6 +2216,17 @@ class Handler(BaseHTTPRequestHandler):
         options = {name: value for name, value in (
             ("max_iterations", max_iterations), ("max_attempts_per_task", max_attempts),
             ("deadline_seconds", deadline_seconds)) if value is not None}
+        # A run nobody named a budget for keeps going until it is done or
+        # cancelled. Naming one - a number of task starts, a deadline - asks
+        # for a run that stops when it is spent; ``policy`` says it outright.
+        policy = body.get("policy")
+        if policy is None:
+            policy = ("bounded" if max_iterations is not None or deadline_seconds is not None
+                      else "durable")
+        if policy not in ("durable", "bounded"):
+            self._json(400, {"error": "policy must be durable or bounded"})
+            return
+        options["policy"] = policy
         try:
             # The goal's task is its specification. A goal from before
             # specifications existed gets one now, from its text.
@@ -2470,6 +2571,10 @@ class Handler(BaseHTTPRequestHandler):
         self.app.projects.get(principal, project_id)  # membership check
         if resource == "repositories":
             return self._json(200, {"repositories": self.app.project_repos.list(principal, project_id)})
+        if resource == "executors":
+            # The project's executors in order (the first is the primary), its
+            # strategy, and the caller's connections that could be added.
+            return self._json(200, self.app.project_executors.get(principal, project_id))
         if resource == "tasks":
             if item_id is None:
                 tasks = self.app.store.list_tasks(project_id=project_id)
@@ -2510,6 +2615,41 @@ class Handler(BaseHTTPRequestHandler):
             if not removed:
                 return self._json(404, {"error": "repository not linked to this project"})
             return self._json(200, {"unlinked": full_name})
+        # POST /api/v1/projects/{id}/executors  — set the whole list, in order.
+        #   {"executors": [{"account_id": uuid, "enabled": bool} | uuid, ...],
+        #    "strategy": "failover" | "distribute"}
+        #   The first entry is the primary. {"primary": uuid|null,
+        #   "fallbacks": [uuid, ...]} is accepted as the same thing.
+        if resource == "executors" and item_id is None:
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be a JSON object"})
+            executors = body.get("executors")
+            if executors is None and ("primary" in body or "fallbacks" in body):
+                primary, fallbacks = body.get("primary"), body.get("fallbacks") or []
+                if primary is not None and not isinstance(primary, str):
+                    return self._json(400, {"error": "primary must be a uuid or null"})
+                if not isinstance(fallbacks, list):
+                    return self._json(400, {"error": "fallbacks must be a list of uuids"})
+                if primary is None and fallbacks:
+                    return self._json(400, {"error": "a list of backups needs a primary"})
+                executors = ([primary] if primary else []) + list(fallbacks)
+            if executors is not None:
+                if not isinstance(executors, list):
+                    return self._json(400, {"error": "executors must be a list"})
+                for item in executors:
+                    account = item.get("account_id") if isinstance(item, dict) else item
+                    if not (isinstance(account, str) and UUID_RE.fullmatch(account)):
+                        return self._json(400, {"error": "each executor must name an "
+                                                         "account_id (a uuid)"})
+            try:
+                assigned = self.app.project_executors.set(
+                    principal, project_id, executors=executors,
+                    strategy=body.get("strategy"))
+            except NotFound as e:
+                return self._json(404, {"error": str(e) or "not found"})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(200, assigned)
         if resource == "tasks" and item_id is None:
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})

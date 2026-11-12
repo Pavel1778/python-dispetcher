@@ -483,7 +483,7 @@ class OpenHandsAccountService:
                 "JOIN nexus_projects p ON p.id = e.project_id "
                 "WHERE e.account_id=%s ORDER BY p.name, p.id", (account_id,))
             projects = [{"id": str(r["id"]), "name": r["name"],
-                         "role": "primary" if r["position"] == 0 else "backup"}
+                         "role": "primary" if r["position"] == 0 else "fallback"}
                         for r in cur.fetchall()]
             cur.execute("SELECT count(*) AS n FROM nexus_executor_stops "
                         "WHERE openhands_account_id=%s AND state='requested'", (account_id,))

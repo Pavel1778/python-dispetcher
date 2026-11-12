@@ -479,6 +479,14 @@ class ReportService:
                 raise NotFound("report not found")
             return _report_view(row)
 
+    def for_run(self, run_id: str) -> dict | None:
+        """A run's report as its card shows it, or ``None``. The caller has
+        already established that the reader may see the run."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_run_reports WHERE run_id=%s", (run_id,))
+            row = cur.fetchone()
+            return _report_view(row) if row else None
+
     def brief(self, run_id: str) -> dict | None:
         """Whether a run has a report and where it stands - no text."""
         with self.store._tx() as cur:

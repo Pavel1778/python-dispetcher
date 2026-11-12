@@ -61,6 +61,29 @@ CREATE TABLE IF NOT EXISTS nexus_project_executors (
 CREATE INDEX IF NOT EXISTS idx_nexus_project_executors_account
     ON nexus_project_executors(account_id);
 
+-- An earlier draft of this work (pull request #29) kept the same list in
+-- ``nexus_project_openhands`` (a ``role`` and a ``position``). Its rows are the
+-- project's list here: the primary first, the rest in their order.
+DO $$
+BEGIN
+    IF to_regclass('nexus_project_openhands') IS NOT NULL THEN
+        INSERT INTO nexus_project_executors(project_id, account_id, position, enabled,
+                                            created_by, created_at)
+        SELECT o.project_id, o.account_id,
+               row_number() OVER (PARTITION BY o.project_id
+                                  ORDER BY (o.role = 'primary') DESC, o.position,
+                                           o.created_at, o.account_id) - 1,
+               o.enabled, o.created_by, o.created_at
+          FROM nexus_project_openhands o
+         WHERE NOT EXISTS (SELECT 1 FROM nexus_project_executors e
+                           WHERE e.project_id = o.project_id);
+        UPDATE nexus_projects p SET openhands_account_id = e.account_id
+          FROM nexus_project_executors e
+         WHERE e.project_id = p.id AND e.position = 0
+           AND p.openhands_account_id IS DISTINCT FROM e.account_id;
+    END IF;
+END $$;
+
 -- A project that had one connection bound has it as its primary executor.
 INSERT INTO nexus_project_executors(project_id, account_id, position, created_by)
 SELECT p.id, p.openhands_account_id, 0, 'migration:0029'

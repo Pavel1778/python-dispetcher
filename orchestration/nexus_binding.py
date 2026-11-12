@@ -32,17 +32,33 @@ class AuthorizationError(StoreError):
 
 
 class ProjectRepositoryService:
-    """Project ↔ repository links (many-to-many)."""
+    """Project ↔ repository links (many-to-many).
+
+    A project may use **several** repositories, each read with its own connected
+    GitHub account (``github_account_id`` on the link). One of them may be the
+    project's **primary** repository - the one a task that names no repository
+    runs against, and the one shown first. The global allowlist is still
+    required (a project cannot bind a name that was never discovered), but it is
+    never sufficient: only an explicit link authorizes work.
+    """
 
     def __init__(self, store: PostgresStore):
         self.store = store
 
-    def link(self, principal: str, project_id: str, repository_full_name: str) -> dict:
+    def link(self, principal: str, project_id: str, repository_full_name: str, *,
+             account_id: str | None = None, label: str = "",
+             make_primary: bool = False) -> dict:
         """Link an allowlisted repository to a project the principal owns.
 
         The repository must exist in the global allowlist (so a project cannot
         bind a name that was never discovered/approved). The project must exist
         and the principal must be its owner.
+
+        *account_id*, when given, is the connected GitHub account whose token
+        reads this repository. It must belong to the same principal: a project
+        cannot be pointed at another principal's account. A link without an
+        account is read with the server token, as before. *make_primary* makes
+        this the project's primary repository (clearing any previous primary).
         """
         with self.store._tx() as cur:
             cur.execute(
@@ -57,20 +73,26 @@ class ProjectRepositoryService:
             repo = cur.fetchone()
             if repo is None:
                 raise NotFound("repository not in the allowlist")
+            if account_id is not None:
+                cur.execute("SELECT 1 FROM nexus_github_accounts "
+                            "WHERE id=%s AND principal=%s", (account_id, principal))
+                if cur.fetchone() is None:
+                    raise NotFound("GitHub account not found")
+            if make_primary:
+                cur.execute("UPDATE nexus_project_repositories SET is_primary=false "
+                            "WHERE project_id=%s AND is_primary", (project_id,))
             cur.execute(
                 "INSERT INTO nexus_project_repositories"
-                "(project_id, repository_id, created_by) VALUES (%s,%s,%s) "
-                "ON CONFLICT (project_id, repository_id) DO NOTHING "
-                "RETURNING project_id, repository_id, created_at",
-                (project_id, repo["id"], principal),
+                "(project_id, repository_id, created_by, github_account_id, label, "
+                " is_primary) VALUES (%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (project_id, repository_id) DO UPDATE SET "
+                "  github_account_id=EXCLUDED.github_account_id, label=EXCLUDED.label, "
+                "  is_primary=EXCLUDED.is_primary "
+                "RETURNING project_id, repository_id, created_at, github_account_id, "
+                "  label, is_primary",
+                (project_id, repo["id"], principal, account_id, label[:120], make_primary),
             )
             row = cur.fetchone()
-            if row is None:
-                cur.execute("SELECT project_id, repository_id, created_at "
-                            "FROM nexus_project_repositories "
-                            "WHERE project_id=%s AND repository_id=%s",
-                            (project_id, repo["id"]))
-                row = cur.fetchone()
             self._event(cur, project_id, principal, "project.repository_linked",
                         repo["id"])
             out = dict(row)
@@ -78,6 +100,64 @@ class ProjectRepositoryService:
             out["default_branch"] = repo["default_branch"]
             out["enabled"] = repo["enabled"]
             return out
+
+    def set_primary(self, principal: str, project_id: str,
+                    repository_full_name: str) -> dict:
+        """Make one linked repository the project's primary. Explicit action."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_project_members "
+                        "WHERE project_id=%s AND principal=%s AND role='owner'",
+                        (project_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("project not found")
+            cur.execute("SELECT id FROM repositories WHERE full_name=%s",
+                        (repository_full_name,))
+            repo = cur.fetchone()
+            if repo is None:
+                raise NotFound("repository not linked to this project")
+            cur.execute("UPDATE nexus_project_repositories SET is_primary=false "
+                        "WHERE project_id=%s AND is_primary", (project_id,))
+            cur.execute("UPDATE nexus_project_repositories SET is_primary=true "
+                        "WHERE project_id=%s AND repository_id=%s "
+                        "RETURNING project_id, repository_id",
+                        (project_id, repo["id"]))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("repository not linked to this project")
+            self._event(cur, project_id, principal, "project.repository_primary",
+                        repo["id"])
+            return {"project_id": project_id, "repository_id": str(repo["id"]),
+                    "full_name": repository_full_name, "is_primary": True}
+
+    def set_account(self, principal: str, project_id: str, repository_full_name: str,
+                    account_id: str | None) -> dict:
+        """Change which GitHub account reads one linked repository."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_project_members "
+                        "WHERE project_id=%s AND principal=%s AND role='owner'",
+                        (project_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("project not found")
+            if account_id is not None:
+                cur.execute("SELECT 1 FROM nexus_github_accounts "
+                            "WHERE id=%s AND principal=%s", (account_id, principal))
+                if cur.fetchone() is None:
+                    raise NotFound("GitHub account not found")
+            cur.execute("SELECT id FROM repositories WHERE full_name=%s",
+                        (repository_full_name,))
+            repo = cur.fetchone()
+            if repo is None:
+                raise NotFound("repository not linked to this project")
+            cur.execute("UPDATE nexus_project_repositories SET github_account_id=%s "
+                        "WHERE project_id=%s AND repository_id=%s "
+                        "RETURNING project_id, repository_id, github_account_id",
+                        (account_id, project_id, repo["id"]))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("repository not linked to this project")
+            self._event(cur, project_id, principal, "project.repository_account",
+                        repo["id"])
+            return dict(row)
 
     def unlink(self, principal: str, project_id: str, repository_full_name: str) -> bool:
         """Remove a link. Fails while a non-terminal task still uses it.
@@ -120,6 +200,13 @@ class ProjectRepositoryService:
             return removed
 
     def list(self, principal: str, project_id: str) -> list[dict]:
+        """The project's linked repositories, primary first.
+
+        Each row names the GitHub account that reads it (``github_account_id``,
+        ``account_login``) and whether it is the primary one. An account that
+        was revoked is reported by its state, never hidden: the operator needs
+        to see that a repository is no longer readable.
+        """
         with self.store._tx() as cur:
             cur.execute(
                 "SELECT 1 FROM nexus_project_members "
@@ -128,13 +215,44 @@ class ProjectRepositoryService:
                 raise NotFound("project not found")
             cur.execute(
                 "SELECT r.id, r.full_name, r.provider, r.default_branch, "
-                "       r.allowed_branches, r.enabled, pr.created_at AS linked_at "
+                "       r.allowed_branches, r.enabled, pr.created_at AS linked_at, "
+                "       pr.github_account_id, pr.is_primary, pr.label, "
+                "       a.login AS account_login, a.state AS account_state "
                 "FROM nexus_project_repositories pr "
                 "JOIN repositories r ON r.id = pr.repository_id "
-                "WHERE pr.project_id=%s ORDER BY r.full_name",
+                "LEFT JOIN nexus_github_accounts a ON a.id = pr.github_account_id "
+                "WHERE pr.project_id=%s "
+                "ORDER BY pr.is_primary DESC, r.full_name",
                 (project_id,),
             )
-            return [dict(row) for row in cur.fetchall()]
+            out = []
+            for row in cur.fetchall():
+                item = dict(row)
+                if item.get("github_account_id") is not None:
+                    item["github_account_id"] = str(item["github_account_id"])
+                out.append(item)
+            return out
+
+    def account_for_repository(self, project_id: str, repository_full_name: str
+                               ) -> tuple[str | None, str | None]:
+        """The (principal, account_id) that reads a linked repository, or (None, None).
+
+        Read by the worker and the verifier, which are not project members: it
+        returns the identity only, never a token. A repository with no linked
+        account returns ``(None, None)``, meaning "read with the server token".
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT a.principal, a.id AS account_id "
+                "FROM nexus_project_repositories pr "
+                "JOIN repositories r ON r.id = pr.repository_id "
+                "JOIN nexus_github_accounts a ON a.id = pr.github_account_id "
+                "WHERE pr.project_id=%s AND r.full_name=%s AND a.state='active'",
+                (project_id, repository_full_name))
+            row = cur.fetchone()
+        if row is None:
+            return (None, None)
+        return (str(row["principal"]), str(row["account_id"]))
 
     def linked(self, project_id: str, repository_full_name: str) -> bool:
         with self.store._tx() as cur:

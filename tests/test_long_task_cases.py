@@ -364,7 +364,11 @@ def test_after_the_run_has_ended_the_same_text_runs_again_from_the_same_plan(lab
     assert [(t["task_key"], t["title"]) for t in lab.run(second)["tasks"]] == tasks
     assert len(lab.model.prompts) == asked, "a finished plan was asked for again"
     assert len(lab.goals()) == 1
-    assert sorted(r["state"] for r in lab.runs()) == ["cancelled", "running"]
+    # The cancelled run is hidden from the active list (the interface shows the
+    # work in progress), but it is kept: it is still readable by id, with its
+    # history. The new run is the only one listed.
+    assert [r["state"] for r in lab.runs()] == ["running"]
+    assert lab.run(run_id)["run"]["state"] == "cancelled"
     assert lab.spec(spec_of(first))["run_id"] == second
 
 
@@ -910,8 +914,10 @@ def test_no_agent_is_started_on_a_text_that_did_not_arrive_whole(lab, fault):
         held = {"cut-short": f"holds {size - 1} bytes", "one-byte-changed": f"holds {size} bytes",
                 "one-byte-added": f"holds more than {size + 1} bytes"}[fault]
         assert held in task["last_error"] and f"{size} bytes were sent" in task["last_error"]
-    # The run stops and its own error says why - nobody has to open the task.
-    assert task["run"]["state"] == "blocked"
+    # The run does not stop for good: it waits and retries, and its own error
+    # says why - nobody has to open the task. (A fresh sandbox may take the file
+    # on the next cycle, so this is a retry, not a permanent failure.)
+    assert task["run"]["state"] == "retrying", task["run"]
     assert f"Task {task['task_key']} was not started: DeliveryError" in task["run"]["last_error"]
     time.sleep(0.6)                                    # more passes of the lab loop
     assert box.conversations == {}

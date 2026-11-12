@@ -927,7 +927,16 @@ class SpecPlanner:
                 max_attempts_per_task=options.get("max_attempts_per_task") or 3,
                 deadline_seconds=options.get("deadline_seconds") or min(
                     MAX_DEADLINE_SECONDS, max(DEFAULT_DEADLINE_SECONDS, 3600 * len(tasks))),
-                plan=tasks, repository=repository, branch=branch, also=also)
+                plan=tasks, repository=repository, branch=branch,
+                # A run nobody named a budget for keeps going until it is done
+                # or cancelled (``durable``); a caller that names one gets a
+                # run that stops when it is spent (``bounded``).
+                policy=options.get("policy") or "durable",
+                # The chat the run was started from; its report is delivered
+                # there. A run started outside a chat has none, and its report
+                # is simply stored (the run's card shows it).
+                conversation_id=spec.get("conversation_id"),
+                also=also)
         except _Lost:
             return {"status": "lost"}
         except NotFound:

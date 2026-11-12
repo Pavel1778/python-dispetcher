@@ -219,6 +219,12 @@ def _send(page, text):
     page.keyboard.press("Enter")
 
 
+def _send_tap(page, text):
+    """Send on a touch device, where Enter is a newline and the button sends."""
+    page.fill("#prompt", text)
+    page.tap("#send")
+
+
 def _overflow(page) -> int:
     """How far the document is wider than the window, in pixels."""
     return page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
@@ -691,6 +697,245 @@ def test_every_width_fits_with_the_workspace_open(stack, chromium, width, height
             assert last["y"] < height
         page.keyboard.press("Escape") if width <= 1180 else page.click("#workspace [data-action='toggle-workspace']")
         assert page.locator("#workspace").is_hidden()
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+# ---------------------------------------------------------------- copy buttons
+def test_a_user_message_and_the_assistant_reply_can_be_copied(stack, chromium):
+    stack.answers("Ответ, который стоит сохранить.")
+    ctx, page, watch = _open(chromium, permissions=["clipboard-read", "clipboard-write"])
+    try:
+        _login(page, stack.base)
+        _send(page, "Задание: сделать что-то полезное и подробное")
+        page.wait_for_selector(".msg.assistant .md")
+        # The user's own message has a copy button; the full text is copied.
+        page.click(".msg.user [data-action='copy-message']")
+        page.wait_for_selector(".toast")
+        assert page.evaluate("() => navigator.clipboard.readText()") == (
+            "Задание: сделать что-то полезное и подробное")
+        # The assistant reply too.
+        page.click(".msg.assistant [data-action='copy-message']")
+        page.wait_for_timeout(150)
+        assert page.evaluate("() => navigator.clipboard.readText()") == (
+            "Ответ, который стоит сохранить.")
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_the_report_can_be_copied_from_the_agent_tab(stack, chromium):
+    ctx, page, watch = _open(chromium, permissions=["clipboard-read", "clipboard-write"])
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        stack.answers(json.dumps({"tasks": [
+            {"id": "one", "title": "Единственная задача", "description": "Сделать.",
+             "acceptance": ["готово"], "dependencies": []}]}))
+        page.click("#mode-btn")
+        page.click('.menu-item[data-mode="autonomous"]')
+        _send(page, "Цель: одна задача")
+        page.wait_for_selector(".work-chip")
+        page.click(".work-chip")
+        page.wait_for_selector(".work")
+
+        # The report is written when the run verifies. Complete the run in the
+        # store and give it a report, the way the worker does.
+        app = stack.app
+        run = app.lab.list_runs(_owner_principal(app), _first_project(app))[0]
+        with app.store._tx() as cur:
+            cur.execute("UPDATE nexus_run_tasks SET state='completed_verified', "
+                        "verification='{\"verdict\":\"completed_verified\",\"reason\":\"ok\"}'::jsonb "
+                        "WHERE run_id=%s", (run["id"],))
+        from orchestration.nexus_reports import ReportBuilder
+        text, meta = ReportBuilder(app.store, app.lab).build(run["id"])
+        app.lab.save_report(run["id"], content=text, meta=meta)
+        page.click("[data-action='refresh-work']") if page.locator("[data-action='refresh-work']").count() else None
+        page.reload()
+        page.wait_for_selector('#app[data-ready="true"]')
+        page.click(".work-chip")
+        page.wait_for_selector("[data-action='copy-report']")
+        page.click("[data-action='copy-report']")
+        page.wait_for_selector(".toast")
+        copied = page.evaluate("() => navigator.clipboard.readText()")
+        assert "Отчёт по автономному прогону" in copied
+        assert "Единственная задача" in copied
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def _owner_principal(app):
+    with app.store._tx() as cur:
+        cur.execute("SELECT principal FROM nexus_project_members ORDER BY created_at LIMIT 1")
+        return cur.fetchone()["principal"]
+
+
+def _first_project(app):
+    with app.store._tx() as cur:
+        cur.execute("SELECT id FROM nexus_projects ORDER BY created_at LIMIT 1")
+        return str(cur.fetchone()["id"])
+
+
+# --------------------------------------------------- cancel hides the run (phone)
+def test_a_cancelled_run_leaves_the_agent_tab_and_stays_gone(stack, chromium):
+    ctx, page, watch = _open(chromium, viewport={"width": 390, "height": 844}, is_mobile=True,
+                             has_touch=True, device_scale_factor=2)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        stack.answers(json.dumps({"tasks": [
+            {"id": "one", "title": "Задача один", "description": "x", "acceptance": [], "dependencies": []},
+            {"id": "two", "title": "Задача два", "description": "x", "acceptance": [], "dependencies": []}]}))
+        page.click("#mode-btn")
+        page.click('.menu-item[data-mode="autonomous"]')
+        _send_tap(page, "Цель: две задачи")
+        page.wait_for_selector(".work-chip")
+        page.click(".work-chip")
+        page.wait_for_selector(".work")
+        assert page.locator(".work").count() == 1
+
+        # Cancel: the card leaves at once.
+        page.click('.work [data-op="cancel"]')
+        page.click(".dialog-foot .btn-danger")
+        page.wait_for_selector(".work", state="detached")
+        assert page.locator(".work").count() == 0
+
+        # A reload does not bring it back.
+        page.reload()
+        page.wait_for_selector('#app[data-ready="true"]')
+        page.click(".work-chip")
+        page.wait_for_timeout(500)
+        assert page.locator(".work").count() == 0
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+# ------------------------------------------------ the report reaches the chat
+def test_the_report_is_posted_into_the_chat_that_asked_for_the_run(stack, chromium):
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        stack.answers(json.dumps({"tasks": [
+            {"id": "one", "title": "Одна задача", "description": "x", "acceptance": ["готово"],
+             "dependencies": []}]}))
+        page.click("#mode-btn")
+        page.click('.menu-item[data-mode="autonomous"]')
+        _send(page, "Цель: одна задача")
+        page.wait_for_selector(".work-chip")
+
+        # Verify the run and write its report, then deliver it (the worker does
+        # this in production; here it is one pass of the same code).
+        app = stack.app
+        run = app.lab.list_runs(_owner_principal(app), _first_project(app))[0]
+        with app.store._tx() as cur:
+            cur.execute("UPDATE nexus_run_tasks SET state='completed_verified', "
+                        "verification='{\"verdict\":\"completed_verified\",\"reason\":\"ok\"}'::jsonb "
+                        "WHERE run_id=%s", (run["id"],))
+        from orchestration.nexus_reports import ReportBuilder, ReportDeliverer
+        text, meta = ReportBuilder(app.store, app.lab).build(run["id"])
+        app.lab.save_report(run["id"], content=text, meta=meta)
+        ReportDeliverer(app.store, app.lab, app.conversations).deliver_pending()
+
+        # The chat now carries the report as an assistant message.
+        page.reload()
+        page.wait_for_selector('#app[data-ready="true"]')
+        page.wait_for_selector(".msg.assistant .md")
+        body = page.inner_text("#thread")
+        assert "Отчёт по автономному прогону" in body
+        assert "Одна задача" in body
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+# ---------------------------------------------------- mobile scroll on the phone
+def test_a_phone_can_scroll_the_agent_tab_to_the_last_run(stack, chromium):
+    """The regression: the last run in a long list was unreachable because a
+    card (``overflow: hidden`` as a flex item) shrank to the list's height and
+    its content was clipped, so the list never overflowed to scroll."""
+    ctx, page, watch = _open(chromium, viewport={"width": 390, "height": 844}, is_mobile=True,
+                             has_touch=True, device_scale_factor=2)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        tasks = [{"id": f"t{i}", "title": f"Задача номер {i} — сделать что-то полезное",
+                  "description": "Описание.", "acceptance": [], "dependencies": []}
+                 for i in range(1, 26)]
+        stack.answers(json.dumps({"tasks": tasks}))
+        page.click("#mode-btn")
+        page.click('.menu-item[data-mode="autonomous"]')
+        _send_tap(page, "Цель: 25 задач")
+        page.wait_for_selector(".work-chip")
+        page.click(".work-chip")
+        page.wait_for_selector(".work")
+
+        # The list really overflows now (a card is as tall as its content).
+        assert page.evaluate(
+            "() => { const l = document.querySelector('.work-list');"
+            " return l.scrollHeight > l.clientHeight + 20; }"), \
+            "the work list does not overflow: cards are clipped, not scrolled"
+        assert page.evaluate(
+            "() => document.querySelectorAll('.step-row').length") == 25
+
+        # Scrolling the list reaches the last task of the DAG.
+        page.evaluate("() => { const l = document.querySelector('.work-list');"
+                      " l.scrollTop = l.scrollHeight; }")
+        page.wait_for_timeout(100)
+        last = page.locator(".step-row").last.bounding_box()
+        assert last is not None and last["y"] + last["height"] <= 844 + 1, \
+            "the last task is not reachable by scrolling"
+
+        # The bottom navigation (the composer) does not cover the last item.
+        composer_top = page.locator("#composer-wrap").bounding_box()["y"]
+        assert last["y"] < composer_top, "the composer covers the last run"
+
+        # A reload keeps the list scrollable.
+        page.reload()
+        page.wait_for_selector('#app[data-ready="true"]')
+        page.click(".work-chip")
+        page.wait_for_selector(".work")
+        assert page.evaluate(
+            "() => { const l = document.querySelector('.work-list');"
+            " return l.scrollHeight > l.clientHeight + 20; }")
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_a_long_dag_scrolls_and_details_open_and_close_on_a_phone(stack, chromium):
+    ctx, page, watch = _open(chromium, viewport={"width": 390, "height": 844}, is_mobile=True,
+                             has_touch=True, device_scale_factor=2)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        # A dependency chain: a long DAG of tasks.
+        tasks = [{"id": f"t{i}", "title": f"Шаг {i}", "description": "x",
+                  "acceptance": [], "dependencies": [f"t{i-1}"] if i > 1 else []}
+                 for i in range(1, 16)]
+        stack.answers(json.dumps({"tasks": tasks}))
+        page.click("#mode-btn")
+        page.click('.menu-item[data-mode="autonomous"]')
+        _send_tap(page, "Цель: длинная цепочка")
+        page.wait_for_selector(".work-chip")
+        page.click(".work-chip")
+        page.wait_for_selector(".steps .step-row")
+        assert page.evaluate("() => document.querySelectorAll('.step-row').length") == 15
+
+        # Scroll to the very last step.
+        page.evaluate("() => { const l = document.querySelector('.work-list');"
+                      " l.scrollTop = l.scrollHeight; }")
+        page.wait_for_timeout(100)
+        last = page.locator(".step-row").last
+        last.scroll_into_view_if_needed()
+        box = last.bounding_box()
+        assert box["y"] + box["height"] <= 844 + 1
+
+        # Nested panels (the workspace over the chat) do not block the scroll.
+        assert _overflow(page) <= 0
         assert watch.problems == []
     finally:
         ctx.close()

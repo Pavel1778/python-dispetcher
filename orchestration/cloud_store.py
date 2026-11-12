@@ -374,7 +374,20 @@ class PostgresStore:
         "nexus_run_tasks": ("id", "run_id", "project_id", "task_key", "state",
                             "attempt", "max_attempts", "conversation_id",
                             "openhands_account_id", "tried_accounts",
-                            "preferred_account_id"),
+                            "preferred_account_id", "cycle", "retry_at",
+                            "wait_reason", "started_at"),
+        "nexus_runs": ("id", "project_id", "goal_id", "state", "iteration",
+                       "policy", "cycle", "resume_at", "conversation_id",
+                       "hidden_at", "total_iterations"),
+        "nexus_run_reports": ("run_id", "project_id", "conversation_id", "state",
+                              "body", "attempts", "next_attempt_at"),
+        "nexus_executor_stops": ("id", "run_id", "task_id", "conversation_id",
+                                 "state", "attempts", "next_attempt_at"),
+        "nexus_task_executions": ("id", "run_id", "task_id", "kind",
+                                  "executor_label", "conversation_id"),
+        "nexus_project_executors": ("project_id", "account_id", "position", "enabled"),
+        "nexus_project_repositories": ("project_id", "repository_id",
+                                       "github_account_id", "is_primary"),
     }
 
     def verify_schema(self) -> list[str]:

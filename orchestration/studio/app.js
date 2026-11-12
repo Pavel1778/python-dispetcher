@@ -60,6 +60,7 @@
     blocked: ['заблокировано', 'warn'], failed: ['ошибка', 'bad'],
     cancelled: ['отменено', 'idle'], dead_letter: ['остановлено после ошибок', 'bad'],
     paused: ['на паузе', 'warn'], waiting_for_approval: ['ждёт подтверждения', 'warn'],
+    retrying: ['повтор после ошибки', 'warn'],
     pending: ['ожидает', 'idle'], dispatched: ['отправлена', 'run'],
     completed_verified: ['готово, проверено', 'ok'],
     completed_unverified: ['готово, без проверки', 'warn'],
@@ -68,7 +69,7 @@
   };
   var TOOLS = { start_workflow: 'Запуск задачи OpenHands', start_run: 'Запуск автономного прогона' };
   // States that change on their own, so they are worth polling.
-  var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1 };
+  var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1, retrying: 1 };
 
   function stateLabel(state) { return (STATES[state] || [state || 'неизвестно'])[0]; }
   function stateTone(state) { return (STATES[state] || ['', 'idle'])[1]; }
@@ -85,8 +86,9 @@
     mode: 'ask', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
-    work: { items: [], data: {}, timer: null },
-    accounts: { github: null, openhands: null }
+    work: { items: [], data: {}, timer: null, hidden: {} },
+    accounts: { github: null, openhands: null },
+    projectSettings: null
   };
   var routeSeq = 0;
 
@@ -550,9 +552,24 @@
         : meta.run_id ? { kind: 'run', id: String(meta.run_id) } : null;
       if (!entry) return;
       entry.key = entry.kind + ':' + entry.id;
-      if (!seen[entry.key]) { seen[entry.key] = true; items.push(entry); }
+      if (!seen[entry.key] && !S.work.hidden[entry.key]) {
+        seen[entry.key] = true;
+        items.push(entry);
+      }
     });
     return items.reverse();   // newest first
+  }
+
+  // A cancelled run is gone from the interface. The card is dropped from the
+  // in-memory list and the record is marked hidden, so a later refresh that
+  // re-reads the run (a reload, a poll) does not bring it back. The row is not
+  // deleted anywhere: the history, tasks and report stay on the server.
+  function dropWork(key) {
+    S.work.hidden[key] = true;
+    S.work.items = S.work.items.filter(function (item) { return item.key !== key; });
+    delete S.work.data[key];
+    renderWorkBadges();
+    if (S.ws.open && S.ws.tab === 'agent') renderAgent();
   }
 
   function openConversation(convId) {
@@ -598,11 +615,22 @@
       icon('chevron-right', 'icon-sm') + '</button>';
   }
 
+  // One copy button, used by every message that has one. The same handler
+  // (``copy-message``) and the same ``copyText`` fallback serve the assistant's
+  // reply and the user's own message; the report uses ``copy-report``.
+  function copyButton(id, label) {
+    return '<button class="icon-btn sm" type="button" data-action="copy-message" data-id="' + id +
+      '" aria-label="' + esc(label) + '" title="Скопировать">' + icon('copy', 'icon-sm') + '</button>';
+  }
+
   function messageHtml(message) {
     var meta = message.meta || {};
     var id = esc(message.id || '');
     if (message.role === 'user') {
-      return '<article class="msg user" data-id="' + id + '"><div class="bubble">' + esc(message.content) + '</div></article>';
+      // A copy button on the user's own message: the task text is often long
+      // and worth reusing. The full text is copied, never the rendered bubble.
+      return '<article class="msg user" data-id="' + id + '"><div class="bubble">' + esc(message.content) + '</div>' +
+        '<div class="msg-actions">' + copyButton(id, 'Скопировать сообщение') + '</div></article>';
     }
     if (message.role === 'tool') {
       var ref = meta.workflow_id || meta.run_id;
@@ -631,7 +659,7 @@
       (entry ? workChip(entry) : '') +
       '<div class="msg-meta">' + (label ? '<span class="msg-model">' + esc(label) + '</span>' : '') +
       '<span title="' + esc(fullTime(message.created_at)) + '">' + esc(clock(message.created_at)) + '</span>' +
-      '<button class="icon-btn sm" type="button" data-action="copy-message" data-id="' + id + '" aria-label="Скопировать ответ" title="Скопировать">' + icon('copy', 'icon-sm') + '</button>' +
+      copyButton(id, 'Скопировать ответ') +
       '</div></div></article>';
   }
 
@@ -862,8 +890,19 @@
       request = api(projectUrl('/runs/' + enc(entry.id)))
         .then(function (data) { return { state: data.run.state, detail: data }; });
     }
-    return request.then(function (record) { S.work.data[entry.key] = record; },
-                        function (error) { S.work.data[entry.key] = { state: null, error: error.message }; });
+    return request.then(function (record) {
+      // A cancelled run is gone from the interface, even when the chat still
+      // carries a chip for it (a run cancelled on another device, or before a
+      // reload). Its history stays on the server; only the view drops it.
+      if (entry.kind === 'run' && record.state === 'cancelled') {
+        dropWork(entry.key);
+        return null;
+      }
+      S.work.data[entry.key] = record;
+      return null;
+    }, function (error) {
+      S.work.data[entry.key] = { state: null, error: error.message };
+    });
   }
 
   function movingWork() {
@@ -980,15 +1019,19 @@
   }
 
   function runCard(entry, detail) {
-    var run = detail.run, tasks = detail.tasks || [];
+    var run = detail.run, tasks = detail.tasks || [], report = detail.report;
     // "Will be taken in a few seconds" is said only of a run nothing has happened to
     // yet. A task that waits out a refused start says why on its own line.
     var waiting = tasks.length && run.state === 'running' &&
       tasks.every(function (task) { return task.state === 'pending' && !task.last_error; });
     var inline = !!(S.status && S.status.lab && S.status.lab.inline);
-    var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state];
+    var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1, retrying: 1 }[run.state];
     var budget = 'запусков ' + esc(run.iteration) + ' из ' + esc(run.max_iterations) +
       (live && run.deadline_at ? ' · до ' + esc(fullTime(run.deadline_at)) : '');
+    if (run.state === 'retrying') {
+      budget += ' · циклов ' + esc(run.retry_attempt) + ' из ' + esc(run.max_retry_cycles);
+      if (run.retry_at) budget += ' · следующая попытка после ' + esc(fullTime(run.retry_at));
+    }
     var steps = tasks.length ? '<ul class="steps">' + tasks.map(function (task) {
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
@@ -1004,8 +1047,20 @@
     }).join('') + '</ul>' : '<p class="step-sub">В плане нет задач.</p>';
     var actions = '';
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
-    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
-    if ({ running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state]) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    if ({ paused: 1, blocked: 1, retrying: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
+    if ({ running: 1, paused: 1, blocked: 1, waiting_for_approval: 1, retrying: 1 }[run.state]) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    // The report is the run's own record: the same text delivered to the chat.
+    // It is copied in full, never the truncated view.
+    var reportSection = report && report.content
+      ? '<div class="work-section"><p class="work-section-title">Итоговый отчёт</p>' +
+        '<div class="md">' + MD.render(report.content) + '</div>' +
+        '<div class="work-foot">' +
+        '<button class="btn btn-sm" type="button" data-action="copy-report" data-id="' + esc(entry.id) + '">' +
+        icon('copy', 'icon-sm') + 'Скопировать отчёт</button>' +
+        '<span class="muted">' + esc(report.status === 'sent' ? 'отправлен в чат'
+          : report.status === 'failed' ? 'доставка не удалась, отчёт сохранён'
+          : 'ожидает отправки в чат') + '</span></div></div>'
+      : '';
     return '<section class="work"><div class="work-head">' + pill(run.state) +
       '<span class="work-kind">Автономный прогон</span><span class="work-id">' + esc(shortId(entry.id)) + '</span>' +
       '<span class="topbar-spacer"></span><span class="work-id" title="Сколько раз прогон запускал задачи и до какого времени он может их запускать">' + budget + '</span></div>' +
@@ -1014,6 +1069,7 @@
       (waiting ? '<p class="step-sub">' + (inline
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
         : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
+      reportSection +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
   }
 
@@ -1494,16 +1550,65 @@
     if (!pane.firstChild || pane.getAttribute('data-tab') !== tab) pane.innerHTML = SKELETON;
     pane.setAttribute('data-tab', tab);
     var load = tab === 'project'
-      ? (S.projectId ? api(projectUrl('/context')).then(function (data) { return data.context; }, function () { return null; })
-                     : Promise.resolve(null))
+      ? (S.projectId
+         ? Promise.all([
+             api(projectUrl('/context')).then(function (data) { return data.context; },
+                                             function () { return null; }),
+             api(projectUrl('/executors')).then(function (data) { return data.executors || []; },
+                                               function () { return []; }),
+             api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
+                                                   function () { return []; }),
+             loadOpenhandsAccounts().then(function () { return S.accounts.openhands || []; },
+                                          function () { return []; }),
+           ]).then(function (parts) {
+             return { context: parts[0], executors: parts[1], repositories: parts[2],
+                      accounts: parts[3] };
+           })
+         : Promise.resolve(null))
       : Promise.all([
           loadGithubAccounts().catch(function () { S.accounts.github = []; }),
+          loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
           api('/api/studio').then(function (data) { S.status = data; }, function () {})
         ]);
     return load.then(function (result) {
       if (settingsTab !== tab || !document.contains(pane)) return;
-      pane.innerHTML = tab === 'project' ? projectSettingsHtml(result) : connectionsHtml();
+      if (tab === 'project') {
+        S.projectSettings = result || null;
+        pane.innerHTML = projectSettingsHtml(result);
+      } else {
+        pane.innerHTML = connectionsHtml();
+      }
     });
+  }
+
+  function loadOpenhandsAccounts() {
+    return api('/api/openhands/accounts').then(function (data) {
+      S.accounts.openhands = data.accounts || [];
+    });
+  }
+
+  function submitOpenhandsForm(form) {
+    var message = $('.form-msg', form), button = $('button[type=submit]', form);
+    message.className = 'form-msg';
+    message.textContent = 'Проверяем ключ в OpenHands…';
+    setBusy(button, true);
+    api('/api/openhands/accounts', { method: 'POST', timeout: 60000,
+        body: { label: form.elements.label.value.trim(),
+                api_key: form.elements.api_key.value,
+                base_url: form.elements.base_url.value.trim() || undefined,
+                transport: form.elements.transport.value,
+                default_model: form.elements.default_model.value.trim() || undefined } })
+      .then(function (data) {
+        setBusy(button, false);
+        form.reset();
+        message.textContent = '';
+        toast('OpenHands «' + data.account.label + '» подключён.');
+        return loadOpenhandsAccounts().then(refreshSettings);
+      }, function (error) {
+        setBusy(button, false);
+        message.className = 'form-msg is-bad';
+        message.textContent = explain(error.message).text;
+      });
   }
 
   function accountCard(account) {
@@ -1516,9 +1621,47 @@
       pill(account.state) + '<div class="card-actions">' + actions + '</div></div>';
   }
 
+  function openhandsCard(account) {
+    var id = esc(account.id);
+    var usable = account.state === 'active' && account.enabled !== false;
+    var health = { healthy: 'работает', degraded: 'нестабилен', unavailable: 'недоступен' }[account.health] || 'не проверялся';
+    var actions = account.state === 'revoked' ? ''
+      : '<button class="btn btn-sm" type="button" data-action="openhands-rename" data-id="' + id + '" data-label="' + esc(account.label) + '">Переименовать</button>' +
+        '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="verify" data-id="' + id + '">Проверить</button>' +
+        '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="' + (usable ? 'disable' : 'enable') + '" data-id="' + id + '">' +
+        (usable ? 'Выключить' : 'Включить') + '</button>' +
+        '<button class="btn btn-sm btn-danger" type="button" data-action="openhands-op" data-op="revoke" data-id="' + id + '">Отключить</button>';
+    return '<div class="card"><div class="card-main"><b>' + esc(account.label) + '</b>' +
+      '<small>' + esc(account.base_url || '') + ' · ' + esc(account.transport || '') +
+      (account.default_model ? ' · ' + esc(account.default_model) : '') + '</small>' +
+      '<small>доступность: ' + esc(health) + (account.api_version ? ' · API ' + esc(account.api_version) : '') +
+      (account.is_default ? ' · по умолчанию' : '') + '</small>' +
+      (account.last_error ? '<small class="is-bad">' + esc(account.last_error) + '</small>' : '') + '</div>' +
+      pill(account.state === 'active' ? (account.enabled === false ? 'invalid' : 'active') : account.state) +
+      '<div class="card-actions">' + actions + '</div></div>';
+  }
+
+  function openhandsFormHtml() {
+    return '<form class="account-form openhands-form" autocomplete="off">' +
+      '<div class="grid-2"><label class="field"><span class="field-label">Название</span>' +
+      '<input class="input" name="label" required maxlength="120" placeholder="Например: основной"></label>' +
+      '<label class="field"><span class="field-label">API URL</span>' +
+      '<input class="input" name="base_url" type="url" placeholder="https://app.all-hands.dev"></label></div>' +
+      '<div class="grid-2"><label class="field"><span class="field-label">API key</span>' +
+      '<input class="input" name="api_key" type="password" required autocomplete="off" placeholder="Ключ OpenHands"></label>' +
+      '<label class="field"><span class="field-label">Транспорт</span>' +
+      '<select class="input" name="transport"><option value="direct">direct — свой sandbox</option>' +
+      '<option value="app">app — app-conversation</option></select></label></div>' +
+      '<label class="field"><span class="field-label">Модель по умолчанию (необязательно)</span>' +
+      '<input class="input" name="default_model" placeholder="openhands/deepseek-v4.1-flash"></label>' +
+      '<p class="field-hint">Ключ проверяется в OpenHands, шифруется (NEXUS_SECRET_KEY) и никогда не возвращается в интерфейс или API. Несколько подключений позволяют переключаться между исполнителями.</p>' +
+      '<div class="row"><button class="btn btn-primary btn-sm" type="submit">Подключить</button><p class="form-msg" role="status"></p></div></form>';
+  }
+
   function connectionsHtml() {
     var status = S.status || {};
     var accounts = S.accounts.github || [];
+    var ohAccounts = S.accounts.openhands || [];
     var providers = (status.providers || []).filter(function (name) { return name !== 'openhands'; });
     var openhands = status.openhands || {}, github = status.github || {}, crypto = status.accounts || {};
     var lab = status.lab || {};
@@ -1529,6 +1672,10 @@
       '<p class="section-note">Аккаунт даёт список репозиториев и чтение файлов проекта. Токен хранится зашифрованным и не возвращается ни в интерфейс, ни в API.</p>' +
       (accounts.length ? '<div class="cards">' + accounts.map(accountCard).join('') + '</div>' : '') +
       '<details class="add"' + (accounts.length ? '' : ' open') + '><summary>' + icon('plus', 'icon-sm') + 'Подключить аккаунт GitHub</summary>' + githubFormHtml() + '</details></div>' +
+      '<div class="section"><h3 class="section-title">' + icon('bot', 'icon-sm') + 'OpenHands</h3>' +
+      '<p class="section-note">Подключения OpenHands, на которых выполняются задачи. Ключ хранится зашифрованным и не показывается. Несколько подключений дают переключение при недоступности одного из них.</p>' +
+      (ohAccounts.length ? '<div class="cards">' + ohAccounts.map(openhandsCard).join('') + '</div>' : '') +
+      '<details class="add"' + (ohAccounts.length ? '' : ' open') + '><summary>' + icon('plus', 'icon-sm') + 'Подключить OpenHands</summary>' + openhandsFormHtml() + '</details></div>' +
       '<div class="section"><h3 class="section-title">' + icon('info', 'icon-sm') + 'Сервер</h3>' +
       '<p class="section-note">Задаётся переменными окружения сервера. Здесь видно только, что настроено: сами значения в браузер не передаются.</p>' +
       '<dl class="kv is-status">' +
@@ -1569,7 +1716,60 @@
           '<dt>Ревизия</dt><dd class="mono">' + esc(revision || '—') + '</dd><dt>Собран</dt><dd>' + esc(fullTime(context.created_at)) + '</dd></dl>'
         : '<p class="section-note">Контекст ещё не собран.</p>') +
       '<button class="btn" type="button" data-action="refresh-context"' + (repoName() ? '' : ' disabled') + '>' + icon('refresh', 'icon-sm') +
-      (context ? 'Изучить заново' : 'Изучить репозиторий') + '</button></div>';
+      (context ? 'Изучить заново' : 'Изучить репозиторий') + '</button></div>' +
+      projectRepositoriesHtml(context && context.repositories) +
+      projectExecutorsHtml(context && context.executors, context && context.accounts);
+  }
+
+  // The project's repositories (several, possibly from different accounts).
+  function projectRepositoriesHtml(repositories) {
+    var rows = repositories || [];
+    var body = rows.length
+      ? '<div class="cards">' + rows.map(function (r) {
+          var actions = '<button class="btn btn-sm" type="button" data-action="repo-primary" data-name="' + esc(r.full_name) + '"' +
+            (r.is_primary ? ' disabled' : '') + '>Основной</button>';
+          return '<div class="card"><div class="card-main"><b>' + esc(r.full_name) + '</b>' +
+            '<small>' + (r.github_account_id ? 'аккаунт: ' + esc(r.account_login || '') : 'токен сервера') +
+            (r.is_primary ? ' · основной' : '') + '</small></div>' +
+            (r.is_primary ? pill('active') : '') +
+            '<div class="card-actions">' + actions + '</div></div>';
+        }).join('') + '</div>'
+      : '<p class="section-note">Репозитории ещё не подключены.</p>';
+    return '<div class="section"><h3 class="section-title">' + icon('repo', 'icon-sm') + 'Репозитории проекта</h3>' +
+      '<p class="section-note">Проект может работать с несколькими репозиториями, в том числе из разных аккаунтов GitHub. Один из них — основной: на него идут задачи без явного репозитория.</p>' +
+      body +
+      '<button class="btn" type="button" data-action="open-repo">Подключить ещё репозиторий</button></div>';
+  }
+
+  // The project's OpenHands executors (primary + fallbacks, in order).
+  function projectExecutorsHtml(executors, accounts) {
+    var assigned = executors || [];
+    var all = accounts || [];
+    var assignedIds = assigned.map(function (e) { return String(e.account_id); });
+    var body = assigned.length
+      ? '<div class="cards">' + assigned.map(function (e) {
+          var role = e.role === 'primary' ? 'основной' : 'резервный ' + (e.position || 0);
+          var actions = '<button class="btn btn-sm" type="button" data-action="executor-role" data-id="' + esc(e.account_id) + '"' +
+            (e.role === 'primary' ? ' disabled' : '') + '>Сделать основным</button>' +
+            '<button class="btn btn-sm" type="button" data-action="executor-enabled" data-id="' + esc(e.account_id) + '" data-enabled="' + (e.enabled ? '0' : '1') + '">' +
+            (e.enabled ? 'Выключить' : 'Включить') + '</button>' +
+            '<button class="btn btn-sm btn-danger" type="button" data-action="executor-remove" data-id="' + esc(e.account_id) + '">Убрать</button>';
+          return '<div class="card"><div class="card-main"><b>' + esc(e.label) + '</b>' +
+            '<small>' + esc(role) + ' · ' + esc(e.state || '') + (e.enabled ? '' : ' · выключен') + '</small></div>' +
+            (e.enabled ? pill('active') : pill('invalid')) +
+            '<div class="card-actions">' + actions + '</div></div>';
+        }).join('') + '</div>'
+      : '<p class="section-note">Исполнители не назначены: проект использует аккаунт по умолчанию.</p>';
+    // Accounts that could still be added.
+    var available = all.filter(function (a) { return assignedIds.indexOf(String(a.id)) === -1; });
+    var add = available.length
+      ? '<form class="row row-fill" id="executor-add"><select class="input" name="account_id" aria-label="Добавить исполнителя">' +
+        available.map(function (a) { return '<option value="' + esc(a.id) + '">' + esc(a.label) + '</option>'; }).join('') +
+        '</select><button class="btn" type="submit">Добавить</button></form>'
+      : (all.length ? '' : '<p class="section-note">Сначала подключите OpenHands во вкладке «Подключения».</p>');
+    return '<div class="section"><h3 class="section-title">' + icon('bot', 'icon-sm') + 'Исполнители OpenHands</h3>' +
+      '<p class="section-note">Какие подключения OpenHands могут выполнять задачи проекта. Основной используется первым, резервные — по порядку при недоступности основного.</p>' +
+      body + add + '</div>';
   }
 
   /* ----------------------------------------------------------------- menus */
@@ -1776,7 +1976,19 @@
     'copy-message': function (el) {
       var id = el.getAttribute('data-id');
       var message = S.messages.filter(function (m) { return String(m.id) === id; })[0];
-      if (message) copied(copyText(message.content), 'Ответ скопирован.');
+      if (!message) return;
+      // The full stored text, not the rendered bubble: the same button copies an
+      // assistant reply and the user's own message.
+      copied(copyText(message.content),
+             message.role === 'user' ? 'Сообщение скопировано.' : 'Ответ скопирован.');
+    },
+    'copy-report': function (el) {
+      var id = el.getAttribute('data-id');
+      var record = S.work.data['run:' + id];
+      var content = record && record.detail && record.detail.report
+        ? record.detail.report.content : '';
+      if (!content) { toast('Отчёт ещё не готов.', 'bad'); return; }
+      copied(copyText(content), 'Отчёт скопирован.');
     },
     'copy-code': function (el) {
       var code = $('code', el.closest('.code'));
@@ -1805,9 +2017,15 @@
       var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.', cancel: 'Прогон отменён.' }[op];
       if (!done) return;
       var act = function (button) {
+        if (op === 'cancel') {
+          // A cancelled run leaves the interface at once: the server hides it
+          // from the active list, and the card is dropped here without waiting
+          // for the next poll. The history stays on the server.
+          dropWork('run:' + id);
+        }
         workAction(button, api(projectUrl('/runs/' + enc(id) + '/' + op), { method: 'POST', body: {} }), done);
       };
-      if (op === 'cancel') confirmDialog('Отменить прогон?', 'Незавершённые задачи больше не будут выполняться.', 'Отменить прогон', function () { act(null); }, true);
+      if (op === 'cancel') confirmDialog('Отменить прогон?', 'Незавершённые задачи больше не будут выполняться. Записи о прогоне останутся в истории.', 'Отменить прогон', function () { act(null); }, true);
       else act(el);
     },
     'toggle-dir': function (el) {
@@ -1840,13 +2058,81 @@
         confirmDialog('Отключить аккаунт?', 'Сохранённый токен перестанет использоваться. Проекты, привязанные к этому аккаунту, потеряют доступ к его репозиториям.', 'Отключить', function () { run(null); }, true);
       } else run(el);
     },
+    'openhands-op': function (el) {
+      var op = el.getAttribute('data-op'), id = el.getAttribute('data-id');
+      var run = function (button) {
+        setBusy(button, true);
+        var body = op === 'enable' ? { enabled: true } : op === 'disable' ? { enabled: false } : {};
+        api('/api/openhands/accounts/' + enc(id) + '/' + op,
+            { method: 'POST', body: body, timeout: 60000 }).then(function (data) {
+          if (op === 'revoke') toast('Подключение отключено.');
+          else if (op === 'verify') {
+            var account = data.account || {};
+            if (account.state === 'active' && !account.last_error) toast('Подключение работает.');
+            else toast('OpenHands: ' + (account.last_error || 'недоступно'), 'bad');
+          } else toast(op === 'enable' ? 'Исполнитель включён.' : 'Исполнитель выключен.');
+          return loadOpenhandsAccounts().then(refreshSettings);
+        }, function (error) { setBusy(button, false); toast(explain(error.message).text, 'bad'); });
+      };
+      if (op === 'revoke') {
+        confirmDialog('Отключить OpenHands?', 'Ключ перестанет использоваться. Проекты, назначившие это подключение, потеряют исполнителя.', 'Отключить', function () { run(null); }, true);
+      } else run(el);
+    },
+    'openhands-rename': function (el) {
+      var id = el.getAttribute('data-id'), label = el.getAttribute('data-label');
+      formDialog({
+        title: 'Переименовать подключение', ok: 'Сохранить', max: 120, value: label,
+        submit: function (name) {
+          return api('/api/openhands/accounts/' + enc(id) + '/rename',
+                     { method: 'POST', body: { label: name } }).then(function () {
+            closeDialog();
+            toast('Подключение переименовано.');
+            return loadOpenhandsAccounts().then(refreshSettings);
+          });
+        }
+      });
+    },
     'refresh-context': function (el) {
       setBusy(el, true);
       api(projectUrl('/context/refresh'), { method: 'POST', body: { repository: repoName(), branch: branchName() }, timeout: 90000 })
         .then(function () { toast('Контекст обновлён.'); return refreshSettings(); },
               function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    // Project executors: make primary / enable / remove.
+    'executor-role': function (el) {
+      executorAction(el, { primary: el.getAttribute('data-id'), fallbacks: [] },
+                     'Исполнитель назначен основным.');
+    },
+    'executor-enabled': function (el) {
+      var id = el.getAttribute('data-id'), enable = el.getAttribute('data-enabled') === '1';
+      executorAction(el, null, enable ? 'Исполнитель включён.' : 'Исполнитель выключен.',
+                     id, enable ? 'enable' : 'disable');
+    },
+    'executor-remove': function (el) {
+      executorAction(el, null, 'Исполнитель убран.', el.getAttribute('data-id'), 'remove');
+    },
+    // Project repositories: make one primary.
+    'repo-primary': function (el) {
+      var name = el.getAttribute('data-name');
+      setBusy(el, true);
+      api(projectUrl('/repositories/' + name.split('/').map(enc).join('/') + '/primary'),
+          { method: 'POST', body: {} }).then(function () {
+        toast('Основной репозиторий: ' + name + '.');
+        return refreshSettings();
+      }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
     }
   };
+
+  // One helper for the executor buttons: set the whole assignment (make
+  // primary) or act on one account (enable/disable/remove).
+  function executorAction(button, replaceBody, done, accountId, op) {
+    setBusy(button, true);
+    var request = replaceBody
+      ? api(projectUrl('/executors'), { method: 'POST', body: replaceBody })
+      : api(projectUrl('/executors/' + enc(accountId) + '/' + op), { method: 'POST', body: {} });
+    request.then(function () { toast(done); return refreshSettings(); },
+                 function (error) { setBusy(button, false); toast(explain(error.message).text, 'bad'); });
+  }
 
   /* ---------------------------------------------------------------- events */
   function bindEvents() {
@@ -1873,6 +2159,24 @@
       if (form.id === 'composer') {
         event.preventDefault();
         send($('#prompt').value);
+      } else if (form.classList.contains('openhands-form')) {
+        event.preventDefault();
+        submitOpenhandsForm(form);
+      } else if (form.id === 'executor-add') {
+        event.preventDefault();
+        var accountId = form.elements.account_id.value;
+        if (!accountId) return;
+        // Add to the current assignment: keep the primary, append the new one
+        // as a fallback. The list is applied whole by the server.
+        var execs = (S.projectSettings && S.projectSettings.executors) || [];
+        var primary = (execs.filter(function (e) { return e.role === 'primary'; })[0] || {}).account_id || null;
+        var fallbacks = execs.filter(function (e) { return e.role !== 'primary'; })
+                             .map(function (e) { return String(e.account_id); });
+        fallbacks.push(accountId);
+        setBusy($('button[type=submit]', form), true);
+        api(projectUrl('/executors'), { method: 'POST', body: { primary: primary, fallbacks: fallbacks } })
+          .then(function () { toast('Исполнитель добавлен.'); return refreshSettings(); },
+                function (error) { toast(explain(error.message).text, 'bad'); });
       } else if (form.classList.contains('account-form')) {
         event.preventDefault();
         submitAccountForm(form);

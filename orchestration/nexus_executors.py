@@ -69,6 +69,10 @@ class ProjectExecutorService:
             for a in self.accounts.list_accounts(principal) if a["id"] not in taken]
         for item in executors:
             item.pop("principal", None)
+            # As the interface sees it: ``enabled`` is the project's own switch
+            # for this executor; the connection's is ``connection_enabled``.
+            item["connection_enabled"] = item.pop("enabled")
+            item["enabled"] = item.pop("project_enabled")
         return {"project_id": project_id, "strategy": strategy, "executors": executors,
                 "available": available, "can_edit": role == "owner",
                 # With no list the project runs under the older rule.
@@ -96,7 +100,7 @@ class ProjectExecutorService:
         for row in cur.fetchall():
             item = dict(row)
             item["id"] = item["account_id"] = str(item["id"])
-            item["role"] = "primary" if item["position"] == 0 else "backup"
+            item["role"] = "primary" if item["position"] == 0 else "fallback"
             # ``enabled`` stays the connection's own switch; the project's is
             # ``project_enabled``. An executor takes work only when both are on.
             item["usable"] = bool(
@@ -178,6 +182,43 @@ class ProjectExecutorService:
                         "VALUES (%s,%s,'project.executors_changed',%s)",
                         (project_id, principal, project_id))
         return self.get(principal, project_id)
+
+    def _entries(self, principal: str, project_id: str) -> list[dict]:
+        """The list as ``set`` takes it, read as an owner."""
+        with self.store._tx() as cur:
+            if self._role(cur, principal, project_id) != "owner":
+                raise NotFound("project not found")
+            return [{"account_id": item["account_id"], "enabled": item["project_enabled"]}
+                    for item in self._assigned(cur, project_id)]
+
+    def set_enabled(self, principal: str, project_id: str, account_id: str,
+                    enabled: bool) -> dict:
+        """Switch one executor on or off for this project only."""
+        entries = self._entries(principal, project_id)
+        if not any(e["account_id"] == account_id for e in entries):
+            raise NotFound("the connection is not an executor of this project")
+        for entry in entries:
+            if entry["account_id"] == account_id:
+                entry["enabled"] = bool(enabled)
+        return self.set(principal, project_id, executors=entries)
+
+    def remove(self, principal: str, project_id: str, account_id: str) -> dict:
+        """Take one executor off the project's list; the rest keep their order."""
+        entries = self._entries(principal, project_id)
+        if not any(e["account_id"] == account_id for e in entries):
+            raise NotFound("the connection is not an executor of this project")
+        return self.set(principal, project_id,
+                        executors=[e for e in entries if e["account_id"] != account_id])
+
+    def make_primary(self, principal: str, project_id: str, account_id: str) -> dict:
+        """Put one executor first; the others follow in the order they had.
+        A connection that is not on the list yet is added."""
+        entries = self._entries(principal, project_id)
+        chosen = next((e for e in entries if e["account_id"] == account_id),
+                      {"account_id": account_id, "enabled": True})
+        return self.set(principal, project_id,
+                        executors=[chosen] + [e for e in entries
+                                              if e["account_id"] != account_id])
 
     def check(self, principal: str, project_id: str) -> dict:
         """Check every executor of the project now, each with its own key, and

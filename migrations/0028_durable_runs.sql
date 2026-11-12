@@ -33,7 +33,31 @@
 --
 -- Additive. No row is deleted or rewritten except as stated under "existing
 -- rows" below.
+--
+-- A database that carries an earlier draft of this work (pull request #29,
+-- ``0026_durable_autonomy.sql``) is brought to this shape and loses nothing:
+-- see "an earlier draft" at the end of each section.
 BEGIN;
+
+-- ------------------------------------------------------------ an earlier draft
+-- The draft's report table has other columns. It is kept, under another name,
+-- so that the table this migration creates can take its place.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema() AND table_name = 'nexus_run_reports'
+                 AND column_name = 'content')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = current_schema()
+                         AND table_name = 'nexus_run_reports' AND column_name = 'body') THEN
+        ALTER TABLE nexus_run_reports RENAME TO nexus_run_reports_draft;
+        ALTER INDEX IF EXISTS nexus_run_reports_pkey RENAME TO nexus_run_reports_draft_pkey;
+        ALTER INDEX IF EXISTS nexus_run_reports_run_id_key
+            RENAME TO nexus_run_reports_draft_run_id_key;
+        ALTER INDEX IF EXISTS idx_nexus_run_reports_pending
+            RENAME TO idx_nexus_run_reports_draft_pending;
+    END IF;
+END $$;
 
 -- --------------------------------------------------------------------- tasks
 -- The state list gains ``waiting``. The constraint is found by what it checks,
@@ -150,8 +174,29 @@ BEGIN
           FROM nexus_conversations c
          WHERE c.run_id = r.id AND r.conversation_id IS NULL;
         -- Runs cancelled before this migration leave the interface as well.
-        UPDATE nexus_runs SET hidden_at = updated_at, cancelled_at = updated_at
+        UPDATE nexus_runs SET hidden_at = COALESCE(hidden_at, updated_at),
+                              cancelled_at = updated_at
          WHERE state = 'cancelled';
+    END IF;
+END $$;
+
+-- An earlier draft: its run state ``retrying`` ("waiting for the next cycle")
+-- is what a durable run that is ``running`` with ``resume_at`` set is here, and
+-- its ``source_conversation_id`` is ``conversation_id``.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema() AND table_name = 'nexus_runs'
+                 AND column_name = 'source_conversation_id') THEN
+        UPDATE nexus_runs SET conversation_id = source_conversation_id
+         WHERE conversation_id IS NULL AND source_conversation_id IS NOT NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema() AND table_name = 'nexus_runs'
+                 AND column_name = 'retry_at') THEN
+        UPDATE nexus_runs SET state = 'running', policy = 'durable',
+                              resume_at = retry_at, wait_reason = retry_reason
+         WHERE state = 'retrying';
     END IF;
 END $$;
 
@@ -185,6 +230,24 @@ CREATE INDEX IF NOT EXISTS idx_nexus_run_reports_pending
     ON nexus_run_reports(next_attempt_at) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS idx_nexus_run_reports_conversation
     ON nexus_run_reports(conversation_id);
+
+-- An earlier draft: the reports it wrote are carried over as they stand. One
+-- that was already in its chat stays delivered and is not sent again.
+DO $$
+BEGIN
+    IF to_regclass('nexus_run_reports_draft') IS NOT NULL THEN
+        INSERT INTO nexus_run_reports(run_id, project_id, conversation_id, state, body,
+                                      summary, attempts, next_attempt_at, last_error,
+                                      created_at, delivered_at)
+        SELECT d.run_id, d.project_id, d.conversation_id,
+               CASE d.status WHEN 'sent' THEN 'delivered'
+                             WHEN 'failed' THEN 'undeliverable' ELSE 'pending' END,
+               d.content, d.meta, d.attempts, COALESCE(d.next_attempt_at, now()),
+               d.last_error, d.created_at, d.sent_at
+          FROM nexus_run_reports_draft d
+        ON CONFLICT (run_id) DO NOTHING;
+    END IF;
+END $$;
 
 -- --------------------------------------------------------------- stop signals
 -- A conversation that has to stop. ``state``:

@@ -136,15 +136,53 @@ def test_the_server_alone_takes_a_run_from_the_chat_to_completed(monkeypatch):
         assert studio.app.last_lab_tick.get("errors") == []
 
 
-def test_a_report_that_names_no_commit_stops_the_run_and_resume_tries_again(monkeypatch):
+def test_a_report_that_names_no_commit_retries_the_task_itself(monkeypatch):
+    """A verification failure is not the end of the run.
+
+    The agent reported no commit, so the task did not verify. The run does not
+    stop for good: it retries the task in a new cycle (a fresh conversation),
+    and the retry that names the commit lets the second task run and the run
+    complete. Nothing is started on the unverified dependency before the retry
+    succeeds.
+    """
+    monkeypatch.setenv("NEXUS_RETRY_BASE_SECONDS", "0")
     with studio_stack(monkeypatch, lab_inline=True) as studio:
         project, run = _start_run(studio)
         first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
         _finish(studio, first, "Всё сделал, поверьте на слово.")
 
-        blocked = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
+        # The first attempt is recorded as unverified, and the run goes on: a
+        # new conversation for the same task is started by the retry cycle.
+        again = _until(lambda: next(
+            (cid for cid, c in list(studio.cloud.cloud.conversations.items())
+             if (c.get("tags") or {}).get("nexustask") == "audit" and cid != first), None),
+            what="the retry to start")
+        assert _task_conversation(studio, "change") is None, "a task ran on an unverified dependency"
+        _finish(studio, again, f"Коммит {HEAD}")
+        second = _until(lambda: _task_conversation(studio, "change"),
+                        what="the second task to start")
+        _finish(studio, second, f"Коммит {HEAD}")
+        done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
+            _detail(studio, project, run)), what="the run to finish")
+        assert done["run"]["state"] == "completed", done["run"]
+        tasks = {t["task_key"]: t for t in done["tasks"]}
+        assert tasks["audit"]["attempt"] == 1 and tasks["audit"]["cycle"] == 1
+        # The first attempt stays on record with its reason and conversation.
+        evidence = tasks["audit"]["evidence"]
+        assert any(e.get("requeued") == "retry-cycle" for e in evidence)
+
+
+def test_a_run_with_no_retry_cycles_blocks_and_resume_tries_again(monkeypatch):
+    """With the cycles spent, the run blocks for a person, and «Продолжить»
+    sends the unverified task back for one more attempt."""
+    monkeypatch.setenv("NEXUS_MAX_RETRY_CYCLES", "0")
+    with studio_stack(monkeypatch, lab_inline=True) as studio:
+        project, run = _start_run(studio)
+        first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
+        _finish(studio, first, "Всё сделал, поверьте на слово.")
+
+        blocked = _until(lambda: (lambda d: d if d["run"]["state"] == "blocked" else None)(
             _detail(studio, project, run)), what="the run to stop")
-        assert blocked["run"]["state"] == "blocked"
         tasks = {t["task_key"]: t for t in blocked["tasks"]}
         assert tasks["audit"]["state"] == "completed_unverified"
         assert tasks["audit"]["verification"]["reason"] == (

@@ -310,5 +310,7 @@ def build_account_router(store: PostgresStore, *,
         accounts.list_accounts(principal)
     except Exception:  # noqa: BLE001 - a database that is not ready means "no pool"
         return None
+    # Which connections a project may use is decided in ``select_for_task``,
+    # from the project's own list of executors (``nexus_executors``).
     pool = AccountPool(store, accounts)
     return AccountRouter(store, pool=pool, lab=LabStore(store), principal=principal)

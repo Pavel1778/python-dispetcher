@@ -451,3 +451,115 @@ def test_manual_executor_switch_over_http(harness):
             f"/api/v1/projects/{pid}/runs/{run_id}/tasks/{task_id}/switch",
             "POST", {"account_id": "not-a-uuid"}, session=harness["alice"])
         assert status == 400
+
+
+# ---------------------------------------------------- cancel / hide / executors
+def _add_openhands_account(app, principal, label="A"):
+    """One stored OpenHands account (a fake Cloud server, a real row)."""
+    from orchestration.cloud_client import CloudClient
+    from orchestration.nexus_openhands_accounts import OpenHandsAccountService
+    from tests.fake_cloud import FakeCloudServer
+    os.environ.setdefault("NEXUS_SECRET_KEY", "test-secret-key")
+    service = OpenHandsAccountService(
+        app.store, client_factory=lambda u, k: CloudClient(base_url=u, api_key=k, timeout=5.0))
+    with FakeCloudServer() as cloud:
+        cloud.cloud.settings = {"llm_api_key_set": True, "active_agent_profile_id": "p",
+                                "agent_settings": {"mcp_config": {}},
+                                "registered_marketplaces": [], "inherited_marketplaces": []}
+        return service.add(principal, label=label, api_key=f"sk-{label}",
+                           base_url=cloud.base_url)
+
+
+def test_cancel_hides_the_run_but_keeps_it(harness):
+    pid = _project(harness)
+    _connect(harness, pid)
+    gid = _goal(harness, pid)
+    _, payload = _start(harness, pid, gid)
+    run_id = payload["run"]["id"]
+
+    status, body = _run_action(harness, pid, run_id, "cancel")
+    assert status == 200 and body["run"]["state"] == "cancelled"
+    assert body["run"]["hidden_at"] is not None
+
+    # Gone from the active list...
+    _, listing = request(harness["base"], f"/api/v1/projects/{pid}/runs",
+                         session=harness["alice"])
+    assert run_id not in [r["id"] for r in listing["runs"]]
+    # ...but the run, its tasks and its history are kept and readable by id.
+    detail = _detail(harness, pid, run_id)
+    assert detail["run"]["state"] == "cancelled"
+    assert detail["tasks"]
+    # Cancelling again is idempotent, not an error.
+    status, again = _run_action(harness, pid, run_id, "cancel")
+    assert status == 200 and again["run"]["state"] == "cancelled"
+
+
+def test_a_cancelled_run_does_not_block_a_new_one(harness):
+    pid = _project(harness)
+    _connect(harness, pid)
+    gid = _goal(harness, pid)
+    _, first = _start(harness, pid, gid)
+    _run_action(harness, pid, first["run"]["id"], "cancel")
+    # The goal is free again: a second run can start.
+    status, second = _start(harness, pid, gid)
+    assert status in (200, 201), second
+    assert second["run"]["id"] != first["run"]["id"]
+
+
+def test_a_project_can_be_assigned_executors(harness):
+    pid = _project(harness)
+    account = _add_openhands_account(harness["app"], "user:alice", label="A")
+    status, body = request(harness["base"], f"/api/v1/projects/{pid}/executors", "POST",
+                           {"primary": account["id"], "fallbacks": []},
+                           session=harness["alice"])
+    assert status == 200, body
+    assert [e["account_id"] for e in body["executors"]] == [account["id"]]
+
+    _, listing = request(harness["base"], f"/api/v1/projects/{pid}/executors",
+                         session=harness["alice"])
+    assert listing["executors"][0]["role"] == "primary"
+    assert listing["executors"][0]["label"] == "A"
+
+    # Disable, then remove.
+    status, out = request(harness["base"],
+                          f"/api/v1/projects/{pid}/executors/{account['id']}/disable", "POST",
+                          {}, session=harness["alice"])
+    assert status == 200 and out["executor"]["enabled"] is False
+    status, _ = request(harness["base"],
+                        f"/api/v1/projects/{pid}/executors/{account['id']}/remove", "POST",
+                        {}, session=harness["alice"])
+    assert status == 200
+    _, listing = request(harness["base"], f"/api/v1/projects/{pid}/executors",
+                         session=harness["alice"])
+    assert listing["executors"] == []
+
+
+def test_an_executor_of_another_principal_is_refused(harness):
+    pid = _project(harness)
+    bob = _add_openhands_account(harness["app"], "user:bob", label="B")
+    status, _ = request(harness["base"], f"/api/v1/projects/{pid}/executors", "POST",
+                        {"primary": bob["id"], "fallbacks": []}, session=harness["alice"])
+    assert status == 404, "a project cannot use another principal's executor"
+
+
+def test_a_project_links_several_repositories_and_picks_a_primary(harness):
+    # Two repositories the fake GitHub knows, both connected through the
+    # studio's own route (which allowlists, links and binds).
+    first, second = "Pavel1778/python-dispetcher", "Pavel1778/Klyrshift"
+    pid = _project(harness)
+    _connect(harness, pid, repository=first)
+    _connect(harness, pid, repository=second)
+    _, listing = request(harness["base"], f"/api/v1/projects/{pid}/repositories",
+                         session=harness["alice"])
+    names = [r["full_name"] for r in listing["repositories"]]
+    assert first in names and second in names
+
+    status, out = request(
+        harness["base"],
+        f"/api/v1/projects/{pid}/repositories/{second}/primary", "POST", {},
+        session=harness["alice"])
+    assert status == 200 and out["repository"]["is_primary"] is True
+    _, listing = request(harness["base"], f"/api/v1/projects/{pid}/repositories",
+                         session=harness["alice"])
+    primaries = [r["full_name"] for r in listing["repositories"] if r["is_primary"]]
+    assert primaries == [second]
