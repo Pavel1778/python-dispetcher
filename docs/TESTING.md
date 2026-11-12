@@ -134,6 +134,33 @@ Against the real Cloud key and a local PostgreSQL:
 
 Each fails if its fix is reverted.
 
+## The acceptance suite (sections A-G of the request)
+
+`tests/test_connectivity.py` and `tests/test_comprehensive_suite.py` are the
+"Создай полноценный набор тестов" delivery, organised the way the request lists
+it. Every assertion is on a real effect; a test that cannot run here says so.
+
+| section | file | what it proves |
+| --- | --- | --- |
+| A. Connectivity | `test_connectivity.py` | `health()`/`ping()` over a real socket; a good key accepted; a rejected key is 401 → `CloudAuthError`, never a silent success; an unreachable endpoint and a timeout are `CloudUnavailable`; a client and an account recover after an outage (`check_connection` false → true) |
+| B. Account Pool | `test_comprehensive_suite.py` | one/two/three accounts; disabling an account; the primary failing over to the reserve; manual mode refusing to switch; manual switch of a running task; automatic (load-balancing) distribution |
+| C. Context Handoff | `test_comprehensive_suite.py` | a task starts on #1, fails over to #2 and completes; the hand-off message carries the task, plan, repository, branch and acceptance criteria; a finished stage is not repeated and its observed commit is preserved; unfinished work continues to completion |
+| D. Autonomous Worker | `test_comprehensive_suite.py` | API + a separate `lab_worker` process; a task is submitted, the client disconnects, the run completes, and a fresh client reads the result |
+| E. Recovery | `test_comprehensive_suite.py` | an expired lease is reclaimed and re-claimed; a worker killed before starting does not duplicate work; a bound conversation is never reclaimed into a second start; a lost OpenHands connection fails over |
+| F. Real Development Task | `test_comprehensive_suite.py` | **BLOCKED** here (no live OpenHands key): the real dev task is skipped with the reason, and the honest half — the diagnostics report `BLOCKED`, not `VERIFIED`, without a key — is asserted |
+| G. End-to-End Failover | `test_comprehensive_suite.py` | a real task starts on #1, #1 fails, the task moves to #2 with the context, #1 is never asked to start again, and the **real** `GitVerifier` reads the branch head on GitHub and accepts the commit the agent named |
+
+The `fake_cloud.py` server gained two controls these use, and nothing else
+changed for the existing tests: `rejected_keys` (a listed Bearer key is answered
+`401`, as the live service rejects a revoked key) and `delay` (a real, slow
+response for a real timeout test). A client that times out and hangs up no longer
+prints a broken-pipe traceback from the server thread.
+
+Section F needs a live OpenHands key and a sandbox, which this environment does
+not have (AGENTS.md: the runtime here has no working LLM key). It is marked
+BLOCKED rather than simulated — the request is explicit that a real switch must
+not be faked.
+
 ## What a mock would hide
 
 Do not replace the Cloud client with a mock in an integration test. The value of
