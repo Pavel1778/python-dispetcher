@@ -370,8 +370,21 @@ def cmd_openhands_accounts(args: argparse.Namespace) -> int:
         f"{a['id']}  {a['label']}  {a['state']}"
         f"{'  default' if a.get('is_default') else ''}"
         f"{'' if a.get('enabled', True) else '  DISABLED'}"
-        f"  health={a.get('health', 'unknown')}" for a in accounts) or "(no accounts)"
+        f"  health={a.get('health', 'unknown')}"
+        f"  key={a.get('api_key_hint') or '(none)'}"
+        f"  errors={a.get('error_count', 0)}" for a in accounts) or "(no accounts)"
     _emit(args, {"accounts": accounts}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_openhands_account_errors(args: argparse.Namespace) -> int:
+    """The account's observed failures and recoveries, newest first."""
+    client = _client(args)
+    errors = client.get(
+        f"/api/openhands/accounts/{args.account_id}/errors").get("errors", [])
+    human = "\n".join(
+        f"{e['created_at']}  {e['kind']}  {e['detail']}" for e in errors) or "(no errors)"
+    _emit(args, {"errors": errors}, human=human)
     return EXIT["ok"]
 
 
@@ -699,6 +712,10 @@ def build_parser() -> argparse.ArgumentParser:
     ohac.add_argument("--priority", type=int, default=None, help="required for the priority action")
     ohac.add_argument("--force", action="store_true", help="remove even with active tasks")
     ohac.set_defaults(func=cmd_openhands_account_action)
+    ohx = oh.add_parser("errors", parents=[common],
+                        help="show an account's error history (failures and recoveries)")
+    ohx.add_argument("--account", dest="account_id", required=True)
+    ohx.set_defaults(func=cmd_openhands_account_errors)
     ohd = oh.add_parser("diagnostics", parents=[common], help="run the diagnostic report")
     ohd.add_argument("--live", action="store_true",
                      help="also run the end-to-end conversation probe (creates and deletes one conversation)")

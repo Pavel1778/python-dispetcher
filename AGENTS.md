@@ -1351,3 +1351,29 @@ verify|default|enable|disable|remove|priority`. `_VIEW_COLUMNS` in
 add a new column there and to `REQUIRED_COLUMNS` in `cloud_store.py`, or a read
 will silently omit it. Tests: `tests/test_openhands_account_admin.py` (16 cases)
 and the new cases in `tests/test_openhands_pool_http.py`.
+
+## Account error history: "ошибки" as a list, not a line (this session)
+
+The account view kept only `last_error`, the *latest* failure. The task's
+per-account field "ошибки" (the account's errors) needs the history, so
+migration `0027_openhands_account_error_history.sql` (additive) adds
+`error_count` and `nexus_openhands_account_events`.
+
+- **`error_count`** is the running total of observed failures, so a flapping
+  account can be ranked without reading the history.
+- **`nexus_openhands_account_events`** is one row per observed failure or
+  recovery: `kind` is `auth` (a rejected key), `transport` (unreachable),
+  `error`, or `recovered`; `detail` is the message and is never a secret.
+  `AccountPool.record_failure`/`record_success` append to it, so
+  `OpenHandsAccountService.error_history` returns the account's failures
+  newest-first. `_append_event` swallows its own errors on purpose: the history
+  is a side record and must never fail the dispatch it observes.
+- **HTTP `GET /api/openhands/accounts/{id}/errors`** and CLI
+  `openhands errors --account <id>`; `error_count` is on the account view and in
+  the pool listing.
+- `error_count` is in `_VIEW_COLUMNS` and both it and the new table are in
+  `REQUIRED_COLUMNS` in `cloud_store.py`.
+- Routes `edit`, `connection` and `errors` are now in `tests/test_route_auth.py`
+  (the `edit`/`connection` routes were added without that coverage). Tests:
+  the error-history cases in `tests/test_openhands_account_admin.py` and
+  `tests/test_openhands_pool_http.py`.

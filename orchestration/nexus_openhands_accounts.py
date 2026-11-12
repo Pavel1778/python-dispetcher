@@ -41,7 +41,8 @@ _VIEW_COLUMNS = (
     "id, principal, label, base_url, transport, default_model, identity, state, "
     "is_default, capabilities, last_checked_at, last_error, created_at, updated_at, "
     "enabled, priority, health, active_tasks, last_error_at, max_concurrent_tasks, "
-    "daily_conversation_limit, api_key_hint, connection_ok, last_connection_at"
+    "daily_conversation_limit, api_key_hint, connection_ok, last_connection_at, "
+    "error_count"
 )
 
 #: A caller that wants "leave this field alone". Distinct from ``None``, which
@@ -231,6 +232,26 @@ class OpenHandsAccountService:
                         "FROM nexus_openhands_accounts WHERE principal=%s "
                         "ORDER BY is_default DESC, created_at DESC, id", (principal,))
             return [self._view(r) for r in cur.fetchall()]
+
+    def error_history(self, principal: str, account_id: str, *,
+                      limit: int = 50) -> list[dict]:
+        """The account's observed failures and recoveries, newest first.
+
+        The latest failure alone (``last_error``) says the account is broken
+        now; the history says whether it is *flapping* — failing, recovering,
+        failing again — which is what an operator needs to decide whether to
+        disable it. Never a secret: the rows carry the failure message only.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("account not found")
+            cur.execute(
+                "SELECT id, kind, detail, created_at FROM nexus_openhands_account_events "
+                "WHERE account_id=%s ORDER BY created_at DESC, id DESC LIMIT %s",
+                (account_id, max(1, min(int(limit), 200))))
+            return [{**dict(r), "id": str(r["id"])} for r in cur.fetchall()]
 
     def rotate(self, principal: str, account_id: str, *, api_key: str) -> dict:
         """Replace an account's key after re-verifying it."""

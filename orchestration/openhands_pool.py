@@ -131,6 +131,7 @@ class AccountPool:
                         "last_error=NULL, last_error_at=NULL, last_checked_at=now(), "
                         "updated_at=now() WHERE id=%s AND principal=%s",
                         (account_id, principal))
+        self._append_event(account_id, "recovered", "account produced a result")
 
     def record_failure(self, principal: str, account_id: str, error: str, *,
                        unavailable: bool = False) -> None:
@@ -139,13 +140,33 @@ class AccountPool:
         ``unavailable`` is for a failure the account cannot serve through right
         now (a rejected key, an unreachable endpoint). A degraded account stays
         selectable, because a single transient error is not a reason to stop
-        using it.
+        using it. Every failure also increments ``error_count`` and appends to
+        the account's error history, so "ошибки" is a readable list rather than
+        only the latest string.
         """
         health = "unavailable" if unavailable else "degraded"
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_openhands_accounts SET health=%s, last_error=%s, "
-                        "last_error_at=now(), updated_at=now() WHERE id=%s AND principal=%s",
+                        "last_error_at=now(), error_count=error_count+1, updated_at=now() "
+                        "WHERE id=%s AND principal=%s",
                         (health, error[:1000], account_id, principal))
+        kind = "auth" if unavailable and "auth" in error.lower() else (
+            "transport" if unavailable else "error")
+        self._append_event(account_id, kind, error)
+
+    def _append_event(self, account_id: str, kind: str, detail: str) -> None:
+        """Record one account event for the error history. Never a secret.
+
+        Swallows its own errors: health tracking is a side record and must never
+        fail the dispatch it is observing.
+        """
+        try:
+            with self.store._tx() as cur:
+                cur.execute(
+                    "INSERT INTO nexus_openhands_account_events(account_id, kind, detail) "
+                    "VALUES (%s,%s,%s)", (account_id, kind, (detail or "")[:1000]))
+        except Exception:  # noqa: BLE001 - a diagnostic side record, not the work
+            pass
 
     def begin_task(self, principal: str, account_id: str) -> None:
         """Reserve capacity on an account (manual counter).

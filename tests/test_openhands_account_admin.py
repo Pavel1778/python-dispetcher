@@ -316,3 +316,44 @@ def test_load_balancing_respects_limits(store, service, clouds):
     pool.set_config(PRINCIPAL, selection_mode="load_balancing")
     _seed_in_flight(store, va["id"], 1)
     assert pool.select(PRINCIPAL)["id"] == vb["id"]
+
+
+# --------------------------------------------------------------- error history
+def test_error_history_records_failures_and_recoveries(store, service, clouds):
+    """Every failure and recovery is appended, so "ошибки" is a list, not a line.
+
+    ``last_error`` says the account is broken *now*; the history says whether it
+    is flapping. The count is the running total; the newest event is first.
+    """
+    a, _b = clouds
+    va = _add(service, a, label="A", key=KEY_A)
+    pool = AccountPool(store, service)
+    pool.record_failure(PRINCIPAL, va["id"], "auth: 401 rejected", unavailable=True)
+    pool.record_failure(PRINCIPAL, va["id"], "transport reset", unavailable=True)
+    pool.record_failure(PRINCIPAL, va["id"], "a transient coding error", unavailable=False)
+    pool.record_success(PRINCIPAL, va["id"])
+
+    history = service.error_history(PRINCIPAL, va["id"])
+    kinds = [e["kind"] for e in history]
+    assert kinds[0] == "recovered"          # newest first
+    assert set(kinds) >= {"auth", "transport", "error", "recovered"}
+    assert all("detail" in e and "created_at" in e for e in history)
+
+    account = [x for x in service.list_accounts(PRINCIPAL) if x["id"] == va["id"]][0]
+    assert account["error_count"] == 3
+    assert account["health"] == "healthy"
+    assert KEY_A not in str(history)
+
+
+def test_error_history_is_empty_for_a_fresh_account(store, service, clouds):
+    a, _b = clouds
+    va = _add(service, a, label="A", key=KEY_A)
+    assert service.error_history(PRINCIPAL, va["id"]) == []
+    assert va["error_count"] == 0
+
+
+def test_error_history_is_scoped_to_the_principal(service, clouds):
+    a, _b = clouds
+    va = _add(service, a, label="A", key=KEY_A)
+    with pytest.raises(NotFound):
+        service.error_history("user:bob", va["id"])

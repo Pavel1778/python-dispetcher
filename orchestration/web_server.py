@@ -1680,6 +1680,12 @@ class Handler(BaseHTTPRequestHandler):
             except CloudError as e:
                 return self._json(502, {"error": f"cloud: {e}"})
             return self._json(200, {"capabilities": caps})
+        if len(parts) == 5 and parts[4] == "errors":
+            try:
+                errors = self.app.openhands_accounts.error_history(principal, parts[3])
+            except NotFound:
+                return self._json(404, {"error": "account not found"})
+            return self._json(200, {"errors": errors})
         return self._json(404, {"error": "not found"})
 
     @staticmethod
@@ -2744,7 +2750,8 @@ class Handler(BaseHTTPRequestHandler):
                          "daily_conversation_limit": a.get("daily_conversation_limit"),
                          "api_key_hint": a.get("api_key_hint", ""),
                          "connection_ok": a.get("connection_ok"),
-                         "last_connection_at": a.get("last_connection_at")}
+                         "last_connection_at": a.get("last_connection_at"),
+                         "error_count": a.get("error_count", 0)}
                         for a in self.app.account_pool.candidates(principal)],
                 })
             if path.startswith("/api/github/accounts/"):

@@ -185,3 +185,27 @@ def test_diagnostics_over_http(base, fake):
     assert names["live_conversation"] == "UNVERIFIED"
     # No key value anywhere in the report.
     assert KEY not in json.dumps(report)
+
+
+def test_account_error_history_over_http(base, fake, app):
+    """The error history is reachable over HTTP and never carries the key."""
+    a, _b = fake
+    va = _add_account(base, "A", a)
+    # Empty to begin with.
+    status, out = _req("GET", base, f"/api/openhands/accounts/{va['id']}/errors")
+    assert status == 200 and out["errors"] == []
+    # Record a failure through the real pool path, then read it back. A degraded
+    # failure (not ``unavailable``) keeps the account selectable, so the pool
+    # listing still shows it.
+    app.account_pool.record_failure("machine:default", va["id"], "transport reset",
+                                    unavailable=False)
+    status, out = _req("GET", base, f"/api/openhands/accounts/{va['id']}/errors")
+    assert status == 200
+    assert out["errors"][0]["kind"] == "error"
+    assert out["errors"][0]["detail"] == "transport reset"
+    assert KEY not in json.dumps(out)
+    # The count is on the account view and in the pool listing.
+    status, listing = _req("GET", base, "/api/openhands/accounts")
+    assert listing["accounts"][0]["error_count"] == 1
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert pool["candidates"][0]["error_count"] == 1

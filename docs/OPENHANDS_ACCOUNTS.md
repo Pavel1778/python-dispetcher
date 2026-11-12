@@ -41,6 +41,7 @@ and an **encrypted** API key. The pool decides which account runs each task.
 | `max_concurrent_tasks` | the concurrency ceiling; `null` means no limit |
 | `daily_conversation_limit` | the account's daily ceiling, recorded for the operator; `null` means unknown |
 | `connection_ok` / `last_connection_at` | the last reachability probe result and when |
+| `error_count` | how many real calls have failed on this account |
 | `api_key_hint` | the masked key fragment; never the key |
 
 ## Managing accounts (HTTP / CLI)
@@ -94,6 +95,7 @@ python -m orchestration.cli openhands account priority --account <id> --priority
 | priority | `POST /api/openhands/accounts/{id}/priority {"priority": 1}` | the failover order (lower is tried first) |
 | verify | `POST /api/openhands/accounts/{id}/verify` | re-check **authorization**; a rejected key marks the account `invalid` |
 | connection | `POST /api/openhands/accounts/{id}/connection` | probe **reachability**; an endpoint that answers (even `401`) is reachable, a transport failure is not. The two are different questions |
+| error history | `GET /api/openhands/accounts/{id}/errors` | the account's observed failures and recoveries, newest first (`python -m orchestration.cli openhands errors --account <id>`) |
 | remove | `POST /api/openhands/accounts/{id}/remove {"force": true}` | delete; refused while the account has active tasks unless forced |
 
 Disabling is reversible and keeps the key. Revoking (`state='revoked'`) also
