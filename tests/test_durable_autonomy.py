@@ -499,3 +499,62 @@ def test_a_run_that_names_no_cycles_gets_the_default(env):
     run = env["lab"].start_run("user:alice", env["project"], env["goal"])
     assert run["max_retry_cycles"] == DEFAULT_MAX_RETRY_CYCLES
     assert run["total_iterations"] == 0
+
+
+def test_two_workers_deliver_a_report_once(env):
+    """A report must reach the chat exactly once, even with two workers.
+
+    The inline lab loop and a standalone ``lab_worker`` may run side by side.
+    Delivery used to read the pending rows and mark them sent only after
+    posting, so both workers read the same report and the chat got it twice.
+    The claim (``FOR UPDATE SKIP LOCKED``) hands each report to one worker.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from orchestration.nexus_conversations import ConversationService
+
+    with env["store"]._tx() as cur:
+        cur.execute("INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
+                    "VALUES (%s,'chat','auto','user:alice') RETURNING id",
+                    (env["project"],))
+        conversation = str(cur.fetchone()["id"])
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}],
+                          source_conversation_id=conversation)
+    env["lab"].save_report(run["id"], content="Отчёт по автономному прогону", meta={})
+
+    conv = ConversationService(env["store"])
+
+    def deliver():
+        return ReportDeliverer(env["store"], env["lab"], conv).deliver_pending()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tallies = list(pool.map(lambda _: deliver(), range(4)))
+    assert sum(t["delivered"] for t in tallies) == 1, tallies
+
+    messages = conv.list_messages("user:alice", env["project"], conversation)
+    posted = [m for m in messages if (m.get("meta") or {}).get("kind") == "run_report"]
+    assert len(posted) == 1, f"the report was posted {len(posted)} times"
+    assert env["lab"].report_for_run(run["id"])["status"] == "sent"
+
+
+def test_a_report_left_sending_by_a_dead_worker_is_reclaimed(env):
+    """A worker that claims a report and dies leaves it ``sending``; the next
+    pass takes it back, so the report is not lost."""
+    with env["store"]._tx() as cur:
+        cur.execute("INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
+                    "VALUES (%s,'chat','auto','user:alice') RETURNING id",
+                    (env["project"],))
+        conversation = str(cur.fetchone()["id"])
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}],
+                          source_conversation_id=conversation)
+    env["lab"].save_report(run["id"], content="Отчёт", meta={})
+    claimed = env["lab"].claim_pending_reports()
+    assert len(claimed) == 1
+    assert env["lab"].report_for_run(run["id"])["status"] == "sending"
+    # Not reclaimed while it is fresh.
+    assert env["lab"].reclaim_stale_report_sends(older_than_seconds=300) == 0
+    # Reclaimed once it is old enough (a dead worker's claim).
+    _sql(env, "UPDATE nexus_run_reports SET updated_at = now() - interval '10 minutes' "
+              "WHERE run_id=%s", run["id"])
+    assert env["lab"].reclaim_stale_report_sends(older_than_seconds=300) == 1
+    assert env["lab"].report_for_run(run["id"])["status"] == "pending"
