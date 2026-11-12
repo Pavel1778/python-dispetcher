@@ -189,6 +189,11 @@ security and known blockers are in [docs/CLIENTS.md](docs/CLIENTS.md).
 NEXUS drives OpenHands conversations to execute work, verifies the result
 independently, and can route work across several accounts. Start here:
 
+- [docs/OPENHANDS_INVENTORY.md](docs/OPENHANDS_INVENTORY.md) — the full
+  inventory of the OpenHands surface NEXUS depends on (API, version,
+  authorization, conversations, events, status, runtime, workspace, tools,
+  limits, errors, timeouts, availability) and how the current client maps onto
+  it, with the live versions and the live probe result.
 - [docs/OPENHANDS_SETUP.md](docs/OPENHANDS_SETUP.md) — the two transports, the
   required environment (including the `OPENHANDS_DEFAULT_MODEL` trap), and how
   to verify a real conversation runs.
