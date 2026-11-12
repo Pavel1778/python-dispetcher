@@ -30,6 +30,13 @@ from typing import Any, Callable
 
 from .cloud_store import NotFound, PostgresStore, StoreError
 from .nexus_binding import AuthorizationError, authorize_dispatch
+from .nexus_policy import (
+    MCP_TOOL_SCOPES,
+    ROLE_OWNER,
+    PolicyViolation,
+    install_log_redaction,
+    require_tool_scope,
+)
 from .nexus_projects import ProjectService
 
 log = logging.getLogger("mcp_server")
@@ -49,9 +56,14 @@ class McpError(Exception):
 class McpServer:
     """The tool surface. One instance per process; ``principal`` is the caller."""
 
-    def __init__(self, store: PostgresStore, principal: str):
+    def __init__(self, store: PostgresStore, principal: str, *,
+                 role: str = ROLE_OWNER):
         self.store = store
         self.principal = principal
+        #: The caller's role, which decides which tool scopes it carries. The
+        #: stdio/HTTP entry points pass the authenticated user's role; the
+        #: default is the owner, matching the owner-level machine bearer.
+        self.role = role
         self.projects = ProjectService(store)
         self.tools: dict[str, Callable[[dict], Any]] = {
             "list_projects": self._list_projects,
@@ -72,7 +84,8 @@ class McpServer:
         }
 
     # -------------------------------------------------------------- schemas
-    def tool_schemas(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def tool_schemas() -> list[dict[str, Any]]:
         return [
             _tool("list_projects", "List projects the caller is a member of.", {}),
             _tool("get_project", "Get one project by id.", {"project_id": _s("string")},
@@ -268,6 +281,13 @@ class McpServer:
             fn = self.tools.get(name)
             if fn is None:
                 raise McpError(-32601, f"unknown tool: {name}")
+            # The permission policy decides whether this caller's role may run
+            # this tool. A tool that declares no scope is refused, so a tool
+            # added without an authority is not silently callable.
+            try:
+                require_tool_scope(self.role, name)
+            except PolicyViolation as e:
+                raise McpError(-32003, f"permission denied: {e}") from None
             try:
                 result = fn(arguments)
             except NotFound:
@@ -292,7 +312,15 @@ def _tool(name: str, description: str, properties: dict[str, Any],
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         schema["required"] = required
-    return {"name": name, "description": description, "inputSchema": schema}
+    # The scope the tool needs, from the permission policy. It is advertised so a
+    # client can see the authority a tool demands; the check itself is enforced
+    # in ``handle``.
+    scope = MCP_TOOL_SCOPES.get(name)
+    tool: dict[str, Any] = {"name": name, "description": description,
+                            "inputSchema": schema}
+    if scope:
+        tool["scope"] = scope
+    return tool
 
 
 def serve(server: McpServer, stdin: Any = None, stdout: Any = None) -> None:
@@ -365,6 +393,7 @@ def handle_http(server: McpServer, message: dict) -> tuple[int, dict]:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    install_log_redaction()
     dsn = os.environ.get("NEXUS_DB_URL") or os.environ.get("SUPABASE_DB_URL")
     if not dsn:
         print("set NEXUS_DB_URL (or SUPABASE_DB_URL)", file=sys.stderr)

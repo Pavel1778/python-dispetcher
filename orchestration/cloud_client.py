@@ -44,6 +44,11 @@ def validate_base_url(url: str) -> str:
     ``OPENHANDS_CLOUD_URL`` is operator-supplied, so a typo or a hostile value
     must fail loudly at construction instead of letting the client read a local
     file or speak a non-HTTP protocol to something that is not the Cloud API.
+
+    It also enforces the NEXUS SSRF policy (:func:`nexus_policy.check_outbound_url`):
+    a URL that names a loopback, private-network or cloud-metadata target is
+    refused unless the operator explicitly permits private targets, so an
+    operator-supplied base cannot aim the server at its own network.
     """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -51,6 +56,12 @@ def validate_base_url(url: str) -> str:
             "OPENHANDS_CLOUD_URL must be an http(s) URL, got "
             f"{parsed.scheme or '(none)'}"
         )
+    from .nexus_policy import UnsafeTarget, check_outbound_url
+
+    try:
+        check_outbound_url(url)
+    except UnsafeTarget as e:
+        raise CloudError(f"OPENHANDS_CLOUD_URL is not a safe target: {e}") from e
     return url
 
 
@@ -771,6 +782,21 @@ class CloudClient:
             elif isinstance(item, dict) and item.get("name"):
                 names.append(str(item["name"]))
         return names
+
+    def tool_catalog(self) -> dict[str, Any]:
+        """The agent-server tool catalog — not available on the app transport.
+
+        Cloud V1's app-conversation endpoint exposes no agent-server tool
+        catalog: the tools live inside a sandbox this transport never addresses.
+        Raising :class:`ToolCatalogUnsupported` is honest — nothing was proved
+        either way — and lets the diagnostics report ``BLOCKED`` rather than
+        invent a tool list.
+        """
+        from .openhands_tools import ToolCatalogUnsupported
+
+        raise ToolCatalogUnsupported(
+            "the Cloud app transport exposes no agent-server tool catalog"
+        )
 
     def account_capabilities(self) -> dict[str, Any]:
         """A read-only snapshot of the account-level capabilities.

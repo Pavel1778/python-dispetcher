@@ -266,6 +266,22 @@ class LocalCloudClient(OpenHandsClient):
     def health(self) -> bool:
         return super().health()
 
+    def tool_catalog(self) -> dict[str, Any]:
+        """The local agent-server's own tool catalog (``GET /api/tools/catalog``).
+
+        The local server is a real agent-server, so it publishes the same tool
+        surface a Cloud sandbox does. A 404 is ``ToolCatalogUnsupported``
+        (``BLOCKED``); any other non-200 is a real error.
+        """
+        from .openhands_tools import ToolCatalogUnsupported, normalize_catalog
+
+        status, payload = self._request("GET", "/api/tools/catalog")
+        if status == 404:
+            raise ToolCatalogUnsupported("the local server exposes no /api/tools/catalog")
+        if status != 200 or not isinstance(payload, dict):
+            raise CloudUnavailable(f"tool catalog -> {status}")
+        return {"tools": normalize_catalog(payload), "raw": payload}
+
     # ---------------------------------------------------- account metadata
     def get_settings(self) -> dict[str, Any]:
         return super().settings()
