@@ -425,6 +425,58 @@ def cmd_qa_verify(args: argparse.Namespace) -> int:
     return EXIT["ok"] if ok else EXIT["conflict"]
 
 
+def cmd_restore_point_create(args: argparse.Namespace) -> int:
+    """Create a restore point (git bundle) for the repository. Local, no API."""
+    from .restore_point import create_restore_point
+
+    try:
+        record = create_restore_point(
+            args.repo, args.out, label=args.label,
+        )
+    except Exception as exc:  # RestorePointError and OS errors alike
+        raise CliError(str(exc), EXIT["error"]) from exc
+    human = (
+        f"restore point created\n"
+        f"  HEAD:   {record.head}\n"
+        f"  branch: {record.branch or '(detached)'}\n"
+        f"  bundle: {record.bundle_path} ({record.bundle_size} bytes)\n"
+        f"  sha256: {record.bundle_sha256}\n"
+        f"  dirty:  {record.dirty}"
+        + (f" ({len(record.untracked)} untracked path(s))" if record.untracked else "")
+    )
+    _emit(args, record.to_dict(), human=human)
+    return EXIT["ok"]
+
+
+def cmd_restore_point_list(args: argparse.Namespace) -> int:
+    from .restore_point import DEFAULT_DIR, list_restore_points
+    from pathlib import Path
+
+    out = args.out or str(Path(args.repo) / DEFAULT_DIR)
+    points = list_restore_points(out)
+    human = "\n".join(
+        f"{p.created_at}  {p.head[:12]}  {'dirty' if p.dirty else 'clean'}  {p.bundle}"
+        for p in points
+    ) or "(no restore points)"
+    _emit(args, {"count": len(points), "restore_points": [p.to_dict() for p in points]},
+          human=human)
+    return EXIT["ok"]
+
+
+def cmd_restore_point_verify(args: argparse.Namespace) -> int:
+    from .restore_point import verify_restore_point
+
+    try:
+        report = verify_restore_point(args.path, args.repo)
+    except Exception as exc:
+        raise CliError(str(exc), EXIT["error"]) from exc
+    human = f"{report['status']}" + (
+        "" if report["ok"] else "\n" + "\n".join(report["reasons"])
+    )
+    _emit(args, report, human=human)
+    return EXIT["ok"] if report["ok"] else EXIT["conflict"]
+
+
 # ----------------------------------------------------------------------- parser
 def _add_global_flags(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
     """Add the global options to *parser*.
@@ -547,6 +599,25 @@ def build_parser() -> argparse.ArgumentParser:
     osw.add_argument("--task", dest="task_id", required=True)
     osw.add_argument("--account", dest="account_id", required=True)
     osw.set_defaults(func=cmd_openhands_switch)
+
+    rp = sub.add_parser("restore-point", parents=[common],
+                        help="safe restore points (local git bundles)")
+    rp_sub = rp.add_subparsers(dest="sub", required=True)
+    rpc = rp_sub.add_parser("create", parents=[common],
+                            help="create a restore point before making changes")
+    rpc.add_argument("--repo", default=".", help="path inside the repository")
+    rpc.add_argument("--out", default=None, help="output directory (default .restore-points)")
+    rpc.add_argument("--label", default=None, help="a short note to record with the point")
+    rpc.set_defaults(func=cmd_restore_point_create)
+    rpl = rp_sub.add_parser("list", parents=[common], help="list restore points")
+    rpl.add_argument("--repo", default=".", help="path inside the repository")
+    rpl.add_argument("--out", default=None, help="output directory (default .restore-points)")
+    rpl.set_defaults(func=cmd_restore_point_list)
+    rpv = rp_sub.add_parser("verify", parents=[common],
+                            help="verify a restore point's integrity")
+    rpv.add_argument("path", help="a .json metadata file or a .bundle file")
+    rpv.add_argument("--repo", default=None, help="repository used for git bundle verify")
+    rpv.set_defaults(func=cmd_restore_point_verify)
 
     qa = sub.add_parser("qa", parents=[common], help="QA and evidence reports").add_subparsers(dest="sub", required=True)
     qa.add_parser("report", parents=[common], help="real system report").set_defaults(func=cmd_qa_report)

@@ -9,6 +9,7 @@ state/
 .env.*
 !.env.example
 .audit-baseline/
+.restore-points/
 dist/
 *.deb
 *.keystore

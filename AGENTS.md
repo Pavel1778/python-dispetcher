@@ -37,6 +37,11 @@ agent-server.
   (start task → poll → bind), allowlist, bounded retry, recovery.
 - `orchestration/sr_tools.py` — Sr operations (create/list/status/report/
   revise/accept/cancel) with real, durable effects.
+- `orchestration/restore_point.py` — safe restore points. A restore point is a
+  **git bundle** of every ref plus a JSON record (HEAD, branch, dirty state,
+  SHA-256) under `.restore-points/` (gitignored, never pushed). Create, list and
+  verify through `nexus restore-point …`; it is local and needs no API. See
+  "Safe restore points" below.
 - `migrations/0001_init.sql` — Supabase schema. Idempotent; apply with `psql`.
 - `tests/fake_cloud.py` — a real local HTTP server speaking the Cloud V1
   surface. Cloud tests use it, not mocks of the client.
@@ -1250,3 +1255,28 @@ is undone. Keep these invariants:
   broke and fixed it, and committed — recorded `completed_unverified` because no
   repository was bound. `test_backup_restore.py` and `test_browser_e2e.py` were
   run with the PostgreSQL client tools and Chromium installed.
+
+## Safe restore points (the first safety rule)
+
+Before touching anything, a run takes a restore point. `orchestration/restore_point.py`
+writes a **git bundle** (`git bundle create --all`, every ref) plus a JSON record
+under `.restore-points/` (gitignored). The record names the exact `head`, `branch`,
+whether the tree was `dirty`, the `untracked` paths, the bundle's SHA-256 and size.
+Invariants to keep:
+
+- **Non-destructive.** Creating one only reads the repository and writes new files
+  into the output directory. It never resets, checks out, stashes or deletes. A test
+  asserts HEAD, branches and tracked status are unchanged.
+- **Self-contained and offline.** `--all` packs every ref, so the whole history
+  restores from the one file with no network. `verify` re-checks the SHA-256, runs
+  `git bundle verify`, and confirms the recorded HEAD is among the bundle's refs;
+  `restore` clones it into a scratch directory to prove it comes back.
+- **Honest about the working tree.** A bundle cannot carry uncommitted changes, so a
+  dirty tree also records the patch of tracked changes (`git diff --binary HEAD`) and
+  the *names* of untracked paths. Untracked contents are deliberately not copied:
+  they may hold secrets and can be large. The `dirty`/`untracked`/`notes` fields say
+  what was and was not captured.
+- **CLI:** `nexus restore-point create|list|verify` (`orchestration/cli.py`). It is
+  local, needs no `NEXUS_URL`/token, and never prints a secret.
+- Tests: `tests/test_restore_point.py` (13 cases; a real git repository, a real
+  bundle, a real restore, tamper detection, and the CLI).

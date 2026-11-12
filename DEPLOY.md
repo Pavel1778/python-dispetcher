@@ -337,6 +337,26 @@ psql "postgresql://.../nexus_restore" -c "SELECT filename FROM schema_migrations
 properties against a disposable database; it is the automated proxy for a
 restore drill, not a substitute for one against a real backup.
 
+### Repository restore points
+
+Before changing the code, take a restore point — a self-contained git bundle of
+every ref plus a JSON record of the exact HEAD and working-tree state:
+
+```
+python -m orchestration.cli restore-point create --label "before <change>"
+python -m orchestration.cli restore-point verify .restore-points/<name>.json
+```
+
+They are written under `.restore-points/` (gitignored, never pushed). A restore
+point is a git bundle, so it restores the whole history offline:
+
+```
+git clone .restore-points/nexus-restore-<stamp>-<head12>.bundle /tmp/restored
+```
+
+A bundle cannot carry uncommitted changes; when the tree is dirty the record
+also holds the patch of tracked changes and the names of untracked paths.
+
 Do not run migrations against production without authorization. Applying them on
 boot is still a deliberate step: it happens once per file, the SQL is
 idempotent, and `AUTO_MIGRATE=false` turns it off for environments that manage
