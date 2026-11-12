@@ -165,4 +165,26 @@ task and dispatches through a client built for that account's base URL,
 transport and model. A poll reattaches to the **same** account — a different
 account is a different sandbox and cannot read that conversation.
 
+A worker that started when the deployment had no stored account asks again on
+every pass (`LabWorker._find_router`), so a connection added later is used
+without a restart.
+
 See `FAILOVER.md` for what happens when an account fails.
+
+## Connections a person adds: the address check
+
+The API URL of a connection added through the API is checked before anything
+is stored and again whenever a socket is opened to it (`net_guard`): `http` or
+`https` only, no credentials in the URL, and every address the host resolves to
+must be a public one — not loopback, private, link-local, carrier-grade NAT or
+the like, for IPv4 and IPv6. Redirects are never followed. A self-hosted
+OpenHands on a private network is allowed by the operator, not the caller:
+`NEXUS_OPENHANDS_ALLOWED_HOSTS=host[,host:port…]`, or
+`NEXUS_OPENHANDS_ALLOW_PRIVATE=1` for a deployment on a trusted network.
+
+## Executors of a project
+
+A project may be given its own ordered list of connections — a primary and
+backups — with `failover` or `distribute` as the strategy
+(`/api/v1/projects/<id>/executors`). It then runs on those connections only.
+A project without a list keeps the pool rules above. See `DURABLE-RUNS.md`.

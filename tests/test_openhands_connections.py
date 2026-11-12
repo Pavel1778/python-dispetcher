@@ -577,3 +577,44 @@ def test_a_project_without_a_list_keeps_the_rule_it_had(lab):
     assert [(e["label"], e["role"]) for e in state["executors"]] == [("C", "primary")]
     lab["service"].bind_project(OWNER, lab["project"], None)
     assert lab["executors"].get(OWNER, lab["project"])["mode"] == "default"
+
+
+# -------------------------------------- a worker that started before any of this
+def test_a_worker_started_with_no_connection_uses_one_that_is_added_later(
+        store, service, clouds):
+    """``build_account_router`` says "none" for a deployment with no stored
+    connection, and the worker then runs under the server's own key. That used
+    to be decided once, when the process started: a connection added in the
+    studio afterwards did nothing until a restart."""
+    from orchestration.lab_worker import LabWorker
+    from orchestration.openhands_router import build_account_router
+
+    a, b, _c = clouds
+    assert build_account_router(store) is None
+    worker = LabWorker(store, worker_id="early-bird",
+                       client=CloudClient(a.base_url, api_key="server-own-key"))
+    assert worker.account_router is None
+    worker.tick_once()
+    assert worker.account_router is None, "nothing is stored yet"
+
+    added = service.add(OWNER, label="later", api_key="sk-key-later-00000000",
+                        base_url=b.base_url, transport="app")
+    project = _project(store)
+    goal = ProjectService(store).create_goal(OWNER, project, "Do it")[0]
+    run = worker.lab.start_run(OWNER, project, str(goal["id"]), policy="durable")
+    worker.lab.add_task(OWNER, project, run["id"], task_key="one", title="one")
+
+    worker.tick_once()
+    assert worker.account_router is not None
+    assert worker.executor.router is worker.account_router
+    task = worker.lab.tasks_internal(str(run["id"]))[0]
+    assert (task["state"], task["openhands_account_id"]) == ("running", added["id"])
+    assert len(b.cloud.conversations) == 1 and a.cloud.conversations == {}, (
+        "the task runs on the stored connection, not under the server's own key")
+
+    # A caller that wants the server's own key whatever is stored says so.
+    fixed = LabWorker(store, worker_id="fixed",
+                      client=CloudClient(a.base_url, api_key="server-own-key"),
+                      discover_router=False)
+    fixed.tick_once()
+    assert fixed.account_router is None
