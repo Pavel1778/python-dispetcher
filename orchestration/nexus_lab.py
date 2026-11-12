@@ -42,6 +42,7 @@ from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
 from .nexus_binding import AuthorizationError, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
+from .nexus_evidence import LabEvidence
 from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
 from .nexus_spec_delivery import Delivery, prepare, prepare_request
 from .nexus_specs import SpecService
@@ -204,8 +205,11 @@ class OpenHandsExecutor:
             "1. Inspect the repository before changing anything.\n"
             "2. Preserve unrelated user changes; do not revert others' work.\n"
             "3. Follow the repository's own instructions (README, AGENTS.md).\n"
-            "4. Implement the acceptance criteria.\n"
-            "5. Run the relevant tests and report their output.\n"
+            "4. Implement the acceptance criteria: read and change the files that are "
+            "needed, use Git, and install only the dependencies the repository already "
+            "allows (its lock file or manifest) - nothing else.\n"
+            "5. Run the relevant tests and report their output. If a test fails, read "
+            "the failure, find the cause and fix it, then run the tests again.\n"
             + OpenHandsExecutor._hand_in(task) +
             "7. Finish with a short report: the full SHA of the branch head after your "
             "push, files changed, tests run and their result, and any blocker. Do not "
@@ -283,9 +287,54 @@ class OpenHandsExecutor:
             return self.client
         return self._client_for_account(str(account_id), task)
 
+    def stop(self, account_id: str | None, conversation_id: str,
+             project_id: str | None = None) -> bool:
+        """Stop an abandoned conversation for real, on the account that owns it.
+
+        Called when a switch or a failover left a conversation behind: it may
+        still be running in its sandbox, editing the task's checkout, and it must
+        not go on changing the working copy beside the new executor. The client's
+        ``stop_conversation`` pauses the agent-server's run loop and keeps the
+        transcript.
+
+        Returns whether the caller may treat the conversation as stopped. On a
+        transport that cannot stop a conversation at all
+        (``supports_conversation_stop`` is ``False``: the Cloud V1
+        app-conversation surface pauses only a whole sandbox) there is nothing to
+        wait for, so this returns ``True`` - holding the branch forever for a
+        stop that can never happen would strand the task. Where a stop is
+        possible, ``False`` (the pause failed) leaves the entry in the task's
+        ``abandoned`` list so the branch stays held and the caller retries.
+        """
+        if self.router is not None and account_id:
+            client = self._client_for_account(
+                str(account_id), {"project_id": project_id} if project_id else None)
+        else:
+            client = self.client
+        if not getattr(client, "supports_conversation_stop", False):
+            # No conversation-scoped stop on this transport; nothing was stopped
+            # and nothing can be. The branch lock is the guarantee, as before.
+            return True
+        stop = getattr(client, "stop_conversation", None)
+        if not callable(stop):
+            return True
+        try:
+            return bool(stop(conversation_id))
+        except CloudError:
+            return False
+
     def dispatch(self, task: dict) -> str:
         client, account_id = self._dispatch_client(task)
         try:
+            if (self.router is not None and account_id is not None
+                    and self.router.should_verify_authorization(task, account_id)):
+                # Step 6 of the failover sequence: confirm the account we are
+                # switching to actually accepts its key before starting work on
+                # it. A rejected key raises CloudAuthError here and is turned
+                # into a DispatchError naming this account, so the scheduler
+                # excludes it and fails over again - rather than starting a
+                # conversation that would only fail inside the sandbox.
+                self.router.ensure_authorized(task, account_id, client)
             return self._dispatch_with(client, account_id, task)
         except DispatchError:
             raise
@@ -615,7 +664,8 @@ class LabScheduler:
                  principal: str = "machine:default", worker_id: str = "lab",
                  lease_seconds: int = 900, router: AccountRouter | None = None,
                  start_wait: Callable[[CloudRateLimited], float] | None = None,
-                 reports: Any | None = None):
+                 reports: Any | None = None,
+                 evidence: Any | None = None, acceptance: Any | None = None):
         self.store = store
         self.executor = executor
         self.verifier = verifier
@@ -629,6 +679,20 @@ class LabScheduler:
         self.router = router
         #: When set, a completed run's report is written here (a ReportBuilder).
         self.reports = reports
+        #: The EVIDENCE stage. When given an
+        #: :class:`~orchestration.nexus_evidence.EvidenceService`, every settled
+        #: task result is also signed into the Evidence Trust Engine, so a run's
+        #: outcome is independently re-verifiable and not only a task column.
+        #: ``None`` (a deployment with no evidence key) leaves the loop exactly
+        #: as it was - the record is skipped, never faked.
+        self.evidence = evidence
+        #: The ACCEPTANCE stage: the run's terminal decision is signed into the
+        #: same Trust Engine over the tasks' own verdicts (``LabEvidence``), so a
+        #: run's outcome is an attested ACCEPTED/REJECTED, not the scheduler's
+        #: word. Built on demand, so the loop always attests what it decided; it
+        #: records nothing without a signer.
+        self.acceptance = acceptance if acceptance is not None else LabEvidence(
+            store.store, principal=principal)
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -643,6 +707,24 @@ class LabScheduler:
             return str(named)
         account_id = task.get("openhands_account_id")
         return str(account_id) if account_id else None
+
+    def _record_evidence(self, task: dict, verdict: Verification, report: TaskReport) -> None:
+        """EVIDENCE stage: sign a settled task result into the Trust Engine.
+
+        Best effort and never fatal. The task's own verdict is already written;
+        this only *adds* a signed, re-verifiable record. A deployment without an
+        evidence key (``evidence is None``) skips it, and a signing failure is
+        logged, not raised - a broken key must not stall a run, and must not be
+        mistaken for a task failure. The record is never fabricated: when there
+        is no signer, nothing is stored.
+        """
+        if self.evidence is None:
+            return
+        try:
+            self.evidence.record_task_result(task, verdict, report)
+        except Exception as e:  # noqa: BLE001 - evidence must not stop the loop
+            log.warning("could not record evidence for task %s: %s",
+                        task.get("task_key"), type(e).__name__)
 
     def _start_refused(self, task: dict, error: Exception, refused: CloudRateLimited) -> None:
         """The service is working and will not take this start now (429).
@@ -671,13 +753,48 @@ class LabScheduler:
             self.store.postpone_task(
                 task["id"], seconds=0.0, failed_account_id=account,
                 error=("OpenHands did not take the start on this account; another account "
-                       f"takes the task (this is not counted as an attempt). {why}"))
+                       f"takes the task (this is not counted as an attempt). {why}"),
+                lease_token=task.get("lease_token"))
             return
         wait = self.start_wait(refused)
         self.store.postpone_task(
             task["id"], seconds=wait, forget_tried=account is not None,
             error=(f"OpenHands did not take the start; trying again in {_span(wait)} "
-                   f"(this is not counted as an attempt). {why}"))
+                   f"(this is not counted as an attempt). {why}"),
+            lease_token=task.get("lease_token"))
+
+    def _stop_abandoned(self, run_id: str) -> None:
+        """Stop every conversation a switch or failover left behind.
+
+        A switch records the old conversation in the task's ``abandoned`` list.
+        Until each is stopped, ``claim_task`` holds the task's branch, so a new
+        executor cannot start beside the old writer. This stops them one by one
+        and drops each from the list only once the executor reports it stopped;
+        a transport that cannot stop a conversation reports success at once (so
+        the branch is not held forever), a failure leaves the entry for the next
+        tick and keeps the branch held.
+        """
+        stop = getattr(self.executor, "stop", None)
+        for entry in self.store.pending_stops(run_id):
+            conversation_id = entry["conversation_id"]
+            if not callable(stop):
+                # An executor that cannot stop a conversation (a test double, a
+                # transport with no stop) - drop the entry so the branch is not
+                # held by something that can never be stopped.
+                self.store.mark_abandoned_stopped(entry["task_id"], conversation_id)
+                continue
+            try:
+                stopped = stop(entry.get("account_id"), conversation_id,
+                               entry.get("project_id"))
+            except Exception as e:  # noqa: BLE001 - one bad stop must not stop the tick
+                log.warning("could not stop abandoned conversation %s: %s",
+                            conversation_id, type(e).__name__)
+                continue
+            if stopped:
+                self.store.mark_abandoned_stopped(entry["task_id"], conversation_id)
+            else:
+                log.info("abandoned conversation %s could not be stopped; branch stays held",
+                         conversation_id)
 
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
@@ -687,6 +804,11 @@ class LabScheduler:
             result.note = "run not found"
             return result
         if run["state"] in TERMINAL_RUN_STATES:
+            # A run an operator ended (cancelled) or one that failed is already
+            # terminal, so the loop stops touching it - but its ACCEPTANCE
+            # decision must still be attested, and this is the pass that sees
+            # it. Idempotent, so a settled run costs one read and no write.
+            self._record_run_acceptance(run_id, run["state"], run.get("last_error"))
             result.finished = True
             result.note = f"run is {run['state']}"
             return result
@@ -706,6 +828,11 @@ class LabScheduler:
                 return result
         result.reclaimed = len(self.store.reclaim_expired(run_id))
 
+        # 0. Stop every conversation a switch or failover left behind, so a task
+        #    cannot have two writers on its branch at once. The branch stays held
+        #    (``_BRANCH_FREE``) until this succeeds.
+        self._stop_abandoned(run_id)
+
         # 1. Poll every task already dispatched, so a slow conversation advances.
         in_flight = self._collect_in_flight(run_id, result)
 
@@ -715,7 +842,10 @@ class LabScheduler:
             return result
 
         # 2. Claim and dispatch the next claimable task. The claim refuses by
-        #    itself when the run stopped running or is out of budget.
+        #    itself when the run stopped running or is out of budget. Any
+        #    conversation the poll above just abandoned is stopped first, so a
+        #    failover in this same tick is not held back by the branch lock.
+        self._stop_abandoned(run_id)
         task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds)
         if task is not None:
             result.claimed = task["task_key"]
@@ -730,12 +860,22 @@ class LabScheduler:
                 reason = f"not authorized: {e}"
                 self.store.record_verification(
                     task["id"], verdict="blocked", evidence={"reason": reason},
-                    detail={"verdict": "blocked", "reason": reason})
+                    detail={"verdict": "blocked", "reason": reason},
+                    lease_token=task["lease_token"])
+                self._record_evidence(task, Verification("blocked", reason),
+                                      TaskReport(state="blocked"))
                 applied = self.store.set_run_state_internal(
                     run_id, "blocked",
                     last_error=f"task {task['task_key']} was not started: {e}")
                 result.finished = applied is not None
                 result.note = "blocked: dispatch not authorized"
+                return result
+            if not self.store.holds_lease(task["id"], task["lease_token"]):
+                # The claim was taken away between the claim and now (the lease
+                # expired and another worker reclaimed the task, or an operator
+                # switched it). Starting a conversation here would be a second
+                # executor on the same work; the new holder starts it instead.
+                result.note = "claim lost before dispatch; not started"
                 return result
             try:
                 conversation_id = self.executor.dispatch(task)
@@ -745,7 +885,10 @@ class LabScheduler:
                 # cannot succeed, so the task is dead-lettered with the reason.
                 self.store.record_verification(
                     task["id"], verdict="blocked", evidence={"reason": str(e)},
-                    detail={"verdict": "blocked", "reason": str(e)})
+                    detail={"verdict": "blocked", "reason": str(e)},
+                    lease_token=task["lease_token"])
+                self._record_evidence(task, Verification("blocked", str(e)),
+                                      TaskReport(state="blocked"))
                 applied = self.store.set_run_state_internal(
                     run_id, "blocked",
                     last_error=f"task {task['task_key']}: no usable OpenHands account")
@@ -770,7 +913,8 @@ class LabScheduler:
                 again = task["attempt"] < task["max_attempts"] and not permanent
                 self.store.release_task(task["id"], error=f"{type(e).__name__}: {e}",
                                         requeue=again, failed_account_id=failed_account,
-                                        permanent=permanent and not again)
+                                        permanent=permanent and not again,
+                                        lease_token=task["lease_token"])
                 if failed_account and self.router is not None:
                     self.router.note_failure(
                         task, account_id=failed_account,
@@ -796,7 +940,8 @@ class LabScheduler:
                     reason="previous account failed", context=context)
             self.store.mark_running(task["id"], conversation_id=conversation_id or None,
                                     delivery=getattr(conversation_id, "delivery", None),
-                                    account_id=account_id)
+                                    account_id=account_id,
+                                    lease_token=task["lease_token"])
             result.dispatched = True
 
         # 3. Decide the run's fate.
@@ -831,6 +976,11 @@ class LabScheduler:
                 except Exception as e:  # noqa: BLE001 - a report must not undo a finish
                     log.exception("could not write the report for run %s", run_id)
                     result.note = result.note or f"completed: report failed ({type(e).__name__})"
+            if applied is not None and state in TERMINAL_RUN_STATES:
+                # ACCEPTANCE: the run's terminal decision is attested over the
+                # tasks' own verdicts - ACCEPTED only when every task verified,
+                # otherwise REJECTED/NOT_READY - never asserted by the scheduler.
+                self._record_run_acceptance(run_id, state, last_error)
         return result
 
     def _collect_in_flight(self, run_id: str, result: TickResult) -> int:
@@ -868,7 +1018,8 @@ class LabScheduler:
                 self.store.requeue_for_failover(
                     task["id"], failed_account_id=account_id,
                     error="conversation missing; executor may be gone",
-                    requeue=task["attempt"] < task["max_attempts"])
+                    requeue=task["attempt"] < task["max_attempts"],
+                    lease_token=task["lease_token"])
                 result.note = "executor gone: task requeued for failover"
                 continue
             else:
@@ -881,10 +1032,30 @@ class LabScheduler:
             self.store.record_verification(
                 task["id"], verdict=verdict.verdict,
                 evidence={"reason": verdict.reason, **verdict.evidence},
-                detail=verdict.as_detail())
+                detail=verdict.as_detail(), lease_token=task["lease_token"])
+            self._record_evidence(task, verdict, report)
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
         return in_flight
+
+    # ------------------------------------------------- evidence / acceptance
+    def _record_run_acceptance(self, run_id: str, state: str,
+                               last_error: str | None) -> None:
+        """Attest the run's terminal decision. Best effort; never fatal.
+
+        The task-level EVIDENCE records are written by ``_record_evidence``
+        (one per settled verdict). This is the stage after them: the run's own
+        ACCEPTANCE decision, earned from those verdicts rather than asserted.
+        """
+        try:
+            run = self.store.run_row(run_id)
+            if run is None:
+                return
+            tasks = self.store.list_tasks_internal(run_id)
+            self.acceptance.accept_run(run_id=run_id, project_id=str(run["project_id"]),
+                                       state=state, tasks=tasks, last_error=last_error)
+        except Exception:  # noqa: BLE001 - evidence is a record, not the work
+            log.exception("could not record acceptance for run %s", run_id)
 
     def _decide(self, run_id: str) -> tuple[str, str | None, str] | None:
         """The state the run should move to now, or ``None`` to keep going.

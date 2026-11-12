@@ -1078,3 +1078,75 @@ def test_a_stopped_run_says_which_task_stopped_it_and_why(env):
     assert _run(env, late)["last_error"] == (
         "dependency graph deadlocked: a dependency is not verified. Task x ended failed: "
         "timed out after 60 s; the conversation was left running")
+
+
+# ------------------------------------------------------- the EVIDENCE stage
+def _evidence_service(env):
+    """A real EvidenceService with a fresh Ed25519 signer for the test."""
+    from orchestration.evidence_trust import (
+        EvidenceTrustEngine,
+        Keyring,
+        generate_signer,
+        public_key_b64,
+    )
+    from orchestration.nexus_evidence import EvidenceService
+
+    signer = generate_signer("lab-key")
+    ring = Keyring()
+    ring.add("lab-key", public_key_b64(signer))
+    return EvidenceService(env["store"], EvidenceTrustEngine(ring, signer)), signer
+
+
+def _evidence_rows(env, task_id):
+    with env["store"]._tx() as cur:
+        cur.execute("SELECT id, subject_id, commit_sha, verdict FROM nexus_evidence "
+                    "WHERE subject_kind='task' AND subject_id=%s", (task_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def test_a_settled_task_is_signed_into_the_evidence_trust_engine(env):
+    """The EVIDENCE stage: every settled task result is recorded through the
+    Trust Engine, not only written to the task row. The record re-verifies."""
+    _allow(env)
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A",
+                                 "repository": REPO, "branch": "main"}])
+    service, _signer = _evidence_service(env)
+    sched = LabScheduler(env["lab"], FakeExecutor(), FakeVerifier(), evidence=service)
+    sched.run_until_done(run["id"])
+
+    task = _tasks(env, run)["a"]
+    rows = _evidence_rows(env, task["id"])
+    assert len(rows) == 1, "the EVIDENCE stage wrote no signed record"
+    assert rows[0]["verdict"] == "VERIFIED"
+    # Re-verify with the real engine through the service, as a reader would.
+    out = service.reverify(str(rows[0]["id"]), project_id=env["project"])
+    assert out["verdict"] == "VERIFIED"
+
+
+def test_the_evidence_stage_never_stops_the_loop(env):
+    """A signing failure is logged, not raised: a broken key must not stall a
+    run, and a task's own verdict is already written before evidence runs."""
+    _allow(env)
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A",
+                                 "repository": REPO, "branch": "main"}])
+
+    class BrokenEvidence:
+        def record_task_result(self, task, verdict, report):
+            raise RuntimeError("the signer is broken")
+
+    sched = LabScheduler(env["lab"], FakeExecutor(), FakeVerifier(), evidence=BrokenEvidence())
+    result = sched.run_until_done(run["id"])
+    assert result.finished
+    assert _run(env, run)["state"] == "completed", "a broken signer stalled the run"
+    assert _tasks(env, run)["a"]["state"] == "completed_verified"
+
+
+def test_without_an_evidence_service_no_record_is_written(env):
+    """A deployment with no evidence key keeps the loop exactly as it was: no
+    record is written, and none is faked."""
+    _allow(env)
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A",
+                                 "repository": REPO, "branch": "main"}])
+    sched = LabScheduler(env["lab"], FakeExecutor(), FakeVerifier())  # no evidence
+    sched.run_until_done(run["id"])
+    assert _evidence_rows(env, _tasks(env, run)["a"]["id"]) == []

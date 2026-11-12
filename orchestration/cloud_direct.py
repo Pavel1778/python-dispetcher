@@ -634,6 +634,25 @@ class CloudDirectClient:
         status, _ = self._send(route, "DELETE", f"/api/conversations/{conversation_id}")
         return status in (200, 204)
 
+    def stop_conversation(self, conversation_id: str) -> bool:
+        """``POST /api/conversations/{id}/pause`` on the sandbox agent-server.
+
+        The agent-server's pause stops the run loop and keeps the conversation
+        (and its transcript). This is the conversation-scoped stop the direct
+        transport can offer; the Cloud V1 app-conversation transport cannot (its
+        pause is sandbox-scoped), so a caller must not assume every transport
+        stopped anything. Returns ``False`` on a failure the caller can tolerate.
+        """
+        try:
+            self.pause(conversation_id)
+        except (CloudError, CloudNotFound):
+            return False
+        return True
+
+    #: The sandbox agent-server has a conversation-scoped pause, so a stop here
+    #: is real; the branch can be held until it succeeds.
+    supports_conversation_stop = True
+
     def pause(self, conversation_id: str) -> None:
         route = self._route_for(conversation_id)
         status, _ = self._send(
@@ -661,6 +680,10 @@ class CloudDirectClient:
     def health(self) -> bool:
         """Healthy when the Cloud account API answers (the app level)."""
         return self.cloud.health()
+
+    def ping(self) -> dict[str, Any]:
+        """Reachability of the account API, distinct from health/authorization."""
+        return self.cloud.ping()
 
     def get_settings(self) -> dict[str, Any]:
         return self.cloud.get_settings()

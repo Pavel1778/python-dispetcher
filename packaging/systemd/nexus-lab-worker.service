@@ -1,0 +1,44 @@
+[Unit]
+# The NEXUS autonomous lab worker as a long-lived systemd service.
+#
+# Install on a host that runs the NEXUS web server and shares its PostgreSQL:
+#
+#   sudo install -m 0644 packaging/systemd/nexus-lab-worker.service \
+#       /etc/systemd/system/nexus-lab-worker.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nexus-lab-worker
+#   systemctl status nexus-lab-worker
+#   journalctl -u nexus-lab-worker -f
+#
+# The unit reads the same EnvironmentFile as the web server, so the worker and
+# the API agree on SUPABASE_DB_URL, OPENHANDS_*, GITHUB_TOKEN and NEXUS_SECRET_KEY.
+# It is a worker, not the web service: it serves no HTTP and needs no port.
+Description=NEXUS autonomous lab worker
+Documentation=https://github.com/Pavel1778/python-dispetcher/blob/main/docs/WORKER_SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust WorkingDirectory and the interpreter path to the deployment.
+WorkingDirectory=/opt/nexus
+EnvironmentFile=/opt/nexus/.env
+# One process per unit. Several units (different --worker-id) may run side by
+# side: every claim is a lease in PostgreSQL, so extra workers only take more
+# work.
+ExecStart=/opt/nexus/.venv/bin/python -m orchestration.lab_worker --worker-id systemd-1
+# A crash (or a host reboot) restarts it; the worker holds no per-run state in
+# memory, so a restart re-reads the active runs and continues.
+Restart=always
+RestartSec=5
+# SIGTERM is the graceful stop: the loop finishes the current pass, marks the
+# worker stopped in nexus_lab_workers, and exits.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Run unprivileged. The worker only needs network access to OpenHands/GitHub and
+# a TCP connection to PostgreSQL.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -363,6 +363,30 @@ def cmd_openhands_diagnostics(args: argparse.Namespace) -> int:
     return EXIT["ok"] if report.get("ok") else EXIT["unavailable"]
 
 
+def cmd_providers(args: argparse.Namespace) -> int:
+    """Show the LLM orchestrator cascade and optionally probe each provider.
+
+    ``--live`` probes every configured provider with one read-only request and
+    reports what each proved; without it only the configured names and their
+    order are shown. This is the provider cascade, not the OpenHands account
+    pool — the two are separate mechanisms.
+    """
+    client = _client(args)
+    path = "/api/providers?live=1" if args.live else "/api/providers"
+    data = client.get(path)
+    configured = data.get("configured", [])
+    lines = [f"order: {' → '.join(data.get('order', []))}",
+             f"configured: {', '.join(configured) or '(none)'}"]
+    for probe in data.get("probes", []):
+        lines.append(f"  {probe['provider']}: {probe['kind']} — {probe['detail']}")
+    _emit(args, data, human="\n".join(lines))
+    # A probe that proved a failure (a rejected key or a missing model) is a
+    # non-zero result; an unreachable provider is reported but is not proven
+    # broken, so it does not by itself fail the command.
+    failed = any(p.get("kind") in ("auth", "rejected") for p in data.get("probes", []))
+    return EXIT["unavailable"] if failed else EXIT["ok"]
+
+
 def cmd_openhands_accounts(args: argparse.Namespace) -> int:
     client = _client(args)
     accounts = client.get("/api/openhands/accounts").get("accounts", [])
@@ -370,8 +394,21 @@ def cmd_openhands_accounts(args: argparse.Namespace) -> int:
         f"{a['id']}  {a['label']}  {a['state']}"
         f"{'  default' if a.get('is_default') else ''}"
         f"{'' if a.get('enabled', True) else '  DISABLED'}"
-        f"  health={a.get('health', 'unknown')}" for a in accounts) or "(no accounts)"
+        f"  health={a.get('health', 'unknown')}"
+        f"  key={a.get('api_key_hint') or '(none)'}"
+        f"  errors={a.get('error_count', 0)}" for a in accounts) or "(no accounts)"
     _emit(args, {"accounts": accounts}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_openhands_account_errors(args: argparse.Namespace) -> int:
+    """The account's observed failures and recoveries, newest first."""
+    client = _client(args)
+    errors = client.get(
+        f"/api/openhands/accounts/{args.account_id}/errors").get("errors", [])
+    human = "\n".join(
+        f"{e['created_at']}  {e['kind']}  {e['detail']}" for e in errors) or "(no errors)"
+    _emit(args, {"errors": errors}, human=human)
     return EXIT["ok"]
 
 
@@ -476,6 +513,91 @@ def cmd_project_repos_primary(args: argparse.Namespace) -> int:
         f"/api/v1/projects/{args.project_id}/repositories/{owner}/{name}/primary", {})
     _emit(args, result, human=f"{result['repository']['full_name']} is now primary")
     return EXIT["ok"]
+def cmd_openhands_add(args: argparse.Namespace) -> int:
+    """Add an OpenHands account. The key is verified, then stored encrypted."""
+    client = _client(args)
+    body: dict[str, Any] = {"label": args.label, "api_key": args.api_key}
+    if args.base_url:
+        body["base_url"] = args.base_url
+    if args.transport:
+        body["transport"] = args.transport
+    if args.default_model:
+        body["default_model"] = args.default_model
+    if args.max_concurrent is not None:
+        body["max_concurrent_tasks"] = args.max_concurrent
+    if args.daily_limit is not None:
+        body["daily_conversation_limit"] = args.daily_limit
+    if args.default:
+        body["make_default"] = True
+    result = client.post("/api/openhands/accounts", body)
+    account = result["account"]
+    _emit(args, result,
+          human=f"added {account['id']}  {account['label']}  key={account.get('api_key_hint', '')}")
+    return EXIT["ok"]
+
+
+def cmd_openhands_edit(args: argparse.Namespace) -> int:
+    """Edit an account's non-secret fields. The API key is not changed here."""
+    client = _client(args)
+    body: dict[str, Any] = {}
+    if args.label is not None:
+        body["label"] = args.label
+    if args.base_url is not None:
+        body["base_url"] = args.base_url
+    if args.transport is not None:
+        body["transport"] = args.transport
+    if args.default_model is not None:
+        # ``none`` clears the field, matching the server's explicit-null contract.
+        body["default_model"] = None if args.default_model == "none" else args.default_model
+    if args.max_concurrent is not None:
+        body["max_concurrent_tasks"] = None if args.max_concurrent == 0 else args.max_concurrent
+    if args.daily_limit is not None:
+        body["daily_conversation_limit"] = None if args.daily_limit == 0 else args.daily_limit
+    result = client.post(f"/api/openhands/accounts/{args.account_id}/edit", body)
+    account = result["account"]
+    _emit(args, result, human=f"edited {account['id']}  {account['label']}")
+    return EXIT["ok"]
+
+
+def cmd_openhands_connection(args: argparse.Namespace) -> int:
+    """Probe an account's endpoint reachability (distinct from authorization)."""
+    client = _client(args)
+    result = client.post(f"/api/openhands/accounts/{args.account_id}/connection", {})
+    account = result["account"]
+    state = "reachable" if account.get("reachable") else "unreachable"
+    _emit(args, result, human=f"{account['label']}: {state}")
+    return EXIT["ok"] if account.get("reachable") else EXIT["unavailable"]
+
+
+def cmd_openhands_account_action(args: argparse.Namespace) -> int:
+    """verify / default / enable / disable / remove an account by id."""
+    client = _client(args)
+    action = args.action
+    if action == "verify":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/verify", {})
+        account = out["account"]
+        _emit(args, out, human=f"{account['label']}: state={account['state']}")
+        return EXIT["ok"]
+    if action == "default":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/default", {})
+        _emit(args, out, human=f"default: {out['account']['label']}")
+        return EXIT["ok"]
+    if action in ("enable", "disable"):
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/enable",
+                          {"enabled": action == "enable"})
+        _emit(args, out, human=f"{out['account']['label']}: enabled={out['account']['enabled']}")
+        return EXIT["ok"]
+    if action == "remove":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/remove",
+                          {"force": bool(args.force)})
+        _emit(args, out, human=f"removed {out['removed']}")
+        return EXIT["ok"]
+    if action == "priority":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/priority",
+                          {"priority": args.priority})
+        _emit(args, out, human=f"{out['account']['label']}: priority={out['account']['priority']}")
+        return EXIT["ok"]
+    raise CliError(f"unknown action {action}", EXIT["usage"])
 
 
 def cmd_qa_verify(args: argparse.Namespace) -> int:
@@ -491,6 +613,58 @@ def cmd_qa_verify(args: argparse.Namespace) -> int:
     data = {"count": len(evidence), "verdicts": verdicts, "ok": ok}
     _emit(args, data, human=f"{len(evidence)} record(s): {verdicts}")
     return EXIT["ok"] if ok else EXIT["conflict"]
+
+
+def cmd_restore_point_create(args: argparse.Namespace) -> int:
+    """Create a restore point (git bundle) for the repository. Local, no API."""
+    from .restore_point import create_restore_point
+
+    try:
+        record = create_restore_point(
+            args.repo, args.out, label=args.label,
+        )
+    except Exception as exc:  # RestorePointError and OS errors alike
+        raise CliError(str(exc), EXIT["error"]) from exc
+    human = (
+        f"restore point created\n"
+        f"  HEAD:   {record.head}\n"
+        f"  branch: {record.branch or '(detached)'}\n"
+        f"  bundle: {record.bundle_path} ({record.bundle_size} bytes)\n"
+        f"  sha256: {record.bundle_sha256}\n"
+        f"  dirty:  {record.dirty}"
+        + (f" ({len(record.untracked)} untracked path(s))" if record.untracked else "")
+    )
+    _emit(args, record.to_dict(), human=human)
+    return EXIT["ok"]
+
+
+def cmd_restore_point_list(args: argparse.Namespace) -> int:
+    from .restore_point import DEFAULT_DIR, list_restore_points
+    from pathlib import Path
+
+    out = args.out or str(Path(args.repo) / DEFAULT_DIR)
+    points = list_restore_points(out)
+    human = "\n".join(
+        f"{p.created_at}  {p.head[:12]}  {'dirty' if p.dirty else 'clean'}  {p.bundle}"
+        for p in points
+    ) or "(no restore points)"
+    _emit(args, {"count": len(points), "restore_points": [p.to_dict() for p in points]},
+          human=human)
+    return EXIT["ok"]
+
+
+def cmd_restore_point_verify(args: argparse.Namespace) -> int:
+    from .restore_point import verify_restore_point
+
+    try:
+        report = verify_restore_point(args.path, args.repo)
+    except Exception as exc:
+        raise CliError(str(exc), EXIT["error"]) from exc
+    human = f"{report['status']}" + (
+        "" if report["ok"] else "\n" + "\n".join(report["reasons"])
+    )
+    _emit(args, report, human=human)
+    return EXIT["ok"] if report["ok"] else EXIT["conflict"]
 
 
 # ----------------------------------------------------------------------- parser
@@ -532,6 +706,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", parents=[common], help="print the version").set_defaults(func=cmd_version)
     sub.add_parser("doctor", parents=[common], help="diagnose connectivity and configuration").set_defaults(func=cmd_doctor)
     sub.add_parser("status", parents=[common], help="dashboard counts and health").set_defaults(func=cmd_status)
+    providers = sub.add_parser("providers", parents=[common],
+                               help="show the LLM orchestrator cascade (Gemini → Groq → OpenRouter → OpenHands)")
+    providers.add_argument("--live", action="store_true",
+                           help="probe each configured provider with one read-only request")
+    providers.set_defaults(func=cmd_providers)
 
     project = sub.add_parser("project", parents=[common], help="manage projects").add_subparsers(dest="sub", required=True)
     project.add_parser("list", parents=[common], help="list projects").set_defaults(func=cmd_project_list)
@@ -629,6 +808,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     oh = sub.add_parser("openhands", parents=[common], help="OpenHands accounts, pool and diagnostics").add_subparsers(dest="sub", required=True)
     oh.add_parser("accounts", parents=[common], help="list OpenHands accounts").set_defaults(func=cmd_openhands_accounts)
+    oha = oh.add_parser("add", parents=[common], help="add an account (verifies the key)")
+    oha.add_argument("--label", required=True)
+    oha.add_argument("--api-key", required=True, help="the API key (stored encrypted)")
+    oha.add_argument("--base-url", default=None)
+    oha.add_argument("--transport", choices=["direct", "app"], default=None)
+    oha.add_argument("--default-model", default=None)
+    oha.add_argument("--max-concurrent", type=int, default=None,
+                     help="maximum concurrent tasks (default: no limit)")
+    oha.add_argument("--daily-limit", type=int, default=None,
+                     help="the account's daily conversation ceiling (default: unknown)")
+    oha.add_argument("--default", action="store_true", help="make this the default account")
+    oha.set_defaults(func=cmd_openhands_add)
+    ohe = oh.add_parser("edit", parents=[common], help="edit an account's non-secret fields")
+    ohe.add_argument("--account", dest="account_id", required=True)
+    ohe.add_argument("--label", default=None)
+    ohe.add_argument("--base-url", default=None)
+    ohe.add_argument("--transport", choices=["direct", "app"], default=None)
+    ohe.add_argument("--default-model", default=None,
+                     help="a model name, or 'none' to clear it")
+    ohe.add_argument("--max-concurrent", type=int, default=None,
+                     help="a positive integer, or 0 to clear the limit")
+    ohe.add_argument("--daily-limit", type=int, default=None,
+                     help="a positive integer, or 0 to clear the limit")
+    ohe.set_defaults(func=cmd_openhands_edit)
+    ohc = oh.add_parser("connection", parents=[common], help="probe an account's endpoint reachability")
+    ohc.add_argument("--account", dest="account_id", required=True)
+    ohc.set_defaults(func=cmd_openhands_connection)
+    ohac = oh.add_parser("account", parents=[common], help="per-account action (verify/default/enable/disable/remove/priority)")
+    ohac.add_argument("action", choices=["verify", "default", "enable", "disable", "remove", "priority"])
+    ohac.add_argument("--account", dest="account_id", required=True)
+    ohac.add_argument("--priority", type=int, default=None, help="required for the priority action")
+    ohac.add_argument("--force", action="store_true", help="remove even with active tasks")
+    ohac.set_defaults(func=cmd_openhands_account_action)
+    ohx = oh.add_parser("errors", parents=[common],
+                        help="show an account's error history (failures and recoveries)")
+    ohx.add_argument("--account", dest="account_id", required=True)
+    ohx.set_defaults(func=cmd_openhands_account_errors)
     ohd = oh.add_parser("diagnostics", parents=[common], help="run the diagnostic report")
     ohd.add_argument("--live", action="store_true",
                      help="also run the end-to-end conversation probe (creates and deletes one conversation)")
@@ -649,6 +865,25 @@ def build_parser() -> argparse.ArgumentParser:
     osw.add_argument("--task", dest="task_id", required=True)
     osw.add_argument("--account", dest="account_id", required=True)
     osw.set_defaults(func=cmd_openhands_switch)
+
+    rp = sub.add_parser("restore-point", parents=[common],
+                        help="safe restore points (local git bundles)")
+    rp_sub = rp.add_subparsers(dest="sub", required=True)
+    rpc = rp_sub.add_parser("create", parents=[common],
+                            help="create a restore point before making changes")
+    rpc.add_argument("--repo", default=".", help="path inside the repository")
+    rpc.add_argument("--out", default=None, help="output directory (default .restore-points)")
+    rpc.add_argument("--label", default=None, help="a short note to record with the point")
+    rpc.set_defaults(func=cmd_restore_point_create)
+    rpl = rp_sub.add_parser("list", parents=[common], help="list restore points")
+    rpl.add_argument("--repo", default=".", help="path inside the repository")
+    rpl.add_argument("--out", default=None, help="output directory (default .restore-points)")
+    rpl.set_defaults(func=cmd_restore_point_list)
+    rpv = rp_sub.add_parser("verify", parents=[common],
+                            help="verify a restore point's integrity")
+    rpv.add_argument("path", help="a .json metadata file or a .bundle file")
+    rpv.add_argument("--repo", default=None, help="repository used for git bundle verify")
+    rpv.set_defaults(func=cmd_restore_point_verify)
 
     qa = sub.add_parser("qa", parents=[common], help="QA and evidence reports").add_subparsers(dest="sub", required=True)
     qa.add_parser("report", parents=[common], help="real system report").set_defaults(func=cmd_qa_report)

@@ -49,6 +49,7 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | `nexus version` | package version |
 | `nexus doctor` | `GET /healthz`, `GET /api/system` (component status) |
 | `nexus status` | `GET /api/dashboard`, `GET /api/health` |
+| `nexus providers [--live]` | `GET /api/providers` (LLM orchestrator cascade; `--live` probes each configured provider, exit 6 if a key was refused or a model is missing) |
 
 ### Projects
 
@@ -90,6 +91,20 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | `nexus agent status` | `GET /api/capabilities`, `GET /api/health` |
 | `nexus qa report` | `GET /api/dashboard`, `GET /api/system` |
 | `nexus qa verify --project <id>` | evidence verdicts (exit 5 if any FAILED) |
+
+### OpenHands accounts
+
+| Command | Backed by |
+|---|---|
+| `nexus openhands accounts` | `GET /api/openhands/accounts` (key-free views with a masked hint) |
+| `nexus openhands add --label L --api-key K [--base-url U] [--transport T] [--default-model M] [--max-concurrent N] [--daily-limit N] [--default]` | `POST /api/openhands/accounts` |
+| `nexus openhands edit --account ID [--label L] [--base-url U] [--transport T] [--default-model M\|none] [--max-concurrent N\|0] [--daily-limit N\|0]` | `POST /api/openhands/accounts/{id}/edit` |
+| `nexus openhands connection --account ID` | `POST /api/openhands/accounts/{id}/connection` (reachability; exit 6 when unreachable) |
+| `nexus openhands account verify\|default\|enable\|disable\|remove\|priority --account ID` | the matching per-account route |
+| `nexus openhands pool show` | `GET /api/openhands/pool` |
+| `nexus openhands pool set --mode MODE [--order id1,id2]` | `POST /api/openhands/pool` |
+| `nexus openhands diagnostics [--live] [--account ID] [--project ID]` | `POST /api/openhands/diagnostics` (exit 6 if any FAILED) |
+| `nexus openhands switch --project P --run R --task T --account ID` | `POST /api/v1/projects/{p}/runs/{r}/tasks/{t}/switch` |
 
 ## 5. OpenHands engineering session flow
 

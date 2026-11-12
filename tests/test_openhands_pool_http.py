@@ -133,6 +133,45 @@ def test_remove_refuses_while_active_then_forces(base, fake):
     assert listing["accounts"] == []
 
 
+def test_edit_connection_and_limits_over_http(base, fake):
+    a, _b = fake
+    va = _add_account(base, "A", a)
+    # Edit the non-secret fields; the key is untouched and never echoed.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{va['id']}/edit",
+                       {"label": "renamed", "max_concurrent_tasks": 2,
+                        "daily_conversation_limit": 10})
+    assert status == 200, out
+    account = out["account"]
+    assert account["label"] == "renamed"
+    assert account["max_concurrent_tasks"] == 2
+    assert account["daily_conversation_limit"] == 10
+    assert KEY not in json.dumps(out)
+    # Clearing a limit with an explicit null.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{va['id']}/edit",
+                       {"max_concurrent_tasks": None})
+    assert status == 200 and out["account"]["max_concurrent_tasks"] is None
+    # The connection probe reports reachability against the real fake server.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{va['id']}/connection", {})
+    assert status == 200 and out["account"]["reachable"] is True
+    assert KEY not in json.dumps(out)
+    # The pool view exposes the masked hint and never the key.
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert status == 200
+    assert KEY not in json.dumps(pool)
+    assert pool["candidates"][0]["api_key_hint"] == "sk-o…onse"
+
+
+def test_add_with_limits_over_http(base, fake):
+    a, _b = fake
+    status, body = _req("POST", base, "/api/openhands/accounts",
+                        {"label": "capped", "api_key": KEY, "base_url": a.base_url,
+                         "max_concurrent_tasks": 1, "daily_conversation_limit": 5})
+    assert status == 201, body
+    assert body["account"]["max_concurrent_tasks"] == 1
+    assert body["account"]["daily_conversation_limit"] == 5
+    assert KEY not in json.dumps(body)
+
+
 def test_diagnostics_over_http(base, fake):
     a, _b = fake
     _add_account(base, "A", a)
@@ -145,4 +184,93 @@ def test_diagnostics_over_http(base, fake):
     assert names["account_pool"] == "VERIFIED"
     assert names["live_conversation"] == "UNVERIFIED"
     # No key value anywhere in the report.
+    assert KEY not in json.dumps(report)
+
+
+def test_account_error_history_over_http(base, fake, app):
+    """The error history is reachable over HTTP and never carries the key."""
+    a, _b = fake
+    va = _add_account(base, "A", a)
+    # Empty to begin with.
+    status, out = _req("GET", base, f"/api/openhands/accounts/{va['id']}/errors")
+    assert status == 200 and out["errors"] == []
+    # Record a failure through the real pool path, then read it back. A degraded
+    # failure (not ``unavailable``) keeps the account selectable, so the pool
+    # listing still shows it.
+    app.account_pool.record_failure("machine:default", va["id"], "transport reset",
+                                    unavailable=False)
+    status, out = _req("GET", base, f"/api/openhands/accounts/{va['id']}/errors")
+    assert status == 200
+    assert out["errors"][0]["kind"] == "error"
+    assert out["errors"][0]["detail"] == "transport reset"
+    assert KEY not in json.dumps(out)
+    # The count is on the account view and in the pool listing.
+    status, listing = _req("GET", base, "/api/openhands/accounts")
+    assert listing["accounts"][0]["error_count"] == 1
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert pool["candidates"][0]["error_count"] == 1
+
+
+# ------------------------------------------------------ the AI provider cascade
+def test_providers_route_reports_configuration_without_a_call(base, app, monkeypatch):
+    """``/api/providers`` names the configured cascade; no provider is contacted."""
+    from orchestration.providers import ProviderCascade, GroqProvider
+
+    secret = "sk-provider-key-never-leaked"
+    app.providers = ProviderCascade([GroqProvider(api_key=secret, base_url="http://127.0.0.1:1")])
+    status, body = _req("GET", base, "/api/providers")
+    assert status == 200
+    assert body["configured"] == ["groq"]
+    assert body["order"] == ["groq"]
+    assert "probes" not in body  # not live: nothing was probed
+    assert secret not in json.dumps(body)
+
+
+def test_providers_route_live_probes_a_real_provider(base, app):
+    """``?live=1`` probes each configured provider over a real socket."""
+    from orchestration.providers import GroqProvider
+    from tests.test_provider_diagnostics import FakeProvider
+    from http.server import ThreadingHTTPServer
+    import threading
+
+    secret = "sk-provider-key-never-leaked"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+    srv.script = [{"payload": {}}]
+    srv.calls, srv.gets, srv.index = [], [], 0
+    srv.models = ["llama-3.3-70b-versatile"]
+    srv.models_status = None
+    srv.delay = 0
+    srv.gemini_shape = False
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        from orchestration.providers import ProviderCascade
+        app.providers = ProviderCascade([
+            GroqProvider(base_url=f"http://127.0.0.1:{srv.server_port}",
+                         api_key=secret, model="llama-3.3-70b-versatile",
+                         sleep=lambda _s: None)])
+        status, body = _req("GET", base, "/api/providers?live=1")
+        assert status == 200
+        probe = body["probes"][0]
+        assert probe["provider"] == "groq" and probe["kind"] == "ok"
+        assert probe["model_available"] is True
+        assert secret not in json.dumps(body)
+    finally:
+        srv.shutdown()
+        t.join()
+        srv.server_close()
+
+
+def test_diagnostics_report_carries_the_provider_checks(base, fake, app):
+    a, _b = fake
+    _add_account(base, "A", a)
+    status, report = _req("POST", base, "/api/openhands/diagnostics", {"live": False})
+    assert status == 200
+    names = {c["name"]: c["status"] for c in report["checks"]}
+    # The provider checks are part of the report. This process has
+    # OPENHANDS_API_KEY set, so the OpenHands orchestrator provider is
+    # configured: the configuration check is VERIFIED by presence. Without a
+    # live request the probe never runs, so it is UNVERIFIED, never VERIFIED.
+    assert names["providers"] == "VERIFIED"
+    assert names["provider_probe"] == "UNVERIFIED"
     assert KEY not in json.dumps(report)

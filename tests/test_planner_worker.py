@@ -181,3 +181,99 @@ def test_worker_survives_a_failing_run(env):
     w.verifier = FakeVerifier()
     summary = w.tick_once()  # must not raise
     assert summary["errors"] and summary["runs"] == 1
+
+
+def test_the_worker_loop_outlives_a_transient_database_error(env, monkeypatch):
+    """A database blip must not end the process.
+
+    The worker holds one connection for its life and the store raises
+    ``StoreUnavailable`` while it reconnects. The web server's own loop catches
+    that and keeps going; the separate worker used to let it propagate out of
+    ``run_forever``, so one transient error (a database restart, a pooler
+    recycling its clients) killed the only thing advancing the runs. Here the
+    run is real: the first pass sees an unavailable store, later passes work.
+    """
+    import threading
+    import time
+
+    from orchestration import lab_worker as lw
+    from orchestration.cloud_store import StoreUnavailable
+
+    run = env["lab"].start_run("user:alice", env["project"], env["goal"])
+    store_plan(env["lab"], "user:alice", env["project"], run["id"],
+               tasks=[{"id": "a", "title": "A", "description": "", "acceptance": [],
+                       "dependencies": []}])
+
+    real = lw.active_run_ids
+    calls = {"n": 0}
+
+    def flaky(store):
+        calls["n"] += 1
+        if calls["n"] == 2:                 # the first pass the loop makes
+            raise StoreUnavailable("database unavailable")
+        return real(store)
+
+    monkeypatch.setattr(lw, "active_run_ids", flaky)
+    w = LabWorker(env["store"], worker_id="live", poll_interval=0.02,
+                  client=object(), github=object())
+    w.executor = FakeExecutor()
+    w.verifier = FakeVerifier()
+    thread = threading.Thread(target=w.run_forever, daemon=True)
+    thread.start()
+    try:
+        # The loop kept ticking through the error and finished the run: a
+        # process that died on the first pass would never complete it.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if env["lab"].get_run("user:alice", env["project"], run["id"])["state"] == "completed":
+                break
+            time.sleep(0.05)
+        assert env["lab"].get_run("user:alice", env["project"], run["id"])["state"] == "completed"
+        assert thread.is_alive(), "the worker loop died on a transient database error"
+        assert calls["n"] >= 3, "the loop did not retry after the error"
+    finally:
+        w.stop()
+        thread.join(timeout=5)
+
+
+def test_run_once_registers_and_heartbeats_like_a_long_lived_worker(env):
+    """``--once`` is the cron-style deployment: it must leave the same trace a
+    long-lived worker does, or the diagnostics read the runs as unserviced."""
+    run = env["lab"].start_run("user:alice", env["project"], env["goal"])
+    store_plan(env["lab"], "user:alice", env["project"], run["id"],
+               tasks=[{"id": "a", "title": "A", "description": "", "acceptance": [],
+                       "dependencies": []}])
+    w = LabWorker(env["store"], worker_id="cron-1", client=object(), github=object())
+    w.executor = FakeExecutor()
+    w.verifier = FakeVerifier()
+    summary = w.run_once()
+    assert summary["runs"] == 1
+    # The pass advanced the run (one claim), and the worker row is there -
+    # marked stopped, because a single pass cannot stay live.
+    assert env["lab"].get_run("user:alice", env["project"], run["id"])["iteration"] == 1
+    with env["store"]._tx() as cur:
+        cur.execute("SELECT worker_id, kind, state, heartbeat_at FROM nexus_lab_workers "
+                    "WHERE worker_id=%s", ("cron-1",))
+        stored = cur.fetchone()
+    assert stored is not None
+    assert (stored["kind"], stored["state"]) == ("worker", "stopped")
+    assert stored["heartbeat_at"] is not None
+
+
+def test_run_once_still_ticks_when_it_cannot_register(env):
+    """A pass that cannot write its worker row must still advance the runs."""
+    run = env["lab"].start_run("user:alice", env["project"], env["goal"])
+    store_plan(env["lab"], "user:alice", env["project"], run["id"],
+               tasks=[{"id": "a", "title": "A", "description": "", "acceptance": [],
+                       "dependencies": []}])
+    w = LabWorker(env["store"], worker_id="cron-2", client=object(), github=object())
+    w.executor = FakeExecutor()
+    w.verifier = FakeVerifier()
+
+    def boom(_worker_id, kind="worker"):
+        raise RuntimeError("database unavailable")
+
+    w.lab.register_worker = boom
+    summary = w.run_once()
+    assert summary["runs"] == 1
+    assert env["lab"].get_run("user:alice", env["project"], run["id"])["iteration"] == 1

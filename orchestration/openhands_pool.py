@@ -152,6 +152,7 @@ class AccountPool:
                         "last_error=NULL, last_error_at=NULL, last_checked_at=now(), "
                         "updated_at=now() WHERE id=%s AND principal=%s",
                         (account_id, principal))
+        self._append_event(account_id, "recovered", "account produced a result")
 
     def record_failure(self, principal: str, account_id: str, error: str, *,
                        unavailable: bool = False) -> None:
@@ -160,13 +161,33 @@ class AccountPool:
         ``unavailable`` is for a failure the account cannot serve through right
         now (a rejected key, an unreachable endpoint). A degraded account stays
         selectable, because a single transient error is not a reason to stop
-        using it.
+        using it. Every failure also increments ``error_count`` and appends to
+        the account's error history, so "ошибки" is a readable list rather than
+        only the latest string.
         """
         health = "unavailable" if unavailable else "degraded"
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_openhands_accounts SET health=%s, last_error=%s, "
-                        "last_error_at=now(), updated_at=now() WHERE id=%s AND principal=%s",
+                        "last_error_at=now(), error_count=error_count+1, updated_at=now() "
+                        "WHERE id=%s AND principal=%s",
                         (health, error[:1000], account_id, principal))
+        kind = "auth" if unavailable and "auth" in error.lower() else (
+            "transport" if unavailable else "error")
+        self._append_event(account_id, kind, error)
+
+    def _append_event(self, account_id: str, kind: str, detail: str) -> None:
+        """Record one account event for the error history. Never a secret.
+
+        Swallows its own errors: health tracking is a side record and must never
+        fail the dispatch it is observing.
+        """
+        try:
+            with self.store._tx() as cur:
+                cur.execute(
+                    "INSERT INTO nexus_openhands_account_events(account_id, kind, detail) "
+                    "VALUES (%s,%s,%s)", (account_id, kind, (detail or "")[:1000]))
+        except Exception:  # noqa: BLE001 - a diagnostic side record, not the work
+            pass
 
     def begin_task(self, principal: str, account_id: str) -> None:
         """Reserve capacity on an account (manual counter).
@@ -209,8 +230,24 @@ class AccountPool:
         except Exception:  # noqa: BLE001 - a pool must work before the lab schema exists
             return {}
 
-    def _load_of(self, account: dict, live: dict[str, int]) -> int:
+    @staticmethod
+    def _load_of(account: dict, live: dict[str, int]) -> int:
         return int(account.get("active_tasks", 0) or 0) + live.get(str(account["id"]), 0)
+
+    @staticmethod
+    def _at_limit(account: dict, live: dict[str, int]) -> bool:
+        """True when an account is already running as much as it is allowed to.
+
+        ``max_concurrent_tasks`` is the account's own ceiling; ``NULL`` means
+        "no limit". The count is the same observed load the load-balancing mode
+        uses, so an account is not offered work it has no capacity for. A limit
+        of 1 with one task in flight excludes it; the caller then falls through
+        to another account rather than over-committing this one.
+        """
+        limit = account.get("max_concurrent_tasks")
+        if limit is None:
+            return False
+        return AccountPool._load_of(account, live) >= int(limit)
 
     # ----------------------------------------------------------- selection
     def _usable(self, account: dict, exclude: set[str]) -> bool:
@@ -274,7 +311,10 @@ class AccountPool:
 
         if mode == "manual":
             # The operator's explicit choice, and only that. A bound account is
-            # explicit; otherwise the default. Manual never falls back.
+            # explicit; otherwise the default. Manual never falls back, and it
+            # honours the choice even when the account is at its concurrency
+            # limit: a limit steers automatic selection, it does not veto an
+            # operator's direct instruction. A project's assignments still apply.
             chosen = bound if allowed(bound) else (default if allowed(default) else None)
             if chosen is None:
                 raise PoolError(
@@ -282,15 +322,23 @@ class AccountPool:
                     "mode never switches to another account")
             return chosen
 
+        live = self._live_load()
+
+        #: Usable *and* with capacity left. An account at its concurrency limit
+        #: is skipped here so automatic selection never over-commits it.
+        def selectable(account: dict) -> bool:
+            return (allowed(account) and not self._at_limit(account, live))
+
         if mode == "load_balancing":
             # Spread work: the usable account running the fewest active tasks.
             # The bound account is honoured only when it is also a valid choice;
             # the point of this mode is balance, so it is not forced.
-            candidates = self.candidates(principal, exclude=exclude, project_id=project_id)
+            candidates = [a for a in self.candidates(principal, exclude=exclude,
+                                                     project_id=project_id)
+                          if not self._at_limit(a, live)]
             if not candidates:
-                raise PoolError("no usable OpenHands account for load balancing")
-            live = self._live_load()
-            if bound and allowed(bound):
+                raise PoolError(self._capacity_message(principal, exclude, project_id))
+            if bound and selectable(bound):
                 fewest = min(self._load_of(a, live) for a in candidates)
                 if self._load_of(bound, live) == fewest:
                     return bound
@@ -301,15 +349,29 @@ class AccountPool:
         # auto and failover: the bound account, then the default, then the best
         # candidate. failover differs only in the exclude set the caller passes.
         for preferred in (bound, default):
-            if preferred is not None and allowed(preferred):
+            if preferred is not None and selectable(preferred):
                 return preferred
-        candidates = self.candidates(principal, exclude=exclude, project_id=project_id)
+        candidates = [a for a in self.candidates(principal, exclude=exclude,
+                                                 project_id=project_id)
+                      if not self._at_limit(a, live)]
         if not candidates:
-            if assigned is not None:
-                raise PoolError("no usable OpenHands account among the project's "
-                                "assigned executors")
-            raise PoolError("no usable OpenHands account")
+            raise PoolError(self._capacity_message(principal, exclude, project_id))
         return candidates[0]
+
+    def _capacity_message(self, principal: str, exclude: set[str],
+                          project_id: str | None = None) -> str:
+        """A reason that names *why* nothing was selectable, not just "none"."""
+        if self._assigned(project_id) is not None:
+            any_assigned = self.candidates(principal, exclude=exclude,
+                                           project_id=project_id)
+            if not any_assigned:
+                return ("no usable OpenHands account among the project's "
+                        "assigned executors")
+        any_usable = self.candidates(principal, exclude=exclude)
+        if not any_usable:
+            return "no usable OpenHands account"
+        return ("every usable OpenHands account is at its concurrency limit "
+                f"({len(any_usable)} account(s) busy)")
 
     def _default(self, principal: str) -> dict | None:
         for a in self.accounts.list_accounts(principal):

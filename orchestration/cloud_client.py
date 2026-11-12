@@ -504,6 +504,25 @@ class CloudClient:
         )
         return status == 200 and bool((payload or {}).get("success", True))
 
+    def stop_conversation(self, conversation_id: str) -> bool:
+        """Stop the agent working on a conversation, keeping its transcript.
+
+        The app-conversation transport has no conversation-scoped stop: the only
+        pause the Cloud V1 surface exposes is sandbox-scoped
+        (``POST /api/v1/sandboxes/{id}/pause``), and pausing the whole sandbox
+        would also stop unrelated work on it. So this reports ``False`` (nothing
+        was stopped) rather than pretending. A caller that switched an executor
+        away must treat a conversation it could not stop as one still running on
+        its branch, which is exactly what the branch lock already enforces.
+        """
+        return False
+
+    #: Whether ``stop_conversation`` can really stop a conversation on this
+    #: transport. The app-conversation surface cannot (its pause is
+    #: sandbox-scoped), so a caller must not hold a branch forever waiting for a
+    #: stop that will never come - see ``LabScheduler._stop_abandoned``.
+    supports_conversation_stop = False
+
     def update_conversation(self, conversation_id: str, *,
                             title: str | None = None) -> bool:
         """``PATCH /api/v1/app-conversations/{id}`` (title only, here).
@@ -685,6 +704,26 @@ class CloudClient:
         info = payload.get("info")
         version = info.get("version") if isinstance(info, dict) else None
         return str(version) if version else None
+    def ping(self) -> dict[str, Any]:
+        """Probe *reachability* of the endpoint, distinct from authorization.
+
+        Returns ``{"reachable": bool, "status": int | None, "detail": str}``. An
+        HTTP answer of any status — including 401/403/429 — means the endpoint is
+        reachable; only a transport failure (a refused connection, a DNS error, a
+        timeout) means it is not. This is deliberately not :meth:`health`, which
+        answers "is the account usable right now": an endpoint can be reachable
+        while the key is rejected, and the operator needs to tell those apart.
+        """
+        try:
+            status, _ = self._request("GET", "/api/v1/app-conversations/count")
+        except CloudUnavailable as e:
+            # A rate limit is an *answer*: the endpoint is up, it is declining.
+            if isinstance(e, CloudRateLimited):
+                return {"reachable": True, "status": 429, "detail": str(e)}
+            return {"reachable": False, "status": None, "detail": str(e)}
+        except CloudError as e:
+            return {"reachable": True, "status": None, "detail": str(e)}
+        return {"reachable": True, "status": status, "detail": ""}
 
     # -------------------------------------------------- account capabilities
     # These are read-only. They report what the account *has configured* and

@@ -591,7 +591,8 @@ class App:
                     built = LabWorker(self.store, worker_id=self._lab_worker_id,
                                       client=self.client, github=self.github,
                                       github_accounts=self.github_accounts,
-                                      account_router=build_account_router(self.store))
+                                      account_router=build_account_router(self.store),
+                                      evidence=self.evidence)
                     # Known to the diagnostics as a live worker (migration 0023):
                     # a server that advances runs is one. Its heartbeat is
                     # written by every pass.
@@ -950,6 +951,14 @@ class App:
         404). The account must be one of the principal's active accounts. The
         switch is prepared here; the lab worker performs it on its next tick,
         passing the hand-off context. A task that is not in flight is refused.
+
+        The abandoned conversation is **stopped** (best effort) so the old
+        executor does not keep writing to the working copy while the new one
+        works. Its transcript is kept; only the run loop is stopped. When the
+        transport cannot stop a conversation (the Cloud V1 app-conversation
+        transport pauses at the sandbox, not the conversation), the stop is
+        reported as ``False`` and the branch lock remains the guarantee that two
+        executors do not push to one branch at once.
         """
         if not UUID_RE.fullmatch(task_id) or not UUID_RE.fullmatch(account_id):
             raise NotFound("task or account id")
@@ -967,9 +976,46 @@ class App:
             raise NotFound("account not found")
         if account["state"] != "active" or not account.get("enabled", True):
             raise ValueError("the target account is not active and enabled")
+        # Read the abandoned conversation before the switch clears it, so the
+        # old executor can be stopped rather than merely left unpolled.
+        abandoned = task.get("conversation_id")
+        from_account = task.get("openhands_account_id")
         updated = self.lab.switch_task_executor(task_id, target_account_id=account_id)
+        stopped = self._stop_abandoned_conversation(principal, from_account, abandoned)
+        # The store also recorded the conversation in the task's ``abandoned``
+        # list, which holds the branch until it is stopped. This path stopped it
+        # here, so drop the entry too; when it did not stop (the app transport
+        # cannot), leave the entry and let the worker try (it will report the
+        # transport cannot stop, and release the branch).
+        if stopped and abandoned:
+            self.lab.mark_abandoned_stopped(task_id, abandoned)
         return {"task": updated, "target_account": {"id": account_id,
-                                                    "label": account["label"]}}
+                                                    "label": account["label"]},
+                "abandoned_conversation": abandoned, "stopped": stopped}
+
+    def _stop_abandoned_conversation(self, principal: str, account_id: str | None,
+                                     conversation_id: str | None) -> bool:
+        """Stop the conversation a switch left behind, without deleting it.
+
+        Best effort and never fatal: a switch that has already been recorded must
+        not fail because the old conversation could not be stopped. The
+        transcript is the record of why the work moved, so the conversation is
+        not deleted. Returns whether the transport reported a stop.
+        """
+        if not conversation_id:
+            return False
+        try:
+            if account_id:
+                client = self.openhands_accounts.execution_client_for_account(
+                    principal, str(account_id))
+            else:
+                client = self.client
+            stop = getattr(client, "stop_conversation", None)
+            return bool(stop(conversation_id)) if stop is not None else False
+        except Exception as e:  # noqa: BLE001 - the switch already stands
+            log.warning("could not stop abandoned conversation %s: %s",
+                        conversation_id, type(e).__name__)
+            return False
 
     def rename_sr(self, workflow_id: str, title: str) -> dict[str, Any]:
         """Rename the workflow's Sr conversation in Cloud.
@@ -1079,9 +1125,30 @@ class App:
 
         diagnostics = OpenHandsDiagnostics(
             self.store, accounts=self.openhands_accounts, pool=self.account_pool,
-            cloud_client=self.client)
+            cloud_client=self.client, providers=self.providers)
         return diagnostics.run(principal, live=live, account_id=account_id,
                                project_id=project_id).as_dict()
+
+    def provider_status(self, *, live: bool = False) -> dict[str, Any]:
+        """The orchestrator cascade: configuration, and an optional real probe.
+
+        ``live=False`` reports only which providers have a key and the order
+        they are tried in — no provider is contacted, no key is returned. With
+        ``live=True`` each configured provider is probed with one read-only
+        request (see :meth:`Provider.probe`) and earns its own status, so a
+        provider is never reported connected on faith. This is deliberately
+        separate from the OpenHands account pool: switching a *model* provider
+        is not switching an OpenHands *account*.
+        """
+        configured = self.providers.configured()
+        order = [p.name for p in self.providers.providers]
+        out: dict[str, Any] = {"order": order, "configured": configured}
+        if live:
+            out["probes"] = [
+                {"provider": r.provider, "model": r.model, "kind": r.kind,
+                 "detail": r.detail, "model_available": r.model_available}
+                for r in self.providers.probe_all()]
+        return out
 
     def system_info(self) -> dict[str, Any]:
         """Safe diagnostics: presence of settings, never their values."""
@@ -1699,6 +1766,12 @@ class Handler(BaseHTTPRequestHandler):
             except CloudError as e:
                 return self._json(502, {"error": f"cloud: {e}"})
             return self._json(200, {"capabilities": caps})
+        if len(parts) == 5 and parts[4] == "errors":
+            try:
+                errors = self.app.openhands_accounts.error_history(principal, parts[3])
+            except NotFound:
+                return self._json(404, {"error": "account not found"})
+            return self._json(200, {"errors": errors})
         return self._json(404, {"error": "not found"})
 
     @staticmethod
@@ -1737,6 +1810,7 @@ class Handler(BaseHTTPRequestHandler):
         Pool actions (enable / disable / priority / remove) go through the pool
         service, so the selection policy and the account controls stay together.
         """
+        from .nexus_openhands_accounts import _UNSET
         from .openhands_pool import PoolError
 
         parts = path.strip("/").split("/")
@@ -1748,6 +1822,19 @@ class Handler(BaseHTTPRequestHandler):
             if action == "verify":
                 return self._json(200, {"account": self.app.openhands_accounts.verify(
                     principal, account_id)})
+            if action == "connection":
+                return self._json(200, {"account": self.app.openhands_accounts.check_connection(
+                    principal, account_id)})
+            if action == "edit":
+                return self._json(200, {"account": self.app.openhands_accounts.edit(
+                    principal, account_id,
+                    label=body.get("label"),
+                    base_url=(body.get("base_url") or None),
+                    transport=(body.get("transport") or None),
+                    default_model=body.get("default_model", _UNSET),
+                    max_concurrent_tasks=body.get("max_concurrent_tasks", _UNSET),
+                    daily_conversation_limit=body.get(
+                        "daily_conversation_limit", _UNSET))})
             if action == "rotate":
                 return self._json(200, {"account": self.app.openhands_accounts.rotate(
                     principal, account_id, api_key=body.get("api_key"))})
@@ -2933,6 +3020,13 @@ class Handler(BaseHTTPRequestHandler):
                     live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes"),
                     account_id=(query.get("account_id") or [None])[0],
                     project_id=(query.get("project_id") or [None])[0]))
+            if path == "/api/providers":
+                # The orchestrator cascade: configured provider names and the
+                # order they are tried in. No key is returned; ?live=1 also
+                # probes each configured provider with a read-only request.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                return self._json(200, self.app.provider_status(
+                    live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes")))
             if path == "/api/openhands/pool":
                 principal = self._project_principal()
                 return self._json(200, {
@@ -2940,7 +3034,13 @@ class Handler(BaseHTTPRequestHandler):
                     "candidates": [
                         {"id": a["id"], "label": a["label"], "priority": a.get("priority"),
                          "health": a.get("health"), "active_tasks": a.get("active_tasks", 0),
-                         "enabled": a.get("enabled", True), "is_default": a.get("is_default")}
+                         "enabled": a.get("enabled", True), "is_default": a.get("is_default"),
+                         "max_concurrent_tasks": a.get("max_concurrent_tasks"),
+                         "daily_conversation_limit": a.get("daily_conversation_limit"),
+                         "api_key_hint": a.get("api_key_hint", ""),
+                         "connection_ok": a.get("connection_ok"),
+                         "last_connection_at": a.get("last_connection_at"),
+                         "error_count": a.get("error_count", 0)}
                         for a in self.app.account_pool.candidates(principal)],
                 })
             if path.startswith("/api/github/accounts/"):
@@ -3187,7 +3287,9 @@ class Handler(BaseHTTPRequestHandler):
                         base_url=(body.get("base_url") or None),
                         transport=(body.get("transport") or "direct"),
                         default_model=(body.get("default_model") or None),
-                        make_default=bool(body.get("make_default")))
+                        make_default=bool(body.get("make_default")),
+                        max_concurrent_tasks=body.get("max_concurrent_tasks"),
+                        daily_conversation_limit=body.get("daily_conversation_limit"))
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(201, {"account": account})

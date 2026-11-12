@@ -38,6 +38,7 @@ from .cloud_store import PostgresStore
 from .openhands_pool import AccountPool, PoolError
 from .nexus_lab_store import LabStore
 from .nexus_openhands_accounts import OpenHandsAccountService
+from .providers import ProviderCascade
 
 VERIFIED = "VERIFIED"
 FAILED = "FAILED"
@@ -97,11 +98,17 @@ class OpenHandsDiagnostics:
                  pool: AccountPool, client_factory: Callable[[str, str], Any] | None = None,
                  cloud_client: Any | None = None, lab: LabStore | None = None,
                  live_client_factory: Callable[[str], Any] | None = None,
+                 providers: ProviderCascade | None = None,
                  worker_max_age: int = 120):
         self.store = store
         self.accounts = accounts
         self.pool = pool
         self.lab = lab or LabStore(store)
+        #: The LLM orchestrator cascade (Gemini → Groq → OpenRouter → OpenHands).
+        #: Read only for the provider checks; a live probe is opt-in. Built from
+        #: the environment when the caller does not supply one, so the report
+        #: always describes the providers this process would actually use.
+        self.providers = providers if providers is not None else ProviderCascade()
         #: Builds a per-account Cloud client (base URL + key). Injectable so the
         #: account checks can speak to the fake Cloud server in tests.
         self._client_factory = client_factory or (
@@ -133,6 +140,8 @@ class OpenHandsDiagnostics:
         self.check_cloud_api(report)
         self.check_queues_and_leases(report, principal)
         self.check_worker(report)
+        self.check_providers(report)
+        self.check_provider_probe(report, live=live)
         self.check_live_conversation(report, principal, live=live,
                                      account_id=account_id, project_id=project_id)
         return report
@@ -178,7 +187,11 @@ class OpenHandsDiagnostics:
             state = account["state"]
             row = {"id": account["id"], "label": account["label"],
                    "state": state, "enabled": account.get("enabled", True),
-                   "health": account.get("health", "unknown")}
+                   "health": account.get("health", "unknown"),
+                   "api_key_hint": account.get("api_key_hint", ""),
+                   "max_concurrent_tasks": account.get("max_concurrent_tasks"),
+                   "daily_conversation_limit": account.get("daily_conversation_limit"),
+                   "connection_ok": account.get("connection_ok")}
             if state != "active" or not account.get("enabled", True):
                 row["auth"] = "skipped (not active/enabled)"
                 rows.append(row)
@@ -296,7 +309,94 @@ class OpenHandsDiagnostics:
                 except Exception:  # noqa: BLE001 - cleanup is best effort
                     pass
 
-    # -- 6. worker heartbeat ----------------------------------------------
+    # -- 6. AI provider cascade -------------------------------------------
+    def check_providers(self, report: Report) -> None:
+        """Report the orchestrator cascade's configuration, by presence only.
+
+        This is the *configuration* half of the provider check: which providers
+        have a key, in cascade order, and whether any does. It never contacts a
+        provider and never returns a key — only names and booleans. ``VERIFIED``
+        here means "configured", which is exactly what this check claims; the
+        real, earned check is :meth:`check_provider_probe`.
+
+        A separate check keeps "switch the model provider" (this cascade) apart
+        from "switch the OpenHands account" (the account pool) — the two are
+        different mechanisms and must not be conflated.
+        """
+        try:
+            configured = self.providers.configured()
+            order = [p.name for p in self.providers.providers]
+        except Exception as e:  # noqa: BLE001 - a diagnostic must report, not raise
+            report.add("providers", FAILED, f"{type(e).__name__}: {e}")
+            return
+        evidence = {"order": order, "configured": configured}
+        if configured:
+            report.add("providers", VERIFIED,
+                       f"configured: {', '.join(configured)} (order: {' → '.join(order)})",
+                       evidence)
+        else:
+            # No key is not a failure of the integration: nothing could be
+            # configured in this environment. BLOCKED says so without claiming
+            # the providers are broken.
+            report.add("providers", BLOCKED,
+                       "no orchestrator provider has a key configured", evidence)
+
+    def check_provider_probe(self, report: Report, *, live: bool) -> None:
+        """Probe each configured provider for real; opt-in with ``live``.
+
+        Skipped (``UNVERIFIED``) unless *live* is requested, exactly like the
+        conversation probe: a read-only request per provider is a real call and
+        must not happen on every page load. When it runs, each provider earns
+        its own status from an observation:
+
+        * ``VERIFIED``   — the endpoint answered, the key was accepted and (when
+                           the provider lists models) the configured model is
+                           among them;
+        * ``FAILED``     — the key was refused, or the model is not available;
+        * ``BLOCKED``    — a transport failure, 5xx or 429: nothing was proved;
+        * ``UNVERIFIED`` — no provider has a key, so nothing was probed.
+
+        A provider is never reported connected without this real call — the
+        rule the request states explicitly ("do not declare a provider
+        connected without a real check").
+        """
+        if not live:
+            report.add("provider_probe", UNVERIFIED,
+                       "not requested (pass live=true to probe the configured providers)")
+            return
+        try:
+            results = self.providers.probe_all()
+        except Exception as e:  # noqa: BLE001
+            report.add("provider_probe", FAILED, f"{type(e).__name__}: {e}")
+            return
+        rows = []
+        probed = [r for r in results if r.kind != "blocked"]
+        worst = VERIFIED
+        for r in results:
+            row = {"provider": r.provider, "model": r.model, "kind": r.kind,
+                   "detail": r.detail}
+            if r.model_available is not None:
+                row["model_available"] = r.model_available
+            rows.append(row)
+            if r.kind == "blocked":
+                continue
+            if r.kind in ("auth", "rejected"):
+                worst = FAILED
+            elif r.kind == "unavailable" and worst != FAILED:
+                worst = BLOCKED
+        if not probed:
+            report.add("provider_probe", UNVERIFIED,
+                       "no provider has a key, so nothing was probed",
+                       {"providers": rows})
+            return
+        if worst == VERIFIED:
+            detail = f"{len(probed)} provider(s) probed: " + ", ".join(
+                f"{r.provider} ok" for r in probed)
+        else:
+            detail = "; ".join(f"{r.provider}: {r.detail}" for r in probed)
+        report.add("provider_probe", worst, detail, {"providers": rows})
+
+    # -- 7. worker heartbeat ----------------------------------------------
     def check_worker(self, report: Report) -> None:
         try:
             live = self.lab.live_workers(max_age_seconds=self.worker_max_age)

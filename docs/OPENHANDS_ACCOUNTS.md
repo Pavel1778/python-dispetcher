@@ -11,11 +11,38 @@ and an **encrypted** API key. The pool decides which account runs each task.
   never writes a plaintext credential.
 - The key is never returned by any method, never logged, never in an exception
   message. `account_view` is the only shape that leaves the service, and it has
-  no key field.
+  no key field. It carries a **masked hint** (`api_key_hint`) instead — the first
+  and last four characters, e.g. `sk-o…onse` — so the interface and the logs can
+  show *which* key is stored without holding it. A key shorter than 12
+  characters is masked whole.
 - An account is verified against Cloud (`GET /api/settings`) before it is
   trusted. A rejected key marks the account `invalid`, not silently kept.
 - Accounts are scoped to a principal. A project may bind exactly one; the
   worker resolves the project's owner as the principal whose pool applies.
+
+## The account fields
+
+| field | meaning |
+| --- | --- |
+| `id` | unique id (uuid) |
+| `label` | a human name, unique per principal |
+| `base_url` | the Cloud (or self-hosted) API endpoint |
+| `transport` | `direct` (sandbox agent-server) or `app` (app-conversation endpoint) |
+| `default_model` | the model a bare sandbox is told to use; optional |
+| `state` | `active` / `invalid` / `revoked` — the **authorization** status |
+| `identity` | the verified agent-profile id, when known |
+| `is_default` | the principal's primary account (at most one) |
+| `enabled` | the **on/off** switch; disabling is reversible and keeps the key |
+| `priority` | the failover order (lower is tried first) |
+| `health` | the last observed health: `unknown` / `healthy` / `degraded` / `unavailable` |
+| `active_tasks` | the reserved-load counter (observed load is read from the task rows) |
+| `last_error` / `last_error_at` | the last failure and when it happened |
+| `last_checked_at` | when the account was last verified |
+| `max_concurrent_tasks` | the concurrency ceiling; `null` means no limit |
+| `daily_conversation_limit` | the account's daily ceiling, recorded for the operator; `null` means unknown |
+| `connection_ok` / `last_connection_at` | the last reachability probe result and when |
+| `error_count` | how many real calls have failed on this account |
+| `api_key_hint` | the masked key fragment; never the key |
 
 ## Managing accounts (HTTP / CLI)
 
@@ -29,23 +56,65 @@ curl -sS -X POST "$NEXUS_URL/api/openhands/accounts" \
   -d '{"label":"personal","api_key":"sk-...","base_url":"https://app.all-hands.dev",
        "transport":"direct","make_default":true}'
 
-# Verify / rotate / revoke / set default:
+# Edit the non-secret fields (the key is not changed here):
+POST /api/openhands/accounts/{id}/edit
+  {"label":"...","base_url":"...","transport":"direct|app",
+   "default_model":"...|null","max_concurrent_tasks":N|null,
+   "daily_conversation_limit":N|null}
+
+# Verify authorization / rotate the key / revoke / set default:
 POST /api/openhands/accounts/{id}/verify
 POST /api/openhands/accounts/{id}/rotate   {"api_key": "sk-..."}
 POST /api/openhands/accounts/{id}/revoke
 POST /api/openhands/accounts/{id}/default
+
+# Probe endpoint reachability (distinct from authorization):
+POST /api/openhands/accounts/{id}/connection
+```
+
+```bash
+# The same through the CLI:
+python -m orchestration.cli openhands add --label personal --api-key sk-... \
+  --base-url https://app.all-hands.dev --transport direct --default \
+  --max-concurrent 4 --daily-limit 20
+python -m orchestration.cli openhands edit --account <id> --label renamed \
+  --max-concurrent 0            # 0 clears the limit
+python -m orchestration.cli openhands connection --account <id>
+python -m orchestration.cli openhands account verify --account <id>
+python -m orchestration.cli openhands account disable --account <id>
+python -m orchestration.cli openhands account remove --account <id> --force
+python -m orchestration.cli openhands account priority --account <id> --priority 1
 ```
 
 ## Per-account controls
 
 | action | endpoint | effect |
 | --- | --- | --- |
+| edit | `POST /api/openhands/accounts/{id}/edit {...}` | change label/base URL/transport/model/limits; the key is untouched. A new base URL re-verifies the stored key against it before the change is committed |
 | enable / disable | `POST /api/openhands/accounts/{id}/enable {"enabled": false}` | a disabled account is never selected; the key is kept |
 | priority | `POST /api/openhands/accounts/{id}/priority {"priority": 1}` | the failover order (lower is tried first) |
+| verify | `POST /api/openhands/accounts/{id}/verify` | re-check **authorization**; a rejected key marks the account `invalid` |
+| connection | `POST /api/openhands/accounts/{id}/connection` | probe **reachability**; an endpoint that answers (even `401`) is reachable, a transport failure is not. The two are different questions |
+| error history | `GET /api/openhands/accounts/{id}/errors` | the account's observed failures and recoveries, newest first (`python -m orchestration.cli openhands errors --account <id>`) |
 | remove | `POST /api/openhands/accounts/{id}/remove {"force": true}` | delete; refused while the account has active tasks unless forced |
 
 Disabling is reversible and keeps the key. Revoking (`state='revoked'`) also
 clears the default and requires re-adding. Removing deletes the row.
+
+### Limits
+
+`max_concurrent_tasks` is the account's own concurrency ceiling. The pool counts
+the tasks actually in flight for the account (the same observed load
+`load_balancing` uses) and **skips an account already at its limit** in the
+automatic modes (`auto`, `failover`, `load_balancing`). If every usable account
+is full, the pool raises a reason that says so ("every usable OpenHands account
+is at its concurrency limit") rather than a generic "no account". `MANUAL` is the
+exception: a limit steers automatic selection, it does not veto an operator's
+explicit choice. `null` means no limit.
+
+`daily_conversation_limit` records the account's daily ceiling for the operator
+and the diagnostics. It is informational — the pool never guesses a value and
+never enforces a number the service did not report.
 
 ## Selection modes
 
@@ -81,11 +150,19 @@ python -m orchestration.cli openhands pool set --mode failover \
 
 ## How the worker uses the pool
 
-`build_account_router` returns a router when the principal has any stored
-account, and `None` otherwise (the pre-existing single-key behaviour). When a
-router is present, `OpenHandsExecutor` asks it which account runs each task and
-dispatches through a client built for that account's base URL, transport and
-model. A poll reattaches to the **same** account — a different account is a
-different sandbox and cannot read that conversation.
+`build_account_router` returns a router when the **deployment** has any stored
+account (any principal), and `None` otherwise (the pre-existing single-key
+behaviour). The check is `OpenHandsAccountService.has_any_accounts`, not
+`list_accounts(principal)`: the worker runs as `machine:default` and owns no
+accounts, while an account added in the studio belongs to `user:<login>`, so a
+per-principal check left the pool — and the automatic selection modes — switched
+off on every deployment with a login. The router still *selects* per project:
+`AccountRouter._principal_for_project` resolves the project's owner as the
+principal whose pool applies.
+
+When a router is present, `OpenHandsExecutor` asks it which account runs each
+task and dispatches through a client built for that account's base URL,
+transport and model. A poll reattaches to the **same** account — a different
+account is a different sandbox and cannot read that conversation.
 
 See `FAILOVER.md` for what happens when an account fails.

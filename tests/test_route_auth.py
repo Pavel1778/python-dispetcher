@@ -61,12 +61,13 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
     f"/api/v1/projects/{UUID}/agents", f"/api/v1/projects/{UUID}/binding",
     "/api/openhands/accounts", f"/api/openhands/accounts/{UUID}",
-    "/api/openhands/pool", "/api/openhands/diagnostics",
+    "/api/openhands/pool", "/api/openhands/diagnostics", "/api/providers",
     f"/api/github/accounts/{UUID}/repositories",
     "/api/github/accounts", f"/api/github/accounts/{UUID}",
     f"/api/github/accounts/{UUID}/repositories/owner/name/branches",
     "/api/github/repositories/owner/name/branches",
     f"/api/openhands/accounts/{UUID}/capabilities",
+    f"/api/openhands/accounts/{UUID}/errors",
     f"/api/v1/projects/{UUID}/workflows/{UUID}", f"/api/v1/projects/{UUID}/runs/{UUID}",
     f"/api/v1/projects/{UUID}/context",
     f"/api/v1/projects/{UUID}/executors",
@@ -105,6 +106,8 @@ PROTECTED_POST = [
     f"/api/openhands/accounts/{UUID}/enable",
     f"/api/openhands/accounts/{UUID}/priority",
     f"/api/openhands/accounts/{UUID}/remove",
+    f"/api/openhands/accounts/{UUID}/edit",
+    f"/api/openhands/accounts/{UUID}/connection",
     f"/api/github/accounts/{UUID}/verify",
 ]
 

@@ -5,6 +5,13 @@
 > repository/branch was selected, global sandbox reuse is not project-scoped,
 > and workspace claim checks can race across processes. A nonempty result is
 > not independent QA evidence. See [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md).
+>
+> **Current versions (2026-11-12):** the live Cloud is now **1.87.1** (OpenAPI
+> 3.1.0) and the sandbox agent-server is **1.60.1**, not the versions implied
+> below. A start with an initial message was observed reaching `READY` (the
+> 500-on-inner-create described below was not reproduced this session). See
+> [docs/OPENHANDS_INVENTORY.md](docs/OPENHANDS_INVENTORY.md) for the dated
+> inventory and the live probe result.
 
 Every fact below was read from the live OpenAPI document at
 `https://app.all-hands.dev/openapi.json` and confirmed by making real calls,

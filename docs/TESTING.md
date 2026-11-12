@@ -55,7 +55,16 @@ two-phase start). Only the LLM behind a conversation is simulated.
   dead-lettering, and no usable account blocks the run with a reason.
 - `tests/test_openhands_pool_http.py` — the HTTP surface for the pool,
   per-account controls and the diagnostics report; asserts the API key never
-  appears in a response.
+  appears in a response. Also the `/api/providers` route (configuration, and a
+  real live probe of a fake provider over a socket) and the provider checks in
+  the report.
+- `tests/test_provider_diagnostics.py` — the AI provider cascade: configuration
+  presence, key checking, model availability, authorization errors, timeouts,
+  failover switching, context preservation across a switch, and return to the
+  primary provider; plus the two provider diagnostic checks (``providers`` for
+  configuration by presence only, ``provider_probe`` earned from a real
+  read-only call and ``UNVERIFIED`` unless requested). Each provider is a real
+  local HTTP server the client speaks to over a socket.
 - `tests/test_lab_store.py` — worker heartbeat (live/old/stopped), lease
   reclaim, attempt budgets.
 - `tests/test_route_auth.py` — every new endpoint requires auth.
