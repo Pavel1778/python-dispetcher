@@ -122,6 +122,13 @@ class FakeAgentServer:
         box = self._box(route.agent_server_url)
         if path == "/api/settings":
             return 200, {"agent_settings": {"llm": {"model": "fake-model"}}}
+        if path == "/api/tools/catalog":
+            return 200, {"tools": [
+                {"name": "terminal", "user_selectable": True, "in_default_set": True,
+                 "usable": True},
+                {"name": "file_editor", "user_selectable": True, "in_default_set": True,
+                 "usable": True},
+            ]}
         if path.startswith("/api/conversations/search"):
             return 200, {"items": list(box.values())}
         if method == "POST" and path == "/api/conversations":

@@ -1613,6 +1613,46 @@ NOTIFICATION` ended at EVIDENCE.
   whole-pipeline walk asserting a durable artifact per stage). Removing the
   acceptance recording makes them fail.
 
+## OpenHands tool availability (this session)
+
+The request asks two questions and forbids conflating them: which tools the
+**agent inside a conversation** has, and which tools **NEXUS** exposes. Both are
+now diagnosed, each with an earned status.
+
+- **`orchestration/openhands_tools.py`** is the pure analysis. `normalize_catalog`
+  reads either documented shape — the agent-server tool catalog
+  (`GET /api/tools/catalog`, a list/mapping of descriptors with
+  `user_selectable`/`in_default_set`/`usable`) or `/server_info`'s
+  `usable_tools` — into `{name: {usable, ...}}`. `capability_report` maps the
+  request's groups onto it; **Git and testing have no built-in and are proved by
+  `terminal`** (that is how an agent runs `git`/`pytest`), and the evidence says
+  so rather than inventing a tool name. `mcp_server_names` returns only the
+  configured MCP server *names*, never a body. `nexus_tool_names` reads the two
+  real NEXUS surfaces from the code that serves them: `McpServer.tool_schemas()`
+  (made a `@staticmethod` for this) and `SrTools.tool_schemas()`.
+- **`tool_catalog()` on each transport.** `CloudDirectClient` and
+  `LocalCloudClient` read `GET /api/tools/catalog` from a real agent-server
+  (reusing a running sandbox, as the live probe does). `CloudClient` (the Cloud
+  *app* transport) has no agent-server to ask, so it raises
+  `ToolCatalogUnsupported`; a sandbox that answers `404` raises the same. Both
+  mean **BLOCKED** — nothing was proved — never FAILED.
+- **Three new diagnostic checks** (`OpenHandsDiagnostics.run`): `openhands_tools`
+  (the catalog; opt-in with `live`, since reading it may provision a sandbox),
+  `mcp_configuration` (configured MCP server names; `VERIFIED` means
+  *configured*, which is all it claims) and `nexus_tools` (the NEXUS surfaces,
+  local, always runnable). The tool/MCP checks prefer the selected account's
+  execution client and fall back to the process transport, so a single-key
+  deployment still gets an answer.
+- **A configured tool is not an available tool, and availability is not
+  exercise.** The checks report the catalog's own `usable` flag and the account's
+  configured MCP names; neither claims a tool *ran* — only an observed
+  `ActionEvent` proves that.
+- Tests: `tests/test_openhands_tools.py` (20 cases: the normaliser on both
+  shapes, the capability mapping, the transport reads over real sockets, the
+  three checks' VERIFIED/FAILED/BLOCKED/UNVERIFIED paths, and the no-key-leak
+  assertion). The fakes gained the catalog route (`tests/fake_runtime.py`,
+  `tests/test_cloud_direct.py`'s `FakeAgentServer`).
+
 ## Durable runs, reports, stop signals, project executors, several repositories (2026-11-12)
 
 Full description: `docs/DURABLE-RUNS.md`. What a future change has to know:

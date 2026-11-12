@@ -896,6 +896,21 @@ class CloudClient:
                 names.append(str(item["name"]))
         return names
 
+    def tool_catalog(self) -> dict[str, Any]:
+        """The agent-server tool catalog — not available on the app transport.
+
+        Cloud V1's app-conversation endpoint exposes no agent-server tool
+        catalog: the tools live inside a sandbox this transport never addresses.
+        Raising :class:`ToolCatalogUnsupported` is honest — nothing was proved
+        either way — and lets the diagnostics report ``BLOCKED`` rather than
+        invent a tool list.
+        """
+        from .openhands_tools import ToolCatalogUnsupported
+
+        raise ToolCatalogUnsupported(
+            "the Cloud app transport exposes no agent-server tool catalog"
+        )
+
     def account_capabilities(self) -> dict[str, Any]:
         """A read-only snapshot of the account-level capabilities.
 
