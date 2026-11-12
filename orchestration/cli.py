@@ -340,6 +340,65 @@ def cmd_qa_report(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_openhands_diagnostics(args: argparse.Namespace) -> int:
+    """Run the OpenHands diagnostic report and exit non-zero on any FAILED.
+
+    ``--live`` opts into the end-to-end conversation probe (creates and deletes
+    one conversation). Without it, checks that need a live conversation are
+    reported UNVERIFIED, never assumed.
+    """
+    client = _client(args)
+    body: dict[str, Any] = {"live": bool(args.live)}
+    if getattr(args, "account", None):
+        body["account_id"] = args.account
+    if getattr(args, "project", None):
+        body["project_id"] = args.project
+    report = client.post("/api/openhands/diagnostics", body)
+    counts = report.get("counts", {})
+    human_lines = [
+        f"{c['name']}: {c['status']} — {c['detail']}" for c in report.get("checks", [])]
+    human = "\n".join(human_lines) + "\n" + "  ".join(
+        f"{k}={v}" for k, v in counts.items())
+    _emit(args, report, human=human)
+    return EXIT["ok"] if report.get("ok") else EXIT["unavailable"]
+
+
+def cmd_openhands_accounts(args: argparse.Namespace) -> int:
+    client = _client(args)
+    accounts = client.get("/api/openhands/accounts").get("accounts", [])
+    human = "\n".join(
+        f"{a['id']}  {a['label']}  {a['state']}"
+        f"{'  default' if a.get('is_default') else ''}"
+        f"{'' if a.get('enabled', True) else '  DISABLED'}"
+        f"  health={a.get('health', 'unknown')}" for a in accounts) or "(no accounts)"
+    _emit(args, {"accounts": accounts}, human=human)
+    return EXIT["ok"]
+
+
+def cmd_openhands_pool_show(args: argparse.Namespace) -> int:
+    client = _client(args)
+    data = client.get("/api/openhands/pool")
+    cfg = data.get("config", {})
+    human = f"mode: {cfg.get('selection_mode')}\n" + "\n".join(
+        f"{a['id']}  {a['label']}  priority={a['priority']}  "
+        f"health={a['health']}  active={a['active_tasks']}"
+        for a in data.get("candidates", []))
+    _emit(args, data, human=human)
+    return EXIT["ok"]
+
+
+def cmd_openhands_pool_set(args: argparse.Namespace) -> int:
+    client = _client(args)
+    body: dict[str, Any] = {}
+    if args.mode:
+        body["selection_mode"] = args.mode
+    if args.order is not None:
+        body["fallback_order"] = [x for x in args.order.split(",") if x]
+    result = client.post("/api/openhands/pool", body)
+    _emit(args, result, human=f"mode: {result['config']['selection_mode']}")
+    return EXIT["ok"]
+
+
 def cmd_qa_verify(args: argparse.Namespace) -> int:
     """Verify the evidence hash chain for a project."""
     client = _client(args)
@@ -454,6 +513,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent = sub.add_parser("agent", parents=[common], help="agent/account status").add_subparsers(dest="sub", required=True)
     agent.add_parser("status", parents=[common], help="account capability and health").set_defaults(func=cmd_agent_status)
+
+    oh = sub.add_parser("openhands", parents=[common], help="OpenHands accounts, pool and diagnostics").add_subparsers(dest="sub", required=True)
+    oh.add_parser("accounts", parents=[common], help="list OpenHands accounts").set_defaults(func=cmd_openhands_accounts)
+    ohd = oh.add_parser("diagnostics", parents=[common], help="run the diagnostic report")
+    ohd.add_argument("--live", action="store_true",
+                     help="also run the end-to-end conversation probe (creates and deletes one conversation)")
+    ohd.add_argument("--account", default=None, help="check one account id")
+    ohd.add_argument("--project", default=None, help="select the account this project would use")
+    ohd.set_defaults(func=cmd_openhands_diagnostics)
+    pool = oh.add_parser("pool", parents=[common], help="account pool configuration").add_subparsers(dest="action", required=True)
+    pool.add_parser("show", parents=[common], help="show the pool configuration and order").set_defaults(func=cmd_openhands_pool_show)
+    pool_set = pool.add_parser("set", parents=[common], help="set the selection mode / fallback order")
+    pool_set.add_argument("--mode", choices=["manual", "auto", "failover", "load_balancing"], default=None)
+    pool_set.add_argument("--order", default=None,
+                          help="comma-separated account ids, in failover order")
+    pool_set.set_defaults(func=cmd_openhands_pool_set)
 
     qa = sub.add_parser("qa", parents=[common], help="QA and evidence reports").add_subparsers(dest="sub", required=True)
     qa.add_parser("report", parents=[common], help="real system report").set_defaults(func=cmd_qa_report)

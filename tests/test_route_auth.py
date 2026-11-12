@@ -61,6 +61,7 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
     f"/api/v1/projects/{UUID}/agents", f"/api/v1/projects/{UUID}/binding",
     "/api/openhands/accounts", f"/api/openhands/accounts/{UUID}",
+    "/api/openhands/pool", "/api/openhands/diagnostics",
     f"/api/github/accounts/{UUID}/repositories",
     "/api/github/accounts", f"/api/github/accounts/{UUID}",
     f"/api/github/accounts/{UUID}/repositories/owner/name/branches",
@@ -92,6 +93,10 @@ PROTECTED_POST = [
     f"/api/v1/projects/{UUID}/openhands-account",
     "/api/openhands/accounts",
     f"/api/openhands/accounts/{UUID}/verify",
+    "/api/openhands/pool", "/api/openhands/diagnostics",
+    f"/api/openhands/accounts/{UUID}/enable",
+    f"/api/openhands/accounts/{UUID}/priority",
+    f"/api/openhands/accounts/{UUID}/remove",
     f"/api/github/accounts/{UUID}/verify",
 ]
 
@@ -200,6 +205,40 @@ def test_wrong_bearer_is_refused(base):
     status = _status("GET", base + "/api/system",
                      headers={"Authorization": "Bearer nope"})
     assert status == 401
+
+
+def test_the_bearer_is_the_whole_token_or_nothing(base):
+    """Compared whole, as bytes, in constant time: nearly right is wrong, and a
+    header that is not ASCII gets an answer, not an exception."""
+    import http.client
+    from urllib.parse import urlparse
+
+    where = urlparse(base)
+
+    def status_for(header: bytes) -> int:
+        conn = http.client.HTTPConnection(where.hostname, where.port, timeout=10)
+        try:
+            conn.putrequest("GET", "/api/system")
+            conn.putheader("Authorization", header)
+            conn.endheaders()
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    right = f"Bearer {TOKEN}".encode()
+    assert status_for(right) == 200
+    for wrong in (
+        right + b"x",                                  # the token and more
+        right[:-1],                                    # all of it but the last character
+        right[:-1] + b"X",                             # the same length, one character off
+        b"Bearer  " + TOKEN.encode(),
+        b"Basic " + TOKEN.encode(),
+        b"Bearer",
+        right[:-1] + b"\xe9",                          # not ASCII
+        right + b"\xc3\xa9",
+        b"Bearer \xff\xfe\xfd",
+    ):
+        assert status_for(wrong) == 401, wrong
 
 
 def test_session_cookie_without_csrf_cannot_write(base, app):

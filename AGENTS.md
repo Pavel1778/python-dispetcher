@@ -958,6 +958,73 @@ the part to read first: those defects were reproduced and are **not fixed**.
    `docs/NEXUS-AUDIT.md`, `docs/NEXUS-SPEC.md`, `docs/MASTER_COMPLETION_AUDIT.md`,
    `docs/MASTER_COMPLETION_ROADMAP.md`. They were not rewritten in this session.
 
+## OpenHands account pool, failover and diagnostics (this session)
+
+Added to make NEXUS drive several OpenHands accounts, switch executors on
+failure, and prove the integration with one command. The invariants to keep:
+
+- **`orchestration/openhands_pool.py`** is the selection policy and the only
+  place the four modes live (`manual`, `auto`, `failover`, `load_balancing`).
+  "Usable" = `state='active'` AND `enabled` AND health not `unavailable`; a
+  `degraded` account stays selectable. `manual` never falls back. Health and
+  `active_tasks` are written by the callers that make real calls — observed, not
+  guessed. Migration `0022` adds the columns and `nexus_openhands_pool`.
+- **`orchestration/openhands_router.py`** chooses an account per task and builds
+  the hand-off context. `tried_accounts` (on the task) is what makes failover
+  terminate: an account that failed is never selected for that task again. The
+  account a task last *ran* on is not excluded - a result that did not verify
+  is tried again there - and a start the service refuses (429) is not a
+  failure; both are item 13 of "Autonomous runs on the deployed service".
+  `build_account_router` returns `None` when the principal has no stored
+  account, so a single-key deployment keeps its exact previous behaviour.
+- **A Cloud conversation cannot move between accounts.** A switch is a *new*
+  conversation on the new account with the context passed in the first message
+  (`handoff_message`). The old account is never polled again: `poll` uses
+  `_client_for_task`, which is bound to the task's account. Migration `0024`
+  records every switch in `nexus_task_handoffs`.
+- **`OpenHandsExecutor.dispatch` raises `DispatchError`** carrying the account
+  that failed, so the scheduler can exclude it. A failed *start* requeues the
+  task (transport problem); a **vanished** conversation (the executor is gone)
+  requeues via `requeue_for_failover` from `running` too, which
+  `release_task` (dispatched only) could not do. When the pool has nothing left,
+  the run is **blocked** with the reason — never spun.
+- **`orchestration/openhands_diagnostics.py`** is the one diagnostic engine.
+  Four statuses, earned: `VERIFIED` (ran and worked), `FAILED` (ran and failed),
+  `BLOCKED` (could not run: no credential/resource — a 429 is BLOCKED, not
+  FAILED), `UNVERIFIED` (not run — the live probe is opt-in). `report.ok` is
+  true unless something FAILED. The `queues_leases` check does a real
+  claim→release→re-claim on a throwaway project it deletes; the live probe
+  creates and deletes exactly one conversation.
+- **Worker heartbeat (migration `0023`).** `LabWorker` registers and heartbeats
+  every tick (`register_worker`/`heartbeat`/`stop_worker`); `live_workers` is
+  how the diagnostics tell a live worker from a dead one — a lease cannot.
+  `lab_worker: FAILED` means active runs exist with no fresh heartbeat. The web
+  server's own loop registers too, as kind `inline` (`App._run_lab`).
+- **`OPENHANDS_DEFAULT_MODEL` is required in practice.** Verified live: a bare
+  sandbox fails with `LLMAuthenticationError` (`classification.kind=auth`,
+  retryable=false); with `openhands/deepseek-v4.1-flash` the same task finishes.
+- **`render.yaml` and `docker-compose.yml` now define the worker service**, so a
+  deployed autonomous run is not left queued (this closes the earlier open item).
+  The web service advances runs as well, by default; on the live service it is
+  the only one that does (`nexus_lab_workers` was empty on 2026-11-12).
+- New endpoints: `GET/POST /api/openhands/diagnostics` (`live` opt-in),
+  `GET/POST /api/openhands/pool`, and per-account `enable`/`priority`/`remove`.
+  CLI: `nexus openhands accounts|pool|diagnostics [--live]`.
+- Tests: `tests/test_openhands_pool.py`, `tests/test_openhands_failover.py`
+  (the load-bearing end-to-end failover + hand-off), `tests/test_openhands_pool_http.py`,
+  and the worker-heartbeat cases in `tests/test_lab_store.py`. Docs:
+  `docs/OPENHANDS_SETUP.md`, `OPENHANDS_ACCOUNTS.md`, `FAILOVER.md`,
+  `WORKER_SETUP.md`, `TROUBLESHOOTING.md`, `TESTING.md`.
+- **Live verification (2026-11-11):** against the real key — account capabilities
+  and health VERIFIED; the live conversation probe VERIFIED (create, message,
+  events, a shell command echoed, workspace file upload + SHA-256 read-back) on a
+  reused running sandbox; and a NEXUS run task dispatched through the pool
+  router to real Cloud reached `finished` with the marker echoed. Creating a new
+  sandbox returned `429 daily_sandbox_limit_reached` (account quota), reported
+  BLOCKED. No second OpenHands key is available, so a *two-live-account*
+  failover is BLOCKED; the failover logic is proven end to end against real
+  PostgreSQL with honest transport fakes.
+
 ## Task texts of any size (PR #27, 2026-11-11)
 
 An autonomous run used to be refused above 20 000 characters
@@ -1078,13 +1145,43 @@ and 12), two on the thirty-minute limit (item 11). What was found:
     were recorded as `failed` ("timed out after 1800 s; the conversation was
     left running"), and their runs stopped while the agents went on. The
     default is two hours (`DEFAULT_TASK_TIMEOUT_SECONDS`,
-    `NEXUS_TASK_TIMEOUT_SECONDS`); migration 0022 changes the column default
+    `NEXUS_TASK_TIMEOUT_SECONDS`); migration 0025 changes the column default
     and gives every task that may still run and carries the old default the
     new one, without touching `updated_at` (the limit is counted from it).
 12. **A stopped run said "a dependency is not verified" and nothing else.**
     `LabScheduler._why` now adds the first task that stopped it and the
     verifier's reason (`LabStore.first_unverified`); the studio shows a task's
     reason on its own line.
+13. **The account pool and these rules.** `main` gained the account pool
+    (previous section) while this was being written; three things did not hold
+    together when the two were merged, each shown by a test first
+    (`tests/test_openhands_failover.py`, `tests/test_lab_inline.py`):
+    - The server's own loop never registered in `nexus_lab_workers`, so the
+      diagnostics said "active run(s) exist but no worker heartbeat is fresh"
+      on the very deployment where that loop is the only thing advancing runs.
+      It registers as kind `inline` and marks itself stopped on the way out.
+    - A refused start (429) from a pool account took the failure path: an
+      attempt spent, the account marked `unavailable`, and with one account the
+      run blocked on "no usable OpenHands account". `DispatchError.refused`
+      now carries the 429 and `LabScheduler._start_refused` handles it with or
+      without a pool: nothing is spent and the account becomes `degraded`
+      (still selectable). If another account can take the task it does, at
+      once (`postpone_task(failed_account_id=)`); if none can, the task waits
+      and is then offered to the whole pool again (`forget_tried`).
+    - The account a task had run on was excluded from its next attempt, so
+      with one account in the pool "resume" after a result that did not verify
+      blocked the run. `AccountRouter.select_for_task` excludes only
+      `tried_accounts`, and the first message is a hand-off only when the
+      account really changes (`nexus_lab._last_account`). The hand-off message
+      now ends with rule 6 (where the work has to be pushed).
+
+    True of the pool as merged, and not changed here: `build_account_router`
+    asks for the accounts of `machine:default`, while an account added in the
+    studio belongs to `user:<login>`, so on a deployment with a login the pool
+    is never switched on (and the live service has no stored account). Nothing
+    in the loop calls `AccountPool.record_success`, so an account marked
+    `unavailable` by a failed start stays that way. The router is built once,
+    when the loop starts.
 
 Still true, and worth knowing before changing this:
 

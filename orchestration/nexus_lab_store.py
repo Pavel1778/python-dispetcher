@@ -85,7 +85,7 @@ _RETRYABLE_TASK_STATES = ("completed_unverified", "partial", "failed", "blocked"
 #: How long one task's conversation may run before the task is given up, in
 #: seconds, unless ``NEXUS_TASK_TIMEOUT_SECONDS`` says otherwise. It was thirty
 #: minutes; real tasks ran longer and were recorded as failed while their
-#: agents were still at work (see migration 0022).
+#: agents were still at work (see migration 0025).
 DEFAULT_TASK_TIMEOUT_SECONDS = 7200
 
 
@@ -433,6 +433,9 @@ class LabStore:
         out["evidence"] = _loads(out.get("evidence")) or []
         out["verification"] = _loads(out.get("verification"))
         out["spec_ref"] = _loads(out.get("spec_ref"))
+        out["tried_accounts"] = _loads(out.get("tried_accounts")) or []
+        if out.get("openhands_account_id") is not None:
+            out["openhands_account_id"] = str(out["openhands_account_id"])
         return out
 
     def dependency_states(self, cur: Any, task: dict) -> dict[str, str]:
@@ -507,7 +510,8 @@ class LabStore:
             return self._task_row(cur.fetchone())
 
     def mark_running(self, task_id: str, *, conversation_id: str | None = None,
-                     delivery: dict | None = None) -> dict:
+                     delivery: dict | None = None,
+                     account_id: str | None = None) -> dict:
         """Bind the conversation that was started and mark the task running.
 
         The conversation id is always kept. The state changes only if the task
@@ -523,11 +527,13 @@ class LabStore:
             cur.execute("UPDATE nexus_run_tasks SET "
                         "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
                         "conversation_id=COALESCE(%s, conversation_id), "
+                        "openhands_account_id=COALESCE(%s, openhands_account_id), "
                         "spec_ref = CASE WHEN %s::jsonb IS NULL THEN spec_ref ELSE "
                         "  COALESCE(spec_ref, '{}'::jsonb) || jsonb_build_object("
                         "    'delivery', %s::jsonb || jsonb_build_object('at', now())) END, "
                         "updated_at=now() "
-                        "WHERE id=%s RETURNING *", (conversation_id, proof, proof, task_id))
+                        "WHERE id=%s RETURNING *",
+                        (conversation_id, account_id, proof, proof, task_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
@@ -567,19 +573,25 @@ class LabStore:
             self._notify(cur, project_id, f"task_{verdict}", task["title"], task["id"])
             return task
 
-    def release_task(self, task_id: str, *, error: str, requeue: bool) -> dict:
+    def release_task(self, task_id: str, *, error: str, requeue: bool,
+                     failed_account_id: str | None = None) -> dict:
         """Return a claimed task to ``pending`` (requeue) or mark it ``failed``.
 
         Only a task that is still ``dispatched`` is released. One that was
         settled while its start was failing (the run was cancelled) keeps the
         state it was given.
+
+        *failed_account_id*, when given, is appended to ``tried_accounts`` so a
+        later failover never picks that account for this task again.
         """
         state = "pending" if requeue else "failed"
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, last_error=%s, "
+                "tried_accounts = CASE WHEN %s::uuid IS NULL THEN tried_accounts "
+                "  ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
-                (state, error, task_id))
+                (state, error, failed_account_id, failed_account_id, task_id))
             row = cur.fetchone()
             if row is None:
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -588,7 +600,9 @@ class LabStore:
                 raise NotFound("task not found")
             return self._task_row(row)
 
-    def postpone_task(self, task_id: str, *, error: str, seconds: float) -> dict:
+    def postpone_task(self, task_id: str, *, error: str, seconds: float,
+                      failed_account_id: str | None = None,
+                      forget_tried: bool = False) -> dict:
         """Put a claimed task back because the start was refused, not failed.
 
         The service said "not now" (a rate limit, a daily quota). No
@@ -598,6 +612,14 @@ class LabStore:
         live lease is not claimable). Without this a quota that lasts until
         tomorrow used up all three attempts within seconds, and a run stopped
         that way could not be resumed: "every task has used all its attempts".
+
+        With an account pool: *failed_account_id* is the account that refused,
+        given when another account can take the task - it is added to
+        ``tried_accounts`` so the next claim goes there (and *seconds* is then
+        0, nothing to wait for). *forget_tried* is for the opposite case, no
+        account left to ask: ``tried_accounts`` is emptied, so that after the
+        wait the task is offered to the whole pool again and starts on
+        whichever account takes work first.
 
         Like ``release_task``, only a task that is still ``dispatched`` is
         touched; one settled meanwhile keeps the state it was given.
@@ -612,8 +634,12 @@ class LabStore:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='pending', attempt=GREATEST(attempt - 1, 0), "
                 "lease_expires=now() + (%s || ' seconds')::interval, last_error=%s, "
+                "tried_accounts = CASE WHEN %s THEN '[]'::jsonb "
+                "  WHEN %s::text IS NULL OR tried_accounts ? %s::text THEN tried_accounts "
+                "  ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
-                (max(0.0, float(seconds)), error, task_id))
+                (max(0.0, float(seconds)), error, bool(forget_tried), failed_account_id,
+                 failed_account_id, failed_account_id, task_id))
             row = cur.fetchone()
             if row is not None:
                 cur.execute("UPDATE nexus_runs SET iteration=GREATEST(iteration - 1, 0), "
@@ -622,6 +648,63 @@ class LabStore:
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
                 row = cur.fetchone()
             return self._task_row(row)
+
+    def requeue_for_failover(self, task_id: str, *, failed_account_id: str,
+                             error: str, requeue: bool = True) -> dict:
+        """Requeue a task whose executor failed, excluding that account.
+
+        Works from ``dispatched`` or ``running`` (a conversation that was
+        started and then vanished): the task goes back to ``pending`` so another
+        account can pick it up, and the failed account is added to
+        ``tried_accounts`` so the pool never selects it for this task again. A
+        task that is already terminal keeps its state.
+        """
+        state = "pending" if requeue else "failed"
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, "
+                "conversation_id=NULL, last_error=%s, "
+                "tried_accounts = CASE WHEN tried_accounts ? %s::text THEN tried_accounts "
+                "  ELSE tried_accounts || to_jsonb(%s::text) END, "
+                "updated_at=now() "
+                "WHERE id=%s AND state IN ('dispatched','running','verifying') RETURNING *",
+                (state, error[:2000], failed_account_id, failed_account_id, task_id))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
+            if row is None:
+                raise NotFound("task not found")
+            return self._task_row(row)
+
+    def tried_accounts(self, task_id: str) -> list[str]:
+        with self.store._tx() as cur:
+            cur.execute("SELECT tried_accounts FROM nexus_run_tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("task not found")
+            return [str(x) for x in (row["tried_accounts"] or [])]
+
+    def record_handoff(self, *, run_id: str, task_id: str,
+                       from_account_id: str | None, to_account_id: str | None,
+                       reason: str, context: dict) -> dict:
+        """Record that a task's executor was switched, and the context passed."""
+        with self.store._tx() as cur:
+            cur.execute(
+                "INSERT INTO nexus_task_handoffs(run_id, task_id, from_account_id, "
+                "  to_account_id, reason, context) VALUES (%s,%s,%s,%s,%s,%s::jsonb) "
+                "RETURNING id, created_at",
+                (run_id, task_id, from_account_id, to_account_id, reason[:2000],
+                 _jsonb(context)))
+            row = cur.fetchone()
+            return {"id": str(row["id"]), "created_at": row["created_at"]}
+
+    def handoffs(self, task_id: str) -> list[dict]:
+        with self.store._tx() as cur:
+            cur.execute("SELECT id, from_account_id, to_account_id, reason, context, "
+                        "created_at FROM nexus_task_handoffs WHERE task_id=%s "
+                        "ORDER BY created_at, id", (task_id,))
+            return [dict(r) for r in cur.fetchall()]
 
     def reclaim_expired(self, run_id: str) -> list[dict]:
         """Requeue tasks a worker claimed and never started (it died in between).
@@ -762,4 +845,38 @@ class LabStore:
             cur.execute("SELECT id, kind, title, body, resource_id, created_at, read_at "
                         "FROM nexus_notifications WHERE project_id=%s "
                         "ORDER BY created_at DESC, id LIMIT %s", (project_id, limit))
+            return [dict(r) for r in cur.fetchall()]
+
+    # -------------------------------------------------------- worker heartbeat
+    def register_worker(self, worker_id: str, *, kind: str = "worker") -> None:
+        """Record that a worker is running (upsert; also restarts the clock)."""
+        if kind not in ("worker", "inline"):
+            raise ValueError("kind must be 'worker' or 'inline'")
+        with self.store._tx() as cur:
+            cur.execute(
+                "INSERT INTO nexus_lab_workers(worker_id, kind, state, started_at, "
+                "  heartbeat_at) VALUES (%s,%s,'running',now(),now()) "
+                "ON CONFLICT (worker_id) DO UPDATE SET kind=EXCLUDED.kind, state='running', "
+                "  heartbeat_at=now()", (worker_id, kind))
+
+    def heartbeat(self, worker_id: str, *, error: str | None = None) -> None:
+        with self.store._tx() as cur:
+            cur.execute("UPDATE nexus_lab_workers SET heartbeat_at=now(), "
+                        "last_error=%s, state='running' WHERE worker_id=%s",
+                        ((error or None) and error[:1000], worker_id))
+
+    def stop_worker(self, worker_id: str) -> None:
+        with self.store._tx() as cur:
+            cur.execute("UPDATE nexus_lab_workers SET state='stopped', heartbeat_at=now() "
+                        "WHERE worker_id=%s", (worker_id,))
+
+    def live_workers(self, *, max_age_seconds: int = 60) -> list[dict]:
+        """Workers whose heartbeat is fresh enough to be considered running."""
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT worker_id, kind, state, started_at, heartbeat_at, last_error, "
+                "  EXTRACT(EPOCH FROM (now() - heartbeat_at))::int AS age_seconds "
+                "FROM nexus_lab_workers "
+                "WHERE state='running' AND heartbeat_at > now() - (%s || ' seconds')::interval "
+                "ORDER BY heartbeat_at DESC", (max_age_seconds,))
             return [dict(r) for r in cur.fetchall()]

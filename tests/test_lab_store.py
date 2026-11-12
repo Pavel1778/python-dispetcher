@@ -262,3 +262,39 @@ def test_budgets_outside_their_bounds_are_refused(lab, options):
         lab["lab"].start_run("user:alice", lab["project"], lab["goal"], **options)
     assert lab["lab"].list_runs("user:alice", lab["project"]) == []
 
+
+# ------------------------------------------------------------- worker heartbeat
+def test_a_registered_worker_reads_as_live_and_a_stopped_one_does_not(lab):
+    """A lease cannot tell an idle worker from a dead one; the heartbeat can."""
+    lab["lab"].register_worker("w1")
+    live = lab["lab"].live_workers(max_age_seconds=60)
+    assert [w["worker_id"] for w in live] == ["w1"]
+    assert live[0]["kind"] == "worker"
+    # A heartbeat with an error still keeps the worker live, with the reason.
+    lab["lab"].heartbeat("w1", error="run X failed")
+    live = lab["lab"].live_workers(max_age_seconds=60)
+    assert live[0]["last_error"] == "run X failed"
+    # A graceful stop is no longer live.
+    lab["lab"].stop_worker("w1")
+    assert lab["lab"].live_workers(max_age_seconds=60) == []
+
+
+def test_an_old_heartbeat_is_not_live(lab):
+    lab["lab"].register_worker("w1")
+    with lab["store"]._tx() as cur:
+        cur.execute("UPDATE nexus_lab_workers SET heartbeat_at=now() - interval '10 minutes' "
+                    "WHERE worker_id='w1'")
+    assert lab["lab"].live_workers(max_age_seconds=60) == []
+
+
+def test_registering_the_same_worker_twice_is_an_upsert(lab):
+    lab["lab"].register_worker("w1", kind="worker")
+    lab["lab"].register_worker("w1", kind="inline")
+    live = lab["lab"].live_workers(max_age_seconds=60)
+    assert len(live) == 1 and live[0]["kind"] == "inline"
+
+
+def test_register_worker_rejects_an_unknown_kind(lab):
+    with pytest.raises(ValueError):
+        lab["lab"].register_worker("w1", kind="bogus")
+

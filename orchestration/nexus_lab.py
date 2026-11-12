@@ -30,7 +30,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .cloud_client import CloudError, CloudNotFound, CloudRateLimited, DeliveryError
+from .cloud_client import (
+    CloudAuthError,
+    CloudError,
+    CloudNotFound,
+    CloudRateLimited,
+    CloudUnavailable,
+    DeliveryError,
+)
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
 from .nexus_binding import AuthorizationError, authorize_run_task
@@ -38,6 +45,7 @@ from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
 from .nexus_spec_delivery import Delivery, prepare, prepare_request
 from .nexus_specs import SpecService
+from .openhands_router import AccountRouter, NoUsableAccount
 
 log = logging.getLogger("nexus_lab")
 
@@ -77,14 +85,19 @@ class Dispatched(str):
     """A conversation id that also says how the task was handed to the agent.
 
     A plain ``str`` everywhere a conversation id is expected; ``delivery`` is
-    the evidence the scheduler records on the task (see ``mark_running``).
+    the evidence the scheduler records on the task (see ``mark_running``), and
+    ``account_id`` is the OpenHands account that ran it (``None`` for an
+    executor that is not account-aware).
     """
 
     delivery: dict[str, Any] | None = None
+    account_id: str | None = None
 
-    def __new__(cls, conversation_id: str, delivery: dict[str, Any] | None = None):
+    def __new__(cls, conversation_id: str, delivery: dict[str, Any] | None = None,
+                account_id: str | None = None):
         self = super().__new__(cls, conversation_id)
         self.delivery = delivery
+        self.account_id = account_id
         return self
 
 
@@ -93,6 +106,35 @@ class Executor(Protocol):
 
     def dispatch(self, task: dict) -> str: ...
     def poll(self, task: dict, conversation_id: str) -> TaskReport: ...
+
+
+class DispatchError(CloudError):
+    """A dispatch failed, and the account that failed is known.
+
+    The scheduler uses ``account_id`` to exclude that account on the next
+    attempt (failover). It carries the underlying ``CloudError`` message.
+    """
+
+    def __init__(self, message: str, *, account_id: str | None, unavailable: bool,
+                 permanent: bool = False, refused: CloudRateLimited | None = None):
+        super().__init__(message)
+        self.account_id = account_id
+        self.unavailable = unavailable
+        #: Another attempt would fail the same way (see ``DeliveryError``).
+        self.permanent = permanent
+        #: The 429, when that is what this was: the account answered and would
+        #: not take the start. Not a failure of the account or of the task.
+        self.refused = refused
+
+
+def _last_account(task: dict) -> str:
+    """The account *task* was last on: the one it ran on, else the last one
+    that failed or refused it. Empty when it has not been anywhere yet."""
+    bound = task.get("openhands_account_id")
+    if bound:
+        return str(bound)
+    tried = task.get("tried_accounts") or []
+    return str(tried[-1]) if tried else ""
 
 
 class Verifier(Protocol):
@@ -126,11 +168,18 @@ class OpenHandsExecutor:
     """
 
     def __init__(self, client: Any, *, poll_interval: float = 2.0,
-                 start_poll_attempts: int = 150, specs: SpecService | None = None):
+                 start_poll_attempts: int = 150, specs: SpecService | None = None,
+                 router: Any | None = None, client_factory: Any | None = None):
         self.client = client
         self.poll_interval = poll_interval
         self.start_poll_attempts = start_poll_attempts
         self.specs = specs
+        #: When set, the executor is account-aware: it asks the router which
+        #: OpenHands account runs each task and dispatches through a client for
+        #: that account (``client_factory`` builds one from its config). Without
+        #: it, the process-wide ``client`` is used, exactly as before.
+        self.router = router
+        self._client_factory = client_factory
 
     @staticmethod
     def instructions(task: dict, original: str = "") -> str:
@@ -186,9 +235,11 @@ class OpenHandsExecutor:
             "nothing had to change, name the current head. If the push is refused, say "
             "so and quote the error.\n")
 
-    def delivery(self, task: dict) -> Delivery | None:
+    def delivery(self, task: dict, client: Any | None = None) -> Delivery | None:
         """How *task*'s original text reaches the agent, or ``None`` when there
-        is none to give."""
+        is none to give. *client* is the one the task is dispatched through:
+        whether a file can be placed depends on its transport, and with an
+        account pool that is the account's, not the process's."""
         if not (task.get("spec_ref") or {}).get("spec_id"):
             # A run planned before specifications existed: its goal holds the
             # request, and the agent is given that.
@@ -198,16 +249,72 @@ class OpenHandsExecutor:
                 "the task was planned from a specification, and this executor was built "
                 "without access to specifications; the agent would not get the task",
                 permanent=True)
-        return prepare(self.specs, task,
-                       files=bool(getattr(self.client, "supports_files", False)))
+        return prepare(self.specs, task, files=bool(getattr(
+            client if client is not None else self.client, "supports_files", False)))
+
+    def _dispatch_client(self, task: dict) -> tuple[Any, str | None]:
+        """The client to dispatch *task* through, and the account id it belongs to.
+
+        Without a router this is the process-wide client and ``None`` (the
+        pre-existing behaviour). With a router the account is chosen by the pool
+        policy, and a failure to choose raises so the caller can decide.
+        """
+        if self.router is None:
+            return self.client, None
+        account = self.router.select_for_task(task)
+        return self._client_for_account(str(account["id"]), task), str(account["id"])
+
+    def _client_for_account(self, account_id: str, task: dict | None = None) -> Any:
+        if self._client_factory is None:
+            # No factory: only the default account can be served by the
+            # process-wide client, which is what a single-account deployment has.
+            return self.client
+        return self._client_factory(account_id, task)
+
+    def _client_for_task(self, task: dict) -> Any:
+        """The client bound to the account a running task was dispatched to.
+
+        A poll must talk to the *same* account that started the conversation: a
+        different account is a different sandbox and cannot read that
+        conversation. Without a router or a bound account, the process client.
+        """
+        account_id = task.get("openhands_account_id")
+        if self.router is None or not account_id:
+            return self.client
+        return self._client_for_account(str(account_id), task)
 
     def dispatch(self, task: dict) -> str:
-        delivery = self.delivery(task)
+        client, account_id = self._dispatch_client(task)
+        try:
+            return self._dispatch_with(client, account_id, task)
+        except DispatchError:
+            raise
+        except CloudError as e:
+            if account_id is None:
+                # No pool, no account to hold the failure against: the error
+                # goes up as it is, and its kind decides what happens next (a
+                # refusal waits, a permanent failure is not tried again).
+                raise
+            # Attach the account that failed so the scheduler can exclude it.
+            # A refusal (429) is an account at work saying "not now": it is
+            # passed on as what it is, and the account is not marked as down.
+            refused = e if isinstance(e, CloudRateLimited) else None
+            raise DispatchError(
+                f"{type(e).__name__}: {e}", account_id=account_id,
+                unavailable=(refused is None
+                             and isinstance(e, (CloudAuthError, CloudUnavailable))),
+                permanent=bool(getattr(e, "permanent", False)), refused=refused) from e
+
+    def _dispatch_with(self, client: Any, account_id: str | None, task: dict) -> str:
+        delivery = self.delivery(task, client)
+        # A hand-off (the task was already tried on another account) continues
+        # rather than restarts: the new executor is told what is done.
+        initial = self._initial_message(task, delivery, account_id)
         extra: dict[str, Any] = {}
         if delivery is not None and delivery.files:
             extra["files"] = delivery.files
-        start = self.client.start_conversation(
-            initial_message=self.instructions(task, delivery.block if delivery else ""),
+        start = client.start_conversation(
+            initial_message=initial,
             selected_repository=task.get("repository") or None,
             selected_branch=task.get("branch") or None,
             title=f"lab:{task['task_key']}",
@@ -232,26 +339,49 @@ class OpenHandsExecutor:
         # start-task API (e.g. a local agent-server), fall back to its id.
         conv_id = getattr(start, "app_conversation_id", None)
         if conv_id:
-            return Dispatched(conv_id, proof)
-        if hasattr(self.client, "get_start_task") and getattr(start, "id", None):
+            return Dispatched(conv_id, proof, account_id)
+        if hasattr(client, "get_start_task") and getattr(start, "id", None):
             current = start
             for _ in range(self.start_poll_attempts):
                 conv_id = getattr(current, "app_conversation_id", None)
                 if conv_id:
-                    return Dispatched(conv_id, proof)
+                    return Dispatched(conv_id, proof, account_id)
                 if getattr(current, "failed", False):
                     raise CloudError(f"start task failed: {getattr(current, 'detail', '')}")
                 time.sleep(self.poll_interval)
-                nxt = self.client.get_start_task(current.id)
+                nxt = client.get_start_task(current.id)
                 if nxt is None:
                     raise CloudError("start task disappeared")
                 current = nxt
             raise CloudError("start task not READY within the poll budget")
-        return Dispatched(getattr(start, "id", ""), proof)
+        return Dispatched(getattr(start, "id", ""), proof, account_id)
+
+    def _initial_message(self, task: dict, delivery: Delivery | None,
+                         account_id: str | None = None) -> str:
+        """The first message: the task's instructions, or a hand-off continuation.
+
+        A start on a different account from the one the task was last on is a
+        continuation: the new executor is told what is done instead of starting
+        over. A start on the same account - another attempt after a result that
+        did not verify - is an ordinary start with the task's instructions;
+        nothing was handed over, and "the previous account is no longer
+        available" would not be true.
+        """
+        previous = _last_account(task)
+        if self.router is not None and previous and previous != str(account_id or ""):
+            context = self.router.handoff_context(task)
+            # The continuation is held to the same rule as a first start: the
+            # work counts when it is on the task's branch on GitHub.
+            base = self.router.handoff_message(context) + "\n" + self._hand_in(task).rstrip("\n")
+            if delivery is not None:
+                return f"{base}\n\n{delivery.block}"
+            return base
+        return self.instructions(task, delivery.block if delivery else "")
 
     def poll(self, task: dict, conversation_id: str) -> TaskReport:
+        client = self._client_for_task(task)
         try:
-            conv = self.client.get_conversation(conversation_id)
+            conv = client.get_conversation(conversation_id)
         except CloudNotFound:
             return TaskReport(state="missing", conversation_id=conversation_id,
                               detail="conversation not found")
@@ -269,7 +399,7 @@ class OpenHandsExecutor:
                               detail=status)
         if status == "finished":
             try:
-                text = self.client.final_response(conversation_id) or ""
+                text = client.final_response(conversation_id) or ""
             except CloudError:
                 text = ""
             return TaskReport(state="finished", final_text=text,
@@ -462,7 +592,7 @@ class LabScheduler:
 
     def __init__(self, store: LabStore, executor: Executor, verifier: Verifier, *,
                  principal: str = "machine:default", worker_id: str = "lab",
-                 lease_seconds: int = 900,
+                 lease_seconds: int = 900, router: AccountRouter | None = None,
                  start_wait: Callable[[CloudRateLimited], float] | None = None):
         self.store = store
         self.executor = executor
@@ -472,6 +602,58 @@ class LabScheduler:
         self.lease_seconds = lease_seconds
         #: How long a task waits after the service refused to start it.
         self.start_wait = start_wait or refused_start_wait
+        #: When set, a dispatch failure is attributed to the account the task
+        #: was bound to, so a failover excludes it on the next attempt.
+        self.router = router
+
+    @staticmethod
+    def _failed_account(error: Exception, task: dict) -> str | None:
+        """Which account a dispatch failure belongs to, if it can be told.
+
+        A ``DispatchError`` names the account it tried. Otherwise the account the
+        task was already bound to is used; a failure with no account bound is the
+        process-wide client, which has no pool identity to exclude.
+        """
+        named = getattr(error, "account_id", None)
+        if named:
+            return str(named)
+        account_id = task.get("openhands_account_id")
+        return str(account_id) if account_id else None
+
+    def _start_refused(self, task: dict, error: Exception, refused: CloudRateLimited) -> None:
+        """The service is working and will not take this start now (429).
+
+        Nothing was started, so nothing is spent: the task goes back with the
+        attempt it had, and the run with its iteration. Without an account pool
+        the task waits and is claimed again. With one, the account that refused
+        is set aside for this task and another takes it at once; when there is
+        no other left, the task waits and is then offered to the whole pool
+        again. The account is not written off in either case - it answered - so
+        other work still goes to it.
+        """
+        why = f"{type(refused).__name__}: {refused}"
+        account = self._failed_account(error, task) if self.router is not None else None
+        elsewhere = False
+        if account:
+            self.router.pool.record_failure(self.router.principal_for_task(task), account,
+                                            why, unavailable=False)
+            try:
+                self.router.select_for_task(
+                    {**task, "tried_accounts": [*(task.get("tried_accounts") or []), account]})
+                elsewhere = True
+            except NoUsableAccount:
+                pass
+        if elsewhere:
+            self.store.postpone_task(
+                task["id"], seconds=0.0, failed_account_id=account,
+                error=("OpenHands did not take the start on this account; another account "
+                       f"takes the task (this is not counted as an attempt). {why}"))
+            return
+        wait = self.start_wait(refused)
+        self.store.postpone_task(
+            task["id"], seconds=wait, forget_tried=account is not None,
+            error=(f"OpenHands did not take the start; trying again in {_span(wait)} "
+                   f"(this is not counted as an attempt). {why}"))
 
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
@@ -505,6 +687,21 @@ class LabScheduler:
                     "failed",
                     f"timed out after {task['timeout_seconds']} s; the conversation was left running",
                     {"state": "running", "conversation_id": conv})
+            elif report.state == "missing" and self.router is not None \
+                    and task.get("openhands_account_id"):
+                # The account that ran this conversation can no longer see it:
+                # the executor is gone. Mark the account failed so the next
+                # attempt fails over to a different one, and put the task back.
+                account_id = str(task["openhands_account_id"])
+                self.router.note_failure(task, account_id=account_id,
+                                         error="conversation missing: executor gone",
+                                         unavailable=True)
+                self.store.requeue_for_failover(
+                    task["id"], failed_account_id=account_id,
+                    error="conversation missing; executor may be gone",
+                    requeue=task["attempt"] < task["max_attempts"])
+                result.note = "executor gone: task requeued for failover"
+                continue
             else:
                 verdict = self.verifier.verify(task, report)
             self.store.record_verification(
@@ -544,31 +741,63 @@ class LabScheduler:
                 return result
             try:
                 conversation_id = self.executor.dispatch(task)
-            except CloudRateLimited as e:
-                # The service is working and will not take this now. Nothing
-                # was started, so nothing is spent: the task waits and is
-                # claimed again, with the attempt it had.
-                wait = self.start_wait(e)
-                self.store.postpone_task(
-                    task["id"], seconds=wait,
-                    error=(f"OpenHands did not take the start; trying again in "
-                           f"{_span(wait)} (this is not counted as an attempt). "
-                           f"{type(e).__name__}: {e}"))
-                result.note = "start refused: rate limited"
+            except NoUsableAccount as e:
+                # The pool has nothing left for this task (every account tried
+                # or unusable). That is not a transient transport error: retrying
+                # cannot succeed, so the task is dead-lettered with the reason.
+                self.store.record_verification(
+                    task["id"], verdict="blocked", evidence={"reason": str(e)},
+                    detail={"verdict": "blocked", "reason": str(e)})
+                applied = self.store.set_run_state_internal(
+                    run_id, "blocked",
+                    last_error=f"task {task['task_key']}: no usable OpenHands account")
+                result.finished = applied is not None
+                result.note = "blocked: no usable account"
                 return result
             except (CloudError, GitHubError) as e:
-                # A dispatch failure is a provider/transport problem: release the
-                # task so another attempt (or worker) can try, and keep the lease
-                # short so recovery is fast. A failure that another attempt
-                # would only repeat ends the task now, with its reason.
+                refused = e if isinstance(e, CloudRateLimited) else getattr(e, "refused", None)
+                if refused is not None:
+                    self._start_refused(task, e, refused)
+                    result.note = "start refused: rate limited"
+                    return result
+                # A dispatch failure is a provider/transport problem: record the
+                # account that failed (so a failover excludes it), release the
+                # task so another attempt - or another account - can try, and
+                # keep the lease short so recovery is fast. A failure that
+                # another attempt would only repeat ends the task now, with its
+                # reason.
+                failed_account = self._failed_account(e, task)
+                unavailable = getattr(e, "unavailable", isinstance(e, CloudAuthError))
                 again = (task["attempt"] < task["max_attempts"]
                          and not getattr(e, "permanent", False))
                 self.store.release_task(task["id"], error=f"{type(e).__name__}: {e}",
-                                        requeue=again)
+                                        requeue=again, failed_account_id=failed_account)
+                if failed_account and self.router is not None:
+                    self.router.note_failure(
+                        task, account_id=failed_account,
+                        error=f"{type(e).__name__}: {e}",
+                        unavailable=unavailable)
                 result.note = f"dispatch failed: {type(e).__name__}"
                 return result
+            account_id = getattr(conversation_id, "account_id", None)
+            if account_id is None and task.get("openhands_account_id"):
+                account_id = str(task["openhands_account_id"])
+            # A switch between accounts is recorded as a hand-off, with the
+            # context that was passed, so the history of an executor change is
+            # durable and auditable. The "from" account is whatever this task
+            # was previously bound to or had tried.
+            previous = _last_account(task)
+            if (account_id and previous and previous != str(account_id)
+                    and self.router is not None):
+                context = self.router.handoff_context(task)
+                self.store.record_handoff(
+                    run_id=run_id, task_id=task["id"],
+                    from_account_id=previous,
+                    to_account_id=str(account_id),
+                    reason="previous account failed", context=context)
             self.store.mark_running(task["id"], conversation_id=conversation_id or None,
-                                    delivery=getattr(conversation_id, "delivery", None))
+                                    delivery=getattr(conversation_id, "delivery", None),
+                                    account_id=account_id)
             result.dispatched = True
 
         # 3. Decide the run's fate.

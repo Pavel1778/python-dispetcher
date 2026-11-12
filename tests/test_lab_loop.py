@@ -1026,7 +1026,7 @@ def test_the_migration_lifts_the_limit_of_tasks_that_are_still_to_run(env):
               "updated_at = now() - interval '40 minutes' WHERE task_key='working'")
     before = _tasks(env, run)["working"]["updated_at"]
 
-    _sql(env, open(os.path.join(_MIG, "0022_task_time_limit.sql")).read())
+    _sql(env, open(os.path.join(_MIG, "0025_task_time_limit.sql")).read())
 
     tasks = _tasks(env, run)
     # "timed-out" already failed on the old limit; resumed, it gets the new one.

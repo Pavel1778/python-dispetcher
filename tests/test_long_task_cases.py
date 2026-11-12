@@ -276,6 +276,75 @@ def test_a_resend_while_the_plan_is_being_built_does_not_plan_twice(lab):
                                      "user", "existing"]
 
 
+def _gone():
+    from orchestration.cloud_store import StoreUnavailable
+
+    raise StoreUnavailable("this process has been stopped")
+
+
+def test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on(lab):
+    """The service stops with the plan half built - a deploy, a crash, a free
+    instance put to sleep - while the model is thinking about the third part.
+    What was planned is in PostgreSQL and nowhere else. The next process plans
+    the third part again (the answer to the first request never arrived), then
+    the rest: no part that had a plan is planned twice, and one run comes out."""
+    studio = lab.studio
+    reached, release = threading.Event(), threading.Event()
+
+    def hold(number, _prompt):
+        if number == 3:                                # the third part, asked by the first process
+            reached.set()
+            release.wait(60)
+
+    lab.model.before = hold
+    lab.model.pieces_per_task = 400                    # one task per part
+    # The claim of a planner that is gone is free again after seconds, not 90.
+    studio.app.spec_planner.lease_seconds = 3
+    text = specification(STAGED_CHARS)
+    try:
+        status, first = lab.send(text)
+        assert status == 200, first
+        assert kinds(first["messages"]) == ["user", "planning"]
+        spec_id = spec_of(first)
+        assert reached.wait(15), "planning never reached the third part"
+        assert [stage["state"] for stage in lab.stages(spec_id)] == [
+            "planned", "planned", "planning", "pending", "pending"]
+
+        # A real stop ends the process and its planning thread with it. Here
+        # the "process" is threads of this one and that thread is still inside
+        # its request, so its database is taken away: once the server has
+        # stopped, nothing more is written on its behalf.
+        studio.app.store._reconnect = _gone
+        studio.server.stop()                           # with the third request still open
+        app = studio.boot()
+        app.spec_planner.retry_delay = lambda attempts: 0
+        assert lab.runs() == [] and len(lab.goals()) == 1
+        run_id = lab.wait_run()
+    finally:
+        release.set()
+
+    # Asked once per part, and once more for the part whose answer was lost.
+    assert lab.model.asked == [PARTS[0], PARTS[1], PARTS[2], PARTS[2], PARTS[3], PARTS[4]]
+    stages = lab.stages(spec_id)
+    assert [stage["state"] for stage in stages] == ["planned"] * len(PARTS)
+    assert [stage["attempts"] for stage in stages] == [1, 1, 2, 1, 1]
+    assert lab.spec(spec_id)["state"] == "planned"
+
+    # The plan is the two parts the first process kept and the three the second
+    # one made: the third part's tasks are the answer to request 4, not 3.
+    tasks = lab.run(run_id)["tasks"]
+    assert [task["task_key"] for task in tasks] == [f"p00{n}-t1" for n in range(1, 6)]
+    assert [tuple(task["spec_ref"]["lines"]) for task in tasks] == PARTS
+    assert [task["title"].rsplit("#", 1)[1] for task in tasks] == ["1", "2", "4", "5", "6"]
+    assert [run["id"] for run in lab.runs()] == [run_id] and len(lab.goals()) == 1
+    assert len(lab.announcements()) == 1
+    assert kinds(lab.messages()) == ["user", "planning", "tool", "started"]
+
+    # And the new process hands the text over as the first would have.
+    data, digest = text.encode("utf-8"), sha256(text)
+    assert agent_bytes(lab.agent("p001-t1", run_id), digest) == ("file", data)
+
+
 def test_after_the_run_has_ended_the_same_text_runs_again_from_the_same_plan(lab):
     text = specification(STAGED_CHARS)
     status, first = lab.send(text)

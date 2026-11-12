@@ -443,6 +443,13 @@ task at a time works on a branch: a second run on the same branch waits its
 turn task by task, and a push by anyone else while a task is at work can leave
 that task unverified.
 
+`render.yaml` also defines a worker service (`python-dispetcher-lab-worker`)
+alongside the web service. Whoever advances runs registers a heartbeat
+(`nexus_lab_workers`: kind `worker` for the separate process, `inline` for the
+web server's own loop), so `GET /api/openhands/diagnostics` can tell a live
+loop from a dead one — a lease alone cannot. See
+[docs/WORKER_SETUP.md](docs/WORKER_SETUP.md).
+
 Client packages (`packaging/`): a `.deb` (Debian/Linux), a signed `.apk`
 (Android) and a `.exe` (Windows). All three are thin clients that open the same
 backend URL and store no credential; build them with the scripts in

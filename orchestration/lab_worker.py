@@ -60,14 +60,22 @@ class LabWorker:
     def __init__(self, store: PostgresStore, *, worker_id: str, poll_interval: float = 5.0,
                  lease_seconds: int = 900, client: Any | None = None,
                  github: GitHubClient | None = None,
-                 github_accounts: GitHubAccountService | None = None):
+                 github_accounts: GitHubAccountService | None = None,
+                 heartbeat_seconds: int = 60, account_router: Any | None = None):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
         self.github = github if github is not None else GitHubClient()
+        # The account router: when present, each task is dispatched through the
+        # OpenHands account the pool policy selects, and a failed account is
+        # switched out for another with a context hand-off. Without it the
+        # process-wide client runs every task, as before.
+        self.account_router = account_router
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
-        self.executor = OpenHandsExecutor(self.client, specs=SpecService(store))
+        self.executor = OpenHandsExecutor(
+            self.client, specs=SpecService(store), router=account_router,
+            client_factory=self._client_for_account if account_router else None)
         # A branch is read with the GitHub account its project is bound to, as
         # the studio reads it; the server token only where no account is bound.
         self.verifier = GitVerifier(self.github, client_for=project_github(
@@ -75,11 +83,41 @@ class LabWorker:
         self.worker_id = worker_id
         self.poll_interval = poll_interval
         self.lease_seconds = lease_seconds
+        #: A worker whose heartbeat is older than this reads as dead in the
+        #: diagnostics; it is written on register and every tick.
+        self.heartbeat_seconds = heartbeat_seconds
         self._stop = threading.Event()
+
+    def _client_for_account(self, account_id: str, task: dict | None = None) -> Any:
+        """A client for one OpenHands account, built from its stored config.
+
+        The transport is per account, so an account can be ``direct`` while the
+        process default is ``app`` (or the reverse). The key is decrypted here
+        and used immediately; it is never logged. The principal comes from the
+        task's project, because accounts are stored per principal and the worker
+        is not the account's owner.
+        """
+        from .cloud_client import CloudClient
+        from .cloud_direct import build_direct_client
+        from .nexus_openhands_accounts import OpenHandsAccountService
+
+        service = OpenHandsAccountService(self.store)
+        principal = (self.account_router.principal_for_task(task)
+                     if self.account_router and task
+                     else (self.account_router.principal if self.account_router
+                           else "machine:default"))
+        cfg = service.account_config(principal, account_id)
+        key = service._decrypt(principal, account_id)
+        cloud = CloudClient(base_url=cfg["base_url"], api_key=key)
+        if cfg["transport"] == "app":
+            return cloud
+        return build_direct_client(self.store, cloud=cloud,
+                                   llm_model=cfg.get("default_model"))
 
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,
-                            worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                            worker_id=self.worker_id, lease_seconds=self.lease_seconds,
+                            router=self.account_router)
 
     def tick_once(self) -> dict[str, Any]:
         """One pass over every active run. Returns a small summary for logs."""
@@ -94,14 +132,22 @@ class LabWorker:
             except Exception as e:  # noqa: BLE001 - one bad run must not stop the loop
                 log.exception("run %s tick failed", run_id)
                 summary["errors"].append(f"{run_id}: {type(e).__name__}: {e}")
+        # The heartbeat is written even when nothing advanced, so an idle worker
+        # still reads as alive (a lease alone cannot tell idle from dead).
+        last_error = summary["errors"][-1] if summary["errors"] else None
+        self.lab.heartbeat(self.worker_id, error=last_error)
         return summary
 
     def run_forever(self) -> None:
-        while not self._stop.is_set():
-            summary = self.tick_once()
-            if summary["advanced"] or summary["errors"]:
-                log.info("tick: %s", summary)
-            self._stop.wait(self.poll_interval)
+        self.lab.register_worker(self.worker_id, kind="worker")
+        try:
+            while not self._stop.is_set():
+                summary = self.tick_once()
+                if summary["advanced"] or summary["errors"]:
+                    log.info("tick: %s", summary)
+                self._stop.wait(self.poll_interval)
+        finally:
+            self.lab.stop_worker(self.worker_id)
 
     def stop(self) -> None:
         self._stop.set()
@@ -117,8 +163,15 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     store = PostgresStore()
+    # An account router when the deployment has stored OpenHands accounts, so
+    # the worker uses the pool; None (the pre-existing path) when it has none.
+    from .openhands_router import build_account_router
+    router = build_account_router(store, principal="machine:default")
     worker = LabWorker(store, worker_id=args.worker_id,
-                       poll_interval=args.poll_interval, lease_seconds=args.lease_seconds)
+                       poll_interval=args.poll_interval, lease_seconds=args.lease_seconds,
+                       account_router=router)
+    if router is not None:
+        log.info("OpenHands account pool is active")
 
     def _stop(signum, frame):  # graceful shutdown
         log.info("signal %s: stopping after the current pass", signum)
