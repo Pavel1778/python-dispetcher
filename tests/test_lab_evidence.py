@@ -212,12 +212,16 @@ def test_a_repeated_pass_appends_nothing(env, monkeypatch):
 # --------------------------------------------------------------- what stopped
 def test_a_blocked_run_is_not_decided_yet(env, monkeypatch):
     """A blocked run is not terminal: the task that stopped it is attested (the
-    EVIDENCE stage), but the run's ACCEPTANCE is not decided until it ends."""
+    EVIDENCE stage), but the run's ACCEPTANCE is not decided until it ends.
+
+    No retry cycles, so the cycle end is final and the run blocks for a person
+    (with cycles it would go to ``retrying`` first - the retry-cycle behaviour).
+    """
     _signer_env(monkeypatch)
     run = _run_with_tasks(env, [
         {"task_key": "a", "title": "A"},
         {"task_key": "b", "title": "B", "dependencies": ["a"]},
-    ])
+    ], max_retry_cycles=0)
     sched = _scheduler(env, FakeExecutor(),
                        FakeVerifier({"a": "completed_unverified"}))
     sched.run_until_done(run["id"])

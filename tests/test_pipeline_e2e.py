@@ -222,7 +222,12 @@ def test_a_text_answer_is_never_proof_of_work(monkeypatch):
     A conversation that finishes with a confident report but names no commit is
     ``completed_unverified``; its dependent task is never started and the run is
     blocked, not completed.
+
+    No retry cycles, so the cycle end is final and the run blocks (with cycles
+    the run would go to ``retrying`` and retry the task - the retry-cycle
+    behaviour, covered in ``test_lab_loop``).
     """
+    monkeypatch.setenv("NEXUS_MAX_RETRY_CYCLES", "0")
     with studio_stack(monkeypatch, lab_inline=True) as studio:
         project, run = _start_run(studio)
         first = _until(lambda: _conversation_for(studio, "audit"),
