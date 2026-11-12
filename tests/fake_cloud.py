@@ -25,6 +25,9 @@ class FakeCloud:
         # Stop signals: the sandboxes asked to pause, in order; sandboxes
         # that take the call and go on all the same; a status to refuse the
         # call with; and one to refuse a follow-up message with.
+        # A status to answer the account's settings with instead of the
+        # settings: 401 is a rejected key, 503 a service that is down.
+        self.settings_status = 0
         self.paused: list[str] = []
         self.pause_ignored: set[str] = set()
         self.pause_status = 0
@@ -211,6 +214,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"items": items, "next_page_id": None})
 
         if path == "/api/v1/settings":
+            if self.cloud.settings_status:
+                # The service is down (5xx) or the key is rejected (401).
+                return self._json(self.cloud.settings_status, {"detail": "refused"})
             return self._json(200, self.cloud.settings)
 
         if path == "/api/agent-profiles":
