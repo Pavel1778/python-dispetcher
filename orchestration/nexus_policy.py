@@ -72,6 +72,11 @@ MCP_TOOL_SCOPES: dict[str, str] = {
     "create_task": SCOPE_PROJECT_WRITE,
     "dispatch_task": SCOPE_TASK_DISPATCH,
     "get_execution_status": SCOPE_PROJECT_READ,
+    "list_runs": SCOPE_PROJECT_READ,
+    "get_run": SCOPE_PROJECT_READ,
+    "cancel_run": SCOPE_RUN_CONTROL,
+    "list_project_executors": SCOPE_PROJECT_READ,
+    "assign_project_executor": SCOPE_ACCOUNT_ADMIN,
 }
 
 
