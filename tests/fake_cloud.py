@@ -22,6 +22,8 @@ class FakeCloud:
     """Mutable state backing the fake server."""
 
     def __init__(self):
+        # The API version reported through /openapi.json (read-only discovery).
+        self.api_version = "1.50.1"
         self.start_tasks: dict[str, dict] = {}
         self.conversations: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}
@@ -159,6 +161,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/app-conversations/count":
             return self._json(200, {"count": len(self.cloud.conversations)})
+
+        if path == "/openapi.json":
+            # The live service serves this; the API version is read from it.
+            return self._json(200, {"openapi": "3.1.0",
+                                    "info": {"title": "OpenHands", "version": self.cloud.api_version}})
 
         if path == "/api/v1/app-conversations":
             ids = self._query("ids")

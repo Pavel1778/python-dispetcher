@@ -1746,6 +1746,9 @@ class Handler(BaseHTTPRequestHandler):
             if action == "rotate":
                 return self._json(200, {"account": self.app.openhands_accounts.rotate(
                     principal, account_id, api_key=body.get("api_key"))})
+            if action == "rename":
+                return self._json(200, {"account": self.app.openhands_accounts.rename(
+                    principal, account_id, label=body.get("label"))})
             if action == "revoke":
                 return self._json(200, {"account": self.app.openhands_accounts.revoke(
                     principal, account_id)})

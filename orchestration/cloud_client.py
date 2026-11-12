@@ -668,6 +668,24 @@ class CloudClient:
             return False
         return status == 200
 
+    def api_version(self) -> str | None:
+        """The API version the service reports, or ``None`` if it is not readable.
+
+        The live OpenAPI document (``/openapi.json``) carries ``info.version``;
+        this is read-only and returns nothing sensitive. A service that does not
+        serve it is not "incompatible" - the capability probe is what decides
+        usability - so an unreadable version is ``None``, never an error.
+        """
+        try:
+            status, payload = self._request("GET", "/openapi.json")
+        except CloudError:
+            return None
+        if status != 200 or not isinstance(payload, dict):
+            return None
+        info = payload.get("info")
+        version = info.get("version") if isinstance(info, dict) else None
+        return str(version) if version else None
+
     # -------------------------------------------------- account capabilities
     # These are read-only. They report what the account *has configured* and
     # what a conversation *has available*; neither is proof that a tool ran.

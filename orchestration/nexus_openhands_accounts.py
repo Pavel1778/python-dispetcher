@@ -67,24 +67,29 @@ class OpenHandsAccountService:
         except (CloudUnavailable, CloudError) as e:
             raise ValueError(f"OpenHands is unavailable: {e}") from e
         identity = str(capabilities.get("active_agent_profile_id") or "")
+        # Read-only discovery of the API version; a service that does not report
+        # one is still accepted (the capability probe is what decides usability).
+        # A minimal client (a test double) without the method reads as "unknown".
+        version = client.api_version() if hasattr(client, "api_version") else None
         ciphertext = _encrypt_secret(api_key)
         with self.store._tx() as cur:
             cur.execute(
                 "INSERT INTO nexus_openhands_accounts"
                 "(principal, label, base_url, transport, default_model, api_key_encrypted, "
-                " identity, capabilities, last_checked_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now()) "
+                " identity, capabilities, api_version, last_checked_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now()) "
                 "ON CONFLICT (principal, label) DO UPDATE SET "
                 "  base_url=EXCLUDED.base_url, transport=EXCLUDED.transport, "
                 "  default_model=EXCLUDED.default_model, "
                 "  api_key_encrypted=EXCLUDED.api_key_encrypted, "
                 "  identity=EXCLUDED.identity, capabilities=EXCLUDED.capabilities, "
+                "  api_version=EXCLUDED.api_version, "
                 "  state='active', last_error=NULL, last_checked_at=now(), updated_at=now() "
                 "RETURNING id, principal, label, base_url, transport, default_model, "
-                "  identity, state, is_default, capabilities, last_checked_at, "
+                "  identity, state, is_default, capabilities, api_version, last_checked_at, "
                 "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                 (principal, label, base_url, transport, default_model, ciphertext,
-                 identity, _json(capabilities)))
+                 identity, _json(capabilities), version))
             view = self._view(cur.fetchone())
             if make_default:
                 self._set_default(cur, principal, view["id"])
@@ -94,7 +99,7 @@ class OpenHandsAccountService:
     def list_accounts(self, principal: str) -> list[dict]:
         with self.store._tx() as cur:
             cur.execute("SELECT id, principal, label, base_url, transport, default_model, "
-                        "identity, state, is_default, capabilities, last_checked_at, "
+                        "identity, state, is_default, capabilities, api_version, last_checked_at, "
                         "last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at "
                         "FROM nexus_openhands_accounts WHERE principal=%s "
                         "ORDER BY is_default DESC, created_at DESC, id", (principal,))
@@ -124,7 +129,7 @@ class OpenHandsAccountService:
                 "last_checked_at=now(), updated_at=now() "
                 "WHERE id=%s AND principal=%s "
                 "RETURNING id, principal, label, base_url, transport, default_model, "
-                "  identity, state, is_default, capabilities, last_checked_at, "
+                "  identity, state, is_default, capabilities, api_version, last_checked_at, "
                 "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                 (ciphertext, _json(capabilities), account_id, principal))
             return self._view(cur.fetchone())
@@ -135,7 +140,7 @@ class OpenHandsAccountService:
                         "is_default=false, updated_at=now() "
                         "WHERE id=%s AND principal=%s "
                         "RETURNING id, principal, label, base_url, transport, default_model, "
-                        "  identity, state, is_default, capabilities, last_checked_at, "
+                        "  identity, state, is_default, capabilities, api_version, last_checked_at, "
                         "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                         (account_id, principal))
             row = cur.fetchone()
@@ -144,7 +149,13 @@ class OpenHandsAccountService:
             return self._view(row)
 
     def verify(self, principal: str, account_id: str) -> dict:
-        """Re-check an account against Cloud; mark it invalid if rejected."""
+        """Re-check an account against Cloud; mark it invalid if rejected.
+
+        The API version is read and stored alongside the capabilities, so the
+        operator can see which OpenHands an account talks to. A service that
+        does not report a version is not refused; the capability probe decides
+        usability.
+        """
         with self.store._tx() as cur:
             cur.execute("SELECT base_url FROM nexus_openhands_accounts "
                         "WHERE id=%s AND principal=%s", (account_id, principal))
@@ -152,9 +163,11 @@ class OpenHandsAccountService:
             if row is None:
                 raise NotFound("account not found")
         key = self._decrypt(principal, account_id)
-        state, error, capabilities = "active", None, None
+        state, error, capabilities, version = "active", None, None, None
+        client = self._client(row["base_url"], key)
         try:
-            capabilities = self._client(row["base_url"], key).account_capabilities()
+            capabilities = client.account_capabilities()
+            version = client.api_version()
         except CloudAuthError as e:
             state, error = "invalid", str(e)
         except (CloudUnavailable, CloudError) as e:
@@ -162,20 +175,35 @@ class OpenHandsAccountService:
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_openhands_accounts SET state=%s, last_error=%s, "
-                "capabilities=COALESCE(%s, capabilities), last_checked_at=now(), "
-                "updated_at=now() WHERE id=%s AND principal=%s "
+                "capabilities=COALESCE(%s, capabilities), api_version=COALESCE(%s, api_version), "
+                "last_checked_at=now(), updated_at=now() WHERE id=%s AND principal=%s "
                 "RETURNING id, principal, label, base_url, transport, default_model, "
-                "  identity, state, is_default, capabilities, last_checked_at, "
+                "  identity, state, is_default, capabilities, api_version, last_checked_at, "
                 "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
                 (state, error, _json(capabilities) if capabilities else None,
-                 account_id, principal))
+                 version, account_id, principal))
             return self._view(cur.fetchone())
+
+    def rename(self, principal: str, account_id: str, *, label: str) -> dict:
+        """Rename an account. The key, URL and state are untouched."""
+        label = _text(label, "label", maximum=120)
+        with self.store._tx() as cur:
+            cur.execute("UPDATE nexus_openhands_accounts SET label=%s, updated_at=now() "
+                        "WHERE id=%s AND principal=%s "
+                        "RETURNING id, principal, label, base_url, transport, default_model, "
+                        "  identity, state, is_default, capabilities, api_version, last_checked_at, "
+                        "  last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at",
+                        (label, account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+            return self._view(row)
 
     def set_default(self, principal: str, account_id: str) -> dict:
         with self.store._tx() as cur:
             self._set_default(cur, principal, account_id)
             cur.execute("SELECT id, principal, label, base_url, transport, default_model, "
-                        "identity, state, is_default, capabilities, last_checked_at, "
+                        "identity, state, is_default, capabilities, api_version, last_checked_at, "
                         "last_error, created_at, updated_at, enabled, priority, health, active_tasks, last_error_at "
                         "FROM nexus_openhands_accounts WHERE id=%s", (account_id,))
             return self._view(cur.fetchone())

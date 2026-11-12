@@ -1626,14 +1626,16 @@
     var usable = account.state === 'active' && account.enabled !== false;
     var health = { healthy: 'работает', degraded: 'нестабилен', unavailable: 'недоступен' }[account.health] || 'не проверялся';
     var actions = account.state === 'revoked' ? ''
-      : '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="verify" data-id="' + id + '">Проверить</button>' +
+      : '<button class="btn btn-sm" type="button" data-action="openhands-rename" data-id="' + id + '" data-label="' + esc(account.label) + '">Переименовать</button>' +
+        '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="verify" data-id="' + id + '">Проверить</button>' +
         '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="' + (usable ? 'disable' : 'enable') + '" data-id="' + id + '">' +
         (usable ? 'Выключить' : 'Включить') + '</button>' +
         '<button class="btn btn-sm btn-danger" type="button" data-action="openhands-op" data-op="revoke" data-id="' + id + '">Отключить</button>';
     return '<div class="card"><div class="card-main"><b>' + esc(account.label) + '</b>' +
       '<small>' + esc(account.base_url || '') + ' · ' + esc(account.transport || '') +
       (account.default_model ? ' · ' + esc(account.default_model) : '') + '</small>' +
-      '<small>доступность: ' + esc(health) + (account.is_default ? ' · по умолчанию' : '') + '</small>' +
+      '<small>доступность: ' + esc(health) + (account.api_version ? ' · API ' + esc(account.api_version) : '') +
+      (account.is_default ? ' · по умолчанию' : '') + '</small>' +
       (account.last_error ? '<small class="is-bad">' + esc(account.last_error) + '</small>' : '') + '</div>' +
       pill(account.state === 'active' ? (account.enabled === false ? 'invalid' : 'active') : account.state) +
       '<div class="card-actions">' + actions + '</div></div>';
@@ -2075,6 +2077,20 @@
       if (op === 'revoke') {
         confirmDialog('Отключить OpenHands?', 'Ключ перестанет использоваться. Проекты, назначившие это подключение, потеряют исполнителя.', 'Отключить', function () { run(null); }, true);
       } else run(el);
+    },
+    'openhands-rename': function (el) {
+      var id = el.getAttribute('data-id'), label = el.getAttribute('data-label');
+      formDialog({
+        title: 'Переименовать подключение', ok: 'Сохранить', max: 120, value: label,
+        submit: function (name) {
+          return api('/api/openhands/accounts/' + enc(id) + '/rename',
+                     { method: 'POST', body: { label: name } }).then(function () {
+            closeDialog();
+            toast('Подключение переименовано.');
+            return loadOpenhandsAccounts().then(refreshSettings);
+          });
+        }
+      });
     },
     'refresh-context': function (el) {
       setBusy(el, true);
