@@ -868,6 +868,91 @@ class SpecPlanner:
                               f"{reason}", announce=True)
         return "failed"
 
+    # ------------------------------------------------- fallback decomposition
+    def _fallback_plan(self, spec: dict) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """A minimal executable DAG from the specification's own index, or ``None``.
+
+        Used only when the model left the plan empty. It groups the
+        specification's addressable pieces by section and makes one task per
+        section that holds at least one *normative* piece (an obligation). The
+        tasks run in document order - each waits for the one before it - so a
+        specification is carried out in the order it was written.
+
+        It never fabricates work: a section whose every piece is background
+        contributes no task. When no section has an obligation, the result is
+        ``None`` and the caller keeps the honest "nothing to plan" failure.
+
+        Each task carries the ``spec_ref`` the delivery path needs, so the agent
+        is given the original text (whole or by part) exactly as a planned task
+        would be. The plan is not the model's; it is the application's, and it
+        is recorded as such (``coverage["fallback"]``).
+        """
+        spec_id = str(spec["id"])
+        pieces = self.specs.requirements_internal(spec_id)
+        if not pieces:
+            return None
+        sections = {s["ordinal"]: s for s in self.specs.sections_internal(spec_id)}
+
+        # One task per section that holds at least one *obligation* (a normative
+        # piece), in document order. A section that is only background gets no
+        # task: the recovery must not invent work to make the plan look non-empty
+        # (the requirement forbids fabricated tasks). When nothing in the text
+        # reads as an obligation, the result is ``None`` and the honest failure
+        # stands - with the reason, so the person can refine the request.
+        by_section: dict[int, list[dict]] = {}
+        for piece in pieces:
+            if piece.get("normative"):
+                by_section.setdefault(piece["section"], []).append(piece)
+        if not by_section:
+            return None
+
+        tasks: list[dict[str, Any]] = []
+        previous: str | None = None
+        for position, (section_ordinal, group) in enumerate(sorted(by_section.items()), 1):
+            section = sections.get(section_ordinal) or {}
+            title = f"{section.get('number') or ''} {section.get('title') or ''}".strip()
+            title = title or f"Раздел {position}"
+            first, last = group[0], group[-1]
+            keys = [p["key"] for p in group]
+            key = f"s{position:03d}"
+            tasks.append({
+                "id": key,
+                "title": (f"Выполнить требования: {title}")[:200],
+                "description": (
+                    "Выполни то, что требует этот раздел ТЗ. Пункты: "
+                    + ", ".join(keys[:40]) + (" и др." if len(keys) > 40 else "") + "."
+                )[:4000],
+                "acceptance": ["Требования раздела выполнены",
+                               "Изменения закоммичены, коммиты названы в отчёте"],
+                "dependencies": [previous] if previous else [],
+                "spec_ref": {
+                    "spec_id": spec_id, "sha256": spec["sha256"],
+                    "stage": 1, "stages": 1,
+                    "lines": [section.get("start_line", 1), section.get("end_line",
+                                                                      spec["line_count"])],
+                    "bytes": [section.get("start_char", 0), section.get("end_char",
+                                                                       spec["byte_count"])],
+                    "sections": [section.get("key")] if section.get("key") else [],
+                    "requirements": [first["key"]] if first["key"] == last["key"]
+                    else [f"{first['key']}..{last['key']}"],
+                    "fallback": True,
+                },
+            })
+            previous = key
+
+        coverage = {
+            "stages": 1, "pieces": len(pieces),
+            "in_tasks": sum(len(g) for g in by_section.values()),
+            "declared_context": 0, "in_verification_tasks": 0,
+            "implicit_context": len(pieces) - sum(len(g) for g in by_section.values()),
+            "tasks": len(tasks), "fallback": True,
+        }
+        try:
+            _check_graph(tasks)
+        except PlanningFailed:
+            return None
+        return tasks, coverage
+
     # ------------------------------------------------------------- the run
     def _finish(self, spec_id: str, *, announce: bool, reuse: bool = False,
                 inline: tuple[int, str, dict, str] | None = None,
@@ -896,10 +981,21 @@ class SpecPlanner:
         try:
             tasks, coverage = merge(spec, stages)
         except PlanningFailed as e:
-            if inline is not None:
-                self.specs.stage_failed(spec_id, inline[0], inline[1], error=str(e))
-            self._failed(spec_id, str(e), announce=announce, discard=True, while_in=states)
-            raise
+            # The model's answers left the plan empty. Before giving up, build a
+            # minimal plan from the specification's own index - one task per
+            # section that holds obligations - so a real brief is not refused
+            # just because a model answered with nothing. This is the recovery
+            # the requirement asks for; it never fabricates work (a section with
+            # no obligation contributes no task), and if even that finds nothing
+            # the honest failure below is kept.
+            fallback = self._fallback_plan(spec)
+            if fallback is None:
+                if inline is not None:
+                    self.specs.stage_failed(spec_id, inline[0], inline[1], error=str(e))
+                self._failed(spec_id, str(e), announce=announce, discard=True, while_in=states)
+                raise
+            tasks, coverage = fallback
+            coverage["fallback"] = True
         options = spec.get("plan_options") or {}
         principal = options.get("principal") or spec["created_by"]
         repository, branch = options.get("repository") or "", options.get("branch") or ""
