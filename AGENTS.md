@@ -1481,3 +1481,14 @@ the worker agree on configuration and share one PostgreSQL.
   Render define a worker service on the same database, and `docs/WORKER_SETUP.md`
   documents every mechanism. Keep the three launch paths pointing at the same
   module.
+- **`--once` registers too (this session).** The cron-style single pass
+  (`main()` with `--once`) called `tick_once()` directly and left no worker row,
+  so a deployment that advances runs by cron read as "active run(s) exist but no
+  worker heartbeat is fresh" to `GET /api/openhands/diagnostics`. It now goes
+  through `LabWorker.run_once()`: register (`kind=worker`), one pass (which
+  writes the heartbeat), then mark the row `stopped` on the way out - the same
+  trace a long-lived worker leaves, minus liveness a single pass cannot have. A
+  pass whose registration fails still ticks. `run_forever` marks the row stopped
+  through the same `_stop_worker_best_effort`. Tests:
+  `tests/test_planner_worker.py::test_run_once_registers_and_heartbeats_like_a_long_lived_worker`
+  and `::test_run_once_still_ticks_when_it_cannot_register`.

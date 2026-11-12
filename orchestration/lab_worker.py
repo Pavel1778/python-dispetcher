@@ -161,11 +161,34 @@ class LabWorker:
                     log.info("tick: %s", summary)
                 self._stop.wait(self.poll_interval)
         finally:
-            try:
-                self.lab.stop_worker(self.worker_id)
-            except Exception:  # noqa: BLE001 - the process is stopping; best effort
-                log.debug("could not record that worker %s stopped", self.worker_id,
-                          exc_info=True)
+            self._stop_worker_best_effort()
+
+    def run_once(self) -> dict[str, Any]:
+        """One pass, registered so the pass is visible to the diagnostics.
+
+        ``--once`` is the cron-style deployment (and the health check): it must
+        leave the same trace a long-lived worker does - a worker row and a
+        heartbeat - or the run list would look unserviced to
+        ``GET /api/openhands/diagnostics`` while the cron is in fact advancing
+        it. A single pass cannot stay "live", so the row is marked stopped as it
+        leaves; the heartbeat it wrote is what a caller inspects immediately.
+        """
+        try:
+            self.lab.register_worker(self.worker_id, kind="worker")
+        except Exception as e:  # noqa: BLE001 - a pass that cannot register still runs
+            log.warning("could not register worker %s: %s: %s",
+                        self.worker_id, type(e).__name__, e)
+        try:
+            return self.tick_once()
+        finally:
+            self._stop_worker_best_effort()
+
+    def _stop_worker_best_effort(self) -> None:
+        try:
+            self.lab.stop_worker(self.worker_id)
+        except Exception:  # noqa: BLE001 - the process is stopping; best effort
+            log.debug("could not record that worker %s stopped", self.worker_id,
+                      exc_info=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -200,7 +223,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.once:
-            log.info("tick: %s", worker.tick_once())
+            # A single pass still registers and heartbeats, so a cron-style
+            # deployment is visible to the diagnostics exactly as a long-lived
+            # worker is; the row is marked stopped as the pass leaves.
+            log.info("lab worker %s: one pass", args.worker_id)
+            log.info("tick: %s", worker.run_once())
         else:
             log.info("lab worker %s starting", args.worker_id)
             worker.run_forever()

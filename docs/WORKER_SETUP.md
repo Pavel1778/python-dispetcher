@@ -28,6 +28,14 @@ restart is a non-event. It re-reads the active runs and continues.
 Run it beside the web server. More than one worker is fine — claims are leases
 (`SELECT ... FOR UPDATE SKIP LOCKED`), so extra workers only take more work.
 
+**`--once` registers too.** A single pass writes the same worker row and
+heartbeat a long-lived worker does (`register_worker`, kind `worker`; the row is
+marked `stopped` as the pass leaves), so a cron-style deployment is visible to
+`GET /api/openhands/diagnostics` instead of reading as "active run(s) exist but
+no worker heartbeat is fresh" while the cron is in fact advancing it. A pass
+whose registration fails still ticks: the run is advanced and only the
+visibility is lost.
+
 ## Worker heartbeat
 
 The worker registers itself and writes a heartbeat every tick
