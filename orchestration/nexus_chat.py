@@ -34,12 +34,6 @@ from .providers import (
 
 _MODES = ("ask", "analysis", "code", "plan", "autonomous")
 
-#: The modes the *responder* can produce for a turn. ``analysis`` is not a
-#: stored conversation mode (the DB constraint keeps ``ask``/``code``/``plan``/
-#: ``autonomous``); it is what the intent router asks for when a turn is a
-#: request to explain a failure without changing code.
-_RESPOND_MODES = ("ask", "analysis", "code", "plan", "autonomous")
-
 #: Characters of earlier messages a prompt carries, newest first. History is
 #: background: it is shortened to fit, so that one long message does not make
 #: every later question in the conversation too large to ask. The request

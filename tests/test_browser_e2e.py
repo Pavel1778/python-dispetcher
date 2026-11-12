@@ -954,7 +954,9 @@ def test_a_plain_question_is_answered_and_starts_no_run(stack, chromium):
     try:
         _login(page, stack.base)
         _connect_repository(page)
-        expect(page.locator("#mode-label")).to_have_text("Чат")
+        # The default mode is "Авто": the router decides per message. A question
+        # is answered and starts nothing.
+        expect(page.locator("#mode-label")).to_have_text("Авто")
         _send(page, "Как устроен этот проект?")
         page.wait_for_selector(".msg.assistant .md")
         expect(page.locator(".msg.assistant .md")).to_contain_text("точки входа")

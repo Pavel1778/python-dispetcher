@@ -457,10 +457,6 @@ class App:
             dispatch_code=self._chat_dispatch_code,
             start_autonomous=self._chat_start_autonomous,
         )
-        # The intent router: a plain message in the default chat is answered,
-        # not turned into a run. It classifies only; the dispatch hooks above
-        # are what actually start work, and only when the person asked for it.
-        self.intent = IntentRouter(self.providers)
         # A task text of any size up to NEXUS_SPEC_MAX_CHARS: stored exactly as
         # it was sent, indexed, and planned in parts that fit the planning
         # model. A text that is one part is planned inside the request; a
@@ -2344,38 +2340,6 @@ class Handler(BaseHTTPRequestHandler):
             # Re-read so the joined repository/branch fields are present; set_mode
             # returns only the conversation row itself.
             conversation = self.app.conversations.get(principal, project_id, conversation_id)
-        # Intent routing. In the default chat mode a plain message is answered;
-        # work is started only when the person clearly asked for it. An explicit
-        # non-default mode ("Код", "План", "Автономно" in the composer) is
-        # honoured as it always was - it is an instruction, not a hint, so those
-        # modes are used directly and not re-routed. The router classifies only;
-        # the respond() call below is what acts on the result.
-        explicit = conversation["mode"]
-        if explicit == "code":
-            # "Код" is an explicit instruction to run, not re-classified.
-            routed = Intent("autonomous", "выбран режим «Код»", "rule", 1.0)
-            respond_mode = "code"
-        elif explicit == "plan":
-            routed = Intent("chat", "выбран режим «План»", "rule", 1.0)
-            respond_mode = "plan"
-        else:
-            # The default chat, and the explicit "Автономно" mode: the router
-            # decides. "Автономно" still routes so a "продолжи"/status turn is
-            # answered instead of starting a second run.
-            routed = self.app.intent.route(
-                text, conversation_mode=explicit,
-                has_active_run=self._has_active_run(principal, project_id))
-            # The router speaks of chat/analysis/autonomous; the responder speaks
-            # of ask/analysis/autonomous. "chat" is the plain conversational turn.
-            respond_mode = {"chat": "ask", "analysis": "analysis",
-                            "autonomous": "autonomous"}[routed.mode]
-        # "analysis" is a responder-only mode: the stored conversation mode stays
-        # one the DB constraint allows. Only a routed autonomous turn switches the
-        # conversation to autonomous, so the composer reflects what is happening.
-        stored_mode = "autonomous" if respond_mode == "autonomous" else conversation["mode"]
-        if stored_mode != conversation["mode"]:
-            self.app.conversations.set_mode(principal, project_id, conversation_id, stored_mode)
-            conversation = self.app.conversations.get(principal, project_id, conversation_id)
         if not (conversation.get("title") or "").strip():
             # An untitled conversation is named after its first message, so the
             # history reads as what was asked. This only fills a blank; a title
@@ -2398,10 +2362,6 @@ class Handler(BaseHTTPRequestHandler):
                 # points at the whole text. Nothing downstream reads this copy.
                 shown = preview(sent)
                 user_meta["spec"]["preview"] = True
-        # A routed turn says what it is, so the reply is not a surprise: a
-        # question answered, an analysis with no code change, or work started.
-        if routed.mode in ("analysis",) or (routed.source == "default" and routed.clarifying):
-            user_meta = {**(user_meta or {}), "intent": routed.as_dict()}
         # Persist the user turn first: it must not be lost to an assistant failure.
         user_msg = self.app.conversations.add_message(
             principal, project_id, conversation_id, role="user", content=shown,
@@ -2437,19 +2397,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"messages": appended + [ask]})
             return
         self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
-        # A continuation continues the run in flight: no new run is created. The
-        # reply names the run and how to watch it. Answered before a provider is
-        # asked, so "продолжи" works even with no model configured.
-        if routed.continuation and not routed.clarifying:
-            continued = self._continue_active_run(principal, project_id)
-            if continued is not None:
-                stored = self.app.conversations.add_message(
-                    principal, project_id, conversation_id, role="assistant",
-                    content=continued["content"], meta=continued["meta"])
-                appended.append(stored)
-                self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
-                self._json(200, {"messages": appended, "intent": routed.as_dict()})
-                return
         context = self.app.context.current(principal, project_id)
         memory = self.app.memory.retrieve(principal, project_id, limit=30)
         # What the project's runs really did, for an analysis turn. Read here so
@@ -2490,49 +2437,6 @@ class Handler(BaseHTTPRequestHandler):
                     principal, project_id, conversation_id, str(meta["run_id"]))
         self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
         self._json(200, {"messages": appended})
-
-    def _has_active_run(self, principal: str, project_id: str) -> bool:
-        """Whether the project has a run in flight (any goal).
-
-        Used by the intent router: "продолжи"/"повтори" continues such a run
-        instead of starting a new one, so a follow-up never duplicates work.
-        """
-        try:
-            runs = self.app.lab.list_runs(principal, project_id, limit=50)
-        except Exception:  # noqa: BLE001 - routing must not fail on a read
-            return False
-        live = {"running", "paused", "waiting_for_approval", "blocked", "retrying"}
-        return any(r["state"] in live for r in runs)
-
-    def _continue_active_run(self, principal: str, project_id: str) -> dict | None:
-        """The reply that continues the project's run in flight, or ``None``.
-
-        Continuing is durable and idempotent: for a run that is ``retrying`` or
-        ``blocked`` it makes the wait due and lets the scheduler pick it up; for
-        a run already ``running`` it just says so. No new run is created, and
-        the same command twice is one continuation.
-        """
-        try:
-            runs = self.app.lab.list_runs(principal, project_id, limit=50)
-        except Exception:  # noqa: BLE001 - a read failure is "no run to continue"
-            return None
-        live = {"running", "paused", "waiting_for_approval", "blocked", "retrying"}
-        run = next((r for r in runs if r["state"] in live), None)
-        if run is None:
-            return None
-        resumed = False
-        if run["state"] in ("retrying", "blocked"):
-            try:
-                self.app.lab.set_run_state(principal, project_id, run["id"], "running")
-                resumed = True
-            except Exception:  # noqa: BLE001 - the run keeps its state; say so
-                resumed = False
-        state = "продолжается" if run["state"] == "running" else (
-            "продолжен" if resumed else "ждёт действия")
-        return {"content": (f"Прогон `{str(run['id'])[:8]}` {state}. "
-                            "Новый прогон не создан. Ход работы — на вкладке «Агент»."),
-                "meta": {"mode": "autonomous", "run_id": str(run["id"]),
-                         "continuation": True, "resumed": resumed}}
 
     def _record_agent_session(self, principal: str, project_id: str,
                               conversation_id: str, meta: dict, msg: dict) -> None:
