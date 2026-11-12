@@ -158,7 +158,10 @@ class _Handler(BaseHTTPRequestHandler):
             if gh.page_size:
                 per_page = gh.page_size
             start = (page - 1) * per_page
-            self._json(200, gh.repos[start:start + per_page])
+            # A token is shown only what it has access to, as on GitHub.
+            authorization = self.headers.get("Authorization")
+            visible = [repo for repo in gh.repos if gh.sees(authorization, repo["full_name"])]
+            self._json(200, visible[start:start + per_page])
             return
 
         if parsed.path == "/user":

@@ -28,6 +28,9 @@ class FakeCloud:
         # A status to answer the account's settings with instead of the
         # settings: 401 is a rejected key, 503 a service that is down.
         self.settings_status = 0
+        # The key every request carried, in order: which key a service was
+        # shown is what says two connections are kept apart.
+        self.keys: list[str] = []
         self.paused: list[str] = []
         self.pause_ignored: set[str] = set()
         self.pause_status = 0
@@ -152,7 +155,11 @@ class _Handler(BaseHTTPRequestHandler):
         return self.server.cloud  # type: ignore[attr-defined]
 
     def _auth_ok(self) -> bool:
-        return self.headers.get("Authorization", "").startswith("Bearer ")
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            self.cloud.keys.append(header[len("Bearer "):])
+            return True
+        return False
 
     def _json(self, code: int, payload) -> None:
         body = json.dumps(payload).encode()

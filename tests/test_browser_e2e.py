@@ -1237,3 +1237,202 @@ def test_the_settings_scroll_to_their_last_section_on_a_phone(stack, chromium):
         assert watch.problems == []
     finally:
         ctx.close()
+
+
+# ------------------------------------------- OpenHands connections and executors
+def test_two_openhands_are_connected_and_given_to_the_project_in_the_settings(stack, chromium):
+    """Two connections, each to its own service, added and checked in the
+    settings; one that stops answering says so without touching the other; the
+    project is given both - a primary and a backup - the order is changed and
+    the strategy switched. No key is in the page at any point."""
+    keys = ("sk-first-openhands-key-0001", "sk-second-openhands-key-0002")
+    with FakeCloudServer() as second:
+        second.cloud.settings = dict(stack.cloud.cloud.settings)
+        ctx, page, watch = _open(chromium)
+        try:
+            _login(page, stack.base)
+            _connect_repository(page)                  # the project the executors are for
+            page.click("#user-menu")
+            page.click(".menu-item[data-action='open-settings']")
+            form = ".openhands-form"
+            for label, server, key in (("основной", stack.cloud, keys[0]),
+                                       ("запасной", second, keys[1])):
+                # The form folds away once there is a connection; unfold it.
+                summary = page.locator("details.add summary", has_text="Подключить OpenHands")
+                summary.wait_for()
+                if not summary.evaluate("el => el.parentElement.open"):
+                    summary.click()
+                page.fill(f"{form} [name=label]", label)
+                page.fill(f"{form} [name=base_url]", server.base_url)
+                page.fill(f"{form} [name=api_key]", key)
+                page.select_option(f"{form} [name=transport]", "app")
+                page.click(f"{form} button[type=submit]")
+                card = page.locator("[data-openhands]", has_text=label)
+                expect(card.locator(".pill")).to_have_text("активен")
+                assert server.base_url in card.inner_text()
+            assert page.locator("[data-openhands]").count() == 2
+            for key in keys:
+                assert key not in page.content(), "a key came back to the page"
+            # Each was checked against its own service, with its own key, and
+            # neither service was ever shown the other's.
+            assert keys[0] in stack.cloud.cloud.keys and keys[1] not in stack.cloud.cloud.keys
+            assert set(second.cloud.keys) == {keys[1]}
+
+            # The second service stops answering: its card says so, the first
+            # one is untouched; when it is back, a check says that too.
+            backup = page.locator("[data-openhands]", has_text="запасной")
+            main = page.locator("[data-openhands]", has_text="основной")
+            second.cloud.settings_status = 503
+            backup.locator("[data-op='verify']").click()
+            expect(backup.locator("small.is-bad")).to_be_visible()
+            assert main.locator("small.is-bad").count() == 0
+            expect(main.locator(".pill")).to_have_text("активен")
+            second.cloud.settings_status = 0
+            backup.locator("[data-op='verify']").click()
+            expect(backup.locator("small.is-bad")).to_have_count(0)
+            expect(backup.locator(".pill")).to_have_text("активен")
+
+            # The project tab: both are given to the project, in order.
+            page.click(".settings-nav [data-tab='project']")
+            page.wait_for_selector("#project-executors")
+            assert "Список пуст" in page.inner_text("#project-executors")
+            for label in ("основной", "запасной"):
+                page.select_option("#executor-add [name=account_id]", label=label)
+                page.click("#executor-add button[type=submit]")
+                expect(page.locator("[data-executor]", has_text=label)).to_be_visible()
+            roles = lambda: [text.split("\n")[1].split(" · ")[0] for text in  # noqa: E731
+                             page.locator("[data-executor] .card-main").all_inner_texts()]
+            labels = lambda: page.locator("[data-executor] .card-main b").all_inner_texts()  # noqa: E731
+            assert labels() == ["основной", "запасной"]
+            assert roles() == ["основной", "резервный 1"]
+
+            # The backup becomes the primary; the order follows.
+            page.locator("[data-executor]", has_text="запасной").locator(
+                "[data-op='primary']").click()
+            expect(page.locator("[data-executor] .card-main b").first).to_have_text("запасной")
+            assert roles() == ["основной", "резервный 1"] and labels() == ["запасной", "основной"]
+
+            # The strategy is the project's own, and it is kept.
+            page.select_option("#executor-strategy", "distribute")
+            expect(page.locator(".toast").last).to_be_visible()
+            page.click("[data-action='executors-check']")
+            expect(page.locator("[data-executor] .pill").first).to_have_text("активен")
+
+            page.reload()
+            page.wait_for_selector('#app[data-ready="true"]')
+            page.click("#user-menu")
+            page.click(".menu-item[data-action='open-settings']")
+            page.click(".settings-nav [data-tab='project']")
+            page.wait_for_selector("[data-executor]")
+            assert labels() == ["запасной", "основной"]
+            assert page.input_value("#executor-strategy") == "distribute"
+            for key in keys:
+                assert key not in page.content()
+            assert watch.problems == []
+        finally:
+            ctx.close()
+
+
+# ------------------------------- several repositories, each with its own account
+def test_a_project_gets_a_second_repository_from_another_github_account(stack, chromium):
+    """Two private repositories, each visible to one GitHub account only. The
+    project is given both in the interface: the main one with the first
+    account, one more with the second. Each is shown with the account that
+    reads it and checked with that account's own token; the second becomes the
+    main one; no token is in the page."""
+    api_repo, web_repo = "acme/api", "acme/web"
+    tokens = {"команда api": "ghp_token_of_the_api_account_0001",
+              "команда web": "ghp_token_of_the_web_account_0002"}
+    gh = stack.github
+    for name in (api_repo, web_repo):
+        gh.repos.append({"full_name": name, "default_branch": "main", "private": True,
+                         "archived": False, "pushed_at": "2026-01-05T00:00:00Z"})
+        gh.push(name, ("a" if name == api_repo else "b") + "0" * 39, "initial")
+    gh.token_repos = {tokens["команда api"]: {api_repo}, tokens["команда web"]: {web_repo},
+                      "server-github-token": set()}
+
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        page.click("#user-menu")
+        page.click(".menu-item[data-action='open-settings']")
+        for label, token in tokens.items():
+            summary = page.locator("details.add summary", has_text="Подключить аккаунт GitHub")
+            summary.wait_for()
+            if not summary.evaluate("el => el.parentElement.open"):
+                summary.click()
+            page.fill(".account-form:not(.openhands-form) [name=label]", label)
+            page.fill(".account-form:not(.openhands-form) [name=token]", token)
+            page.click(".account-form:not(.openhands-form) button[type=submit]")
+            expect(page.locator(".card", has_text=label).locator(".pill")).to_have_text("активен")
+        page.keyboard.press("Escape")
+
+        def pick(source_label: str, name: str) -> None:
+            page.wait_for_selector("#repo-source")
+            page.select_option("#repo-source", label=source_label)
+            page.click(f'.picker-item[data-name="{name}"]')
+            page.wait_for_selector("#repo-branch option:nth-of-type(2)", state="attached")
+            page.click("#repo-connect")
+            page.wait_for_selector("#repo-connect", state="detached")
+
+        # The main repository, with the first account. That account does not
+        # even see the other repository.
+        page.click("#repo-chip")
+        page.wait_for_selector("#repo-source")
+        page.select_option("#repo-source", label="команда api — acme")
+        page.wait_for_selector(f'.picker-item[data-name="{api_repo}"]')
+        assert page.locator(f'.picker-item[data-name="{web_repo}"]').count() == 0
+        page.keyboard.press("Escape")
+        page.click("#repo-chip")
+        pick("команда api — acme", api_repo)
+        expect(page.locator("#repo-chip-text")).to_have_text(f"{api_repo} · main")
+
+        def project_settings() -> None:
+            """The project tab of the settings, wherever the page is now."""
+            if page.locator(".dialog.is-settings").count() == 0:
+                page.click("#user-menu")
+                page.click(".menu-item[data-action='open-settings']")
+            page.click(".settings-nav [data-tab='project']")
+            page.wait_for_selector("#project-repositories")
+
+        # One more repository, from the second account.
+        project_settings()
+        page.wait_for_selector(f'#project-repositories [data-repo="{api_repo}"]')
+        page.click("#project-repositories [data-action='open-repo'][data-additional]")
+        pick("команда web — acme", web_repo)
+
+        # The interface comes back to the project's settings by itself, with
+        # the new repository listed.
+        page.wait_for_selector(f'#project-repositories [data-repo="{web_repo}"]')
+        first = page.locator(f'#project-repositories [data-repo="{api_repo}"]')
+        second = page.locator(f'#project-repositories [data-repo="{web_repo}"]')
+        expect(second).to_be_visible()
+        assert "основной" in first.inner_text() and "основной" not in second.inner_text()
+        assert "команда web" in second.inner_text()
+        # The chat still works in the main repository.
+        expect(page.locator("#repo-chip-text")).to_have_text(f"{api_repo} · main")
+
+        # Access is asked of GitHub for each with its own token.
+        seen = len(gh.paths)
+        page.click("#project-repositories [data-action='repos-check']")
+        for card in (first, second):
+            expect(card).to_contain_text("приватный · запись разрешена")
+            expect(card.locator(".pill")).to_have_text("активен")
+        asked = {(path, (header or "").split()[-1])
+                 for path, header in zip(gh.paths[seen:], gh.auth_headers[seen:])}
+        assert (f"/repos/{api_repo}", tokens["команда api"]) in asked
+        assert (f"/repos/{web_repo}", tokens["команда web"]) in asked
+        assert (f"/repos/{web_repo}", tokens["команда api"]) not in asked
+        assert (f"/repos/{api_repo}", tokens["команда web"]) not in asked
+
+        # The second one becomes the main repository.
+        second.locator("[data-op='primary']").click()
+        expect(page.locator("#project-repositories [data-repo] b").first).to_have_text(web_repo)
+        page.keyboard.press("Escape")
+        expect(page.locator("#repo-chip-text")).to_have_text(f"{web_repo} · main")
+
+        for token in tokens.values():
+            assert token not in page.content(), "a token came back to the page"
+        assert watch.problems == []
+    finally:
+        ctx.close()
