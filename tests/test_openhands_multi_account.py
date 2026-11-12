@@ -195,7 +195,7 @@ def test_verify_records_the_api_version(service, clouds):
 def test_rename_changes_only_the_label(service, store, clouds):
     a, _b = clouds
     view = service.add("user:alice", label="before", api_key=KEY_A, base_url=a.base_url)
-    renamed = service.rename("user:alice", view["id"], label="after")
+    renamed = service.edit("user:alice", view["id"], label="after")
     assert renamed["label"] == "after"
     # The key and the URL are untouched.
     with store._tx() as cur:

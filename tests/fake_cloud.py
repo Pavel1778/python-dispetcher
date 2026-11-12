@@ -22,8 +22,12 @@ class FakeCloud:
     """Mutable state backing the fake server."""
 
     def __init__(self):
-        # The API version reported through /openapi.json (read-only discovery).
-        self.api_version = "1.50.1"
+        # What /openapi.json says (read-only discovery): the version, and the
+        # paths. ``None`` for the version means "publishes no description"
+        # (404); ``api_paths_missing`` takes paths out of the description, the
+        # way an older or different service would lack them.
+        self.api_version: str | None = "1.50.1"
+        self.api_paths_missing: set[str] = set()
         self.start_tasks: dict[str, dict] = {}
         self.conversations: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}
@@ -163,9 +167,26 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"count": len(self.cloud.conversations)})
 
         if path == "/openapi.json":
-            # The live service serves this; the API version is read from it.
-            return self._json(200, {"openapi": "3.1.0",
-                                    "info": {"title": "OpenHands", "version": self.cloud.api_version}})
+            # The live service serves this; the version and the paths are read
+            # from it. The parameter names differ from the client's on purpose:
+            # only the shape of a path may matter.
+            if self.cloud.api_version is None:
+                return self._json(404, {"detail": "Not Found"})
+            paths = [
+                "/api/v1/app-conversations",
+                "/api/v1/app-conversations/start-tasks",
+                "/api/v1/app-conversations/search",
+                "/api/v1/app-conversations/count",
+                "/api/v1/app-conversations/{conversation_id}/send-message",
+                "/api/v1/conversation/{conversation_id}/events/search",
+                "/api/v1/sandboxes",
+                "/api/v1/sandboxes/{sandbox_id}/pause",
+                "/api/v1/settings",
+            ]
+            return self._json(200, {
+                "openapi": "3.1.0",
+                "info": {"title": "OpenHands", "version": self.cloud.api_version},
+                "paths": {p: {} for p in paths if p not in self.cloud.api_paths_missing}})
 
         if path == "/api/v1/app-conversations":
             ids = self._query("ids")

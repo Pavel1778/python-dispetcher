@@ -383,9 +383,10 @@ class LabStore:
             cur.execute("UPDATE nexus_runs SET hidden_at = CASE WHEN %s THEN "
                         "COALESCE(hidden_at, now()) ELSE NULL END WHERE id=%s RETURNING *",
                         (bool(hidden), run_id))
+            run = self._run_view(cur.fetchone())
             ProjectService._event(cur, project_id, principal,
                                   "run.hidden" if hidden else "run.shown", run_id)
-            return self._run_view(cur.fetchone())
+            return run
 
     def set_run_state_internal(self, run_id: str, state: str,
                                *, last_error: str | None = None,
