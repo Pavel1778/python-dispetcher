@@ -1045,6 +1045,14 @@ class App:
         404). The account must be one of the principal's active accounts. The
         switch is prepared here; the lab worker performs it on its next tick,
         passing the hand-off context. A task that is not in flight is refused.
+
+        The abandoned conversation is **stopped** (best effort) so the old
+        executor does not keep writing to the working copy while the new one
+        works. Its transcript is kept; only the run loop is stopped. When the
+        transport cannot stop a conversation (the Cloud V1 app-conversation
+        transport pauses at the sandbox, not the conversation), the stop is
+        reported as ``False`` and the branch lock remains the guarantee that two
+        executors do not push to one branch at once.
         """
         if not UUID_RE.fullmatch(task_id) or not UUID_RE.fullmatch(account_id):
             raise NotFound("task or account id")
@@ -1062,9 +1070,39 @@ class App:
             raise NotFound("account not found")
         if account["state"] != "active" or not account.get("enabled", True):
             raise ValueError("the target account is not active and enabled")
+        # Read the abandoned conversation before the switch clears it, so the
+        # old executor can be stopped rather than merely left unpolled.
+        abandoned = task.get("conversation_id")
+        from_account = task.get("openhands_account_id")
         updated = self.lab.switch_task_executor(task_id, target_account_id=account_id)
+        stopped = self._stop_abandoned_conversation(principal, from_account, abandoned)
         return {"task": updated, "target_account": {"id": account_id,
-                                                    "label": account["label"]}}
+                                                    "label": account["label"]},
+                "abandoned_conversation": abandoned, "stopped": stopped}
+
+    def _stop_abandoned_conversation(self, principal: str, account_id: str | None,
+                                     conversation_id: str | None) -> bool:
+        """Stop the conversation a switch left behind, without deleting it.
+
+        Best effort and never fatal: a switch that has already been recorded must
+        not fail because the old conversation could not be stopped. The
+        transcript is the record of why the work moved, so the conversation is
+        not deleted. Returns whether the transport reported a stop.
+        """
+        if not conversation_id:
+            return False
+        try:
+            if account_id:
+                client = self.openhands_accounts.execution_client_for_account(
+                    principal, str(account_id))
+            else:
+                client = self.client
+            stop = getattr(client, "stop_conversation", None)
+            return bool(stop(conversation_id)) if stop is not None else False
+        except Exception as e:  # noqa: BLE001 - the switch already stands
+            log.warning("could not stop abandoned conversation %s: %s",
+                        conversation_id, type(e).__name__)
+            return False
 
     def rename_sr(self, workflow_id: str, title: str) -> dict[str, Any]:
         """Rename the workflow's Sr conversation in Cloud.

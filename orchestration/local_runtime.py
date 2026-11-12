@@ -250,6 +250,22 @@ class LocalCloudClient(OpenHandsClient):
         status, _ = self._request("DELETE", f"/api/conversations/{conversation_id}")
         return status in (200, 204)
 
+    #: The local agent-server exposes the same conversation-scoped pause as the
+    #: direct transport, so a stop here is real.
+    supports_conversation_stop = True
+
+    def stop_conversation(self, conversation_id: str) -> bool:
+        """``POST /api/conversations/{id}/pause``: stop the loop, keep the
+        conversation. The local agent-server exposes the same conversation-scoped
+        pause as the direct transport. ``False`` when it was not taken."""
+        try:
+            status, _ = self._request(
+                "POST", f"/api/conversations/{conversation_id}/pause", {}
+            )
+        except (ApiUnavailable, CloudError):
+            return False
+        return status in (200, 201, 202, 204)
+
     def health(self) -> bool:
         return super().health()
 

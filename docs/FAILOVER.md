@@ -26,6 +26,32 @@ old conversation said.
 The switch is recorded durably in `nexus_task_handoffs` (from account, to
 account, reason, context), so the history of an executor change is auditable.
 
+## Checking the new account before trusting it (step 6)
+
+A switch does not assume the account it moves to still works. Before the start,
+`OpenHandsExecutor.dispatch` calls `AccountRouter.ensure_authorized`, which makes
+one read-only call to that account's own API (`account_capabilities`) through the
+*same client* the task will be dispatched with. A rejected key raises
+`CloudAuthError`, which becomes a `DispatchError` naming the account, so the
+scheduler excludes it and fails over again — rather than starting a conversation
+that would only fail inside the sandbox.
+
+The check runs only on a *switch*: a task that already has a `tried_accounts`
+entry, or an operator's `preferred_account_id`. A first start on the account the
+pool picked is an ordinary dispatch and is not probed, so an ordinary task pays
+no extra round trip. A transient transport failure during the probe is not read
+as a rejected key: it propagates as `CloudUnavailable` and the normal retry
+applies, so a blip never writes off a working account.
+
+## Confirming the new executor really works (step 10)
+
+A switch is not treated as successful because a conversation started. The
+account is marked healthy (`AccountRouter.note_success`) only when a poll
+observes a terminal conversation on it (`finished` / `error` / `stuck`) — the
+observed evidence that the new executor is reachable and running, not a
+guess. Until then the task's result is whatever the verifier makes of the real
+report and the real branch head.
+
 ## A start the service refuses (429)
 
 A rate limit or a daily quota is not a failure of the account: it answered, and

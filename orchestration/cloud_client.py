@@ -451,29 +451,35 @@ class CloudClient:
         status, _ = self._request("POST", f"/api/v1/sandboxes/{sandbox_id}/pause")
         return status == 200
 
-    #: This transport can tell a conversation's runtime to stop.
-    supports_stop = True
+    #: Whether ``stop_conversation`` can really stop a conversation on this
+    #: transport. It can, for a conversation this transport started: see below.
+    supports_conversation_stop = True
 
-    def stop_conversation(self, conversation_id: str) -> dict[str, Any]:
+    def stop_conversation(self, conversation_id: str) -> bool:
         """Stop the runtime that owns a conversation, so that it does no more.
+        Returns whether the stop was taken; the transcript is kept.
 
-        The Cloud has no conversation-scoped stop. Its own client stops a cloud
-        conversation by pausing the sandbox that runs it
-        (``POST /api/v1/sandboxes/{id}/pause``; OpenHands' ``pauseConversation``,
-        "Cloud mode: Pauses the sandbox"), and that is what is done here. A
-        conversation started through this transport has a sandbox of its own,
-        so nothing else is stopped with it.
+        The Cloud has no conversation-scoped stop: the only pause its V1
+        surface has is the sandbox's (``POST /api/v1/sandboxes/{id}/pause``).
+        Its own client stops a cloud conversation exactly that way (OpenHands'
+        ``pauseConversation``, "Cloud mode: Pauses the sandbox"), and so does
+        this. Pausing a sandbox stops everything on it - which is safe here
+        because a conversation started through this transport is never given
+        somebody else's sandbox (``start_conversation`` sends no
+        ``sandbox_id``), so it has one of its own.
 
-        Raises :class:`CloudNotFound` when the conversation is gone - there is
-        then nothing left to stop - and :class:`CloudError` when it names no
-        sandbox or the pause is refused.
+        ``False`` means nothing was stopped: the conversation could not be
+        read, names no sandbox, or the pause was refused. It is never a guess:
+        a caller must go on treating that conversation as one still at work on
+        its branch.
         """
-        conversation = self.get_conversation(conversation_id)
-        if not conversation.sandbox_id:
-            raise CloudError(f"conversation {conversation_id} names no sandbox to pause")
-        if not self.pause_sandbox(conversation.sandbox_id):
-            raise CloudError(f"sandbox {conversation.sandbox_id} was not paused")
-        return {"method": "sandbox_pause", "sandbox_id": conversation.sandbox_id}
+        try:
+            conversation = self.get_conversation(conversation_id)
+            if not conversation.sandbox_id:
+                return False
+            return bool(self.pause_sandbox(conversation.sandbox_id))
+        except CloudError:
+            return False
 
     def activity_marker(self, conversation_id: str) -> str | None:
         """A value that changes whenever the conversation produces an event,

@@ -91,6 +91,16 @@ class AccountClient:
                                  selected_repository=None, selected_branch=None,
                                  conversation_url=None, raw={})
 
+    def account_capabilities(self):
+        """The read-only probe the failover sequence uses to check authorization.
+
+        A normal account accepts it; the rejecting subclass overrides it.
+        """
+        return {"llm_api_key_set": True, "active_agent_profile_id": f"{self.name}-profile",
+                "mcp_servers": [], "registered_marketplaces": 0,
+                "inherited_marketplaces": 0, "disabled_skills": [],
+                "provider_tokens_set": {}}
+
     def final_response(self, conversation_id):
         return self._conversations[conversation_id]["text"]
 
@@ -537,3 +547,87 @@ def test_manual_switch_is_refused_for_a_task_that_is_not_in_flight(store, servic
 
     with _pytest.raises(ValueError):
         lab.switch_task_executor(str(task["id"]), target_account_id="00000000-0000-0000-0000-000000000000")
+
+
+class _AuthRejectingClient(AccountClient):
+    """An account whose key is rejected the moment its authorization is probed.
+
+    The failover sequence asks for the new account's authorization to be checked
+    before it is trusted (step 6). This client refuses that probe, which is how
+    a stored-but-revoked key behaves: the start would fail inside the sandbox.
+    """
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.auth_probes = 0
+
+    def account_capabilities(self):
+        from orchestration.cloud_client import CloudAuthError
+
+        self.auth_probes += 1
+        raise CloudAuthError(f"{self.name}: 401 invalid api key")
+
+
+def test_a_switch_to_an_account_with_a_rejected_key_fails_over_again(
+        store, service, clouds):
+    """Step 6: the account we switch to is authorization-checked first.
+
+    Account A fails to start, so the scheduler fails over to B. B's stored key
+    is rejected when its authorization is probed, so B is excluded too and the
+    task does not start a conversation that would only fail inside the sandbox.
+    """
+    a, b = clouds
+    va = service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url,
+                     make_default=True)
+    vb = service.add(PRINCIPAL, label="B", api_key="sk-b", base_url=b.base_url)
+    pool = AccountPool(store, service)
+    pool.set_config(PRINCIPAL, selection_mode="failover")
+    pool.set_priority(PRINCIPAL, vb["id"], 1)
+
+    client_a = AccountClient("A", start_fails=True)
+    client_b = _AuthRejectingClient("B")
+    clients = {va["id"]: client_a, vb["id"]: client_b}
+    _pool, lab, sched = _stack(store, service, clients)
+    project, run, _ = _make_run(store)
+
+    # Tick 1: A fails to start; the task is requeued with A tried.
+    sched.tick(str(run["id"]))
+    task = _task(lab, project, run)
+    assert task["state"] == "pending" and va["id"] in task["tried_accounts"]
+
+    # Tick 2: B is selected, but its authorization probe is rejected. The task
+    # must not start on B, and B must be recorded as tried.
+    sched.tick(str(run["id"]))
+    assert client_b.auth_probes == 1, "the switch must probe the new account's auth"
+    assert client_b.started == [], "a rejected key must not start a conversation"
+    task = _task(lab, project, run)
+    assert task["state"] == "pending"
+    assert vb["id"] in task["tried_accounts"]
+    assert _health(service, vb["id"]) == "unavailable"
+
+    # Tick 3: every account is now excluded, so the run is blocked with a reason
+    # - never spun.
+    sched.tick(str(run["id"]))
+    final = lab.get_run(PRINCIPAL, str(project["id"]), str(run["id"]))
+    assert final["state"] == "blocked"
+    assert "no usable OpenHands account" in (final["last_error"] or "")
+
+
+def test_a_first_start_is_not_probed_for_authorization(store, service, clouds):
+    """An ordinary first dispatch is not an authorization switch.
+
+    Probing on every task would add an account-API round trip for no new
+    information; the account was verified when it was added. Only a switch (a
+    task that already tried an account, or an operator's manual preference) is
+    re-checked.
+    """
+    a, _b = clouds
+    va = service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url,
+                     make_default=True)
+    client_a = _AuthRejectingClient("A")     # probe would fail if it were made
+    _pool, lab, sched = _stack(store, service, {va["id"]: client_a})
+    project, run, _ = _make_run(store)
+
+    sched.tick(str(run["id"]))
+    assert client_a.auth_probes == 0, "a first start must not be probed"
+    assert len(client_a.started) == 1, "the first start must go through"

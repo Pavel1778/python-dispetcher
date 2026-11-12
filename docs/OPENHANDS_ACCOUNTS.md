@@ -150,11 +150,19 @@ python -m orchestration.cli openhands pool set --mode failover \
 
 ## How the worker uses the pool
 
-`build_account_router` returns a router when the principal has any stored
-account, and `None` otherwise (the pre-existing single-key behaviour). When a
-router is present, `OpenHandsExecutor` asks it which account runs each task and
-dispatches through a client built for that account's base URL, transport and
-model. A poll reattaches to the **same** account — a different account is a
-different sandbox and cannot read that conversation.
+`build_account_router` returns a router when the **deployment** has any stored
+account (any principal), and `None` otherwise (the pre-existing single-key
+behaviour). The check is `OpenHandsAccountService.has_any_accounts`, not
+`list_accounts(principal)`: the worker runs as `machine:default` and owns no
+accounts, while an account added in the studio belongs to `user:<login>`, so a
+per-principal check left the pool — and the automatic selection modes — switched
+off on every deployment with a login. The router still *selects* per project:
+`AccountRouter._principal_for_project` resolves the project's owner as the
+principal whose pool applies.
+
+When a router is present, `OpenHandsExecutor` asks it which account runs each
+task and dispatches through a client built for that account's base URL,
+transport and model. A poll reattaches to the **same** account — a different
+account is a different sandbox and cannot read that conversation.
 
 See `FAILOVER.md` for what happens when an account fails.

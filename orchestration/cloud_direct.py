@@ -672,12 +672,14 @@ class CloudDirectClient:
         if status not in (200, 201):
             raise CloudError(f"pause -> {status}")
 
-    #: This transport can tell a conversation's agent to stop.
-    supports_stop = True
+    #: The sandbox agent-server has a conversation-scoped pause, so a stop here
+    #: is real; the branch can be held until it succeeds.
+    supports_conversation_stop = True
 
-    def stop_conversation(self, conversation_id: str) -> dict[str, Any]:
+    def stop_conversation(self, conversation_id: str) -> bool:
         """Stop the agent of one conversation; the sandbox and every other
-        conversation on it go on.
+        conversation on it go on. Returns whether the stop was taken; the
+        conversation and its transcript are kept.
 
         Sandboxes are shared here, so the stop is conversation-scoped. The
         agent-server has two calls for it: ``/interrupt`` cancels a request to
@@ -686,23 +688,21 @@ class CloudDirectClient:
         it; it is not on every server), so it is tried and a refusal of it is
         not an error; ``/pause`` is what decides.
 
-        Raises :class:`CloudNotFound` when the conversation is gone.
+        ``False`` on a failure the caller can tolerate (the conversation is
+        gone, the sandbox does not answer): nothing was stopped by this call.
         """
-        route = self._route_for(conversation_id)
-        interrupted = False
         try:
+            route = self._route_for(conversation_id)
+            try:
+                self._send(route, "POST",
+                           f"/api/conversations/{conversation_id}/interrupt", {})
+            except CloudError:
+                pass
             status, _ = self._send(
-                route, "POST", f"/api/conversations/{conversation_id}/interrupt", {})
-            interrupted = status in (200, 201, 202, 204)
+                route, "POST", f"/api/conversations/{conversation_id}/pause", {})
         except CloudError:
-            interrupted = False
-        status, _ = self._send(route, "POST", f"/api/conversations/{conversation_id}/pause", {})
-        if status == 404:
-            raise CloudNotFound(conversation_id)
-        if status not in (200, 201, 202, 204):
-            raise CloudError(f"pause -> {status}")
-        return {"method": "interrupt+pause" if interrupted else "pause",
-                "sandbox_id": route.sandbox_id}
+            return False
+        return status in (200, 201, 202, 204)
 
     def activity_marker(self, conversation_id: str) -> str | None:
         """A value that changes whenever the conversation produces an event:

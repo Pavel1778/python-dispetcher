@@ -1188,6 +1188,21 @@ and 12), two on the thirty-minute limit (item 11). What was found:
     `unavailable` by a failed start stays that way. The router is built once,
     when the loop starts.
 
+    **Status (automatic mode switching).** Two of the above are now closed:
+    `build_account_router` gates on `OpenHandsAccountService.has_any_accounts()`
+    (any principal), so the pool — and the four selection modes — are switched
+    on for a deployment whose accounts belong to `user:<login>`. And the loop
+    calls `AccountRouter.note_success` whenever a poll observes a terminal
+    conversation, so an account is not written off for ever. The failover
+    sequence's step 6 ("проверить его авторизацию") is now enforced:
+    `OpenHandsExecutor.dispatch` calls `AccountRouter.ensure_authorized` on a
+    *switch* (a task with `tried_accounts`, or an operator's
+    `preferred_account_id`), so a revoked key fails over again instead of
+    starting a conversation that would only fail inside the sandbox. Tests:
+    `tests/test_openhands_pool.py::test_the_pool_activates_when_any_principal_has_an_account`,
+    `tests/test_openhands_failover.py::test_a_switch_to_an_account_with_a_rejected_key_fails_over_again`
+    and `::test_a_first_start_is_not_probed_for_authorization`.
+
 Still true, and worth knowing before changing this:
 
 - **Render's free plan stops the process after about 15 minutes without a
@@ -1377,3 +1392,57 @@ migration `0027_openhands_account_error_history.sql` (additive) adds
   (the `edit`/`connection` routes were added without that coverage). Tests:
   the error-history cases in `tests/test_openhands_account_admin.py` and
   `tests/test_openhands_pool_http.py`.
+
+## Race-condition protection: fencing tokens and task ownership (this session)
+
+`claim_task` was already atomic (`FOR UPDATE SKIP LOCKED` plus a lease) and
+refused a second claim of one task. What was missing was any way to stop a
+worker that had **lost** its task from still writing to it: the claim took a
+`worker_id` and never stored it, and no mutation was fenced. Migration
+`0028_task_lease_fencing.sql` (additive) adds two columns to `nexus_run_tasks`:
+
+- **`lease_owner`** — the worker that holds the claim, `NULL` when unclaimed.
+  Informational (diagnostics, the operator surface); never a secret.
+- **`lease_token`** — a per-task counter that only moves forward. `claim_task`
+  bumps it and records the owner; **every transition that takes a task away from
+  its holder bumps it too and clears the owner**: `reclaim_expired`,
+  `switch_task_executor`, `_requeue_retryable` (a resumed run), the cancel/fail
+  block in `_apply_run_state`, and the release/postpone/requeue mutators.
+
+The fence is the **token, not the clock**. `mark_running`, `record_verification`,
+`release_task`, `postpone_task` and `requeue_for_failover` take an optional
+`lease_token`; when given, the `UPDATE` carries `AND lease_token=%s`, so a stale
+holder's write matches no row and is a no-op (the row is returned as it stands,
+not an error). The compare and the write are the same statement, in the
+database. `LabStore.holds_lease(task_id, token)` is checked by the scheduler
+immediately before it starts a conversation; it does **not** consult
+`lease_expires`, because a lease that expired but that nobody reclaimed still
+belongs to its worker — it is the reclaim (or switch, or resume) that takes the
+task away, and that is what bumps the token.
+
+Do not "simplify" this back to a time-based check, and do not drop the
+`lease_token` argument from a mutation: without it the fence is open. A caller
+that read the task carries `task["lease_token"]` back; `_task_row` always
+exposes it (default 0 for a row written by an older writer). `lease_owner` and
+`lease_token` are in `REQUIRED_COLUMNS` in `cloud_store.py`.
+
+Tests: `tests/test_race_protection.py` (13 cases; stale bind, stale verdict,
+stale release/postpone/requeue, switch, resume, the pre-dispatch lease check,
+the expired-but-unreclaimed lease, the column default, the schema guard, the
+abandoned-conversation record, and the transport stop over real HTTP).
+Removing the `mark_running` fence makes two of them fail, so they are
+load-bearing.
+
+**Stopping the abandoned executor.** A switch clears the task's binding, which
+alone does **not** stop an agent already running in the Cloud. So the switch is
+a *hand-off plus a stop*: `switch_task_executor` records the abandoned
+conversation in the task's evidence (it is never lost) and
+`App.switch_task_executor` stops it before returning
+(`App._stop_abandoned_conversation`). `stop_conversation` is best effort and
+never deletes the transcript. It is **transport-honest**: the direct and local
+transports pause the conversation
+(`POST /api/conversations/{id}/pause`, keeps the transcript) and return `True`;
+`CloudClient.stop_conversation` (the `app` transport) returns `False`, because
+the Cloud V1 surface only pauses at the *sandbox* level. A caller must not treat
+a `False` as "stopped" — the branch lock remains the guarantee that two
+executors do not push to one branch at once.
