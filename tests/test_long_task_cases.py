@@ -1098,3 +1098,96 @@ def test_one_long_message_does_not_make_later_questions_too_large(lab):
     assert "assistant: Ответ." in asked[1]
     assert "more characters not shown]" in asked[1]
     assert len(asked[1]) < 26_000, "the whole earlier message was sent again"
+
+
+# --------------------------------------------- planner fallback (empty plan)
+def test_an_empty_plan_is_recovered_by_decomposing_the_specification(lab):
+    """The model answered "no tasks" for a brief that plainly has work. The
+    planner must not hand that back as the end: it decomposes by the
+    specification's own index (one task per section with obligations) and starts
+    a real run, with every normative piece traced to a task."""
+    import re as _re
+
+    def declare_all_background(body):
+        # Return no tasks and claim every piece of the part needs nothing done -
+        # the answer that leaves the merged plan empty ("the plan has no tasks").
+        prompt = body["messages"][-1]["content"]
+        keys = sorted(set(_re.findall(r"\[(R-\d+)\]", prompt)))
+        return 200, completion({"tasks": [], "context": keys})
+
+    lab.studio.llm.respond = declare_all_background
+    text = specification(STAGED_CHARS)
+    status, reply = lab.send(text)
+    assert status == 200, reply
+    spec_of(reply)                                     # the text was stored
+    run_id = lab.wait_run()
+    tasks = lab.run(run_id)["tasks"]
+    # A real DAG, not an empty plan and not a single giant task.
+    assert len(tasks) >= 3, [t["task_key"] for t in tasks]
+    # It is the application's fallback, recorded as such on the run's plan.
+    announced = lab.announcements()[0]["meta"]
+    assert announced["run_id"] == run_id
+    assert announced["coverage"].get("fallback") is True
+    # Every task names the original requirement(s) it covers.
+    for task in tasks:
+        assert task["spec_ref"]["requirements"], task["task_key"]
+        assert task["spec_ref"]["fallback"] is True
+    # The chain is ordered: each task waits for the one before it.
+    assert tasks[0]["dependencies"] == []
+    for earlier, later in zip(tasks, tasks[1:]):
+        assert later["dependencies"] == [earlier["task_key"]]
+
+
+def test_the_fallback_refuses_a_specification_with_nothing_to_do(lab):
+    """A text with no obligation at all is not turned into fabricated work: the
+    honest failure is kept, and nothing is started. Sent over REST (the chat
+    router would answer such a message as chat, which is the point of the router;
+    this test is about the planner)."""
+    lab.studio.llm.respond = lambda body: (200, completion({"tasks": []}))
+    # One paragraph, no imperative, no obligation, no list, no heading.
+    text = "Это просто заметка о проекте и ничего больше. Спасибо за внимание."
+    status, body = lab.post("/goals", {"text": text})
+    assert status == 201, body
+    spec_id = body["spec"]["id"]
+    status, body = lab.post(f"/goals/{body['goal']['id']}/run")
+    assert status == 422, body
+    assert "the plan has no tasks" in body["error"]
+    failed = lab.wait_spec(spec_id, "failed")
+    assert "the plan has no tasks" in failed["last_error"]
+    assert lab.runs() == []
+    assert lab.studio.sandbox.conversations == {}
+
+
+def test_the_fallback_plan_is_executable_and_delivers_the_original(lab):
+    """The fallback plan runs like any other: its first task is dispatched and
+    its agent is given the original text byte for byte.
+
+    The model declares *every* piece to be background ("context") and returns no
+    tasks - the answer that makes the merged plan empty and produces "the plan
+    has no tasks". The fallback recovers it from the specification's index.
+    """
+    import re as _re
+
+    def declare_all_background(body):
+        # The prompt carries the part with each piece marked "[R-0001]"; the
+        # model claims all of them need nothing done. Read them from the prompt.
+        prompt = body["messages"][-1]["content"]
+        keys = sorted(set(_re.findall(r"\[(R-\d+)\]", prompt)))
+        return 200, completion({"tasks": [], "context": keys})
+
+    lab.studio.llm.respond = declare_all_background
+    # Short enough to be one planning stage, so the whole text is one part and
+    # the fallback plan is the plan for it.
+    text = specification(2_000, seed=3)
+    digest = sha256(text)
+    status, body = lab.post("/goals", {"text": text})
+    assert status == 201, body
+    status, body = lab.post(f"/goals/{body['goal']['id']}/run")
+    assert status == 201, body
+    assert body["plan"]["coverage"].get("fallback") is True
+    run_id = body["run"]["id"]
+    first = lab.run(run_id)["tasks"][0]
+    assert first["spec_ref"]["sha256"] == digest
+    mode, got = agent_bytes(lab.agent(first["task_key"], run_id), digest)
+    assert mode in ("file", "inline")
+    assert got == text.encode("utf-8")

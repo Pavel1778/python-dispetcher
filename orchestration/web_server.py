@@ -94,7 +94,7 @@ from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
 from .nexus_binding import AuthorizationError, ProjectBindingError, authorize_run_task
 from .nexus_chat import ChatError
-from .nexus_intent import Intent, IntentRouter
+from .nexus_intent import classify, clarifying_question, effective_mode
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
@@ -761,6 +761,10 @@ class App:
         repository = request.get("repository") or ""
         branch = request.get("branch") or ""
         self.projects.get(principal, project_id)
+        if not repository:
+            # A conversation with no bound repository runs against the project's
+            # primary one (the single linked repository is primary in effect).
+            repository = self.project_repos.primary_repository(project_id) or ""
         # Refuse before a planning call is spent, and before a goal is stored.
         authorize_run_task(self.store, project_id=project_id,
                            repository=repository, branch=branch)
@@ -2148,6 +2152,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "repository and branch must be strings"})
             return
         repository, branch = repository.strip(), branch.strip()
+        if not repository:
+            # No repository named: use the project's primary one (the single
+            # linked repository is primary in effect). This is what makes the
+            # "primary repository" real instead of a label.
+            repository = self.app.project_repos.primary_repository(project_id) or ""
         if repository and not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
             self._json(400, {"error": "repository must be owner/name"})
             return
@@ -2213,6 +2222,73 @@ class Handler(BaseHTTPRequestHandler):
         self._json(201, {"run": run, "tasks": stored, "plan": outcome["plan"],
                          "spec": summary})
 
+    def _run_facts(self, principal: str, project_id: str) -> dict:
+        """The real state of the project's autonomous runs, for an analysis turn.
+
+        Read from the database, not guessed: the newest runs with their state,
+        progress and reason, and each one's report if it has finished. This is
+        what lets "что уже готово?" and "почему прогон остановился?" be answered
+        from facts instead of starting another run. A read error yields an empty
+        shape, never a fabricated one.
+        """
+        try:
+            runs = self.app.lab.list_runs(principal, project_id, include_hidden=True)
+        except NotFound:
+            return {"runs": []}
+        out: list[dict] = []
+        for run in runs[:10]:
+            try:
+                counts = self.app.lab.count_tasks(str(run["id"]))
+            except Exception:  # noqa: BLE001 - a facts gather must not fail a turn
+                counts = {}
+            report = self.app.lab.report_for_run(str(run["id"])) or {}
+            out.append({
+                "id": str(run["id"]),
+                "state": run["state"],
+                "goal_id": str(run.get("goal_id") or ""),
+                "iteration": run.get("iteration"),
+                "max_iterations": run.get("max_iterations"),
+                "retry_attempt": run.get("retry_attempt"),
+                "max_retry_cycles": run.get("max_retry_cycles"),
+                "last_error": (run.get("last_error") or "")[:500],
+                "tasks": counts,
+                "report": (report.get("content") or "")[:3000] if report else "",
+            })
+        return {"runs": out}
+
+    def _continue_run(self, principal: str, project_id: str, conversation_id: str,
+                      active_run: dict) -> list[dict]:
+        """Continue the run this conversation started. Never a second run.
+
+        A ``paused`` or ``blocked`` run is resumed (the same action as the
+        "Продолжить" button). A ``running``/``retrying`` run is already working,
+        so the reply says so and nothing is changed - the dialogue does not stop
+        or restart a working run. A terminal run is reported as finished; a new
+        run needs a new message, not "продолжи".
+        """
+        run_id = str(active_run["id"])
+        state = active_run["state"]
+        if state in ("paused", "blocked"):
+            try:
+                self.app.lab.set_run_state(principal, project_id, run_id, "running")
+            except InvalidTransition as e:
+                return [{"role": "assistant",
+                         "content": f"Прогон {run_id[:8]} не удалось продолжить: {e}",
+                         "meta": {"mode": "autonomous", "run_id": run_id}}]
+            content = (f"Продолжаю прогон {run_id[:8]}: задачи, не прошедшие проверку, "
+                       "возвращены в работу. Ход работы виден на вкладке «Агент».")
+            return [{"role": "assistant", "content": content,
+                     "meta": {"mode": "autonomous", "run_id": run_id, "resumed": True}}]
+        if state in ("running", "retrying", "waiting_for_approval"):
+            content = (f"Прогон {run_id[:8]} уже выполняется (состояние: {state}). "
+                       "Ничего не перезапускаю; ход работы виден на вкладке «Агент».")
+            return [{"role": "assistant", "content": content,
+                     "meta": {"mode": "autonomous", "run_id": run_id, "already_running": True}}]
+        content = (f"Прогон {run_id[:8]} завершён (состояние: {state}). "
+                   "Чтобы начать новую работу, опишите её новым сообщением.")
+        return [{"role": "assistant", "content": content,
+                 "meta": {"mode": "autonomous", "run_id": run_id, "terminal": True}}]
+
     def _chat_turn(self, principal: str, project_id: str, conversation_id: str,
                    body: dict) -> None:
         """Store the user turn, produce the assistant turn, return the new messages.
@@ -2242,10 +2318,27 @@ class Handler(BaseHTTPRequestHandler):
         # answered 400, or 413 for a text that is too long.
         if mode:
             self.app.conversations.check_mode(mode)
-        if (mode or conversation["mode"]) == "autonomous":
+        # The Intent Router decides what this message asks for, before any mode
+        # is applied: a question must not start a run just because the
+        # conversation's mode is ``autonomous``. ``auto`` (the default) and
+        # ``autonomous`` leave the decision to the message; an explicit
+        # ask/plan/analysis/code mode is the person's own choice.
+        active_run = self.app.conversations.linked_run(principal, project_id, conversation_id)
+        chosen = mode or conversation["mode"]
+        intent = classify(text, mode=chosen, has_active_run=active_run is not None)
+        turn_mode = effective_mode(chosen, intent)
+        if (turn_mode == "autonomous" and chosen != "autonomous"
+                and not (conversation.get("repository")
+                         or self.app.project_repos.primary_repository(project_id))):
+            # In "Авто" mode the router chose work, but the project has no
+            # repository to run it on. Rather than fail, answer in the chat and
+            # say what is missing: the conversation stays usable. An explicit
+            # "Автономно" choice is the person's own and is not overridden.
+            turn_mode = "ask"
+        if turn_mode == "autonomous":
             check_text(sent)
         else:
-            check_message(sent, mode or conversation["mode"])
+            check_message(sent, turn_mode)
         if mode:
             self.app.conversations.set_mode(principal, project_id, conversation_id, mode)
             # Re-read so the joined repository/branch fields are present; set_mode
@@ -2296,7 +2389,7 @@ class Handler(BaseHTTPRequestHandler):
         # what lets a repeated send be recognised.
         spec = None
         shown, user_meta = text, None
-        if respond_mode == "autonomous":
+        if turn_mode == "autonomous":
             spec, _new = self.app.specs.create(
                 principal, project_id, sent, source="chat", conversation_id=conversation_id)
             user_meta = {"spec": SpecService.summary(spec)}
@@ -2318,6 +2411,31 @@ class Handler(BaseHTTPRequestHandler):
         history = [m for m in self.app.conversations.list_messages(
             principal, project_id, conversation_id) if str(m["id"]) != str(user_msg["id"])]
         appended: list[dict] = [user_msg]
+        # "Продолжи" continues the run this conversation already started; it
+        # never creates a second one. A run that is paused or blocked is
+        # resumed; a run that is already working is reported as it is.
+        if intent.continue_run and active_run is not None:
+            produced = self._continue_run(principal, project_id, conversation_id,
+                                          active_run)
+            for msg in produced:
+                appended.append(self.app.conversations.add_message(
+                    principal, project_id, conversation_id, role=msg["role"],
+                    content=msg["content"], meta=msg.get("meta")))
+            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+            self._json(200, {"messages": appended})
+            return
+        # An ambiguous message in a mode the router had to guess (``auto``) does
+        # not start a run: it is answered with one short clarifying question. In
+        # an explicit ``autonomous`` conversation the person already chose work,
+        # so an unclear *goal* runs rather than being turned into a question.
+        if intent.ambiguous and turn_mode != "autonomous" and not intent.starts_work:
+            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+            ask = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role="assistant",
+                content=clarifying_question(),
+                meta={"mode": "ask", "clarify": True, "intent": intent.intent})
+            self._json(200, {"messages": appended + [ask]})
+            return
         self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
         # A continuation continues the run in flight: no new run is created. The
         # reply names the run and how to watch it. Answered before a provider is
@@ -2334,9 +2452,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
         context = self.app.context.current(principal, project_id)
         memory = self.app.memory.retrieve(principal, project_id, limit=30)
+        # What the project's runs really did, for an analysis turn. Read here so
+        # a question about progress is answered from the database, not guessed.
+        run_facts = self._run_facts(principal, project_id) if turn_mode == "analysis" else None
         try:
             produced = self.app.chat.respond(
-                mode=respond_mode, goal=text, context=context, memory=memory,
+                mode=turn_mode, goal=text, context=context, memory=memory,
                 repository=conversation.get("repository") or "",
                 branch=conversation.get("selected_branch") or "",
                 history=history,
@@ -2345,7 +2466,7 @@ class Handler(BaseHTTPRequestHandler):
                 project_id=project_id, principal=principal,
                 conversation_id=conversation_id,
                 spec_id=spec["id"] if spec else None,
-                clarifying=routed.clarifying)
+                run_facts=run_facts)
         except ChatError as e:
             self.app.conversations.set_state(principal, project_id, conversation_id, "error")
             err = self.app.conversations.add_message(

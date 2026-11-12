@@ -1321,44 +1321,48 @@ project may use several OpenHands and several GitHub repositories. Migration
   disappearance, report in chat, phone scroll). `tests/test_route_auth.py`
   probes every new endpoint. Full suite: 993 passed / 8 skipped.
 
-## NEXUS is conversational: the intent router (this increment)
+## Independent audit of PR #29 (durable autonomy, multi-connection)
 
-The most important rule: **a message is not a task.** NEXUS answers a question,
-analyses a failure, and starts an autonomous run only when the person clearly
-asks for work. `orchestration/nexus_intent.py` decides which.
+This records what an independent audit found and fixed. Read it before changing
+the chat turn, the run report delivery, or the planner's empty-plan path.
 
-- **Deterministic first.** `IntentRouter.route` runs an explainable rule pass
-  before any model: an explicit non-default mode wins (`Автономно`/`Код` → run,
-  `План` → plan); a status question ("что готово?") is chat; "продолжи"/"повтори"
-  is a continuation when a run is in flight and chat otherwise; a work command in
-  the imperative ("исправь …", "добавь …") is autonomous; an analysis request
-  ("почему …", "объясни …") is analysis; a question is chat. The model is asked
-  **only** for a turn the rules cannot place, and only for a short message (a
-  long one is a specification). A missing/failing/uncertain model leaves the
-  safe default: **chat**. This is why the common cases never depend on a model.
-- **The default conversation mode is the router's job.** `ask` no longer
-  short-circuits; it is exactly the case the router exists for. An explicit
-  `code`/`plan`/`autonomous` mode is honoured and not re-routed. `analysis` is a
-  responder-only mode: the stored conversation mode stays one the DB constraint
-  allows (`ask`/`code`/`plan`/`autonomous`), and only a routed autonomous turn
-  switches the conversation to `autonomous`.
-- **Continuation never duplicates.** `_chat_turn` answers "продолжи" with
-  `_continue_active_run` (which makes a `retrying`/`blocked` run's wait due, or
-  reports a `running` one) **before** a provider is asked, so it works with no
-  model configured and creates no second run.
-- **Ambiguity is one question, not a guess.** A turn the rules cannot place and
-  that carries a weak work hint ("можешь …", "нужно …") is answered and then
-  asked about once; a plain message gets a plain answer with no question.
-- **Planner fallback (never "the plan has no tasks" for real work).** When the
-  model answers a stage with no usable task but the stage has obligations,
-  `stage_plan` adds one deterministic fallback task that carries the whole stage
-  and tells the agent to read the original text. A stage that is pure context
-  may legitimately be empty; a stage with obligations may not.
-- **A plan task may name its own repository/branch** (`validate_tasks` keeps
-  them, `merge` carries them, `start_run` stores them), so one run can span
-  several repositories of a project; without one a task uses the run's.
-- Tests: `tests/test_intent_router.py` (rules, safe defaults, model path),
-  `tests/test_planner_fallback.py` (the fallback task and the context-only case,
-  no DB), and the conversational journey in `tests/test_browser_e2e.py` (a
-  question starts nothing; an explicit command starts work; "продолжи" does not
-  create a second run).
+- **Chat-first intent routing was missing entirely.** With a conversation's mode
+  set to `autonomous`, *any* message started a run - a question ("почему прогон
+  ломается?") launched agents. `orchestration/nexus_intent.py` is now the one
+  router: it classifies a message as `chat` / `analysis` / `autonomous` from its
+  *shape* (question vs order), not from a keyword, and `effective_mode` turns
+  that into the mode the turn runs in. Migration `0027` adds the `analysis` and
+  `auto` modes and makes `auto` the default; the studio has an "Авто" (default)
+  and a "Разбор" mode. Invariants: a question never starts a run; an ambiguous
+  message is answered with one clarifying question (and does not even call the
+  model); `analysis` mode never starts a run; "продолжи" continues the run the
+  conversation already started (resume, never a second run); a question asked
+  during a run does not change the run's state. `tests/test_intent_router.py`.
+- **A statement is not ambiguous.** Only a message that carries a work signal
+  but whose shape is unclear is flagged ambiguous. A plain "Вопрос без
+  провайдера" or a hostile HTML blob is a normal chat turn (answered, never
+  intercepted) - the browser tests depend on that.
+- **The planner recovered nothing from an empty plan.** "the planner found
+  nothing to do in the specification: the plan has no tasks" was terminal.
+  `SpecPlanner._fallback_plan` now decomposes by the specification's own index -
+  one task per section that holds at least one *normative* piece, chained in
+  document order - each task carrying the `spec_ref` the delivery path needs.
+  It never fabricates work: a text with no obligation still fails honestly, with
+  the reason. `coverage["fallback"]` marks it. `tests/test_long_task_cases.py`.
+- **Report delivery was not idempotent under two workers.** `deliver_pending`
+  read the pending rows and marked each `sent` only *after* posting, so the
+  inline lab loop and a standalone `lab_worker` (which the docs say may run side
+  by side) both posted the same report. Delivery now *claims* each report
+  atomically (`claim_pending_reports`, `FOR UPDATE SKIP LOCKED`, status
+  `sending`; migration `0028` widens the CHECK) and `reclaim_stale_report_sends`
+  returns a dead worker's claim. `tests/test_durable_autonomy.py`.
+- **`is_primary` was a label with no effect.** The docstring promised a
+  repository-less task runs against the project's primary repository, but
+  nothing read the column. `ProjectRepositoryService.primary_repository` now
+  resolves it (and treats a project's *single* linked repository as primary in
+  effect), and both run-start paths use it.
+- **Test-suite flakiness (not a product defect).** Running the whole suite can
+  fail with `psycopg.errors.UndefinedTable` when one module's server (with
+  `lab_inline=True`) still touches the database while the next module resets the
+  schema. Each module passes alone; a clean serial run passes. Do not "fix" this
+  by weakening a test.

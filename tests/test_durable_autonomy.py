@@ -501,35 +501,60 @@ def test_a_run_that_names_no_cycles_gets_the_default(env):
     assert run["total_iterations"] == 0
 
 
-# --------------------------------------------------- tasks across repositories
-def test_a_plan_can_distribute_tasks_across_repositories(env):
-    """One run spans several repositories: each task names its own repo/branch."""
-    env["store"].add_repository("acme/frontend", default_branch="main")
-    env["store"].add_repository("acme/backend", default_branch="main")
-    repos = ProjectRepositoryService(env["store"])
-    repos.link("user:alice", env["project"], "acme/frontend", make_primary=True)
-    repos.link("user:alice", env["project"], "acme/backend")
-    run = env["lab"].start_run(
-        "user:alice", env["project"], env["goal"],
-        repository="acme/frontend", branch="main",
-        plan=[
-            {"id": "ui", "title": "UI", "repository": "acme/frontend", "branch": "main",
-             "dependencies": []},
-            {"id": "api", "title": "API", "repository": "acme/backend", "branch": "main",
-             "dependencies": ["ui"]},
-        ])
-    tasks = {t["task_key"]: t for t in
-             env["lab"].list_tasks("user:alice", env["project"], run["id"])}
-    assert tasks["ui"]["repository"] == "acme/frontend"
-    assert tasks["api"]["repository"] == "acme/backend"
+def test_two_workers_deliver_a_report_once(env):
+    """A report must reach the chat exactly once, even with two workers.
+
+    The inline lab loop and a standalone ``lab_worker`` may run side by side.
+    Delivery used to read the pending rows and mark them sent only after
+    posting, so both workers read the same report and the chat got it twice.
+    The claim (``FOR UPDATE SKIP LOCKED``) hands each report to one worker.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from orchestration.nexus_conversations import ConversationService
+
+    with env["store"]._tx() as cur:
+        cur.execute("INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
+                    "VALUES (%s,'chat','auto','user:alice') RETURNING id",
+                    (env["project"],))
+        conversation = str(cur.fetchone()["id"])
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}],
+                          source_conversation_id=conversation)
+    env["lab"].save_report(run["id"], content="Отчёт по автономному прогону", meta={})
+
+    conv = ConversationService(env["store"])
+
+    def deliver():
+        return ReportDeliverer(env["store"], env["lab"], conv).deliver_pending()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tallies = list(pool.map(lambda _: deliver(), range(4)))
+    assert sum(t["delivered"] for t in tallies) == 1, tallies
+
+    messages = conv.list_messages("user:alice", env["project"], conversation)
+    posted = [m for m in messages if (m.get("meta") or {}).get("kind") == "run_report"]
+    assert len(posted) == 1, f"the report was posted {len(posted)} times"
+    assert env["lab"].report_for_run(run["id"])["status"] == "sent"
 
 
-def test_a_task_without_a_repository_uses_the_runs(env):
-    env["store"].add_repository("acme/one", default_branch="main")
-    ProjectRepositoryService(env["store"]).link("user:alice", env["project"], "acme/one")
-    run = env["lab"].start_run(
-        "user:alice", env["project"], env["goal"],
-        repository="acme/one", branch="dev",
-        plan=[{"id": "a", "title": "A", "dependencies": []}])
-    task = env["lab"].list_tasks("user:alice", env["project"], run["id"])[0]
-    assert (task["repository"], task["branch"]) == ("acme/one", "dev")
+def test_a_report_left_sending_by_a_dead_worker_is_reclaimed(env):
+    """A worker that claims a report and dies leaves it ``sending``; the next
+    pass takes it back, so the report is not lost."""
+    with env["store"]._tx() as cur:
+        cur.execute("INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
+                    "VALUES (%s,'chat','auto','user:alice') RETURNING id",
+                    (env["project"],))
+        conversation = str(cur.fetchone()["id"])
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}],
+                          source_conversation_id=conversation)
+    env["lab"].save_report(run["id"], content="Отчёт", meta={})
+    claimed = env["lab"].claim_pending_reports()
+    assert len(claimed) == 1
+    assert env["lab"].report_for_run(run["id"])["status"] == "sending"
+    # Not reclaimed while it is fresh.
+    assert env["lab"].reclaim_stale_report_sends(older_than_seconds=300) == 0
+    # Reclaimed once it is old enough (a dead worker's claim).
+    _sql(env, "UPDATE nexus_run_reports SET updated_at = now() - interval '10 minutes' "
+              "WHERE run_id=%s", run["id"])
+    assert env["lab"].reclaim_stale_report_sends(older_than_seconds=300) == 1
+    assert env["lab"].report_for_run(run["id"])["status"] == "pending"

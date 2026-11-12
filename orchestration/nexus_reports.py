@@ -168,9 +168,15 @@ class ReportDeliverer:
         A report with no conversation (its chat was deleted) is marked sent: it
         can never be delivered, and leaving it pending would make every pass try
         again for ever.
+
+        The reports are **claimed** first (``claim_pending_reports``, an atomic
+        ``FOR UPDATE SKIP LOCKED`` that moves them to ``sending``), so two
+        workers never post the same report: the chat sees one report per run.
+        A report a dead worker left ``sending`` is reclaimed after a short while.
         """
+        self.lab.reclaim_stale_report_sends()
         delivered = failed = 0
-        for report in self.lab.pending_reports(limit=limit):
+        for report in self.lab.claim_pending_reports(limit=limit):
             conversation_id = report.get("conversation_id")
             if not conversation_id:
                 self.lab.mark_report_sent(report["id"])

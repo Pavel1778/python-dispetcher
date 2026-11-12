@@ -1,281 +1,360 @@
-"""Intent routing: is a chat turn a question, an analysis, or a task to run?
+"""The Intent Router: decide what a chat message *asks for* before acting.
 
-NEXUS must not turn every message into an autonomous run. The default is a
-conversation: a question is answered in the chat, an error is analysed without
-changing code, and an autonomous run is started **only** when the person clearly
-asks for work to be done. This module decides which of those a turn is.
+The defect this fixes: NEXUS used to treat a chat message as work to start
+whenever the conversation's mode was ``autonomous``. A person who asked "почему
+прогон ломается?" in that conversation got an autonomous run started for the
+question. The mode was a label on the *conversation*, not a decision about the
+*message*, so a question could not be asked without launching agents.
 
-It is deterministic first. A fast, explainable rule pass runs before any model:
-a clear command ("продолжи", "запусти автономно", "исправь ...") is recognised
-without a provider call, so the common cases are cheap and never depend on a
-model being configured. Only a turn the rules cannot place is handed to the
-model, and a model that is unavailable or uncertain is treated as a **question**
-- the safe default is to answer, never to start work.
+This module makes the decision explicit and deterministic. It classifies one
+message into one of three intents:
 
-The three modes it routes to:
+* ``chat``       - answer in the chat. A question, an explanation, a greeting,
+                   a discussion, an opinion. Nothing is started.
+* ``analysis``   - look at the real state (the project, the runs, the logs) and
+                   answer in the chat. Read-only: it never changes code and
+                   never starts a run.
+* ``autonomous`` - a real engineering task: implement, fix, refactor, run.
+                   Only this intent may start an autonomous run (or a code
+                   workflow), and only when the message also asks for work to be
+                   *done*.
 
-* ``chat``        - answer the question in the chat. Nothing is started.
-* ``analysis``    - explain what is wrong, without changing code. Nothing runs.
-* ``autonomous``  - the person asked for work: plan it and start a run.
+The classification is a small set of ordered rules, not a keyword match. The
+same word ("проверь", "проект", "код") appears in a question and in an order, so
+the *shape* of the message decides. Read :func:`classify` for the order.
 
-A turn the rules or the model cannot place is ``chat`` with a clarifying
-question, so an ambiguous request is asked about once rather than guessed at.
+The router never *starts* anything itself; it returns a decision. The caller
+(the chat turn) is what acts on it, and it acts conservatively: a decision the
+router marks ambiguous does not start a run.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
-#: The modes a routed turn can be. ``chat`` is the default and the safe fallback.
-ROUTED_MODES = ("chat", "analysis", "autonomous")
+#: The intents a message can have.
+CHAT = "chat"
+ANALYSIS = "analysis"
+AUTONOMOUS = "autonomous"
 
-#: A command that clearly asks for work, in the imperative or an explicit
-#: "autonomous" phrasing. Matched case-insensitively against the message start.
-_WORK_COMMANDS = (
-    "реализуй", "сделай", "исправь", "почини", "добавь", "удали", "перепиши",
-    "отрефактори", "закоммить", "запушь", "напиши код", "внедри", "обнови",
-    "implement", "fix", "refactor", "commit", "push", "deploy",
-)
-#: Phrases that name the autonomous mode outright.
-_AUTONOMOUS_PHRASES = (
-    "автономн", "выполни", "запусти прогон", "запусти автономно", "сделай полностью",
-    "выполни задачу", "доведи до конца", "run it autonomously", "autonomous run",
-)
-#: Commands that continue an existing run rather than start a new one.
-_CONTINUE_PHRASES = (
-    "продолжи", "продолжай", "повтори", "попробуй ещё", "доделай", "возобнови",
-    "continue", "retry", "resume",
-)
-#: Questions about a run's state - answered from stored data, never a new run.
-_STATUS_PHRASES = (
-    "что готово", "что сделано", "статус", "как дела", "прогресс", "что сейчас",
-    "где остановились", "что осталось", "покажи отчёт", "отчёт готов",
-    "status", "what is done", "what's left", "progress", "report",
-)
-#: An analysis request: explain, do not change.
-_ANALYSIS_PHRASES = (
-    "почему", "как работает", "объясни", "разбери", "проанализируй", "в чём ошибка",
-    "что не так", "какая причина", "разберись", "диагностика",
-    "why", "explain", "analyse", "analyze", "what is wrong", "diagnose",
-)
-#: A weak signal that the person *might* want work done, without a clear
-#: command. When one of these is present the turn is answered and a single
-#: clarifying question is asked ("do you want this done?"), rather than either
-#: silently starting work or silently ignoring the intent.
-_WORK_HINTS = (
-    "нужно", "надо", "давай", "можешь", "хочу", "помоги", "стоит ли",
-    "could you", "can you", "i need", "i want", "let's", "shall we",
-)
-#: A pure question: starts with an interrogative or ends with a question mark.
-_QUESTION_STARTS = (
-    "что", "как", "почему", "зачем", "где", "когда", "кто", "сколько", "можно ли",
-    "какой", "какая", "какие", "есть ли", "чем",
-    "what", "how", "why", "where", "when", "who", "which", "is ", "are ", "can ",
-    "does ", "do ",
-)
+#: The modes a conversation may be *set* to. ``analysis`` is a real mode (it
+#: reads and answers); ``auto`` is the default that lets the router decide per
+#: message, so a question in an "auto" conversation stays a question.
+CONVERSATION_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto")
 
+#: The modes that mean "the person chose this; do not start work".
+_QUIET_MODES = ("ask", "plan", "analysis")
 
-def _starts_with(text: str, phrases: tuple[str, ...]) -> str | None:
-    """The first phrase *text* begins with, or ``None``.
+#: Question marks, in the scripts this project sees.
+_QUESTION_MARK = re.compile(r"[?？]")
 
-    Only the start matters for a command: "сделай X" is a command, but a
-    sentence that merely mentions "сделай" halfway is not (it may be a
-    question about a past action).
-    """
-    low = text.lstrip().lower()
-    for phrase in phrases:
-        if low.startswith(phrase):
-            return phrase
-    return None
+#: Openers that make a message a question whatever else it contains. Anchored to
+#: the start (after optional polite words) so "почему" inside a sentence does
+#: not by itself make an order a question.
+_INTERROGATIVE = re.compile(
+    r"^\s*(?:"
+    r"почему|зачем|отчего|что|чё|чем|как|какой|какая|какие|каков|когда|где|куда|откуда|"
+    r"кто|кого|кому|сколько|можно\s+ли|есть\s+ли|будет\s+ли|стоит\s+ли|"
+    r"why|what|how|when|where|which|who|whom|whose|is|are|does|do|did|can|could|should|"
+    r"would|will|may|might"
+    r")\b", re.IGNORECASE)
 
+#: "Why did X happen / why is X broken" - a question that needs the real state
+#: looked at. A plain "what is done?" does not need this and stays chat.
+_WHY = re.compile(r"\b(?:почему|зачем|отчего|why|how\s+come)\b", re.IGNORECASE)
 
-def _mentions(text: str, phrases: tuple[str, ...]) -> str | None:
-    low = text.lower()
-    for phrase in phrases:
-        if phrase in low:
-            return phrase
-    return None
+#: Requests to explain / discuss / advise / show - a conversation, not work.
+_DISCUSS = re.compile(
+    r"\b(?:"
+    r"объясни|объясните|поясни|расскажи|опиши|обсуди|обсудим|поговорим|"
+    r"что\s+думаешь|твоё\s+мнение|твое\s+мнение|посоветуй|подскажи|"
+    r"помоги\s+понять|помоги\s+разобраться|"
+    r"explain|describe|discuss|advise|suggest|tell\s+me|what\s+do\s+you\s+think|"
+    r"opinion|thoughts?\s+on"
+    r")\b", re.IGNORECASE)
 
+#: Requests to look at / analyse / investigate real state. Read-only.
+_ANALYSIS = re.compile(
+    r"\b(?:"
+    r"проанализируй|проанализир|анализ|исследуй|изучи|разберись|разбери|"
+    r"посмотри|погляди|взгляни|проверь|проверить|найди|найти|выясни|"
+    r"сравни|сравнить|оцени|диагностир|"
+    r"analyz|analys|investigat|examine|inspect|review|compare|diagnos|"
+    r"look\s+at|find\s+out|figure\s+out|trace"
+    r")", re.IGNORECASE)
 
-#: A status question is short: a person typing "что готово?" asks about the run;
-#: a 5 000-character document that contains the word "status" is a specification
-#: and must reach the planner, not be answered as a question about a run.
-_STATUS_MAX_CHARS = 120
+#: The analysis verbs, anchored to the start: the first word decides, so
+#: "Посмотри логи и объясни проблему" is analysis, not a discussion.
+_ANALYSIS_LEAD = re.compile(
+    r"^\s*(?:"
+    r"проанализируй|проанализир|анализ|исследуй|изучи|разберись|разбери|"
+    r"посмотри|погляди|взгляни|проверь|проверить|найди|найти|выясни|"
+    r"сравни|сравнить|оцени|диагностир|"
+    r"analyz|analys|investigat|examine|inspect|review|compare|diagnos|"
+    r"look\s+at|find\s+out|figure\s+out|trace"
+    r")", re.IGNORECASE)
 
+#: Imperative engineering verbs - an order to *do* work. Chosen as stems so a
+#: word ending does not matter; deliberately does not include read-only verbs.
+_ORDER = re.compile(
+    r"(?:^|[\s,;:(\-—–])(?:"
+    r"реализу|реализова|"
+    r"исправ|почин|поправь|"
+    r"добавь|добави|внедри|"
+    r"сделай|сделать|создай|созда|напиши|написа|"
+    r"удали|убери|убра|замени|замен|перепиши|переписа|"
+    r"отрефактори|рефакторинг|рефакторь|переработай|"
+    r"обнови|обнов|улучши|улучш|оптимизиру|оптимизир|доработа|"
+    r"запусти|запуска|перезапусти|"
+    r"выполни|выполн|собери|собра|разверни|задеплой|"
+    r"покрой|покры|протестируй|настрой|настро|подключи|подключ|"
+    r"продолж|доведи|заверши|закончи|"
+    r"implement|fix|add|create|write|remove|delete|refactor|rewrite|"
+    r"update|improve|optimiz|upgrade|migrate|deploy|build|run|rerun|"
+    r"continue|finish|complete|carry\s+out"
+    r")", re.IGNORECASE)
 
-def _short_status_question(text: str) -> str | None:
-    """The status phrase *text* asks about, if it is a short question about a run."""
-    stripped = text.strip()
-    if len(stripped) > _STATUS_MAX_CHARS:
-        return None
-    low = stripped.lower()
-    for phrase in _STATUS_PHRASES:
-        if low.startswith(phrase) or (phrase in low and stripped.endswith("?")):
-            return phrase
-    return None
+#: Words that mark a message as referring to work already under way.
+_CONTINUE = re.compile(
+    r"\b(?:продолж\w*|возобнови\w*|continue|resume|carry\s+on|go\s+on|keep\s+going)\b",
+    re.IGNORECASE)
+
+#: A greeting or a bare courtesy - a conversation opener, never work.
+_GREETING = re.compile(
+    r"^\s*(?:привет|здравствуй|здравствуйте|добрый\s+день|добрый\s+вечер|"
+    r"хай|ку|спасибо|благодарю|ок|окей|ok|okay|hello|hi|hey|thanks|thank\s+you)"
+    r"[\s!.,:)-]*$", re.IGNORECASE)
+
+#: A request for a plan, answered in the chat (the "plan" reply), never a run.
+_PLAN = re.compile(
+    r"\b(?:предложи\s+план|составь\s+план|спланируй|составить\s+план|"
+    r"план\s+улучшени|suggest\s+a\s+plan|make\s+a\s+plan)\b",
+    re.IGNORECASE)
+
+#: Words that make a request about the *state of work* (runs, progress, status).
+#: Stems on purpose: "ошибка", "прогон", "задача" and their forms must all
+#: match, so no trailing word boundary is written after a stem.
+_STATE = re.compile(
+    r"(?:готов|сдела|прогресс|статус|состояни|"
+    r"прогон|задач|выполнени|"
+    r"останови|остановл|упал|сломал|ломается|ошибк|падает|заверши|закончи|"
+    r"done|ready|status|progress|\bruns?\b|\btasks?\b|finished|stopped|failed|error)",
+    re.IGNORECASE)
+
+#: An order phrased as a direct command. This is the narrow case that lets
+#: "исправь эту ошибку" be work while "почему не исправил?" stays a question:
+#: the order must be at the *start* of the message (after an optional polite
+#: prefix), not quoted inside a question.
+_EXPLICIT_ORDER = re.compile(
+    r"^\s*(?:пожалуйста[,\s]+|давай[,\s]+|ну[,\s]+|please[,\s]+|now[,\s]+)?"
+    r"(?:"
+    r"реализуй|исправь|почини|поправь|добавь|внедри|сделай|создай|напиши|"
+    r"удали|убери|замени|перепиши|отрефактори|переработай|обнови|улучши|"
+    r"оптимизируй|доработай|запусти|перезапусти|выполни|собери|разверни|"
+    r"задеплой|покрой|протестируй|настрой|подключи|доведи|"
+    r"заверши|закончи|продолж(?:ай|и|ите|ать|айте)|"
+    r"implement|fix|add|create|write|remove|delete|refactor|rewrite|update|"
+    r"improve|optimiz|upgrade|migrate|deploy|build|run|rerun|continue|finish|"
+    r"complete"
+    r")\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class Intent:
-    """What a turn is, and why - both are shown to the caller and the UI."""
+    """What one message asks for, and why.
 
-    mode: str                       # chat | analysis | autonomous
-    reason: str                     # a short, human-readable explanation
-    source: str                     # "rule" | "model" | "default"
-    confidence: float               # 0..1
-    continuation: bool = False      # "continue the run I already have"
-    clarifying: str = ""            # a question to ask when it is ambiguous
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"mode": self.mode, "reason": self.reason, "source": self.source,
-                "confidence": self.confidence, "continuation": self.continuation,
-                "clarifying": self.clarifying}
-
-
-class IntentRouter:
-    """Decide a turn's mode: deterministic rules first, the model only after.
-
-    The router never starts anything; it only classifies. The caller
-    (:class:`orchestration.web_server.Handler._chat_turn`) acts on the mode, and
-    the dispatch hooks it calls are the ones that actually run work.
+    ``intent`` is ``chat``/``analysis``/``autonomous``. ``ambiguous`` is True
+    when the message is not clearly a question and not clearly an order, so the
+    caller should ask one clarifying question rather than start work.
+    ``continue_run`` is True when the message asks to carry on work already
+    started. ``reason`` is a short human-readable note for the caller/logs.
     """
 
-    def __init__(self, providers: Any | None = None):
-        #: The provider cascade, used only for a turn the rules cannot place.
-        #: ``None`` (or an unavailable cascade) leaves the safe default: chat.
-        self.providers = providers
+    intent: str
+    ambiguous: bool = False
+    continue_run: bool = False
+    question: bool = False
+    reason: str = ""
 
-    def route(self, text: str, *, conversation_mode: str | None = None,
-              has_active_run: bool = False) -> Intent:
-        """Classify *text*.
-
-        *conversation_mode*, when the person picked one explicitly ("Автономно"
-        in the composer), is honoured: an explicit choice is not second-guessed.
-        *has_active_run* makes "продолжи"/"повтори" a continuation of that run
-        instead of a new one, so a follow-up never starts a duplicate.
-        """
-        text = (text or "").strip()
-        if not text:
-            return Intent("chat", "пустое сообщение", "default", 1.0)
-
-        # 1. An explicit "План" or "Код" mode is an instruction, not a hint, and
-        #    is not re-classified. The default "ask" (a plain chat) does NOT
-        #    short-circuit - it is exactly the case the router exists for.
-        #    "Автономно" is handled below (after the continuation and status
-        #    checks) so that "продолжи" in that mode continues the run and a
-        #    status question is answered, rather than starting a second run.
-        if conversation_mode == "code":
-            return Intent("autonomous", "выбран режим «Код»", "rule", 1.0)
-        if conversation_mode == "plan":
-            return Intent("chat", "выбран режим «План»", "rule", 1.0)
-
-        # 2. A continuation of an existing run is not a new run - this applies in
-        #    every mode, including an explicit "Автономно", so a follow-up never
-        #    starts a duplicate.
-        cont = _starts_with(text, _CONTINUE_PHRASES) or _mentions(text, _CONTINUE_PHRASES)
-        if cont and has_active_run:
-            return Intent("autonomous", f"продолжение текущего прогона («{cont}»)",
-                          "rule", 0.9, continuation=True)
-
-        # 3. A status question about a run is answered from stored data, never a
-        #    new run - this is the "что готово?" case. It must be *short* and
-        #    *start* with the phrase (or end with "?"): a long document that
-        #    merely contains the word "status" is a specification, not a
-        #    question, and must not be diverted from the run it asks for.
-        status = _short_status_question(text)
-        if status and not _starts_with(text, _WORK_COMMANDS):
-            return Intent("chat", f"вопрос о ходе работы («{status}»)", "rule", 0.9)
-
-        # 4. An explicit "Автономно" mode: the text is the task. Reached only
-        #    after the continuation and status checks above.
-        if conversation_mode == "autonomous":
-            return Intent("autonomous", "выбран режим «Автономно»", "rule", 1.0)
-
-        # 5. A continuation with no run to continue is answered, not started.
-        if cont:
-            return Intent("chat", f"продолжение без активного прогона («{cont}»)",
-                          "rule", 0.7)
-
-        # 6. A clear work command in the imperative starts work. Only the start
-        #    of the message counts, so a document that mentions "сделай" in its
-        #    prose is not taken for a command.
-        command = _starts_with(text, _WORK_COMMANDS)
-        if command:
-            return Intent("autonomous", f"команда выполнить работу («{command}»)",
-                          "rule", 0.85)
-        # A *phrase* match ("выполни", "разбери", ...) is only trusted for a
-        # short message; a long one is a specification, and the planner - not
-        # the router - decides what it asks for.
-        if len(text) <= _STATUS_MAX_CHARS:
-            phrase = _mentions(text, _AUTONOMOUS_PHRASES)
-            if phrase:
-                return Intent("autonomous", f"явный запрос автономной работы («{phrase}»)",
-                              "rule", 0.85)
-
-        # 7. An analysis request is answered without changing code.
-        if len(text) <= _STATUS_MAX_CHARS:
-            analysis = (_starts_with(text, _ANALYSIS_PHRASES)
-                        or _mentions(text, _ANALYSIS_PHRASES))
-            if analysis:
-                return Intent("analysis", f"запрос на анализ («{analysis}»)", "rule", 0.8)
-
-        # 8. An obvious question is answered in the chat.
-        if text.endswith("?") or _starts_with(text, _QUESTION_STARTS):
-            return Intent("chat", "вопрос", "rule", 0.8)
-
-        # 9. Nothing matched. Ask the model, but only for a short message; a
-        #    long one is a document, and the rules above already cover the
-        #    explicit commands. An unavailable model leaves the safe default.
-        decided = self._ask_model(text)
-        if decided is not None:
-            return decided
-
-        # 10. The safe default is a conversation: the turn is answered, and work
-        #    is not started on a guess. A *weak* work hint ("можешь ...", "нужно
-        #    ...") earns one clarifying question, because the person may have
-        #    meant a task; a plain message gets a plain answer with no question.
-        hint = _mentions(text, _WORK_HINTS)
-        if hint:
-            return Intent("chat", f"возможная задача без явной команды («{hint}»)",
-                          "default", 0.5,
-                          clarifying="Это вопрос или задача, которую нужно выполнить? "
-                                     "Если задачу — включите режим «Автономно» и повторите.")
-        return Intent("chat", "намерение неясно; по умолчанию — ответ в чате",
-                      "default", 0.4)
-
-    # ------------------------------------------------------------------ model
-    def _ask_model(self, text: str) -> Intent | None:
-        """Ask the cascade to classify a short message. ``None`` if it cannot.
-
-        A provider that is missing, fails, or answers something unexpected
-        returns ``None``, and the caller keeps the safe default (chat). The
-        classification never starts work on its own.
-        """
-        if self.providers is None:
-            return None
-        if len(text) > 600:
-            # A long message is a specification; classifying it is the planner's
-            # job, and the rules already cover an explicit command.
-            return None
-        try:
-            if not self.providers.configured():
-                return None
-            response = self.providers.text(text, _CLASSIFY_SYSTEM)
-            answer = (response.data.get("text") or "").strip().lower()
-        except Exception:  # noqa: BLE001 - a router must never break a turn
-            return None
-        for mode in ROUTED_MODES:
-            if re.search(rf"\b{mode}\b", answer):
-                return Intent(mode, f"модель классифицировала как «{mode}»",
-                              "model", 0.6)
-        return None
+    @property
+    def starts_work(self) -> bool:
+        return self.intent == AUTONOMOUS and not self.ambiguous
 
 
-_CLASSIFY_SYSTEM = (
-    "You classify a developer's message to an AI coding assistant into exactly "
-    "one word: 'chat' (a question or a request for an explanation), 'analysis' "
-    "(explain what is wrong or why, without changing code), or 'autonomous' "
-    "(an explicit request to perform work in the repository). Reply with one "
-    "word only. When unsure, reply 'chat'."
-)
+def _looks_like_question(text: str) -> bool:
+    if _QUESTION_MARK.search(text):
+        return True
+    return bool(_INTERROGATIVE.match(text))
+
+
+def _has_explicit_order(text: str) -> bool:
+    """Whether *text* begins with a direct order to do work.
+
+    "исправь ошибку" -> yes. "почему прогон ломается?" -> no. "ты можешь
+    исправить?" -> no (the order is not at the start). This is what keeps a
+    question a question while still letting an imperative order through.
+    """
+    return bool(_EXPLICIT_ORDER.match(text))
+
+
+def _residual_after_continue(text: str) -> str:
+    """*text* with the continuation cue and polite filler removed.
+
+    A bare "Продолжи" leaves nothing; "Продолжай работу до завершения" leaves
+    "работу до завершения". The residual decides whether a continuation is an
+    order to start something or a question about what to continue.
+    """
+    stripped = _CONTINUE.sub(" ", text)
+    stripped = re.sub(r"^\s*(?:пожалуйста|давай|ну|please|now)\b", " ", stripped,
+                      flags=re.IGNORECASE)
+    return " ".join(stripped.split())
+
+
+def classify(text: str, *, mode: str | None = None, has_active_run: bool = False) -> Intent:
+    """Classify one chat message.
+
+    *mode* is the conversation's chosen mode, used only as a *hint* for the
+    ambiguous case: an explicit ``ask``/``plan``/``analysis`` mode never starts
+    an autonomous run, whatever the words say, because the person chose that
+    mode. ``auto`` (and ``autonomous``) leave the decision to the message.
+    *has_active_run* lets "продолжи" be recognised as continuing real work.
+
+    The rules are ordered; the first that matches decides. Read them as: a
+    question is never an order; an order is only an order when it names work.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return Intent(CHAT, question=True, reason="empty")
+    mode = (mode or "auto").lower()
+    if mode not in CONVERSATION_MODES:
+        mode = "auto"
+
+    question = _looks_like_question(raw)
+    greeting = bool(_GREETING.match(raw))
+    discuss = bool(_DISCUSS.search(raw))
+    analysis = bool(_ANALYSIS.search(raw))
+    order = bool(_ORDER.search(raw))
+    continue_run = bool(_CONTINUE.search(raw))
+    why = bool(_WHY.search(raw))
+    state = bool(_STATE.search(raw))
+    explicit_order = _has_explicit_order(raw)
+    analysis_lead = bool(_ANALYSIS_LEAD.match(raw))
+
+    # 1. A greeting is a conversation.
+    if greeting:
+        return Intent(CHAT, reason="greeting")
+
+    # 2. An explicit non-execution mode is the person's own choice: respect it.
+    #    ("analysis" mode still reads; the others answer.)
+    if mode in _QUIET_MODES:
+        if mode == "analysis" or (analysis and not explicit_order):
+            return Intent(ANALYSIS, reason=f"mode {mode}, read-only request")
+        return Intent(CHAT, reason=f"mode {mode}")
+
+    # 3. A discussion request is a conversation, even when it names an order
+    #    verb ("давай обсудим, как лучше реализовать") - unless the message
+    #    opens with a direct order ("реализуй и объясни, как") or with a
+    #    read-only verb ("посмотри логи и объясни проблему" is analysis).
+    if discuss and not explicit_order:
+        if analysis_lead:
+            return Intent(ANALYSIS, reason="read-only request")
+        return Intent(CHAT, reason="discussion")
+
+    # 4. "Продолжи..." is about work already under way.
+    if continue_run:
+        if has_active_run:
+            return Intent(AUTONOMOUS, continue_run=True, reason="continue existing run")
+        residual = _residual_after_continue(raw)
+        if explicit_order and residual:
+            # "Продолжай работу до завершения": an order that names the work.
+            return Intent(AUTONOMOUS, continue_run=True, reason="continue named work")
+        # A bare "Продолжи" with nothing to continue is a question, not a task.
+        return Intent(CHAT, ambiguous=not question, question=question,
+                      reason="continue with no known run")
+
+    # 5. A question is answered, never executed - even when it contains an
+    #    order verb ("почему прогон ломается?", "почему ты не исправил это?").
+    #    A question that asks *why* about real state, or uses an analysis verb,
+    #    is analysis; any other question is chat. A question whose *only* trace
+    #    of work is an order verb buried inside it ("а не лучше ли переписать?")
+    #    is ambiguous: ask, do not act.
+    if question and not explicit_order:
+        if analysis or (why and state):
+            return Intent(ANALYSIS, question=True, reason="question about real state")
+        if order and not discuss:
+            return Intent(CHAT, ambiguous=True, question=True, reason="question with a buried order")
+        return Intent(CHAT, question=True, reason="question")
+
+    # 6. A request for a plan is answered in the chat.
+    if _PLAN.search(raw) and not explicit_order:
+        return Intent(CHAT, reason="plan request")
+
+    # 7. A read-only request ("проанализируй", "найди причину") is analysis.
+    if analysis and not order:
+        return Intent(ANALYSIS, reason="read-only request")
+    if analysis and order and not explicit_order:
+        # "проверь и исправь?" - an order hidden in a read-only phrase: ask.
+        return Intent(ANALYSIS, ambiguous=True, reason="mixed read-only and order")
+
+    # 8. An order to do work.
+    if order:
+        return Intent(AUTONOMOUS, reason="order to perform work")
+
+    # 9. Nothing matched: a statement, an opinion, a remark, a greeting that was
+    #    not bare. It carries no order and no read-only verb, so it is answered
+    #    in the chat. It is *not* flagged ambiguous: ambiguity is reserved for a
+    #    message that does carry a work signal but whose shape leaves it unclear
+    #    (see the buried-order case above), because only there would asking be
+    #    better than answering.
+    return Intent(CHAT, reason="statement")
+
+
+def effective_mode(mode: str | None, intent: Intent) -> str:
+    """The mode the *turn* should run in, given the conversation's mode.
+
+    An explicit ``ask``/``plan``/``analysis``/``code`` conversation keeps its
+    mode. An ``autonomous`` or ``auto`` conversation runs the mode the router
+    chose, so a question in it is answered instead of starting a run.
+    """
+    mode = (mode or "auto").lower()
+    if mode in ("ask", "plan"):
+        return mode
+    if mode == "analysis":
+        # The person chose "Разбор", which is read-only by definition: it never
+        # starts a run, even when the message is phrased as an order. Work is
+        # asked for in "Авто" or "Автономно" mode.
+        return "analysis"
+    if mode == "code":
+        # The person chose "Code" (one OpenHands workflow). An order stays a
+        # code task; a question is still a question and is answered, not run.
+        if intent.starts_work:
+            return "code"
+        return "analysis" if intent.intent == ANALYSIS else "ask"
+    if mode == "autonomous":
+        # The person chose "Автономно": they are asking for work. A question is
+        # still answered and an explicit discussion is still a discussion, but
+        # anything else - including a stated goal with no order verb ("Цель: 25
+        # задач") - is honoured as work: they selected the mode, so an unclear
+        # goal runs rather than being turned into a chat reply.
+        if intent.question:
+            return "analysis" if intent.intent == ANALYSIS else "ask"
+        if intent.intent == CHAT and intent.reason == "discussion":
+            return "ask"
+        return "autonomous"
+    # auto: the message alone decides.
+    if intent.starts_work:
+        return "autonomous"
+    if intent.intent == ANALYSIS:
+        return "analysis"
+    return "ask"
+
+
+def clarifying_question() -> str:
+    """One short question to ask when the intent is ambiguous.
+
+    The requirement is explicit: do not start a run on an unclear message, and
+    do not turn every message into a form. One sentence, with the two real
+    options, is what is sent.
+    """
+    return ("Уточните, пожалуйста: объяснить и обсудить это в чате, "
+            "или сразу выполнить работу и запустить автономный прогон?")

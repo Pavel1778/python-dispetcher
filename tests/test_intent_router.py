@@ -1,12 +1,20 @@
-"""Intent routing: a message is answered, analysed or run - never guessed at.
+"""Chat-first intent routing: a question is answered, only an order starts work.
 
-The router is deterministic first; the model is asked only for a turn the rules
-cannot place, and a model that is unavailable or uncertain leaves the safe
-default (chat). These tests pin the rules and the safe defaults, so a change
-that would start work on a plain question fails here.
+The defect these tests cover: with the conversation's mode set to
+``autonomous``, *any* message started an autonomous run - so "почему прогон
+ломается?" launched agents. The mode was a label on the conversation, not a
+decision about the message.
+
+The first half is the pure classifier (no database): the table from the
+requirement, and the shape rules that keep a question a question. The second
+half drives the real server over real HTTP and PostgreSQL and asserts the
+observable behaviour the requirement names: a question creates no run and no
+OpenHands conversation, an order does, "продолжи" continues instead of
+duplicating, and an ambiguous message is answered with one clarifying question.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -14,146 +22,228 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from orchestration.nexus_intent import ROUTED_MODES, IntentRouter  # noqa: E402
+from orchestration.nexus_intent import (  # noqa: E402
+    ANALYSIS,
+    AUTONOMOUS,
+    CHAT,
+    classify,
+    clarifying_question,
+    effective_mode,
+)
+from tests.test_studio_api import DSN, REPO, studio_stack  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run intent tests")
 
 
-def router() -> IntentRouter:
-    # No provider: only the rules and the safe default are exercised, which is
-    # the deployment where no model is configured.
-    return IntentRouter(None)
+@pytest.fixture
+def studio(monkeypatch):
+    """The real server on the fakes, exactly as ``test_studio_api`` builds it."""
+    with studio_stack(monkeypatch) as stack:
+        yield stack
+
+PLAN = {"tasks": [
+    {"id": "audit", "title": "Изучить код", "description": "Прочитать модуль.",
+     "acceptance": ["сводка"], "dependencies": []},
+]}
 
 
-# ------------------------------------------------------------------- the default
-@pytest.mark.parametrize("text", [
-    "Привет!",
-    "Как устроен этот проект?",
-    "Что ты умеешь?",
-    "Расскажи про архитектуру",
-    "Спасибо",
+# ------------------------------------------------------------- the classifier
+@pytest.mark.parametrize("text, expected", [
+    # chat: questions, explanations, discussion, opinion, a plan request.
+    ("Привет", CHAT),
+    ("Что уже готово?", CHAT),
+    ("Ок, что уже готово?", CHAT),
+    ("Что ты думаешь об этой архитектуре?", CHAT),
+    ("Объясни, что делает этот модуль.", CHAT),
+    ("Объясни архитектуру", CHAT),
+    ("Давай обсудим, как лучше реализовать эту функцию", CHAT),
+    ("Давай обсудим реализацию", CHAT),
+    ("Предложи план улучшений", CHAT),
+    ("почему проект использует такую архитектуру?", CHAT),
+    # analysis: look into the real state, read-only.
+    ("Почему прогон остановился?", ANALYSIS),
+    ("Почему прогон ломается?", ANALYSIS),
+    ("Посмотри, почему автопрогон ломается.", ANALYSIS),
+    ("Почему возникла эта ошибка?", ANALYSIS),
+    ("Проанализируй проблему", ANALYSIS),
+    ("Проанализируй, почему тесты падают.", ANALYSIS),
+    ("Найди причину ошибки.", ANALYSIS),
+    ("Проверь, почему агент остановился.", ANALYSIS),
+    ("Изучи архитектуру.", ANALYSIS),
+    ("Сравни эти два подхода.", ANALYSIS),
+    ("Посмотри логи и объясни проблему.", ANALYSIS),
+    # autonomous: an order to do work.
+    ("Исправь эту ошибку", AUTONOMOUS),
+    ("Исправь найденные ошибки", AUTONOMOUS),
+    ("Реализуй функцию", AUTONOMOUS),
+    ("Реализуй эту функцию", AUTONOMOUS),
+    ("Доработай проект и проведи тестирование", AUTONOMOUS),
+    ("Запусти автономный прогон", AUTONOMOUS),
+    ("Выполни этот план", AUTONOMOUS),
+    ("Создай полноценную реализацию по этому техническому заданию", AUTONOMOUS),
+    ("Продолжай работу до завершения", AUTONOMOUS),
 ])
-def test_a_plain_message_is_a_chat_and_starts_nothing(text):
-    intent = router().route(text, conversation_mode="ask")
-    assert intent.mode == "chat"
-    assert intent.mode in ROUTED_MODES
+def test_the_requirement_table(text, expected):
+    assert classify(text, mode="auto").intent == expected
 
 
-def test_a_question_about_a_run_is_answered_from_data():
-    for text in ("Что готово?", "Статус?", "Покажи отчёт", "Что осталось?"):
-        intent = router().route(text, conversation_mode="ask")
-        assert intent.mode == "chat", text
+def test_a_question_is_never_an_order_even_in_autonomous_mode():
+    """The exact defect: a question in an autonomous conversation must not run."""
+    for text in ("Почему прогон ломается?", "Что уже готово?", "Объясни ошибку"):
+        intent = classify(text, mode="autonomous")
+        assert not intent.starts_work
+        assert effective_mode("autonomous", intent) != "autonomous"
 
 
-# ------------------------------------------------------------------ work commands
-@pytest.mark.parametrize("text", [
-    "Исправь ошибку в корзине",
-    "Добавь тесты для модуля",
-    "Реализуй авторизацию",
-    "Отрефактори этот файл",
-    "Запусти автономно: покрыть тестами",
-])
-def test_a_clear_work_command_starts_work(text):
-    intent = router().route(text, conversation_mode="ask")
-    assert intent.mode == "autonomous"
+def test_an_order_in_autonomous_mode_does_run():
+    intent = classify("Исправь эту ошибку", mode="autonomous")
+    assert intent.starts_work
+    assert effective_mode("autonomous", intent) == "autonomous"
 
 
-def test_an_explicit_autonomous_mode_is_honoured():
-    intent = router().route("просто текст", conversation_mode="autonomous")
-    assert intent.mode == "autonomous" and intent.source == "rule"
+def test_a_buried_order_in_a_question_is_ambiguous_not_a_run():
+    """"а не лучше ли переписать?" is a question about a change, not an order."""
+    intent = classify("Возможно, стоит переписать модуль?", mode="auto")
+    assert intent.intent == CHAT and intent.ambiguous
+    assert not intent.starts_work
+    assert classify("А не лучше ли переписать модуль?", mode="auto").ambiguous
 
 
-def test_an_explicit_code_mode_is_autonomous_and_plan_is_chat():
-    assert router().route("x", conversation_mode="code").mode == "autonomous"
-    assert router().route("x", conversation_mode="plan").mode == "chat"
+def test_the_analysis_mode_is_read_only_even_for_an_order():
+    assert effective_mode("analysis", classify("Исправь ошибку", mode="analysis")) == "analysis"
 
 
-# -------------------------------------------------------------------- analysis
-@pytest.mark.parametrize("text", [
-    "Почему падает тест?",
-    "Объясни, как работает планировщик",
-    "Проанализируй, в чём ошибка",
-    "Разберись, что не так с этим модулем",
-])
-def test_an_analysis_request_does_not_change_code(text):
-    intent = router().route(text, conversation_mode="ask")
-    assert intent.mode == "analysis"
+def test_continue_is_an_order_only_when_there_is_work():
+    assert classify("Продолжи", has_active_run=True).intent == AUTONOMOUS
+    alone = classify("Продолжи")
+    assert alone.intent == CHAT and not alone.starts_work
+    assert classify("Продолжай работу до завершения").intent == AUTONOMOUS
 
 
-# ------------------------------------------------------------- continuations
-def test_continue_with_an_active_run_is_a_continuation():
-    intent = router().route("Продолжи", conversation_mode="ask", has_active_run=True)
-    assert intent.mode == "autonomous" and intent.continuation
+def test_the_clarifying_question_is_one_short_sentence():
+    text = clarifying_question()
+    assert text.count("?") == 1
+    assert "прогон" in text.lower()
 
 
-def test_continue_with_no_active_run_does_not_start_one():
-    intent = router().route("Продолжи", conversation_mode="ask", has_active_run=False)
-    assert intent.mode == "chat" and not intent.continuation
+# ------------------------------------------------------ the observable behaviour
+def _count_runs(stack, project) -> int:
+    return len(stack.api.get(f"/api/v1/projects/{project}/runs?include_hidden=1")[1]["runs"])
 
 
-def test_a_work_command_is_not_taken_for_a_continuation():
-    intent = router().route("Повтори рефакторинг и добавь тесты",
-                            conversation_mode="ask", has_active_run=True)
-    assert intent.mode in ("autonomous",)
+def _start_conversation(stack, project, mode="auto"):
+    status, body = stack.api.post(f"/api/v1/projects/{project}/conversations",
+                                   {"title": "", "mode": mode})
+    assert status == 201, body
+    return body["conversation"]["id"]
 
 
-# ----------------------------------------------------------------- ambiguity
-def test_an_ambiguous_request_asks_one_clarifying_question():
-    intent = router().route("Можешь глянуть этот модуль", conversation_mode="ask")
-    assert intent.mode == "chat"
-    assert intent.clarifying and "Автономно" in intent.clarifying
+def _send(stack, project, conversation, text, mode=None):
+    body = {"text": text}
+    if mode:
+        body["mode"] = mode
+    return stack.api.post(
+        f"/api/v1/projects/{project}/conversations/{conversation}/messages", body)
 
 
-def test_a_plain_message_asks_no_clarifying_question():
-    intent = router().route("Привет", conversation_mode="ask")
-    assert intent.mode == "chat" and not intent.clarifying
+def test_a_question_in_autonomous_mode_starts_no_run(studio):
+    """The whole point: asking in an autonomous conversation is answered."""
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="autonomous")
+    studio.answers("Прогон остановился из-за ошибки проверки коммита.")
+
+    status, body = _send(studio, project, conversation, "Почему прогон ломается?")
+    assert status == 200, body
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+    assert body["messages"][1]["meta"]["mode"] in ("ask", "analysis")
+    # Nothing was started: no run, no goal, no OpenHands conversation.
+    assert _count_runs(studio, project) == 0
+    assert studio.api.get(f"/api/v1/projects/{project}/goals")[1]["goals"] == []
+    assert studio.cloud.cloud.conversations == {}
 
 
-# ------------------------------------------------------------------- model path
-class _FakeCascade:
-    def __init__(self, answer: str | None, configured: bool = True):
-        self._answer = answer
-        self._configured = configured
-        self.calls = 0
+def test_an_order_in_auto_mode_starts_a_run(studio):
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers(json.dumps(PLAN))
 
-    def configured(self) -> bool:
-        return self._configured
-
-    def text(self, prompt, system):
-        self.calls += 1
-        from orchestration.providers import ProviderResponse
-        return ProviderResponse(provider="fake", model="m",
-                                data={"text": self._answer or ""})
+    status, body = _send(studio, project, conversation, "Исправь найденные ошибки")
+    assert status == 200, body
+    run_ids = [m["meta"].get("run_id") for m in body["messages"] if m["meta"].get("run_id")]
+    assert run_ids, body
+    assert _count_runs(studio, project) == 1
 
 
-def test_the_model_classifies_only_what_the_rules_cannot():
-    cascade = _FakeCascade("autonomous")
-    intent = IntentRouter(cascade).route("нужно поправить этот модуль",
-                                         conversation_mode="ask")
-    assert intent.mode == "autonomous" and intent.source == "model"
-    assert cascade.calls == 1
+def test_an_analysis_turn_reads_the_real_state_and_changes_nothing(studio):
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers("Разбор.")
+
+    status, body = _send(studio, project, conversation, "Проанализируй, почему тесты падают")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["mode"] == "analysis"
+    assert _count_runs(studio, project) == 0
+    # The prompt carried the real run state (the facts block), not a guess.
+    prompt = studio.llm.calls[-1]["body"]["messages"][-1]["content"]
+    assert "Autonomous runs of this project" in prompt
 
 
-def test_an_unavailable_model_leaves_the_safe_default():
-    cascade = _FakeCascade(None, configured=False)
-    intent = IntentRouter(cascade).route("нужно поправить этот модуль",
-                                         conversation_mode="ask")
-    assert intent.mode == "chat" and cascade.calls == 0
+def test_an_ambiguous_message_asks_one_question_and_starts_nothing(studio):
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+
+    status, body = _send(studio, project, conversation, "Возможно, стоит переписать модуль?")
+    assert status == 200, body
+    last = body["messages"][-1]
+    assert last["meta"].get("clarify") is True
+    assert last["content"].count("?") == 1
+    assert _count_runs(studio, project) == 0
+    assert studio.llm.calls == [], "an ambiguous message must not even call the model"
 
 
-def test_a_model_that_fails_never_breaks_the_turn():
-    class Broken:
-        def configured(self):
-            return True
+def test_continue_resumes_the_conversations_run_and_never_duplicates_it(studio):
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers(json.dumps(PLAN))
+    status, body = _send(studio, project, conversation, "Реализуй функцию")
+    assert status == 200, body
+    run_id = next(m["meta"]["run_id"] for m in body["messages"] if m["meta"].get("run_id"))
 
-        def text(self, *a, **k):
-            raise RuntimeError("provider down")
+    # Pause it, then ask to continue: the same run is resumed, not a new one.
+    assert studio.api.post(f"/api/v1/projects/{project}/runs/{run_id}/pause", {})[0] == 200
+    status, body = _send(studio, project, conversation, "Продолжи")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["run_id"] == run_id
+    assert body["messages"][-1]["meta"].get("resumed") is True
+    assert _count_runs(studio, project) == 1, "a duplicate run was created"
+    detail = studio.api.get(f"/api/v1/projects/{project}/runs/{run_id}")[1]
+    assert detail["run"]["state"] == "running"
 
-    intent = IntentRouter(Broken()).route("нужно поправить этот модуль",
-                                          conversation_mode="ask")
-    assert intent.mode == "chat"
 
+def test_a_question_during_a_running_run_does_not_stop_or_restart_it(studio):
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers(json.dumps(PLAN))
+    status, body = _send(studio, project, conversation, "Реализуй функцию")
+    assert status == 200, body
+    run_id = next(m["meta"]["run_id"] for m in body["messages"] if m["meta"].get("run_id"))
+    before = studio.api.get(f"/api/v1/projects/{project}/runs/{run_id}")[1]["run"]
 
-def test_a_long_document_is_not_classified_by_the_model():
-    """A long text is a specification; the planner handles it, not the router."""
-    cascade = _FakeCascade("autonomous")
-    intent = IntentRouter(cascade).route("x" * 2000, conversation_mode="ask")
-    assert intent.mode == "chat" and cascade.calls == 0
+    studio.answers("Агент выполняет первую задачу.")
+    status, body = _send(studio, project, conversation, "Что сейчас делает агент?")
+    assert status == 200, body
+    after = studio.api.get(f"/api/v1/projects/{project}/runs/{run_id}")[1]["run"]
+    assert after["state"] == before["state"], "the question changed the run's state"
+    assert _count_runs(studio, project) == 1

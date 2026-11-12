@@ -32,7 +32,7 @@ from .providers import (
     validate_plan_json,
 )
 
-_MODES = ("ask", "code", "plan", "autonomous")
+_MODES = ("ask", "analysis", "code", "plan", "autonomous")
 
 #: The modes the *responder* can produce for a turn. ``analysis`` is not a
 #: stored conversation mode (the DB constraint keeps ``ask``/``code``/``plan``/
@@ -56,12 +56,13 @@ _ASK_SYSTEM = (
 )
 
 _ANALYSIS_SYSTEM = (
-    "You are NEXUS, an AI development assistant embedded in an IDE. The "
-    "developer asks you to explain something - why a failure happens, how a "
-    "part works, what is wrong. Answer with a diagnosis and reasoning, grounded "
-    "in the provided project context, memory and conversation. Do NOT claim to "
-    "have changed any code: you cannot, in this mode. If a fix is needed, say "
-    "what it would be and that the developer can ask for it to be applied."
+    "You are NEXUS, an AI development assistant. The developer asked you to look "
+    "into something (analyse, find the cause, review, compare). Answer in the "
+    "chat from the provided project context, memory and the real state of the "
+    "project's autonomous runs. Read-only: do not propose to change files as if "
+    "you had, and never claim work was done. Base every statement about runs, "
+    "tasks and results on the given facts; if a fact is not given, say what you "
+    "would need to check. Keep it concrete and short."
 )
 
 _PLAN_SYSTEM = (
@@ -99,7 +100,7 @@ class ChatResponder:
                 principal: str | None = None,
                 conversation_id: str | None = None,
                 spec_id: str | None = None,
-                clarifying: str = "") -> list[dict]:
+                run_facts: dict | None = None) -> list[dict]:
         """Return the messages to append for this turn.
 
         Each message is ``{"role", "content", "meta"}``. A failure is raised as
@@ -115,19 +116,12 @@ class ChatResponder:
         was sent; the autonomous hook works from the stored copy, which is
         exact. *conversation_id* lets it recognise the same text sent twice.
         """
-        if mode not in _RESPOND_MODES:
+        if mode not in _MODES:
             raise ValueError("mode must be ask, analysis, code, plan or autonomous")
         if mode == "ask":
-            answer = self._ask(goal, context, memory, history)
-            if clarifying:
-                # An ambiguous turn is answered, then asked about once: the
-                # person gets an answer now and a single question that decides
-                # whether work should be started.
-                answer["content"] = f"{answer['content']}\n\n**Уточните:** {clarifying}"
-                answer["meta"] = {**answer["meta"], "clarifying": True}
-            return [answer]
+            return [self._ask(goal, context, memory, history)]
         if mode == "analysis":
-            return [self._analysis(goal, context, memory, history)]
+            return [self._analysis(goal, context, memory, history, run_facts)]
         if mode == "plan":
             return [self._plan(goal, context, memory)]
         scope = {"project_id": project_id, "principal": principal}
@@ -152,28 +146,25 @@ class ChatResponder:
                          "mode": "ask"}}
 
     def _analysis(self, goal: str, context: dict | None, memory: list[dict] | None,
-                  history: list[dict] | None) -> dict:
-        """Explain what is wrong or how something works, **without** changing code.
+                  history: list[dict] | None, run_facts: dict | None) -> dict:
+        """Answer a request to look into something, read-only.
 
-        This is the "разбери, почему падает" turn: the assistant reasons over the
-        project context, the stored run/verification records and the message,
-        and answers. It never dispatches: no conversation is started, no file is
-        touched. The reply ends by saying so, so the person knows nothing was
-        changed and how to ask for a change if that is what they want.
+        The prompt carries the project context, the memory, the recent
+        conversation and - crucially - the run facts the caller gathered from
+        the database (*run_facts*). The answer is prose from the provider
+        cascade; nothing is started, and no file is changed. A provider outage
+        is a :class:`ChatError`, never a made-up analysis.
         """
-        prompt = self._prompt(goal, context, memory, history)
+        prompt = self._prompt(goal, context, memory, history, run_facts)
         try:
             response = self.providers.text(prompt, _ANALYSIS_SYSTEM)
         except AllProvidersFailed as e:
             raise ChatError(self._failure(e, goal)) from e
         except ProviderError as e:
             raise ChatError(str(e)) from e
-        text = response.data["text"]
-        return {"role": "assistant",
-                "content": text + "\n\n_(анализ; код не менялся — чтобы поручить "
-                                  "исправление, включите режим «Автономно»)_",
+        return {"role": "assistant", "content": response.data["text"],
                 "meta": {"provider": response.provider, "model": response.model,
-                         "mode": "analysis", "dispatched": False}}
+                         "mode": "analysis"}}
 
     def _plan(self, goal: str, context: dict | None, memory: list[dict] | None) -> dict:
         prompt = self._prompt(goal, context, memory, None)
@@ -314,7 +305,7 @@ class ChatResponder:
 
     @staticmethod
     def _prompt(goal: str, context: dict | None, memory: list[dict] | None,
-                history: list[dict] | None) -> str:
+                history: list[dict] | None, run_facts: dict | None = None) -> str:
         parts: list[str] = []
         if context:
             summary = context.get("summary") if isinstance(context, dict) else None
@@ -326,6 +317,14 @@ class ChatResponder:
             facts = [m.get("content") for m in memory if m.get("content")][:30]
             if facts:
                 parts.append("Known facts:\n- " + "\n- ".join(facts))
+        if run_facts:
+            # What the project's autonomous runs actually did, read from the
+            # database. This is what lets "что уже готово?" be answered from
+            # real data instead of a guess or a new run.
+            import json
+
+            parts.append("Autonomous runs of this project (real state):\n"
+                         + json.dumps(run_facts, default=str, ensure_ascii=False)[:8000])
         if history:
             recent = ChatResponder._recent(history)
             if recent:

@@ -713,12 +713,55 @@ class LabStore:
                 "ORDER BY created_at, id LIMIT %s", (limit,))
             return [self._report_view(r) for r in cur.fetchall()]
 
+    def claim_pending_reports(self, *, limit: int = 50) -> list[dict]:
+        """Atomically take pending reports for delivery, so no two workers do.
+
+        ``pending_reports`` reads what is due; two workers (the web server's
+        inline loop and a standalone ``lab_worker``, which the docs say may run
+        side by side) would then both read the same row and both post it - the
+        report would reach the chat twice. This claims each row under
+        ``FOR UPDATE SKIP LOCKED`` and moves it to ``sending`` in the same
+        transaction, so a row is handed to exactly one caller. A row left
+        ``sending`` by a worker that died is returned to ``pending`` by
+        :meth:`reclaim_stale_report_sends` on the next pass.
+
+        The claim is the idempotency the module promises: the chat sees one
+        report per run even with several workers.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT id, run_id, project_id, conversation_id, status, content, "
+                "  meta, attempts, next_attempt_at, last_error, created_at, sent_at "
+                "FROM nexus_run_reports WHERE status='pending' "
+                "AND (next_attempt_at IS NULL OR next_attempt_at <= now()) "
+                "ORDER BY created_at, id LIMIT %s FOR UPDATE SKIP LOCKED", (limit,))
+            rows = [self._report_view(r) for r in cur.fetchall()]
+            if rows:
+                cur.execute("UPDATE nexus_run_reports SET status='sending', updated_at=now() "
+                            "WHERE id = ANY(%s)", ([r["id"] for r in rows],))
+            return rows
+
+    def reclaim_stale_report_sends(self, *, older_than_seconds: int = 300) -> int:
+        """Return reports stuck in ``sending`` to ``pending``.
+
+        A worker that claimed a report and died before marking it sent would
+        otherwise leave it ``sending`` for ever, and the report would never
+        reach the chat. The claim is short-lived, so a row still ``sending``
+        after a few minutes is taken back.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_run_reports SET status='pending', updated_at=now() "
+                "WHERE status='sending' AND updated_at <= now() - %s * interval '1 second'",
+                (older_than_seconds,))
+            return cur.rowcount
+
     def mark_report_sent(self, report_id: str) -> None:
-        """Record delivery. Only moves forward from ``pending`` (never re-sends)."""
+        """Record delivery. Only moves forward from a claimed report."""
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_run_reports SET status='sent', sent_at=now(), "
                         "last_error=NULL, updated_at=now() "
-                        "WHERE id=%s AND status='pending'", (report_id,))
+                        "WHERE id=%s AND status IN ('pending','sending')", (report_id,))
 
     def mark_report_failed(self, report_id: str, *, error: str, retry_in: float,
                            give_up: bool = False) -> None:
@@ -733,7 +776,7 @@ class LabStore:
             cur.execute(
                 "UPDATE nexus_run_reports SET attempts=attempts+1, last_error=%s, "
                 "next_attempt_at = now() + (%s || ' seconds')::interval, "
-                "status=%s, updated_at=now() WHERE id=%s AND status='pending'",
+                "status=%s, updated_at=now() WHERE id=%s AND status IN ('pending','sending')",
                 (error[:1000], max(0.0, float(retry_in)), status, report_id))
 
     @staticmethod
