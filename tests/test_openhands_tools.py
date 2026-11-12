@@ -355,3 +355,91 @@ def test_the_report_separates_agent_tools_from_nexus_tools(store, service, cloud
     names = {c.name for c in report.checks}
     assert {"openhands_tools", "mcp_configuration", "nexus_tools"} <= names
     assert report.by_name("openhands_tools").evidence["account"] == "A"
+
+
+# ------------------------------------------- the HTTP route and the CLI command
+KEY = "sk-tools-http-never-leaked"
+
+
+def _req(method, base, path, body=None, token="test-token"):
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "null")
+
+
+@pytest.fixture
+def app(clouds, monkeypatch):
+    from orchestration.web_server import App
+
+    _reset()
+    monkeypatch.setenv("OPENHANDS_API_KEY", KEY)
+    monkeypatch.setenv("NEXUS_SECRET_KEY", "test-secret-key")
+    instance = App(DSN, poll_interval=0.2, token="test-token")
+    instance.client = CloudClient(clouds.base_url, api_key=KEY, timeout=10.0)
+    yield instance
+    instance.store.close()
+
+
+@pytest.fixture
+def base(app):
+    from orchestration.web_server import WebServer
+
+    ws = WebServer(app, "127.0.0.1", 0)
+    ws.start()
+    yield f"http://127.0.0.1:{ws.port}"
+    ws.stop()
+
+
+def test_tool_inventory_route_over_http(base, clouds):
+    """The route reports both surfaces; without --live the catalog is UNVERIFIED."""
+    status, body = _req("POST", base, "/api/openhands/accounts",
+                        {"label": "A", "api_key": KEY, "base_url": clouds.base_url,
+                         "make_default": True})
+    assert status == 201, body
+    status, report = _req("GET", base, "/api/openhands/tools")
+    assert status == 200
+    names = {c["name"]: c["status"] for c in report["checks"]}
+    # NEXUS tools are local and always verifiable; the agent catalog needs a
+    # live read, so it is UNVERIFIED unless requested, never assumed.
+    assert names["nexus_tools"] == VERIFIED
+    assert names["openhands_tools"] == UNVERIFIED
+    assert names["mcp_configuration"] == VERIFIED
+    assert KEY not in json.dumps(report)
+
+
+def test_tool_inventory_route_requires_auth(base):
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(base + "/api/openhands/tools")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    assert exc.value.code == 401
+
+
+def test_cli_openhands_tools(base, clouds, monkeypatch, capsys):
+    from orchestration import cli
+
+    status, _body = _req("POST", base, "/api/openhands/accounts",
+                         {"label": "A", "api_key": KEY, "base_url": clouds.base_url,
+                          "make_default": True})
+    assert status == 201
+    monkeypatch.setenv("NEXUS_URL", base)
+    monkeypatch.setenv("NEXUS_TOKEN", "test-token")
+    code = cli.main(["openhands", "tools", "--json"])
+    out = capsys.readouterr().out
+    assert code == cli.EXIT["ok"], out
+    data = json.loads(out)
+    names = {c["name"]: c["status"] for c in data["checks"]}
+    assert names["nexus_tools"] == VERIFIED
+    assert KEY not in out
