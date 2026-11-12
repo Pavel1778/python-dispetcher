@@ -1188,6 +1188,21 @@ and 12), two on the thirty-minute limit (item 11). What was found:
     `unavailable` by a failed start stays that way. The router is built once,
     when the loop starts.
 
+    **Status (automatic mode switching).** Two of the above are now closed:
+    `build_account_router` gates on `OpenHandsAccountService.has_any_accounts()`
+    (any principal), so the pool — and the four selection modes — are switched
+    on for a deployment whose accounts belong to `user:<login>`. And the loop
+    calls `AccountRouter.note_success` whenever a poll observes a terminal
+    conversation, so an account is not written off for ever. The failover
+    sequence's step 6 ("проверить его авторизацию") is now enforced:
+    `OpenHandsExecutor.dispatch` calls `AccountRouter.ensure_authorized` on a
+    *switch* (a task with `tried_accounts`, or an operator's
+    `preferred_account_id`), so a revoked key fails over again instead of
+    starting a conversation that would only fail inside the sandbox. Tests:
+    `tests/test_openhands_pool.py::test_the_pool_activates_when_any_principal_has_an_account`,
+    `tests/test_openhands_failover.py::test_a_switch_to_an_account_with_a_rejected_key_fails_over_again`
+    and `::test_a_first_start_is_not_probed_for_authorization`.
+
 Still true, and worth knowing before changing this:
 
 - **Render's free plan stops the process after about 15 minutes without a

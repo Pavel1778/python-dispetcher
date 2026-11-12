@@ -161,6 +161,27 @@ def test_remove_refuses_while_active_tasks_then_force(store, service, clouds):
     assert "B" not in labels
 
 
+def test_the_pool_activates_when_any_principal_has_an_account(store, service, clouds):
+    """``build_account_router`` must switch the pool on when *any* principal has
+    an account, not only ``machine:default``.
+
+    A worker runs as ``machine:default`` and owns no accounts; an account added
+    in the studio belongs to ``user:<login>``. A per-principal check returned
+    ``None`` on every deployment with a login, so the pool - and with it the
+    automatic selection modes - was never switched on. This pins the fix.
+    """
+    from orchestration.openhands_router import build_account_router
+
+    a, _b, _c = clouds
+    # No accounts anywhere: the pool stays off (the pre-existing single-key path).
+    assert build_account_router(store) is None
+    # An account for a *user* principal, which the worker does not own.
+    service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url, make_default=True)
+    router = build_account_router(store)
+    assert router is not None, "the pool must be on for a deployment that has accounts"
+    assert router.pool is not None
+
+
 def test_priority_and_fallback_order_are_applied(store, service, clouds):
     va, vb, vc = _three_accounts(service, clouds)
     pool = AccountPool(store, service)

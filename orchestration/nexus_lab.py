@@ -286,6 +286,15 @@ class OpenHandsExecutor:
     def dispatch(self, task: dict) -> str:
         client, account_id = self._dispatch_client(task)
         try:
+            if (self.router is not None and account_id is not None
+                    and self.router.should_verify_authorization(task, account_id)):
+                # Step 6 of the failover sequence: confirm the account we are
+                # switching to actually accepts its key before starting work on
+                # it. A rejected key raises CloudAuthError here and is turned
+                # into a DispatchError naming this account, so the scheduler
+                # excludes it and fails over again - rather than starting a
+                # conversation that would only fail inside the sandbox.
+                self.router.ensure_authorized(task, account_id, client)
             return self._dispatch_with(client, account_id, task)
         except DispatchError:
             raise

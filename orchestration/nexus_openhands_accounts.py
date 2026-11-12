@@ -233,6 +233,20 @@ class OpenHandsAccountService:
                         "ORDER BY is_default DESC, created_at DESC, id", (principal,))
             return [self._view(r) for r in cur.fetchall()]
 
+    def has_any_accounts(self) -> bool:
+        """True when *any* principal has at least one stored account.
+
+        Accounts are stored per principal. A worker runs as ``machine:default``
+        and owns none, while an account added in the studio belongs to
+        ``user:<login>``. Asking whether the *deployment* has accounts — not
+        whether one principal has — is what tells ``build_account_router`` the
+        pool should be switched on: a per-principal check left the pool off on
+        every deployment that has a login, so the automatic modes never ran.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_openhands_accounts LIMIT 1")
+            return cur.fetchone() is not None
+
     def error_history(self, principal: str, account_id: str, *,
                       limit: int = 50) -> list[dict]:
         """The account's observed failures and recoveries, newest first.

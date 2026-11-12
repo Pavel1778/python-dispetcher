@@ -28,6 +28,7 @@ Nothing here is a secret: the context is derived from rows the caller may read.
 """
 from __future__ import annotations
 
+from typing import Any
 
 from .cloud_store import PostgresStore
 from .nexus_lab_store import LabStore
@@ -101,6 +102,38 @@ class AccountRouter:
 
     def principal_for_task(self, task: dict) -> str:
         return self._principal_for_project(str(task.get("project_id") or "") or None)
+
+    def should_verify_authorization(self, task: dict, account_id: str) -> bool:
+        """True when this start is a *switch*, so the account must be re-checked.
+
+        The failover sequence asks for the new account's authorization to be
+        confirmed before it is trusted with the work (step 6). That applies to a
+        switch: the task already tried an account, or an operator named one. A
+        first start on the account the pool picked is an ordinary dispatch, and
+        probing it would add an account-API round trip per task for no new
+        information - the account was verified when it was added.
+        """
+        return bool(task.get("tried_accounts") or task.get("preferred_account_id"))
+
+    def ensure_authorized(self, task: dict, account_id: str, client: Any) -> None:
+        """Confirm the account's key is accepted before starting work on it.
+
+        Step 6 of the failover sequence: "проверить его авторизацию". This is a
+        real read-only call to the account's own API (``account_capabilities``)
+        through the *same client* the task will be dispatched with, so the check
+        exercises the transport and the key that will actually be used. A
+        rejected key raises :class:`~orchestration.cloud_client.CloudAuthError`,
+        which the executor turns into a :class:`DispatchError` naming the account,
+        so the scheduler excludes it and fails over again instead of starting a
+        conversation that would only fail inside the sandbox.
+
+        Only called for a switch (see :meth:`should_verify_authorization`), so an
+        ordinary dispatch does not pay for it. A transient transport failure is
+        *not* treated as a rejected key: it propagates as ``CloudUnavailable``
+        and the caller's normal retry applies, so a blip never writes off a
+        working account.
+        """
+        client.account_capabilities()
 
     def handoff_context(self, task: dict, *, previous_report: str = "",
                         last_error: str = "") -> dict:
@@ -224,18 +257,27 @@ class AccountRouter:
 
 def build_account_router(store: PostgresStore, *,
                          principal: str = "machine:default") -> AccountRouter | None:
-    """An account router when the principal has any OpenHands account, else None.
+    """An account router when the *deployment* has any OpenHands account, else None.
 
     Returning ``None`` preserves the pre-existing behaviour exactly: a
     deployment with no stored account runs every task under the process-wide
     ``OPENHANDS_API_KEY``. A deployment that *has* configured accounts routes
     through them, so the pool is used without a second flag to remember.
+
+    The check is :meth:`OpenHandsAccountService.has_any_accounts`, not
+    ``list_accounts(principal)``: accounts are stored per principal, and the
+    worker's ``machine:default`` owns none while an account added in the studio
+    belongs to ``user:<login>``. A per-principal check returned ``None`` on every
+    deployment with a login, so the pool — and with it the automatic selection
+    modes — was never switched on. The router still *selects* per project
+    (``AccountRouter._principal_for_project``); only the on/off decision is
+    deployment-wide.
     """
     from .nexus_openhands_accounts import OpenHandsAccountService
 
     accounts = OpenHandsAccountService(store)
     try:
-        if not accounts.list_accounts(principal):
+        if not accounts.has_any_accounts():
             return None
     except Exception:  # noqa: BLE001 - a database that is not ready means "no pool"
         return None
