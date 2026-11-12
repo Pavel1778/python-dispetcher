@@ -504,6 +504,19 @@ class CloudClient:
         )
         return status == 200 and bool((payload or {}).get("success", True))
 
+    def stop_conversation(self, conversation_id: str) -> bool:
+        """Stop the agent working on a conversation, keeping its transcript.
+
+        The app-conversation transport has no conversation-scoped stop: the only
+        pause the Cloud V1 surface exposes is sandbox-scoped
+        (``POST /api/v1/sandboxes/{id}/pause``), and pausing the whole sandbox
+        would also stop unrelated work on it. So this reports ``False`` (nothing
+        was stopped) rather than pretending. A caller that switched an executor
+        away must treat a conversation it could not stop as one still running on
+        its branch, which is exactly what the branch lock already enforces.
+        """
+        return False
+
     def update_conversation(self, conversation_id: str, *,
                             title: str | None = None) -> bool:
         """``PATCH /api/v1/app-conversations/{id}`` (title only, here).

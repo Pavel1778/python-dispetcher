@@ -225,8 +225,13 @@ class AccountRouter:
         )
 
     def record(self, task: dict, *, account_id: str) -> None:
-        """Persist that *task* is now bound to *account_id*."""
-        self.lab.mark_running(task["id"], account_id=account_id)
+        """Persist that *task* is now bound to *account_id*.
+
+        Fenced on the task's lease token when the caller's copy carries one, so
+        a worker that has lost the task cannot rebind it to an account.
+        """
+        self.lab.mark_running(task["id"], account_id=account_id,
+                              lease_token=task.get("lease_token"))
 
     def note_failure(self, task: dict, *, account_id: str, error: str,
                      unavailable: bool) -> None:

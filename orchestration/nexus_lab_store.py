@@ -328,6 +328,7 @@ class LabStore:
             why = "run cancelled" if state == "cancelled" else f"run failed: {last_error or 'no reason given'}"
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='blocked', lease_expires=NULL, "
+                "lease_owner=NULL, lease_token=lease_token+1, "
                 "last_error=%s, updated_at=now() "
                 "WHERE run_id=%s AND state = ANY(%s)",
                 (why[:500], run_id, list(UNFINISHED_TASK_STATES)))
@@ -355,6 +356,7 @@ class LabStore:
         task's ``conversation_id`` always belongs to its current attempt."""
         cur.execute(
             "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
+            "lease_owner=NULL, lease_token=lease_token+1, "
             "evidence = evidence || jsonb_build_array(jsonb_build_object("
             "  'requeued', %s::text, 'attempt', attempt, 'was', state, "
             "  'conversation_id', conversation_id)), "
@@ -438,6 +440,10 @@ class LabStore:
             out["openhands_account_id"] = str(out["openhands_account_id"])
         if out.get("preferred_account_id") is not None:
             out["preferred_account_id"] = str(out["preferred_account_id"])
+        # The fencing token every mutation of this task is checked against. A
+        # caller that read the task carries it back; an out-of-date token means
+        # the task was taken away in the meantime and the write must not land.
+        out["lease_token"] = int(out.get("lease_token") or 0)
         return out
 
     def dependency_states(self, cur: Any, task: dict) -> dict[str, str]:
@@ -467,6 +473,12 @@ class LabStore:
         cancel that committed first always wins - there is no moment between
         "the run looked fine" and "the task was taken". Each claim uses one
         iteration: an iteration is one start of one task.
+
+        The claim records *worker_id* as the task's ``lease_owner`` and hands
+        back a fresh ``lease_token``. Every mutation the worker makes afterwards
+        is fenced on that token, so once the task is taken away (the lease
+        expires, an operator switches it, the run is resumed) the old worker's
+        writes match no row and are no-ops.
         """
         with self.store._tx() as cur:
             cur.execute(
@@ -505,28 +517,42 @@ class LabStore:
                         "WHERE id=%s", (run_id,))
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='dispatched', attempt=attempt+1, "
-                "conversation_id=NULL, "
+                "conversation_id=NULL, lease_owner=%s, lease_token=lease_token+1, "
                 "lease_expires=now() + (%s || ' seconds')::interval, updated_at=now() "
                 "WHERE id=%s RETURNING *",
-                (lease_seconds, task["id"]))
+                (worker_id, lease_seconds, task["id"]))
             return self._task_row(cur.fetchone())
 
     def mark_running(self, task_id: str, *, conversation_id: str | None = None,
                      delivery: dict | None = None,
-                     account_id: str | None = None) -> dict:
+                     account_id: str | None = None,
+                     lease_token: int | None = None) -> dict:
         """Bind the conversation that was started and mark the task running.
 
         The conversation id is always kept. The state changes only if the task
         is still ``dispatched``: a task settled between the claim and this call
         (its run was cancelled) stays settled.
 
+        *lease_token* is the fencing token the claim handed out. When it is
+        given, the write lands only while the task still carries that token: a
+        worker whose lease expired - or whose task was switched, reclaimed or
+        requeued - cannot bind a conversation onto a task another worker has
+        taken. The whole update is one statement, so the token is compared and
+        the write is applied in the same row lock.
+
         *delivery* is the executor's record of how the task's original text was
         handed to the agent (inline, or a file with the path, size and SHA-256
         that were read back). It is kept under ``spec_ref.delivery``.
         """
         proof = _jsonb(delivery) if delivery else None
+        fence = "AND lease_token=%s" if lease_token is not None else ""
+        params: list[Any] = [conversation_id, account_id, account_id,
+                             proof, proof]
+        params.append(task_id)
+        if lease_token is not None:
+            params.append(lease_token)
         with self.store._tx() as cur:
-            cur.execute("UPDATE nexus_run_tasks SET "
+            cur.execute(f"UPDATE nexus_run_tasks SET "
                         "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
                         "conversation_id=COALESCE(%s, conversation_id), "
                         "openhands_account_id=COALESCE(%s, openhands_account_id), "
@@ -536,16 +562,22 @@ class LabStore:
                         "  COALESCE(spec_ref, '{}'::jsonb) || jsonb_build_object("
                         "    'delivery', %s::jsonb || jsonb_build_object('at', now())) END, "
                         "updated_at=now() "
-                        "WHERE id=%s RETURNING *",
-                        (conversation_id, account_id, account_id,
-                         proof, proof, task_id))
+                        f"WHERE id=%s {fence} RETURNING *",
+                        tuple(params))
             row = cur.fetchone()
+            if row is None:
+                # Either the task is gone, or a stale worker tried to bind a
+                # conversation to a task it no longer holds. Return the row as
+                # it stands; the caller's write did not land.
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
             return self._task_row(row)
 
     def record_verification(self, task_id: str, *, verdict: str, evidence: dict,
-                            detail: dict | None = None) -> dict:
+                            detail: dict | None = None,
+                            lease_token: int | None = None) -> dict:
         """Set the terminal task state from a verifier verdict.
 
         ``verdict`` is one of the five task outcomes. Only
@@ -555,16 +587,28 @@ class LabStore:
         that was settled in the meantime (its run was cancelled while the
         conversation was being polled) keeps the state it was given, and is
         returned as it is.
+
+        *lease_token* fences the verdict: when it is given, the verdict lands
+        only while the task still carries that token, so a worker whose lease
+        expired cannot settle a task that has since been taken up by another
+        worker (or requeued for a new attempt).
         """
         if verdict not in ("completed_verified", "completed_unverified",
                            "partial", "failed", "blocked"):
             raise ValueError("invalid verdict")
+        fence = "AND lease_token=%s" if lease_token is not None else ""
+        params: list[Any] = [verdict, _jsonb(detail or {}), _jsonb([evidence])]
+        params.append(task_id)
+        if lease_token is not None:
+            params.append(lease_token)
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state=%s, verification=%s, "
-                "evidence = evidence || %s::jsonb, lease_expires=NULL, updated_at=now() "
-                "WHERE id=%s AND state IN ('dispatched','running','verifying') RETURNING *",
-                (verdict, _jsonb(detail or {}), _jsonb([evidence]), task_id))
+                "evidence = evidence || %s::jsonb, lease_expires=NULL, "
+                "lease_owner=NULL, updated_at=now() "
+                f"WHERE id=%s AND state IN ('dispatched','running','verifying') {fence} "
+                "RETURNING *",
+                tuple(params))
             row = cur.fetchone()
             if row is None:
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -579,7 +623,8 @@ class LabStore:
             return task
 
     def release_task(self, task_id: str, *, error: str, requeue: bool,
-                     failed_account_id: str | None = None) -> dict:
+                     failed_account_id: str | None = None,
+                     lease_token: int | None = None) -> dict:
         """Return a claimed task to ``pending`` (requeue) or mark it ``failed``.
 
         Only a task that is still ``dispatched`` is released. One that was
@@ -588,15 +633,26 @@ class LabStore:
 
         *failed_account_id*, when given, is appended to ``tried_accounts`` so a
         later failover never picks that account for this task again.
+
+        *lease_token* fences the release: when it is given, the task is released
+        only while it still carries that token, so a worker whose lease expired
+        cannot undo a claim another worker has taken. The token is bumped, so
+        the released task's next holder gets a fresh one.
         """
         state = "pending" if requeue else "failed"
+        fence = "AND lease_token=%s" if lease_token is not None else ""
+        params: list[Any] = [state, error, failed_account_id, failed_account_id]
+        params.append(task_id)
+        if lease_token is not None:
+            params.append(lease_token)
         with self.store._tx() as cur:
             cur.execute(
-                "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, last_error=%s, "
+                "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, "
+                "lease_owner=NULL, lease_token=lease_token+1, last_error=%s, "
                 "tried_accounts = CASE WHEN %s::uuid IS NULL THEN tried_accounts "
                 "  ELSE tried_accounts || to_jsonb(%s::text) END, "
-                "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
-                (state, error, failed_account_id, failed_account_id, task_id))
+                f"updated_at=now() WHERE id=%s AND state='dispatched' {fence} RETURNING *",
+                tuple(params))
             row = cur.fetchone()
             if row is None:
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -607,7 +663,8 @@ class LabStore:
 
     def postpone_task(self, task_id: str, *, error: str, seconds: float,
                       failed_account_id: str | None = None,
-                      forget_tried: bool = False) -> dict:
+                      forget_tried: bool = False,
+                      lease_token: int | None = None) -> dict:
         """Put a claimed task back because the start was refused, not failed.
 
         The service said "not now" (a rate limit, a daily quota). No
@@ -628,6 +685,10 @@ class LabStore:
 
         Like ``release_task``, only a task that is still ``dispatched`` is
         touched; one settled meanwhile keeps the state it was given.
+
+        *lease_token*, when given, fences the postpone: the task goes back only
+        while it still carries that token. The token is bumped so the next
+        holder of the task gets a fresh one.
         """
         with self.store._tx() as cur:
             cur.execute("SELECT run_id FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -636,15 +697,21 @@ class LabStore:
                 raise NotFound("task not found")
             # The run row first, as everywhere else that locks both.
             cur.execute("SELECT id FROM nexus_runs WHERE id=%s FOR UPDATE", (found["run_id"],))
+            fence = "AND lease_token=%s" if lease_token is not None else ""
+            params: list[Any] = [max(0.0, float(seconds)), error, bool(forget_tried),
+                                 failed_account_id, failed_account_id, failed_account_id]
+            params.append(task_id)
+            if lease_token is not None:
+                params.append(lease_token)
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='pending', attempt=GREATEST(attempt - 1, 0), "
                 "lease_expires=now() + (%s || ' seconds')::interval, last_error=%s, "
+                "lease_owner=NULL, lease_token=lease_token+1, "
                 "tried_accounts = CASE WHEN %s THEN '[]'::jsonb "
                 "  WHEN %s::text IS NULL OR tried_accounts ? %s::text THEN tried_accounts "
                 "  ELSE tried_accounts || to_jsonb(%s::text) END, "
-                "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
-                (max(0.0, float(seconds)), error, bool(forget_tried), failed_account_id,
-                 failed_account_id, failed_account_id, task_id))
+                f"updated_at=now() WHERE id=%s AND state='dispatched' {fence} RETURNING *",
+                tuple(params))
             row = cur.fetchone()
             if row is not None:
                 cur.execute("UPDATE nexus_runs SET iteration=GREATEST(iteration - 1, 0), "
@@ -655,7 +722,8 @@ class LabStore:
             return self._task_row(row)
 
     def requeue_for_failover(self, task_id: str, *, failed_account_id: str,
-                             error: str, requeue: bool = True) -> dict:
+                             error: str, requeue: bool = True,
+                             lease_token: int | None = None) -> dict:
         """Requeue a task whose executor failed, excluding that account.
 
         Works from ``dispatched`` or ``running`` (a conversation that was
@@ -663,17 +731,29 @@ class LabStore:
         account can pick it up, and the failed account is added to
         ``tried_accounts`` so the pool never selects it for this task again. A
         task that is already terminal keeps its state.
+
+        *lease_token*, when given, fences the requeue: a worker whose lease
+        expired cannot requeue a task another worker has since taken. The token
+        is bumped and the owner cleared, so the failed worker cannot go on
+        writing to the task it has lost.
         """
         state = "pending" if requeue else "failed"
+        fence = "AND lease_token=%s" if lease_token is not None else ""
+        params: list[Any] = [state, error[:2000], failed_account_id, failed_account_id]
+        params.append(task_id)
+        if lease_token is not None:
+            params.append(lease_token)
         with self.store._tx() as cur:
             cur.execute(
                 "UPDATE nexus_run_tasks SET state=%s, lease_expires=NULL, "
+                "lease_owner=NULL, lease_token=lease_token+1, "
                 "conversation_id=NULL, last_error=%s, "
                 "tried_accounts = CASE WHEN tried_accounts ? %s::text THEN tried_accounts "
                 "  ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "updated_at=now() "
-                "WHERE id=%s AND state IN ('dispatched','running','verifying') RETURNING *",
-                (state, error[:2000], failed_account_id, failed_account_id, task_id))
+                f"WHERE id=%s AND state IN ('dispatched','running','verifying') {fence} "
+                "RETURNING *",
+                tuple(params))
             row = cur.fetchone()
             if row is None:
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -681,6 +761,28 @@ class LabStore:
             if row is None:
                 raise NotFound("task not found")
             return self._task_row(row)
+
+    def holds_lease(self, task_id: str, lease_token: int) -> bool:
+        """Whether the task is still claimed under *lease_token*.
+
+        The scheduler asks this immediately before it starts a conversation, so
+        a worker whose claim was taken away in the meantime (its lease expired
+        and another worker reclaimed the task, or an operator switched it) does
+        not start a second conversation for the same task. This narrows the
+        window; it cannot close it (the check and the start are not one
+        transaction), which is why the conversation is also bound with the token
+        (``mark_running``): the *record* of the start is what must not race.
+
+        The token is the fence, not the clock: a lease that expired but that
+        nobody has reclaimed still belongs to this worker, so the start goes
+        ahead. It is the reclaim (or switch, or resume) that bumps the token and
+        takes the task away.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_run_tasks WHERE id=%s AND lease_token=%s "
+                        "AND state IN ('dispatched','running','verifying')",
+                        (task_id, lease_token))
+            return cur.fetchone() is not None
 
     def tried_accounts(self, task_id: str) -> list[str]:
         with self.store._tx() as cur:
@@ -703,33 +805,45 @@ class LabStore:
 
         Refused (``ValueError``) unless the task is ``dispatched``, ``running``
         or ``verifying``: a pending task has no executor to switch from, and a
-        terminal task is done. The old executor is not stopped here — a
-        conversation already running is left to finish; it is simply never
-        polled again, and the workspace lock keeps two executors off one
-        checkout.
+        terminal task is done.
+
+        The abandoned conversation is **recorded in the task's evidence** before
+        the binding is cleared, so the conversation id is never lost: the
+        operator can still stop that conversation (``stop_abandoned``) and the
+        transcript remains the record of why the work moved. Clearing the
+        binding alone is not enough to stop an agent already running - the
+        conversation goes on in the Cloud - so the switch is a *hand-off plus a
+        stop*, and the two must not be separated.
         """
         with self.store._tx() as cur:
-            cur.execute("SELECT state, openhands_account_id FROM nexus_run_tasks "
-                        "WHERE id=%s FOR UPDATE", (task_id,))
+            cur.execute("SELECT state, openhands_account_id, conversation_id, attempt "
+                        "FROM nexus_run_tasks WHERE id=%s FOR UPDATE", (task_id,))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
             if row["state"] not in ("dispatched", "running", "verifying"):
                 raise ValueError(f"cannot switch a task that is {row['state']}")
             current = row["openhands_account_id"]
+            abandoned = row["conversation_id"]
             # The current account is recorded as tried (the pool never picks it
             # for this task again) and the target is stored as the preference
             # for the next dispatch. The target is only a preference: if it is
             # not usable the pool selects another, rather than failing the task.
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
+                "lease_owner=NULL, lease_token=lease_token+1, "
                 "conversation_id=NULL, openhands_account_id=NULL, "
+                "evidence = CASE WHEN %s::text IS NULL THEN evidence "
+                "  ELSE evidence || jsonb_build_array(jsonb_build_object("
+                "    'abandoned', 'switch', 'attempt', %s, "
+                "    'conversation_id', %s::text)) END, "
                 "preferred_account_id=%s, "
                 "tried_accounts = CASE WHEN %s::text IS NULL THEN tried_accounts "
                 "  WHEN tried_accounts ? %s::text THEN tried_accounts "
                 "  ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "updated_at=now() WHERE id=%s RETURNING *",
-                (target_account_id,
+                (abandoned, row["attempt"], abandoned,
+                 target_account_id,
                  str(current) if current else None,
                  str(current) if current else None,
                  str(current) if current else None, task_id))
@@ -780,10 +894,12 @@ class LabStore:
                 task = self._task_row(row)
                 if task["attempt"] >= task["max_attempts"]:
                     cur.execute("UPDATE nexus_run_tasks SET state='failed', lease_expires=NULL, "
+                                "lease_owner=NULL, lease_token=lease_token+1, "
                                 "last_error='lease expired after max attempts', updated_at=now() "
                                 "WHERE id=%s RETURNING *", (task["id"],))
                 else:
                     cur.execute("UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
+                                "lease_owner=NULL, lease_token=lease_token+1, "
                                 "last_error='lease expired', updated_at=now() WHERE id=%s RETURNING *",
                                 (task["id"],))
                 out.append(self._task_row(cur.fetchone()))

@@ -656,13 +656,15 @@ class LabScheduler:
             self.store.postpone_task(
                 task["id"], seconds=0.0, failed_account_id=account,
                 error=("OpenHands did not take the start on this account; another account "
-                       f"takes the task (this is not counted as an attempt). {why}"))
+                       f"takes the task (this is not counted as an attempt). {why}"),
+                lease_token=task.get("lease_token"))
             return
         wait = self.start_wait(refused)
         self.store.postpone_task(
             task["id"], seconds=wait, forget_tried=account is not None,
             error=(f"OpenHands did not take the start; trying again in {_span(wait)} "
-                   f"(this is not counted as an attempt). {why}"))
+                   f"(this is not counted as an attempt). {why}"),
+            lease_token=task.get("lease_token"))
 
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
@@ -708,7 +710,8 @@ class LabScheduler:
                 self.store.requeue_for_failover(
                     task["id"], failed_account_id=account_id,
                     error="conversation missing; executor may be gone",
-                    requeue=task["attempt"] < task["max_attempts"])
+                    requeue=task["attempt"] < task["max_attempts"],
+                    lease_token=task["lease_token"])
                 result.note = "executor gone: task requeued for failover"
                 continue
             else:
@@ -721,7 +724,7 @@ class LabScheduler:
             self.store.record_verification(
                 task["id"], verdict=verdict.verdict,
                 evidence={"reason": verdict.reason, **verdict.evidence},
-                detail=verdict.as_detail())
+                detail=verdict.as_detail(), lease_token=task["lease_token"])
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
 
@@ -746,12 +749,20 @@ class LabScheduler:
                 reason = f"not authorized: {e}"
                 self.store.record_verification(
                     task["id"], verdict="blocked", evidence={"reason": reason},
-                    detail={"verdict": "blocked", "reason": reason})
+                    detail={"verdict": "blocked", "reason": reason},
+                    lease_token=task["lease_token"])
                 applied = self.store.set_run_state_internal(
                     run_id, "blocked",
                     last_error=f"task {task['task_key']} was not started: {e}")
                 result.finished = applied is not None
                 result.note = "blocked: dispatch not authorized"
+                return result
+            if not self.store.holds_lease(task["id"], task["lease_token"]):
+                # The claim was taken away between the claim and now (the lease
+                # expired and another worker reclaimed the task, or an operator
+                # switched it). Starting a conversation here would be a second
+                # executor on the same work; the new holder starts it instead.
+                result.note = "claim lost before dispatch; not started"
                 return result
             try:
                 conversation_id = self.executor.dispatch(task)
@@ -761,7 +772,8 @@ class LabScheduler:
                 # cannot succeed, so the task is dead-lettered with the reason.
                 self.store.record_verification(
                     task["id"], verdict="blocked", evidence={"reason": str(e)},
-                    detail={"verdict": "blocked", "reason": str(e)})
+                    detail={"verdict": "blocked", "reason": str(e)},
+                    lease_token=task["lease_token"])
                 applied = self.store.set_run_state_internal(
                     run_id, "blocked",
                     last_error=f"task {task['task_key']}: no usable OpenHands account")
@@ -785,7 +797,8 @@ class LabScheduler:
                 again = (task["attempt"] < task["max_attempts"]
                          and not getattr(e, "permanent", False))
                 self.store.release_task(task["id"], error=f"{type(e).__name__}: {e}",
-                                        requeue=again, failed_account_id=failed_account)
+                                        requeue=again, failed_account_id=failed_account,
+                                        lease_token=task["lease_token"])
                 if failed_account and self.router is not None:
                     self.router.note_failure(
                         task, account_id=failed_account,
@@ -811,7 +824,8 @@ class LabScheduler:
                     reason="previous account failed", context=context)
             self.store.mark_running(task["id"], conversation_id=conversation_id or None,
                                     delivery=getattr(conversation_id, "delivery", None),
-                                    account_id=account_id)
+                                    account_id=account_id,
+                                    lease_token=task["lease_token"])
             result.dispatched = True
 
         # 3. Decide the run's fate.

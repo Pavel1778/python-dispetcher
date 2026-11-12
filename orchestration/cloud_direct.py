@@ -634,6 +634,21 @@ class CloudDirectClient:
         status, _ = self._send(route, "DELETE", f"/api/conversations/{conversation_id}")
         return status in (200, 204)
 
+    def stop_conversation(self, conversation_id: str) -> bool:
+        """``POST /api/conversations/{id}/pause`` on the sandbox agent-server.
+
+        The agent-server's pause stops the run loop and keeps the conversation
+        (and its transcript). This is the conversation-scoped stop the direct
+        transport can offer; the Cloud V1 app-conversation transport cannot (its
+        pause is sandbox-scoped), so a caller must not assume every transport
+        stopped anything. Returns ``False`` on a failure the caller can tolerate.
+        """
+        try:
+            self.pause(conversation_id)
+        except (CloudError, CloudNotFound):
+            return False
+        return True
+
     def pause(self, conversation_id: str) -> None:
         route = self._route_for(conversation_id)
         status, _ = self._send(
