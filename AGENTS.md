@@ -1653,6 +1653,28 @@ now diagnosed, each with an earned status.
   assertion). The fakes gained the catalog route (`tests/fake_runtime.py`,
   `tests/test_cloud_direct.py`'s `FakeAgentServer`).
 
+## Tool inventory surface: route and CLI (this session)
+
+The section-9 checks (`nexus_tools`, `openhands_tools`, `mcp_configuration`) had
+no operator-facing surface: they ran only inside the full diagnostics report. A
+focused view was added on top of them, without changing their logic.
+
+- **`App.tool_inventory(principal, *, live, account_id, project_id)`** runs
+  exactly those three checks into a fresh `Report` and returns
+  `report.as_dict()` — the same honest statuses as the full report, so this
+  surface cannot claim more than it does. `GET /api/openhands/tools[?live=1]`
+  (protected; in `tests/test_route_auth.py`) and the CLI
+  `nexus openhands tools [--live] [--account]` (exit 6 when the report is not
+  ok) expose it.
+- **`live` is honest here too.** Reading the agent catalog on the direct
+  transport may provision a sandbox, so `openhands_tools` is `UNVERIFIED`
+  without `live`; `nexus_tools` (local) and `mcp_configuration` (the account's
+  configured names) run regardless. The route never returns a key.
+- Tests: the HTTP/CLI cases appended to `tests/test_openhands_tools.py`
+  (reusing its `_reset`, `clouds`, `app`, `base` helpers) plus the route-auth
+  entry. The CLI/route report is asserted to be `UNVERIFIED` for the agent
+  catalog when `live` is not requested.
+
 ## Durable runs, reports, stop signals, project executors, several repositories (2026-11-12)
 
 Full description: `docs/DURABLE-RUNS.md`. What a future change has to know:

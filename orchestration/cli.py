@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -361,6 +362,44 @@ def cmd_openhands_diagnostics(args: argparse.Namespace) -> int:
         f"{k}={v}" for k, v in counts.items())
     _emit(args, report, human=human)
     return EXIT["ok"] if report.get("ok") else EXIT["unavailable"]
+
+
+def cmd_openhands_tools(args: argparse.Namespace) -> int:
+    """Show which tools are available to NEXUS and which to OpenHands.
+
+    The NEXUS surface (the MCP tools and the ``sr_`` client tools) is enumerated
+    locally; the OpenHands surface (the agent's own tool catalog, mapped to the
+    required capabilities) is read from the agent-server, so ``--live`` is
+    required for it — reading it on the direct transport may provision a sandbox.
+    Without ``--live`` the OpenHands check is UNVERIFIED, never assumed. No key
+    is returned.
+    """
+    client = _client(args)
+    query = "live=1" if args.live else "live=0"
+    if getattr(args, "account", None):
+        query += "&account_id=" + urllib.parse.quote(args.account)
+    data = client.get("/api/openhands/tools?" + query)
+    checks = {c["name"]: c for c in data.get("checks", [])}
+    lines: list[str] = []
+    nexus = checks.get("nexus_tools")
+    if nexus:
+        ev = nexus.get("evidence", {})
+        lines.append(f"NEXUS tools: {nexus['status']} — {nexus['detail']}")
+        lines.append("  MCP: " + ", ".join(ev.get("mcp", [])))
+        lines.append("  client_tools: " + ", ".join(ev.get("client_tools", [])))
+    tools = checks.get("openhands_tools")
+    if tools:
+        ev = tools.get("evidence", {})
+        lines.append(f"OpenHands tools: {tools['status']} — {tools['detail']}")
+        for name, present in (ev.get("capabilities") or {}).items():
+            lines.append(f"  {name}: {'available' if present else 'MISSING'}")
+        if ev.get("tools_usable"):
+            lines.append("  usable: " + ", ".join(ev["tools_usable"]))
+    mcp = checks.get("mcp_configuration")
+    if mcp:
+        lines.append(f"OpenHands MCP: {mcp['status']} — {mcp['detail']}")
+    _emit(args, data, human="\n".join(lines))
+    return EXIT["ok"] if data.get("ok") else EXIT["unavailable"]
 
 
 def cmd_providers(args: argparse.Namespace) -> int:
@@ -857,6 +896,12 @@ def build_parser() -> argparse.ArgumentParser:
     ohd.add_argument("--account", default=None, help="check one account id")
     ohd.add_argument("--project", default=None, help="select the account this project would use")
     ohd.set_defaults(func=cmd_openhands_diagnostics)
+    oht = oh.add_parser("tools", parents=[common],
+                        help="which tools are available to NEXUS and to OpenHands")
+    oht.add_argument("--live", action="store_true",
+                     help="read the agent-server's own tool catalog (may provision a sandbox)")
+    oht.add_argument("--account", default=None, help="read the catalog from one account id")
+    oht.set_defaults(func=cmd_openhands_tools)
     pool = oh.add_parser("pool", parents=[common], help="account pool configuration").add_subparsers(dest="action", required=True)
     pool.add_parser("show", parents=[common], help="show the pool configuration and order").set_defaults(func=cmd_openhands_pool_show)
     pool_set = pool.add_parser("set", parents=[common], help="set the selection mode / fallback order")

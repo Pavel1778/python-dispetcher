@@ -1225,6 +1225,38 @@ class App:
         return diagnostics.run(principal, live=live, account_id=account_id,
                                project_id=project_id).as_dict()
 
+    def tool_inventory(self, principal: str, *, live: bool = False,
+                       account_id: str | None = None,
+                       project_id: str | None = None) -> dict[str, Any]:
+        """Which tools are available to NEXUS and which to OpenHands.
+
+        A focused view of section 9 of the acceptance text: the NEXUS surface
+        (the MCP tools and the ``sr_`` client tools) and the OpenHands surface
+        (the agent's own tool catalog, read from the agent-server and mapped to
+        the required capabilities), plus the MCP servers the account has
+        configured. It runs exactly the three diagnostics checks
+        (``nexus_tools`` / ``openhands_tools`` / ``mcp_configuration``) and
+        returns the same honest statuses, so this surface cannot claim more than
+        the full report does.
+
+        Reading the agent's catalog on the ``direct`` transport may provision a
+        sandbox, so it is opt-in with ``live`` exactly like the conversation
+        probe; without it ``openhands_tools`` is UNVERIFIED, never assumed. No
+        key or secret is returned.
+        """
+        from .openhands_diagnostics import OpenHandsDiagnostics, Report
+
+        diagnostics = OpenHandsDiagnostics(
+            self.store, accounts=self.openhands_accounts, pool=self.account_pool,
+            cloud_client=self.client, providers=self.providers)
+        report = Report()
+        diagnostics.check_nexus_tools(report)
+        diagnostics.check_openhands_tools(report, principal, live=live,
+                                          account_id=account_id, project_id=project_id)
+        diagnostics.check_mcp_configuration(report, principal, account_id=account_id,
+                                            project_id=project_id)
+        return report.as_dict()
+
     def provider_status(self, *, live: bool = False) -> dict[str, Any]:
         """The orchestrator cascade: configuration, and an optional real probe.
 
@@ -3117,6 +3149,17 @@ class Handler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(urlparse(self.path).query)
                 return self._json(200, self.app.provider_status(
                     live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes")))
+            if path == "/api/openhands/tools":
+                # Which tools are available to NEXUS and which to OpenHands.
+                # ?live=1 reads the agent-server's own catalog (it may provision
+                # a sandbox on the direct transport); without it the OpenHands
+                # check is UNVERIFIED. No key is returned.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                return self._json(200, self.app.tool_inventory(
+                    self._project_principal(),
+                    live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes"),
+                    account_id=(query.get("account_id") or [None])[0],
+                    project_id=(query.get("project_id") or [None])[0]))
             if path == "/api/openhands/pool":
                 principal = self._project_principal()
                 return self._json(200, {

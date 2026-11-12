@@ -224,6 +224,21 @@ Each check earns one of four statuses — `VERIFIED`, `FAILED`, `BLOCKED`,
 live probe runs on the account it selected (that account's base URL, key,
 transport and model), so a `VERIFIED` is evidence about *that account*.
 
+To see which tools are available to NEXUS and which to OpenHands:
+
+```bash
+NEXUS_URL=... NEXUS_TOKEN=... \
+  python -m orchestration.cli openhands tools --live
+```
+
+It reports the NEXUS surface (the MCP tools and the `sr_` client tools) and the
+OpenHands surface (the agent's own tool catalog, read from the agent-server and
+mapped to terminal / workspace files / Git / testing / browser, plus the
+account's configured MCP server names). The same three checks appear in the
+diagnostics report as `nexus_tools`, `openhands_tools` and `mcp_configuration`.
+Without `--live` the agent catalog is `UNVERIFIED` (reading it on the direct
+transport may provision a sandbox); a listed tool is not proof it ran.
+
 To move a running task to another account by hand:
 
 ```bash

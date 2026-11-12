@@ -343,6 +343,14 @@ with `live`), `mcp_configuration` (configured MCP server *names* only) and
 `nexus_tools` (NEXUS's own MCP + `sr_` client tools). Git and testing have no
 built-in and are proved by `terminal`.
 
+**Operator surface for the two tool sets.** `GET /api/openhands/tools[?live=1]`
+(`App.tool_inventory`) and the CLI `nexus openhands tools [--live]` run exactly
+those three checks and return the same honest statuses, so this view cannot
+claim more than the full report. Without `live` the agent catalog is
+`UNVERIFIED` (reading it on the direct transport may provision a sandbox);
+`nexus_tools` and `mcp_configuration` run regardless.
+
+
 **MCP.** The account's Cloud settings reported **20 configured MCP servers**
 live (`browser_mcp`, `cloudflare-bindings`, `cloudflare-browser-rendering`,
 `cloudflare-builds`, `cloudflare-docs`, `cloudflare-observability`, `deepwiki`,
