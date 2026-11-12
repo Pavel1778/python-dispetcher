@@ -42,6 +42,23 @@ from .nexus_specs import SpecService
 log = logging.getLogger("lab_worker")
 
 
+def build_evidence_service(store: PostgresStore) -> Any | None:
+    """The Evidence Trust Engine wired for the lab, or ``None``.
+
+    Returns ``None`` when no signer is configured (``NEXUS_EVIDENCE_PRIVATE_KEY``
+    unset), so the worker's loop stays exactly as it was: no evidence is written
+    and none is faked. When a signer exists, task results are signed and can be
+    re-verified with the trusted keyring.
+    """
+    from .evidence_trust import EvidenceTrustEngine, Keyring, signer_from_env
+    from .nexus_evidence import EvidenceService
+
+    signer = signer_from_env()
+    if signer is None:
+        return None
+    return EvidenceService(store, EvidenceTrustEngine(Keyring.from_env(), signer))
+
+
 def active_run_ids(store: PostgresStore) -> list[str]:
     """Every run the worker should service, across all projects.
 
@@ -63,7 +80,7 @@ class LabWorker:
                  github: GitHubClient | None = None,
                  github_accounts: GitHubAccountService | None = None,
                  heartbeat_seconds: int = 60, account_router: Any | None = None,
-                 discover_router: bool = True):
+                 evidence: Any | None = None, discover_router: bool = True):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
@@ -78,6 +95,11 @@ class LabWorker:
         #: ``_find_router``). Off for a caller that wants the server's own key
         #: used whatever is stored.
         self.discover_router = discover_router
+        # The EVIDENCE stage: when given, every settled task result is signed
+        # into the Evidence Trust Engine (``nexus_evidence``). Built from the
+        # environment by ``main`` (a signer only when the key is configured),
+        # so a deployment without one keeps the loop exactly as it was.
+        self.evidence = evidence
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
         self.executor = OpenHandsExecutor(
@@ -116,7 +138,8 @@ class LabWorker:
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
-                            router=self.account_router, reports=self.reports)
+                            router=self.account_router, reports=self.reports,
+                            evidence=self.evidence)
 
     def _find_router(self) -> None:
         """Start using stored connections once the deployment has any.
@@ -184,15 +207,64 @@ class LabWorker:
         return len([item for item in self.account_router.reprobe() if item["healthy"]])
 
     def run_forever(self) -> None:
-        self.lab.register_worker(self.worker_id, kind="worker")
+        # The loop outlives the database. A pass that fails because the store
+        # is briefly unreachable (a restart, a pooler recycling its clients, a
+        # network reset) is logged and retried on the next pass, exactly as the
+        # web server's own loop does; before this, one transient
+        # ``StoreUnavailable`` ended the process, and with it every run the
+        # worker was the only one advancing. Registration is retried until it
+        # sticks, and the final deregistration is best effort: a worker that
+        # cannot reach the database on the way out must still exit.
+        registered = False
         try:
             while not self._stop.is_set():
-                summary = self.tick_once()
+                if not registered:
+                    try:
+                        self.lab.register_worker(self.worker_id, kind="worker")
+                        registered = True
+                    except Exception:  # noqa: BLE001 - retried next pass
+                        log.exception("could not register worker %s; will retry", self.worker_id)
+                if registered:
+                    try:
+                        summary = self.tick_once()
+                    except Exception as e:  # noqa: BLE001 - a database blip must not stop the worker
+                        log.exception("lab pass failed")
+                        summary = {"runs": 0, "advanced": 0,
+                                   "errors": [f"{type(e).__name__}: {e}"]}
+                else:
+                    summary = {"runs": 0, "advanced": 0, "errors": []}
                 if summary["advanced"] or summary["errors"]:
                     log.info("tick: %s", summary)
                 self._stop.wait(self.poll_interval)
         finally:
+            self._stop_worker_best_effort()
+
+    def run_once(self) -> dict[str, Any]:
+        """One pass, registered so the pass is visible to the diagnostics.
+
+        ``--once`` is the cron-style deployment (and the health check): it must
+        leave the same trace a long-lived worker does - a worker row and a
+        heartbeat - or the run list would look unserviced to
+        ``GET /api/openhands/diagnostics`` while the cron is in fact advancing
+        it. A single pass cannot stay "live", so the row is marked stopped as it
+        leaves; the heartbeat it wrote is what a caller inspects immediately.
+        """
+        try:
+            self.lab.register_worker(self.worker_id, kind="worker")
+        except Exception as e:  # noqa: BLE001 - a pass that cannot register still runs
+            log.warning("could not register worker %s: %s: %s",
+                        self.worker_id, type(e).__name__, e)
+        try:
+            return self.tick_once()
+        finally:
+            self._stop_worker_best_effort()
+
+    def _stop_worker_best_effort(self) -> None:
+        try:
             self.lab.stop_worker(self.worker_id)
+        except Exception:  # noqa: BLE001 - the process is stopping; best effort
+            log.debug("could not record that worker %s stopped", self.worker_id,
+                      exc_info=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -214,9 +286,11 @@ def main(argv: list[str] | None = None) -> int:
     router = build_account_router(store, principal="machine:default")
     worker = LabWorker(store, worker_id=args.worker_id,
                        poll_interval=args.poll_interval, lease_seconds=args.lease_seconds,
-                       account_router=router)
+                       account_router=router, evidence=build_evidence_service(store))
     if router is not None:
         log.info("OpenHands account pool is active")
+    if worker.evidence is not None:
+        log.info("Evidence Trust Engine is active: task results are signed")
 
     def _stop(signum, frame):  # graceful shutdown
         log.info("signal %s: stopping after the current pass", signum)
@@ -227,7 +301,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.once:
-            log.info("tick: %s", worker.tick_once())
+            # A single pass still registers and heartbeats, so a cron-style
+            # deployment is visible to the diagnostics exactly as a long-lived
+            # worker is; the row is marked stopped as the pass leaves.
+            log.info("lab worker %s: one pass", args.worker_id)
+            log.info("tick: %s", worker.run_once())
         else:
             log.info("lab worker %s starting", args.worker_id)
             worker.run_forever()

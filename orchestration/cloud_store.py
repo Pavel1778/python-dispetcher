@@ -375,6 +375,7 @@ class PostgresStore:
                             "attempt", "max_attempts", "conversation_id",
                             "openhands_account_id", "tried_accounts",
                             "preferred_account_id", "lease_owner", "lease_token",
+                            "abandoned",
                             "cycle", "retry_at", "wait_reason", "started_at"),
         "nexus_runs": ("id", "project_id", "goal_id", "state", "iteration",
                        "policy", "cycle", "resume_at", "conversation_id",

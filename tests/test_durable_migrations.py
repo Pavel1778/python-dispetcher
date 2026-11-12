@@ -1,4 +1,4 @@
-"""Migrations 0028-0030 on databases that already hold something.
+"""Migrations 0030-0032 on databases that already hold something.
 
 A migration that is only ever applied to an empty schema proves that its SQL
 parses. These apply them where it matters:
@@ -34,8 +34,8 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="set TEST_SUPABASE_DB_URL to a disposable PostgreSQL database")
 
 _MIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
-NEW = ("0028_durable_runs.sql", "0029_openhands_connections.sql",
-       "0030_project_repositories.sql")
+NEW = ("0030_durable_runs.sql", "0031_openhands_connections.sql",
+       "0032_project_repositories.sql")
 OWNER = "user:owner"
 
 #: The schema of the draft (PR #29, ``0026_durable_autonomy.sql``), as it would

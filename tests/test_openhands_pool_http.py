@@ -209,3 +209,68 @@ def test_account_error_history_over_http(base, fake, app):
     assert listing["accounts"][0]["error_count"] == 1
     status, pool = _req("GET", base, "/api/openhands/pool")
     assert pool["candidates"][0]["error_count"] == 1
+
+
+# ------------------------------------------------------ the AI provider cascade
+def test_providers_route_reports_configuration_without_a_call(base, app, monkeypatch):
+    """``/api/providers`` names the configured cascade; no provider is contacted."""
+    from orchestration.providers import ProviderCascade, GroqProvider
+
+    secret = "sk-provider-key-never-leaked"
+    app.providers = ProviderCascade([GroqProvider(api_key=secret, base_url="http://127.0.0.1:1")])
+    status, body = _req("GET", base, "/api/providers")
+    assert status == 200
+    assert body["configured"] == ["groq"]
+    assert body["order"] == ["groq"]
+    assert "probes" not in body  # not live: nothing was probed
+    assert secret not in json.dumps(body)
+
+
+def test_providers_route_live_probes_a_real_provider(base, app):
+    """``?live=1`` probes each configured provider over a real socket."""
+    from orchestration.providers import GroqProvider
+    from tests.test_provider_diagnostics import FakeProvider
+    from http.server import ThreadingHTTPServer
+    import threading
+
+    secret = "sk-provider-key-never-leaked"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+    srv.script = [{"payload": {}}]
+    srv.calls, srv.gets, srv.index = [], [], 0
+    srv.models = ["llama-3.3-70b-versatile"]
+    srv.models_status = None
+    srv.delay = 0
+    srv.gemini_shape = False
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        from orchestration.providers import ProviderCascade
+        app.providers = ProviderCascade([
+            GroqProvider(base_url=f"http://127.0.0.1:{srv.server_port}",
+                         api_key=secret, model="llama-3.3-70b-versatile",
+                         sleep=lambda _s: None)])
+        status, body = _req("GET", base, "/api/providers?live=1")
+        assert status == 200
+        probe = body["probes"][0]
+        assert probe["provider"] == "groq" and probe["kind"] == "ok"
+        assert probe["model_available"] is True
+        assert secret not in json.dumps(body)
+    finally:
+        srv.shutdown()
+        t.join()
+        srv.server_close()
+
+
+def test_diagnostics_report_carries_the_provider_checks(base, fake, app):
+    a, _b = fake
+    _add_account(base, "A", a)
+    status, report = _req("POST", base, "/api/openhands/diagnostics", {"live": False})
+    assert status == 200
+    names = {c["name"]: c["status"] for c in report["checks"]}
+    # The provider checks are part of the report. This process has
+    # OPENHANDS_API_KEY set, so the OpenHands orchestrator provider is
+    # configured: the configuration check is VERIFIED by presence. Without a
+    # live request the probe never runs, so it is UNVERIFIED, never VERIFIED.
+    assert names["providers"] == "VERIFIED"
+    assert names["provider_probe"] == "UNVERIFIED"
+    assert KEY not in json.dumps(report)

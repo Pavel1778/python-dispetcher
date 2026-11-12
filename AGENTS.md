@@ -611,6 +611,45 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
 - Tests: `tests/test_providers.py` (real local HTTP server per provider shape),
   `tests/test_plan_draft.py` (real web server + PostgreSQL).
 
+## Provider fallback diagnostics (this session)
+
+The cascade above had no runtime *diagnostic*: `openhands_diagnostics` verified
+OpenHands accounts, the pool, Cloud, queues and the worker, but nothing checked
+the Gemini/Groq/OpenRouter/OpenHands-orchestrator providers. Section 8 of the
+acceptance text asks for exactly that, so it was added. Keep these invariants:
+
+- **`Provider.probe()` is the one real check.** It makes a *read-only* request
+  (`_models_path()` — `/models` for Gemini/Groq/OpenRouter, the conversation
+  *count* for the OpenHands orchestrator) and returns a `ProbeResult`, never
+  raising: `ok` (key accepted, and the configured model is in the key's list
+  when the endpoint lists models), `auth` (401/403), `unavailable` (transport,
+  5xx, 429), `rejected` (400/422 or the model is not available), `blocked` (no
+  key — nothing was proved). `ProviderCascade.probe_all()` probes every provider
+  in cascade order. **Never send a prompt from a probe**: it costs tokens and
+  could be mistaken for a plan.
+- **Two checks, two claims.** `check_providers` reports *configuration* by
+  presence only (names + order, no call, no key) — `VERIFIED` there means
+  "configured", which is all it claims. `check_provider_probe` is the earned
+  one: opt-in with `live=True`, `UNVERIFIED` otherwise, and it maps each
+  `ProbeResult.kind` to `VERIFIED`/`FAILED`(auth, rejected)/`BLOCKED`
+  (unavailable). A provider is **never** reported connected without this real
+  call — the request's "do not declare a provider connected without a real
+  check".
+- **Model switching ≠ account switching.** The provider cascade is a different
+  mechanism from the OpenHands account pool; the checks are separate and the
+  detail text says which is which. Do not fold them together.
+- **No key ever leaves.** `ProbeResult` and the report carry the provider name,
+  model and a non-secret detail; the `/api/providers` route and `nexus
+  providers` never return a key (asserted in the tests).
+- Surface: `GET /api/providers[?live=1]` (`App.provider_status`) and the CLI
+  `nexus providers [--live]` (exit 6 when a key was refused or a model is
+  missing). The checks are also part of the `POST /api/openhands/diagnostics`
+  report.
+- Tests: `tests/test_provider_diagnostics.py` (25 cases over real local HTTP
+  servers: config presence, key/model checks, timeouts, switching, context
+  preservation, return to primary, the two diagnostic checks, no key leak) and
+  the provider block in `tests/test_openhands_pool_http.py`.
+
 ## Autonomous lab (context, memory, runs, worker)
 
 - `orchestration/nexus_context.py` — versioned project-context snapshots and the
@@ -1446,3 +1485,130 @@ transports pause the conversation
 the Cloud V1 surface only pauses at the *sandbox* level. A caller must not treat
 a `False` as "stopped" — the branch lock remains the guarantee that two
 executors do not push to one branch at once.
+
+## The lab worker is a separate process and must outlive the database (this session)
+
+The autonomous lab is advanced by a loop that runs in two places: the web
+server's own thread (unless `NEXUS_LAB_INLINE` says no) and a separate
+`python -m orchestration.lab_worker` process. Three launch paths start the
+separate process: `docker-compose.yml` (the `worker` service),
+`render.yaml` (the `python-dispetcher-lab-worker` worker service), and the
+systemd unit now shipped at `packaging/systemd/nexus-lab-worker.service`.
+All three run the same module with the same `SUPABASE_DB_URL`, so the API and
+the worker agree on configuration and share one PostgreSQL.
+
+- **The worker loop must survive a transient database error.** `PostgresStore`
+  raises `StoreUnavailable` while it reconnects, and the driver never
+  reconnects by itself. `LabWorker.run_forever` used to let that propagate out
+  of the loop, so one blip (a database restart, a pooler recycling its clients,
+  a network reset) killed the only thing advancing the runs; the web server's
+  inline loop already caught it, so the two paths disagreed. The loop now
+  catches the error, logs it, and retries on the next pass; registration is
+  retried until it sticks and the final deregistration is best effort. Do not
+  "simplify" this back to a bare `tick_once()` in the loop.
+- **The worker is judged by what it changes, not by its log.** `tests/test_lab_worker_process.py`
+  starts the real child process against real PostgreSQL and the fake OpenHands
+  Cloud/GitHub (the web server runs with `NEXUS_LAB_INLINE=0`, so the worker is
+  the only actor): it must register as kind `worker` (a fresh heartbeat in
+  `nexus_lab_workers`), pass the `lab_worker` diagnostic as `VERIFIED`, claim and
+  dispatch, reach `completed`, survive a `SIGKILL` (a second process continues
+  the run without starting a second conversation), and keep working with no
+  client connected. `tests/test_planner_worker.py::test_the_worker_loop_outlives_a_transient_database_error`
+  is the load-bearing resilience case (removing the fix makes it fail).
+- **`tests/test_worker_setup.py`** checks the launch artifacts without starting
+  anything: the systemd unit parses and runs the worker module, Compose and
+  Render define a worker service on the same database, and `docs/WORKER_SETUP.md`
+  documents every mechanism. Keep the three launch paths pointing at the same
+  module.
+- **`--once` registers too (this session).** The cron-style single pass
+  (`main()` with `--once`) called `tick_once()` directly and left no worker row,
+  so a deployment that advances runs by cron read as "active run(s) exist but no
+  worker heartbeat is fresh" to `GET /api/openhands/diagnostics`. It now goes
+  through `LabWorker.run_once()`: register (`kind=worker`), one pass (which
+  writes the heartbeat), then mark the row `stopped` on the way out - the same
+  trace a long-lived worker leaves, minus liveness a single pass cannot have. A
+  pass whose registration fails still ticks. `run_forever` marks the row stopped
+  through the same `_stop_worker_best_effort`. Tests:
+  `tests/test_planner_worker.py::test_run_once_registers_and_heartbeats_like_a_long_lived_worker`
+  and `::test_run_once_still_ticks_when_it_cannot_register`.
+
+## The EVIDENCE stage of the autonomous pipeline (this session)
+
+The audit diagram has always ended `task/workflow result ──▶ Evidence Trust
+Engine`, but the lab loop only wrote the verdict onto the task row
+(`record_verification`); the signed, re-verifiable record the web API and MCP
+produce was never written for an autonomous run. The stage is now wired.
+
+- **`LabScheduler(evidence=…)` is the EVIDENCE stage.** When it is given an
+  `EvidenceService` (`nexus_evidence.py`), every settled task result — a
+  verified/unverified/failed verdict from the poll path, and the `blocked`
+  verdicts from the dispatch gate and the "no usable account" path — is also
+  recorded through the Evidence Trust Engine via
+  `EvidenceService.record_task_result`. `None` (no signer configured) keeps the
+  loop exactly as it was: the record is skipped, never faked.
+- **Best effort, never fatal.** `LabScheduler._record_evidence` logs and returns
+  on any error: a broken key must not stall a run, and the task's own verdict is
+  already written before evidence runs. Removing the `try/except` makes a run
+  die on a bad signer — the wrong failure.
+- **The record binds the observed commit.** `record_task_result` signs
+  `remote_sha` (what the Git verifier read on the branch), not a commit the agent
+  claimed, so `reverify(expected_commit=…)` is meaningful. It also carries the
+  task verdict in `detail.verdict` — a task can be `completed_unverified` in a
+  `VERIFIED` (properly signed) record, and that is honest, not a contradiction:
+  the signature is about the record's integrity, the verdict is about the work.
+- **Wired from the environment in `lab_worker.main`** (`build_evidence_service`,
+  a signer only when `NEXUS_EVIDENCE_PRIVATE_KEY` is set) and from `App`'s own
+  loop (`App.evidence`). A deployment with no key is unchanged.
+- Tests: `tests/test_lab_loop.py` (the EVIDENCE-stage block: signed record +
+  re-verify, a broken signer does not stop the loop, no service writes nothing)
+  and `tests/test_pipeline_e2e.py` (the whole pipeline over HTTP, with the
+  record re-verified through the public route).
+
+## The full autonomous pipeline, verified end to end
+
+`tests/test_pipeline_e2e.py` drives the whole chain over real HTTP and real
+PostgreSQL — `USER PROMPT → PLANNER → DAG → SCHEDULER → OPENHANDS → EXECUTION →
+QA → EVIDENCE → ACCEPTANCE → NOTIFICATION` — against the same local socket
+servers the studio tests use (fake Cloud, fake GitHub, fake LLM). It asserts each
+stage's *effect*, not its claim: the dependency gates the DAG, a text answer
+naming no commit is `completed_unverified` and blocks the run ("не считай
+текстовый ответ доказательством"), a signed evidence record exists and
+re-verifies, and the completion notification appears only after the run ends. It
+also runs the same loop through the real `LabWorker` class with
+`NEXUS_LAB_INLINE=0`, proving the server accepts/plans while the separate worker
+advances. `OpenHandsExecutor.instructions` is asserted to ask the agent for every
+capability the request lists (inspect, read/change files, Git, install allowed
+deps, run tests, analyze and fix errors, push, report).
+
+## The pipeline's ACCEPTANCE stage on the autonomous loop (this session)
+
+The EVIDENCE stage above signs every settled *task* result. What was still missing
+is the stage the pipeline names after it: **ACCEPTANCE**. A run that reached
+`completed` left no signed record of *why* it was accepted - only the scheduler's
+word on the run row - so the two stages `... → EVIDENCE → ACCEPTANCE →
+NOTIFICATION` ended at EVIDENCE.
+
+- **`nexus_evidence.LabEvidence`** records the run's terminal decision over the
+  tasks' own verdicts. `LabScheduler(acceptance=...)` calls it where it decides
+  the run's fate, and again for a terminal run it finds (an operator-cancelled run
+  never went through the decide step, so this is the pass that sees it).
+- **The decision is earned, not asserted.** `ACCEPTED` only when every task is
+  `completed_verified`; `NOT_READY` for a cancelled run; `REJECTED` otherwise.
+  `READY_WITH_CONDITIONS` is not used - a run has no partial-acceptance contract.
+  A blocked run is not terminal, so it is not decided yet; the task that stopped
+  it already has its own EVIDENCE record.
+- **`EvidenceService.record_once` is the exactly-once gate.** The lab names each
+  record with a deterministic uuid (`lab_evidence_id`), so the `nexus_evidence`
+  primary key absorbs a re-run of the step: a worker that crashes between the
+  decision and the record collides with its own row instead of appending a
+  second. `record()` gained `record_id` for this; the id is the row key, not a
+  signed field, so it cannot replace a signed record with a different one.
+- **No signer, no record - never a fake.** Without `NEXUS_EVIDENCE_PRIVATE_KEY`
+  `LabEvidence` records nothing and warns once (per process); the run is
+  unaffected. `/api/system` already reports signer presence.
+- `LabStore` gained `get_task_internal`/`list_tasks_internal` for the loop (it is
+  not a project member), mirroring the `*_internal` methods that already existed.
+- Tests: `tests/test_lab_evidence.py` (the ACCEPTED decision, a cancelled run as
+  NOT_READY, a blocked run leaving no decision, the id derivation, and a
+  whole-pipeline walk asserting a durable artifact per stage). Removing the
+  acceptance recording makes them fail.

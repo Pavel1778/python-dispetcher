@@ -168,6 +168,51 @@ class ProviderResponse:
     attempts: int = 1
 
 
+@dataclass
+class ProbeResult:
+    """What one real, read-only probe of a provider proved. Never a key.
+
+    ``kind`` is the same vocabulary :func:`failure_kind` produces, plus
+    ``blocked`` for a provider that has no key to probe with:
+
+    * ``ok``          — the endpoint answered, the key was accepted and (when
+                        the endpoint lists models) the configured model is
+                        among them. This is what earns ``VERIFIED``.
+    * ``auth``        — the key was refused (401/403).
+    * ``unavailable`` — transport failure, 5xx or 429: nothing was proved.
+    * ``rejected``    — the request was refused (400/422) or the configured
+                        model is not one the key can use.
+    * ``blocked``     — no key is configured, so nothing could be probed.
+    """
+
+    provider: str
+    model: str
+    kind: str
+    detail: str = ""
+    models: list[str] = field(default_factory=list)
+    model_available: bool | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.kind == "ok"
+
+
+def _model_listed(model: str, models: list[str]) -> bool:
+    """Whether *model* appears in *models*, tolerating provider prefixes.
+
+    Gemini lists ``models/gemini-2.5-flash`` and OpenRouter lists
+    ``openai/gpt-4o-mini``; the configured model may carry or omit the prefix,
+    so an exact match or a match on the last path segment both count.
+    """
+    wanted = model.strip().lower()
+    tail = wanted.rsplit("/", 1)[-1]
+    for candidate in models:
+        name = str(candidate).strip().lower()
+        if name == wanted or name.rsplit("/", 1)[-1] == tail:
+            return True
+    return False
+
+
 def _retry_after(headers: Any) -> float | None:
     """Parse a ``Retry-After`` header (seconds form). ``None`` if unusable."""
     if headers is None:
@@ -260,7 +305,79 @@ class Provider:
     def _extract_text(self, body: Any) -> str:
         raise NotImplementedError
 
+    # -- probe (read-only) -------------------------------------------------
+    def _models_path(self) -> str | None:
+        """The endpoint that lists this provider's usable models, or ``None``.
+
+        A provider that can list its models lets a probe answer "is the
+        configured model available to this key" as well as "is the key
+        accepted". The base class returns ``None``; a concrete provider that
+        knows its route overrides this.
+        """
+        return None
+
+    def _extract_models(self, body: Any) -> list[str]:
+        """Pull model names out of a ``_models_path`` response body."""
+        return []
+
+    def _probe(self) -> ProbeResult:
+        """One read-only request that proves the key works and names the models.
+
+        Never sends a prompt, so it costs no tokens and cannot be mistaken for
+        a plan. ``models`` is empty when the provider has no list route.
+        """
+        path = self._models_path()
+        if path is None:
+            return ProbeResult(self.name, self.model, "ok", "key accepted (no model list route)")
+        body = self._get(path)
+        models = self._extract_models(body)
+        if not models:
+            return ProbeResult(self.name, self.model, "ok",
+                               "key accepted (endpoint returned no model list)")
+        available = _model_listed(self.model, models)
+        detail = (f"key accepted; model {self.model} is available"
+                  if available else
+                  f"key accepted but model {self.model} is not in the key's list")
+        return ProbeResult(self.name, self.model, "ok" if available else "rejected",
+                           detail, models=models, model_available=available)
+
+    def probe(self) -> ProbeResult:
+        """Probe this provider for real and return what was proved.
+
+        A provider with no key is ``blocked`` — nothing is claimed about
+        whether it would work. A probe never raises: every failure mode becomes
+        a :class:`ProbeResult`, so a caller can report all providers at once.
+        """
+        if not self.configured:
+            return ProbeResult(self.name, self.model, "blocked", "no API key configured")
+        try:
+            return self._probe()
+        except ProviderError as e:
+            return ProbeResult(self.name, self.model, failure_kind(e), str(e))
+        except Exception as e:  # noqa: BLE001 - a probe reports, it never raises
+            return ProbeResult(self.name, self.model, "rejected", f"{type(e).__name__}: {e}")
+
     # -- shared request path ----------------------------------------------
+    def _get(self, path: str) -> Any:
+        """A read-only GET to *path* on the provider, same error mapping."""
+        req = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+        for key, value in self._headers().items():
+            req.add_header(key, value)
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise ProviderAuthError(f"{self.name} -> {e.code}") from e
+            if e.code == 429:
+                raise ProviderUnavailable(f"{self.name} -> 429") from e
+            if e.code >= 500:
+                raise ProviderUnavailable(f"{self.name} -> {e.code}") from e
+            raise ProviderRejected(f"{self.name} -> {e.code}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
+
     def _post(self, prompt: str, system: str, *, prose: bool = False,
               timeout: float | None = None) -> Any:
         data = json.dumps(self._payload(prompt, system, prose=prose)).encode()
@@ -383,6 +500,15 @@ class GeminiProvider(Provider):
             return ""
         return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
 
+    def _models_path(self) -> str | None:
+        return "/models"
+
+    def _extract_models(self, body: Any) -> list[str]:
+        raw = body.get("models") if isinstance(body, dict) else None
+        if not isinstance(raw, list):
+            return []
+        return [m.get("name") or m.get("id") for m in raw if isinstance(m, dict)]
+
 
 class _OpenAICompatProvider(Provider):
     """Shared shape for Groq and OpenRouter (OpenAI-compatible chat completions)."""
@@ -409,6 +535,15 @@ class _OpenAICompatProvider(Provider):
             return body["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
             return ""
+
+    def _models_path(self) -> str | None:
+        return "/models"
+
+    def _extract_models(self, body: Any) -> list[str]:
+        raw = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(raw, list):
+            return []
+        return [m.get("id") or m.get("name") for m in raw if isinstance(m, dict)]
 
 
 class GroqProvider(_OpenAICompatProvider):
@@ -474,6 +609,14 @@ class OpenHandsOrchestratorProvider(Provider):
                     return body[key]
         return ""
 
+    def _models_path(self) -> str | None:
+        # A read-only count proves the key is accepted without creating a
+        # conversation. OpenHands Cloud exposes no model-list route for a key.
+        return "/api/v1/app-conversations/count"
+
+    def _extract_models(self, body: Any) -> list[str]:
+        return []
+
 
 # --------------------------------------------------------------- the cascade
 
@@ -538,6 +681,16 @@ class ProviderCascade:
     def usable(self) -> list[Provider]:
         """The providers that have a key, in cascade order."""
         return [p for p in self.providers if p.configured]
+
+    def probe_all(self) -> list[ProbeResult]:
+        """Probe every provider in cascade order and report what each proved.
+
+        A real, read-only request per *configured* provider (see
+        :meth:`Provider.probe`); a provider with no key is ``blocked``. Nothing
+        here is guessed: the report says which providers answered and which did
+        not, so the caller can never declare a provider connected on faith.
+        """
+        return [p.probe() for p in self.providers]
 
     def plan(self, prompt: str, system: str = "", *,
              timeout: float | None = None) -> CascadeResult:

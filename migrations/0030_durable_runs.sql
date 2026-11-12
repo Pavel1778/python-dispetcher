@@ -117,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_nexus_run_tasks_waiting
 -- ---------------------------------------------------------------------- runs
 -- Whether this is the first time the columns below are added: what is done to
 -- the rows that already exist is done once, not every time this file is run.
-CREATE TEMP TABLE IF NOT EXISTS nexus_0028_first_run ON COMMIT DROP AS
+CREATE TEMP TABLE IF NOT EXISTS nexus_0030_first_run ON COMMIT DROP AS
     SELECT NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_schema = current_schema() AND table_name = 'nexus_runs'
@@ -156,7 +156,7 @@ CREATE INDEX IF NOT EXISTS idx_nexus_runs_conversation
 -- ------------------------------------------------------------ existing rows
 DO $$
 BEGIN
-    IF (SELECT first FROM nexus_0028_first_run) THEN
+    IF (SELECT first FROM nexus_0030_first_run) THEN
         -- A run that is still alive keeps going under the new rules: it was
         -- started from the chat, where nobody named a budget. Finished runs
         -- are left as they are.

@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchestration import nexus_retry  # noqa: E402
 from orchestration.cloud_client import (  # noqa: E402
+    CloudClient,
     CloudError,
     CloudNotFound,
     CloudRateLimited,
@@ -107,8 +108,8 @@ class Conversations:
         return TaskReport(state=state, final_text=self.texts.get(conversation_id, "did the work"),
                           conversation_id=conversation_id)
 
-    def stop(self, target):
-        conversation = str(target["conversation_id"])
+    def stop(self, account_id, conversation_id, project_id=None):
+        conversation = str(conversation_id)
         if self.stop_errors:
             raise self.stop_errors.pop(0)
         if conversation not in self.states:
@@ -116,7 +117,7 @@ class Conversations:
         self.stop_calls.append(conversation)
         if conversation not in self.deaf:
             self.states[conversation] = "paused"
-        return {"method": "test"}
+        return True
 
     def conversation_state(self, target):
         return self.states.get(str(target["conversation_id"]), "missing")
@@ -940,3 +941,116 @@ def test_a_stranger_cannot_cancel_or_see_a_run(env):
     with pytest.raises(NotFound):
         env["lab"].list_runs("user:mallory", env["project"], include_hidden=True)
     assert run_of(env, run_id)["state"] == "running"
+
+
+# ------------------------- left behind by a switch or a failover (``abandoned``)
+ACCOUNT_B = "22222222-2222-2222-2222-222222222222"
+
+
+def _account_b(env) -> str:
+    sql(env, "INSERT INTO nexus_openhands_accounts(id, principal, label, base_url, "
+             "api_key_encrypted) VALUES (%s, %s, 'B', 'https://example.test', %s)",
+        ACCOUNT_B, ALICE, b"\x00")
+    return ACCOUNT_B
+
+
+def test_what_a_switch_left_behind_is_stopped_even_after_its_run_has_ended(env):
+    """A switch records the old conversation in the task's ``abandoned`` list,
+    and the run's own pass stops it. A run that is cancelled a moment later has
+    no pass any more - and the list would hold the branch against every later
+    run, for ever. The worker's loop stops what such a run left behind."""
+    account = _account_b(env)
+    run_id = start(env, [{"task_key": "build", "title": "Build"}], repository=REPO)
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    sched.tick(run_id)
+    old = executor.of("build")[0]
+    env["lab"].switch_task_executor(tasks_of(env, run_id)["build"]["id"],
+                                    target_account_id=account)
+    env["lab"].set_run_state(ALICE, env["project"], run_id, "cancelled")
+    assert [e["conversation_id"] for e in env["lab"].pending_stops(run_id)] == [old]
+    assert env["lab"].ended_runs_with_abandoned() == [run_id]
+
+    again = start(env, [{"task_key": "build", "title": "Build"}], repository=REPO)
+    for _ in range(3):
+        assert sched.tick(run_id).finished        # an ended run is not advanced
+    sched.tick(again)
+    assert executor.of("build") == [old], "the branch is held by what was left behind"
+
+    sched.deliver_stops()
+    assert executor.stop_calls == [old] and executor.states[old] == "paused"
+    assert env["lab"].pending_stops(run_id) == []
+    assert env["lab"].ended_runs_with_abandoned() == []
+    sched.tick(again)
+    assert len(executor.of("build")) == 2
+
+
+def test_a_run_that_is_alive_stops_what_it_left_behind_itself(env):
+    """Nothing is drained twice: a live run's list is its own pass's business,
+    and the loop's look at ended runs does not see it."""
+    account = _account_b(env)
+    run_id = start(env, [{"task_key": "build", "title": "Build"}], repository=REPO)
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    sched.tick(run_id)
+    old = executor.of("build")[0]
+    env["lab"].switch_task_executor(tasks_of(env, run_id)["build"]["id"],
+                                    target_account_id=account)
+    assert env["lab"].ended_runs_with_abandoned() == []
+    sched.deliver_stops()
+    assert executor.stop_calls == []
+    sched.tick(run_id)                            # stops the old one, starts the new
+    assert executor.stop_calls == [old]
+    assert len(executor.of("build")) == 2
+
+
+def _cloud_conversation(server, client) -> str:
+    """A conversation at work on the stand-in Cloud, started through the client."""
+    start_task = client.start_conversation(initial_message="do the thing", title="t")
+    conversation = start_task.app_conversation_id or client.get_start_task(
+        start_task.id).app_conversation_id
+    server.cloud.conversations[conversation]["execution_status"] = "running"
+    return conversation
+
+
+def test_the_cloud_transport_stops_a_conversation_by_pausing_its_own_sandbox():
+    """Over real HTTP against the stand-in Cloud. The Cloud has no
+    conversation-scoped stop; its own client pauses the sandbox, and a
+    conversation started through this transport has one of its own."""
+    from orchestration.nexus_lab import OpenHandsExecutor
+    from tests.fake_cloud import FakeCloudServer
+
+    with FakeCloudServer() as server:
+        client = CloudClient(server.base_url, api_key="test-key", timeout=10.0)
+        executor = OpenHandsExecutor(client)
+        target = {"conversation_id": None, "project_id": None}
+
+        conversation = _cloud_conversation(server, client)
+        sandbox = server.cloud.conversations[conversation]["sandbox_id"]
+        assert executor.conversation_state({**target, "conversation_id": conversation}) \
+            == "running"
+        assert executor.stop(None, conversation) is True
+        assert server.cloud.paused == [sandbox]
+        assert executor.conversation_state({**target, "conversation_id": conversation}) \
+            == "paused"
+        assert conversation in server.cloud.conversations, "the transcript is kept"
+
+        # A pause the service refuses stops nothing, and is not taken for a stop.
+        second = _cloud_conversation(server, client)
+        server.cloud.pause_status = 503
+        assert client.stop_conversation(second) is False
+        assert executor.stop(None, second) is False
+        server.cloud.pause_status = 0
+
+        # A conversation that is gone has nothing left to stop: a failover away
+        # from it must not hold its branch for ever.
+        assert client.stop_conversation("0" * 32) is False
+        assert executor.stop(None, "0" * 32) is True
+
+
+def test_a_service_that_cannot_be_reached_has_stopped_nothing():
+    from orchestration.nexus_lab import OpenHandsExecutor
+
+    client = CloudClient("http://127.0.0.1:9", api_key="test-key", timeout=2.0)
+    assert client.stop_conversation("whatever") is False
+    assert OpenHandsExecutor(client).stop(None, "whatever") is False

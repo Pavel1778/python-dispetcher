@@ -595,7 +595,8 @@ class App:
                     built = LabWorker(self.store, worker_id=self._lab_worker_id,
                                       client=self.client, github=self.github,
                                       github_accounts=self.github_accounts,
-                                      account_router=build_account_router(self.store))
+                                      account_router=build_account_router(self.store),
+                                      evidence=self.evidence)
                     # Known to the diagnostics as a live worker (migration 0023):
                     # a server that advances runs is one. Its heartbeat is
                     # written by every pass.
@@ -1076,6 +1077,13 @@ class App:
         from_account = task.get("openhands_account_id")
         updated = self.lab.switch_task_executor(task_id, target_account_id=account_id)
         stopped = self._stop_abandoned_conversation(principal, from_account, abandoned)
+        # The store also recorded the conversation in the task's ``abandoned``
+        # list, which holds the branch until it is stopped. This path stopped it
+        # here, so drop the entry too; when it did not stop (the app transport
+        # cannot), leave the entry and let the worker try (it will report the
+        # transport cannot stop, and release the branch).
+        if stopped and abandoned:
+            self.lab.mark_abandoned_stopped(task_id, abandoned)
         return {"task": updated, "target_account": {"id": account_id,
                                                     "label": account["label"]},
                 "abandoned_conversation": abandoned, "stopped": stopped}
@@ -1212,9 +1220,30 @@ class App:
 
         diagnostics = OpenHandsDiagnostics(
             self.store, accounts=self.openhands_accounts, pool=self.account_pool,
-            cloud_client=self.client)
+            cloud_client=self.client, providers=self.providers)
         return diagnostics.run(principal, live=live, account_id=account_id,
                                project_id=project_id).as_dict()
+
+    def provider_status(self, *, live: bool = False) -> dict[str, Any]:
+        """The orchestrator cascade: configuration, and an optional real probe.
+
+        ``live=False`` reports only which providers have a key and the order
+        they are tried in — no provider is contacted, no key is returned. With
+        ``live=True`` each configured provider is probed with one read-only
+        request (see :meth:`Provider.probe`) and earns its own status, so a
+        provider is never reported connected on faith. This is deliberately
+        separate from the OpenHands account pool: switching a *model* provider
+        is not switching an OpenHands *account*.
+        """
+        configured = self.providers.configured()
+        order = [p.name for p in self.providers.providers]
+        out: dict[str, Any] = {"order": order, "configured": configured}
+        if live:
+            out["probes"] = [
+                {"provider": r.provider, "model": r.model, "kind": r.kind,
+                 "detail": r.detail, "model_available": r.model_available}
+                for r in self.providers.probe_all()]
+        return out
 
     def system_info(self) -> dict[str, Any]:
         """Safe diagnostics: presence of settings, never their values."""
@@ -3075,6 +3104,13 @@ class Handler(BaseHTTPRequestHandler):
                     live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes"),
                     account_id=(query.get("account_id") or [None])[0],
                     project_id=(query.get("project_id") or [None])[0]))
+            if path == "/api/providers":
+                # The orchestrator cascade: configured provider names and the
+                # order they are tried in. No key is returned; ?live=1 also
+                # probes each configured provider with a read-only request.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                return self._json(200, self.app.provider_status(
+                    live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes")))
             if path == "/api/openhands/pool":
                 principal = self._project_principal()
                 return self._json(200, {

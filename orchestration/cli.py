@@ -363,6 +363,30 @@ def cmd_openhands_diagnostics(args: argparse.Namespace) -> int:
     return EXIT["ok"] if report.get("ok") else EXIT["unavailable"]
 
 
+def cmd_providers(args: argparse.Namespace) -> int:
+    """Show the LLM orchestrator cascade and optionally probe each provider.
+
+    ``--live`` probes every configured provider with one read-only request and
+    reports what each proved; without it only the configured names and their
+    order are shown. This is the provider cascade, not the OpenHands account
+    pool — the two are separate mechanisms.
+    """
+    client = _client(args)
+    path = "/api/providers?live=1" if args.live else "/api/providers"
+    data = client.get(path)
+    configured = data.get("configured", [])
+    lines = [f"order: {' → '.join(data.get('order', []))}",
+             f"configured: {', '.join(configured) or '(none)'}"]
+    for probe in data.get("probes", []):
+        lines.append(f"  {probe['provider']}: {probe['kind']} — {probe['detail']}")
+    _emit(args, data, human="\n".join(lines))
+    # A probe that proved a failure (a rejected key or a missing model) is a
+    # non-zero result; an unreachable provider is reported but is not proven
+    # broken, so it does not by itself fail the command.
+    failed = any(p.get("kind") in ("auth", "rejected") for p in data.get("probes", []))
+    return EXIT["unavailable"] if failed else EXIT["ok"]
+
+
 def cmd_openhands_accounts(args: argparse.Namespace) -> int:
     client = _client(args)
     accounts = client.get("/api/openhands/accounts").get("accounts", [])
@@ -688,6 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", parents=[common], help="print the version").set_defaults(func=cmd_version)
     sub.add_parser("doctor", parents=[common], help="diagnose connectivity and configuration").set_defaults(func=cmd_doctor)
     sub.add_parser("status", parents=[common], help="dashboard counts and health").set_defaults(func=cmd_status)
+    providers = sub.add_parser("providers", parents=[common],
+                               help="show the LLM orchestrator cascade (Gemini → Groq → OpenRouter → OpenHands)")
+    providers.add_argument("--live", action="store_true",
+                           help="probe each configured provider with one read-only request")
+    providers.set_defaults(func=cmd_providers)
 
     project = sub.add_parser("project", parents=[common], help="manage projects").add_subparsers(dest="sub", required=True)
     project.add_parser("list", parents=[common], help="list projects").set_defaults(func=cmd_project_list)
