@@ -241,7 +241,10 @@ Migration `0010_nexus_plans.sql` is automatically applied on startup unless
 
 ## NEXUS laboratory, files and GitHub (second increment)
 
-The dashboard now has a **Лаборатория** tab and a **GitHub** tab:
+These features are reachable through the API, the CLI and MCP. The studio
+(`orchestration/studio/`) is a single chat application and does **not** show
+them as screens: it has no Лаборатория or GitHub tab. The create/visibility
+flow is still two-step on the server (propose -> confirm).
 
 - **File laboratory** - upload documents, images, source code and archives into
   a project; preview text and images; download; delete. Bytes are stored in
