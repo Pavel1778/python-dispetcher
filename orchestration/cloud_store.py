@@ -1106,41 +1106,52 @@ class PostgresStore:
         session_api_key: str,
         status: str = "RUNNING",
         owner: str = "",
+        workspace: str = "",
     ) -> None:
         """Record a started sandbox so a later dispatch can reuse it.
 
         *owner* is whose sandbox it is: the id of the OpenHands connection that
         started it, or ``""`` for the server's own key. A sandbox is only ever
         offered back to its owner.
+
+        *workspace* is what its working directory holds: ``owner/name#branch``
+        of the repository it was started for, or ``""`` for work that names
+        none. A sandbox is reused only for the same workspace, so two tasks on
+        different repositories or branches never share a checkout.
         """
         with self._tx() as cur:
             cur.execute(
                 """
                 INSERT INTO cloud_sandboxes(sandbox_id, agent_server_url,
-                                            session_api_key, status, owner)
-                VALUES (%s,%s,%s,%s,%s)
+                                            session_api_key, status, owner, workspace)
+                VALUES (%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (sandbox_id) DO UPDATE
                    SET agent_server_url = EXCLUDED.agent_server_url,
                        session_api_key = EXCLUDED.session_api_key,
                        status = EXCLUDED.status,
                        owner = EXCLUDED.owner,
+                       workspace = EXCLUDED.workspace,
                        updated_at = now()
                 """,
-                (sandbox_id, agent_server_url, session_api_key, status, owner),
+                (sandbox_id, agent_server_url, session_api_key, status, owner, workspace),
             )
 
-    def running_sandbox(self, owner: str = "") -> dict[str, Any] | None:
-        """The most recently seen running sandbox of *owner*, if any.
+    def running_sandbox(self, owner: str = "", workspace: str = "") -> dict[str, Any] | None:
+        """The most recently seen running sandbox of *owner* that holds
+        *workspace*, if any.
 
         Sandboxes are not shared between OpenHands connections: one started
         with a connection's key holds that connection's work, and another
-        connection's key cannot even ask the service about it.
+        connection's key cannot even ask the service about it. Nor between
+        workspaces: every conversation of a sandbox works in one directory, so
+        a sandbox that holds a checkout of one repository and branch is not
+        given to a task on another.
         """
         with self._tx() as cur:
             cur.execute(
                 "SELECT sandbox_id, agent_server_url, session_api_key, status "
-                "FROM cloud_sandboxes WHERE status='RUNNING' AND owner=%s "
-                "ORDER BY updated_at DESC LIMIT 1", (owner,)
+                "FROM cloud_sandboxes WHERE status='RUNNING' AND owner=%s AND workspace=%s "
+                "ORDER BY updated_at DESC LIMIT 1", (owner, workspace)
             )
             return cur.fetchone()
 

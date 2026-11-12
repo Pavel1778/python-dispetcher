@@ -50,7 +50,7 @@ from .cloud_client import (
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
 from . import nexus_retry
-from .nexus_binding import AuthorizationError, authorize_run_task
+from .nexus_binding import AuthorizationError, ProjectRepositoryService, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_lab_store import (
     IN_FLIGHT_TASK_STATES,
@@ -236,7 +236,8 @@ class OpenHandsExecutor:
         run = f"NEXUS run {task['run_id']}, task {task['task_key']}.\n" if task.get("run_id") else ""
         return (
             "You are a coding agent working inside a repository checkout.\n"
-            f"Repository: {repo}\nBranch: {branch}\n{run}\n"
+            f"Repository: {repo}\nBranch: {branch}\n{run}"
+            + OpenHandsExecutor._project_repositories(task) + "\n"
             f"Task: {task['title']}\n{task.get('description') or ''}\n\n"
             "Acceptance criteria:\n"
             f"{criteria}\n\n"
@@ -252,6 +253,36 @@ class OpenHandsExecutor:
             "push, files changed, tests run and their result, and any blocker. Do not "
             "claim success you did not verify."
         )
+
+    @staticmethod
+    def _project_repositories(task: dict) -> str:
+        """What the agent is told when its project has several repositories:
+        which they are, which is the main one, which one this task is for, and
+        that it changes that one only. Empty for a project with one repository
+        (the message is then what it always was).
+
+        ``task["project_repositories"]`` is put there by the scheduler just
+        before the start (``ProjectRepositoryService.context``).
+        """
+        repositories = task.get("project_repositories") or []
+        if len(repositories) < 2:
+            return ""
+        mine = task.get("repository") or ""
+        lines = ["", "This project has several repositories:"]
+        for item in repositories:
+            note = (item.get("role_note") or "").strip()
+            lines.append(
+                f"- {item['full_name']}, branch {item.get('branch') or '(default)'}"
+                + (" (the main repository)" if item.get("is_primary") else "")
+                + (f" - {note}" if note else "")
+                + ("  <- this task" if item["full_name"] == mine else ""))
+        lines.append(
+            f"This task changes {mine or 'the repository named above'} only. The other "
+            "repositories are changed by other tasks of the same run, each in a workspace "
+            "of its own: you may read them to understand an interface, and you do not "
+            "commit or push to them. If your task cannot be finished without a change "
+            "in another repository, say exactly which change in your report.")
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _hand_in(task: dict) -> str:
@@ -649,26 +680,31 @@ class OpenHandsExecutor:
 def project_github(store: PostgresStore, fallback: GitHubClient, *,
                    accounts: GitHubAccountService | None = None
                    ) -> Callable[[dict], GitHubClient]:
-    """``client_for(task)``: the GitHub identity a task's project reads with.
+    """``client_for(task)``: the GitHub identity a task's repository is read with.
 
-    A project that has a stored GitHub account bound is read with that account,
-    exactly as the studio reads its files; a project without one is read with
-    *fallback* (the server's ``GITHUB_TOKEN``). The bound account is never
-    swapped for another: if it was revoked, or its token cannot be decrypted,
-    the call raises and the task is ``blocked`` - not verified by other means.
+    A project may have several repositories from different GitHub accounts, so
+    the identity is found per repository: the account of the link that ties
+    the task's repository to its project
+    (``nexus_project_repositories.github_account_id``) - a task on
+    ``account-A/frontend`` is read with account A's token, one on
+    ``account-B/backend`` with account B's. A repository whose link names no
+    account is read with the project's account, exactly as the studio reads
+    its files; a project without one is read with *fallback* (the server's
+    ``GITHUB_TOKEN``).
+
+    The account is never swapped for another: if it was revoked, or its token
+    cannot be decrypted, the call raises and the result is not judged by other
+    means.
     """
     service = accounts or GitHubAccountService(store)
+    links = ProjectRepositoryService(store)
 
     def client_for(task: dict) -> GitHubClient:
-        with store._tx() as cur:
-            cur.execute(
-                "SELECT a.id, a.principal FROM nexus_projects p "
-                "JOIN nexus_github_accounts a ON a.id = p.github_account_id "
-                "WHERE p.id=%s", (task["project_id"],))
-            row = cur.fetchone()
-        if row is None:
+        principal, account_id = links.account_for_repository(
+            str(task["project_id"]), task.get("repository") or "")
+        if account_id is None:
             return fallback
-        return service.client_for_account(row["principal"], str(row["id"]))
+        return service.client_for_account(principal, account_id)
 
     return client_for
 
@@ -1353,6 +1389,11 @@ class LabScheduler:
         base_sha = head(task) if head is not None else None
         if base_sha:
             task = {**task, "base_sha": base_sha}
+        if task.get("repository"):
+            # A project with several repositories: the agent is told which they
+            # are and which one is its own.
+            task = {**task, "project_repositories": ProjectRepositoryService(
+                self.store.store).context(str(task["project_id"]))}
         try:
             conversation_id = self.executor.dispatch(task)
         except NoUsableAccount as e:

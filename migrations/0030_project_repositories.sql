@@ -56,11 +56,29 @@ CREATE INDEX IF NOT EXISTS idx_nexus_project_repositories_account
 CREATE UNIQUE INDEX IF NOT EXISTS uq_nexus_project_repositories_primary
     ON nexus_project_repositories(project_id) WHERE is_primary;
 
--- A project with exactly one linked repository has an obvious main one.
+-- The repository a project is bound to (``nexus_projects.repository_id``) is its
+-- main one, on the bound branch. From here on the two are changed together.
+UPDATE nexus_project_repositories pr
+   SET is_primary = true,
+       branch = CASE WHEN p.selected_branch IS NULL OR p.selected_branch = r.default_branch
+                     THEN '' ELSE p.selected_branch END
+  FROM nexus_projects p, repositories r
+ WHERE p.id = pr.project_id AND r.id = pr.repository_id
+   AND p.repository_id = pr.repository_id
+   AND NOT EXISTS (SELECT 1 FROM nexus_project_repositories o
+                   WHERE o.project_id = pr.project_id AND o.is_primary);
+-- A project bound to nothing, with exactly one linked repository, has an
+-- obvious main one as well (and is bound to it).
 UPDATE nexus_project_repositories pr SET is_primary = true
  WHERE NOT EXISTS (SELECT 1 FROM nexus_project_repositories o
                    WHERE o.project_id = pr.project_id AND o.is_primary)
    AND (SELECT count(*) FROM nexus_project_repositories o
         WHERE o.project_id = pr.project_id) = 1;
+UPDATE nexus_projects p
+   SET repository_id = pr.repository_id,
+       selected_branch = COALESCE(p.selected_branch, r.default_branch)
+  FROM nexus_project_repositories pr, repositories r
+ WHERE pr.project_id = p.id AND pr.is_primary AND r.id = pr.repository_id
+   AND p.repository_id IS NULL;
 
 COMMIT;

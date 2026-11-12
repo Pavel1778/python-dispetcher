@@ -34,8 +34,14 @@ ALTER TABLE nexus_openhands_accounts ADD COLUMN IF NOT EXISTS health_checked_at 
 -- connections, one asked the service about the other's sandbox, was told it
 -- does not exist, and wrote it off for its owner too.
 ALTER TABLE cloud_sandboxes ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT '';
+-- What the sandbox's working directory holds: ``owner/name#branch`` of the
+-- repository it was started for, or '' for work that names none. Every
+-- conversation of a sandbox works in one directory, so a sandbox is reused
+-- only for the same repository and branch: two tasks on different repositories
+-- (or branches) never share - or overwrite - one checkout.
+ALTER TABLE cloud_sandboxes ADD COLUMN IF NOT EXISTS workspace text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_cloud_sandboxes_owner
-    ON cloud_sandboxes(owner, status, updated_at DESC);
+    ON cloud_sandboxes(owner, workspace, status, updated_at DESC);
 
 -- How a project spreads work over its executors:
 --   failover   - the first usable one in order; a backup only while those

@@ -213,8 +213,15 @@ class CloudDirectClient:
         return {"path": path, "bytes": len(stored), "sha256": digest}
 
     # ------------------------------------------------------------- sandboxes
+    @staticmethod
+    def workspace_key(repository: str | None, branch: str | None) -> str:
+        """What a conversation's working directory will hold: the repository
+        and branch it is told to clone, or ``""`` when it names none."""
+        repository = (repository or "").strip()
+        return f"{repository}#{(branch or '').strip()}" if repository else ""
+
     def _new_sandbox(
-        self, *, reuse: bool | None = None, force_new: bool = False
+        self, *, reuse: bool | None = None, force_new: bool = False, workspace: str = ""
     ) -> SandboxRoute:
         """A usable sandbox: an existing running one, or a freshly provisioned one.
 
@@ -222,12 +229,20 @@ class CloudDirectClient:
         deterministic, self-contained conversation: reusing a sandbox is fine for
         Jr tasks but an Sr is long-lived and should not share one that may be
         reclaimed when a Jr conversation is cleaned up.
+
+        *workspace* (``workspace_key``) keeps checkouts apart. Every
+        conversation of a sandbox works in the same directory, so a sandbox is
+        reused only for the repository and branch it was started for: a task
+        on another repository, or on another branch of the same one, gets a
+        sandbox of its own and never finds - or changes - someone else's
+        working tree. Tasks on one branch do share a sandbox; they never run
+        at the same time (``nexus_lab_store``: one task per branch).
         """
         if reuse is None:
             reuse = self.reuse_sandboxes
         if reuse and not force_new:
             # Each pass either returns or takes one sandbox off the list.
-            while (row := self.store.running_sandbox(self.scope)) is not None:
+            while (row := self.store.running_sandbox(self.scope, workspace)) is not None:
                 if self._still_running(row["sandbox_id"]):
                     return SandboxRoute(
                         sandbox_id=row["sandbox_id"],
@@ -247,7 +262,7 @@ class CloudDirectClient:
             raise CloudError(f"sandbox {sandbox_id} has no agent-server url/key")
         self.store.save_sandbox(
             sandbox_id, agent_server_url=url, session_api_key=key, status="RUNNING",
-            owner=self.scope,
+            owner=self.scope, workspace=workspace,
         )
         return SandboxRoute(sandbox_id=sandbox_id, agent_server_url=url, session_api_key=key)
 
@@ -368,6 +383,7 @@ class CloudDirectClient:
         )
         route = self._new_sandbox(
             force_new=client_tools is not None,  # an Sr gets its own sandbox
+            workspace=self.workspace_key(selected_repository, selected_branch),
         )
         delivered: tuple[dict[str, Any], ...] = ()
         if files:

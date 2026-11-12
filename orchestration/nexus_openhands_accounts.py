@@ -490,6 +490,33 @@ class OpenHandsAccountService:
             stops = int(cur.fetchone()["n"])
         return {"active_tasks": active, "projects": projects, "pending_stops": stops}
 
+    def usage(self, principal: str, account_id: str, *, limit: int = 50) -> list[dict]:
+        """Which tasks this connection ran, newest first: the history of its
+        use. Only its owner reads it; the rows are of the owner's own
+        projects and of projects that list the connection."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
+                        (account_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("account not found")
+            cur.execute(
+                "SELECT e.id, e.run_id, e.task_id, e.project_id, p.name AS project_name, "
+                "  e.task_key, e.cycle, e.attempt, e.kind, e.conversation_id, e.repository, "
+                "  e.branch, e.started_at, e.ended_at, e.outcome, e.reason "
+                "FROM nexus_task_executions e JOIN nexus_projects p ON p.id = e.project_id "
+                "WHERE e.openhands_account_id=%s "
+                "AND EXISTS (SELECT 1 FROM nexus_project_members m "
+                "            WHERE m.project_id = e.project_id AND m.principal=%s) "
+                "ORDER BY e.started_at DESC, e.id LIMIT %s",
+                (account_id, principal, max(1, min(int(limit), 200))))
+            out = []
+            for row in cur.fetchall():
+                item = dict(row)
+                for key in ("id", "run_id", "task_id", "project_id"):
+                    item[key] = str(item[key])
+                out.append(item)
+            return out
+
     def remove(self, principal: str, account_id: str, *, force: bool = False) -> dict:
         """Delete a connection and its key.
 

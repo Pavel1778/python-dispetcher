@@ -255,6 +255,30 @@ class GitHubClient:
             raise ValueError("full_name must be owner/name")
         return _repo_dict(self._request(repo_path(full_name)))
 
+    def repository_access(self, full_name: str) -> dict[str, Any]:
+        """What this identity may do with a repository: ``GET /repos/{repo}``.
+
+        Returns ``{full_name, private, default_branch, pull, push, admin}``.
+        GitHub reports ``permissions`` only to an authenticated caller; without
+        them (an anonymous read of a public repository) every permission but
+        ``pull`` is ``False`` - reading it is all that was shown. A repository
+        the identity cannot see raises :class:`GitHubError` (GitHub answers 404
+        for one that is private to somebody else, exactly as for one that does
+        not exist).
+        """
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        data = self._request(repo_path(full_name))
+        if not isinstance(data, dict) or not isinstance(data.get("full_name"), str):
+            raise GitHubError("github returned an invalid repository")
+        permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
+        return {"full_name": data["full_name"], "private": bool(data.get("private")),
+                "default_branch": data.get("default_branch") or "main",
+                "pull": permissions.get("pull") is not False,
+                "push": permissions.get("push") is True,
+                "admin": permissions.get("admin") is True}
+
     def list_branches(self, full_name: str, *, limit: int = 100) -> list[dict[str, Any]]:
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:

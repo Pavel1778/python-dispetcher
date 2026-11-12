@@ -297,6 +297,25 @@ def project_lines(project: dict, limits: Limits) -> list[str]:
     facts = _fit(facts, limits.memory)[0]
     if facts:
         lines += ["Verified project memory:", *facts]
+    lines += repository_lines(project.get("repositories") or [])
+    return lines
+
+
+def repository_lines(repositories: list[dict]) -> list[str]:
+    """What a planner is told when the project has several repositories:
+    which they are and how a task names the one it works in. Nothing for a
+    project with one - its request is what it always was."""
+    if len(repositories) < 2:
+        return []
+    lines = ["This project has several repositories. A task works in exactly one of them "
+             'and names it in "repository" (the full name, as listed). Work that spans '
+             "repositories is split into one task per repository, linked by dependencies. "
+             "A task that names none works in the main repository."]
+    for item in repositories[:20]:
+        note = _clean(item.get("role_note") or "", 300)
+        lines.append(f"- {item['full_name']}"
+                     + (" (the main repository)" if item.get("is_primary") else "")
+                     + (f": {note}" if note else ""))
     return lines
 
 
@@ -337,7 +356,8 @@ def stage_prompt(*, project: dict, spec: dict, position: int, total: int, stage:
 
 # ----------------------------------------------------------------- stage plan
 def stage_plan(data: Any, *, pieces: list[dict], count: int, earlier_keys: set[str],
-               taken: set[str], max_tasks: int, position: int, total: int) -> dict:
+               taken: set[str], max_tasks: int, position: int, total: int,
+               repositories: set[str] | None = None) -> dict:
     """Validate a model's answer for one stage and account for every piece of it.
 
     *pieces* are the rows of the stage's pieces; *count* is how many pieces the
@@ -382,7 +402,18 @@ def stage_plan(data: Any, *, pieces: list[dict], count: int, earlier_keys: set[s
                     "earlier": list(dict.fromkeys(earlier))}
         prepared.append(task)
     tasks = (validate_tasks({"tasks": prepared}, max_tasks=max_tasks,
-                            keep=("requirements", "earlier")) if prepared else [])
+                            keep=("requirements", "earlier", "repository")) if prepared else [])
+    # A task may name the repository it works in - one of the project's own.
+    # Anything else a model writes there (a name that is not on the list, a
+    # URL, a number) is dropped, and the task works in the main repository;
+    # how many were dropped is said in the plan's coverage.
+    unknown_repositories = 0
+    for task in tasks:
+        named = task.pop("repository", None)
+        if isinstance(named, str) and named.strip() in (repositories or ()):
+            task["repository"] = named.strip()
+        elif named not in (None, ""):
+            unknown_repositories += 1
 
     in_stage = {piece["ordinal"] for piece in pieces}
     obligations = {piece["ordinal"] for piece in pieces if piece["normative"]}
@@ -445,7 +476,9 @@ def stage_plan(data: Any, *, pieces: list[dict], count: int, earlier_keys: set[s
                      "declared_context": len(declared),
                      "in_verification_tasks": len(unclaimed),
                      "implicit_context": len(silent - obligations),
-                     "ignored_ids": ignored},
+                     "ignored_ids": ignored,
+                     **({"unknown_repositories": unknown_repositories}
+                        if unknown_repositories else {})},
     }
 
 
@@ -504,10 +537,13 @@ def merge(spec: dict, stages: list[dict]) -> tuple[list[dict[str, Any]], dict[st
                 ref["see"] = plan["see"]
             if task.get("verification"):
                 ref["verification"] = True
-            tasks.append({"id": task["key"], "title": task["title"],
-                          "description": task.get("description") or "",
-                          "acceptance": task.get("acceptance") or [],
-                          "dependencies": deps, "spec_ref": ref})
+            merged = {"id": task["key"], "title": task["title"],
+                      "description": task.get("description") or "",
+                      "acceptance": task.get("acceptance") or [],
+                      "dependencies": deps, "spec_ref": ref}
+            if task.get("repository"):
+                merged["repository"] = task["repository"]
+            tasks.append(merged)
         known.update(final.values())
         waits_for = [task["key"] for task in stage_tasks if task["key"] not in depended]
     if not tasks:
@@ -767,10 +803,13 @@ class SpecPlanner:
             see=see, max_tasks=max_tasks, limits=limits)
         earlier_keys = {key for key, _title in earlier}
 
+        allowed = {item["full_name"] for item in project.get("repositories") or []}
+
         def validate(data: Any) -> dict:
             return stage_plan(data, pieces=pieces, count=spec["requirement_count"],
                               earlier_keys=earlier_keys, taken=set(earlier_keys),
-                              max_tasks=max_tasks, position=position, total=total)
+                              max_tasks=max_tasks, position=position, total=total,
+                              repositories=allowed)
 
         timeout = min(180.0, 30.0 + stage["token_estimate"] / 200.0)
         try:
@@ -903,6 +942,17 @@ class SpecPlanner:
         options = spec.get("plan_options") or {}
         principal = options.get("principal") or spec["created_by"]
         repository, branch = options.get("repository") or "", options.get("branch") or ""
+        # The repositories a task of this plan may be for, each with the branch
+        # its tasks work on - as the project stands now, not as it stood when
+        # planning began. A task that names one that has left the project
+        # meanwhile works in the main repository.
+        try:
+            described = self.describe(principal, spec["project_id"])
+        except NotFound:
+            described = {}
+        repositories = {item["full_name"]: item.get("branch") or ""
+                        for item in described.get("repositories") or []
+                        if item["full_name"] != repository}
         providers = sorted({row["provider"] for row in stages if row.get("provider")})
         plan_meta = {"provider": (meta or {}).get("provider") or ", ".join(providers),
                      "failovers": (meta or {}).get("failovers") or [],
@@ -928,6 +978,7 @@ class SpecPlanner:
                 deadline_seconds=options.get("deadline_seconds") or min(
                     MAX_DEADLINE_SECONDS, max(DEFAULT_DEADLINE_SECONDS, 3600 * len(tasks))),
                 plan=tasks, repository=repository, branch=branch,
+                repositories=repositories,
                 # A run nobody named a budget for keeps going until it is done
                 # or cancelled (``durable``); a caller that names one gets a
                 # run that stops when it is spent (``bounded``).
