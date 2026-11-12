@@ -36,6 +36,7 @@ from .github_client import GitHubClient
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
+from .nexus_policy import install_log_redaction
 from .nexus_specs import SpecService
 
 log = logging.getLogger("lab_worker")
@@ -226,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Scrub credential-looking values from every log record (see nexus_policy).
+    install_log_redaction()
     store = PostgresStore()
     # An account router when the deployment has stored OpenHands accounts, so
     # the worker uses the pool; None (the pre-existing path) when it has none.

@@ -3,6 +3,44 @@
 This describes what the MVP actually enforces. It is not a claim of complete
 security; the open items are listed at the end.
 
+## 0. The permission policy (`orchestration/nexus_policy.py`)
+
+Section 10 of the acceptance text asks that *every* external and potentially
+dangerous operation obey the NEXUS permission policy. That policy is one module,
+with no dependency on the store, so the HTTP layer, MCP, the CLI and the worker
+all consult the same rules:
+
+- **Roles and scopes.** A project member has a role (`owner` or `member`) and a
+  role carries a set of scopes (`project:read`, `project:write`,
+  `project:admin`, `task:dispatch`, `run:control`, `account:admin`). A service
+  asks "does this role carry this scope?", never "is this person an owner?"
+  scattered through the code. `ProjectService.require_scope` is the one RBAC
+  gate; a non-member is a 404 (never a disclosure), a member without the scope
+  is also a 404.
+- **MCP tool permissions.** Every MCP tool declares the scope it needs
+  (`MCP_TOOL_SCOPES`). A tool absent from the table is refused rather than run,
+  so a tool added without an authority is not silently callable. The scope is
+  advertised in the tool's schema and enforced in `McpServer.handle`.
+- **SSRF guard.** `check_outbound_url` refuses a non-http(s) scheme, a URL with
+  embedded credentials, and a loopback, link-local, private-network or
+  cloud-metadata target. Private targets are allowed only when the operator sets
+  `NEXUS_ALLOW_PRIVATE_TARGETS` (a test session does, because its fakes listen on
+  127.0.0.1; a production deployment does not). A metadata address is refused
+  even then. The guard is enforced at every operator-supplied base URL:
+  `OPENHANDS_CLOUD_URL`, the sandbox agent-server URL, `GITHUB_API_URL` and each
+  provider's `<NAME>_BASE_URL`.
+- **Secret redaction.** `install_log_redaction` attaches a `logging.Filter`
+  that replaces credential-looking substrings (known env secrets, `ghp_…`,
+  `github_pat_…`, `sk-…`, `Bearer …`, `user:password@`) with a placeholder, so a
+  stray key in a log message or a traceback never reaches a log file. It is
+  installed by the web server, the worker and the MCP server at startup.
+- **No shell.** `safe_argv` documents and checks the rule that the one external
+  program NEXUS runs (`git`, from the restore-point module) is always an
+  argument list, never a shell string. A test scans the source for `shell=True`.
+
+The policy is readable at `GET /api/security/policy` (authenticated; names and
+booleans only, never a value) and in `policy_report()`.
+
 ## 1. Authentication
 
 Two independent paths, neither a substitute for the other:
@@ -58,9 +96,16 @@ server will bind `0.0.0.0`.
 - `OPENHANDS_API_KEY`, `GITHUB_TOKEN`, `WEB_AUTH_TOKEN`, `AUTH_*`,
   `NEXUS_EVIDENCE_PRIVATE_KEY` are read from the environment and never logged,
   returned by the API, or rendered in the UI. `GitHubClient.__repr__` is
-  redacted. `/api/system` and `/api/capabilities` report presence only.
+  redacted. `/api/system` and `/api/capabilities` report presence only. A
+  logging filter (`nexus_policy.install_log_redaction`) additionally scrubs
+  credential-shaped values from every record, so a stray key in a message is not
+  written to a log.
 - HTTP clients refuse redirects (`CloudClient` all; `OpenHandsClient` same-origin
   only) so an `Authorization` header is never re-sent to a `3xx` target.
+- Every operator-supplied base URL (`OPENHANDS_CLOUD_URL`, the sandbox
+  agent-server URL, `GITHUB_API_URL`, each provider's `<NAME>_BASE_URL`) passes
+  the SSRF guard (`nexus_policy.check_outbound_url`); a loopback, private or
+  metadata target is refused unless `NEXUS_ALLOW_PRIVATE_TARGETS` opts in.
 - The CLI never prints the token; `doctor` reports `token_present` only.
 
 ## 5. Input handling
@@ -79,7 +124,31 @@ and asserts 401 (the dashboard redirects to `/login`), and asserts the small
 public allowlist stays reachable. A protected endpoint added without wiring
 `_require_read`/`_require_write` fails this test.
 
-## 7. Open items (real, not exhaustive)
+## 7. The security check suite
+
+`tests/test_security_checks.py` covers the eleven areas of section 10 of the
+acceptance text, each in the layer that enforces it, against real infrastructure
+where a store or a socket is involved:
+
+| Area | What is asserted |
+| --- | --- |
+| API-key protection | encrypted at rest, masked in views, refuses without a key |
+| Account separation | `account:admin` is owner-only; no cross-account fallback |
+| Project isolation | a non-member gets 404 for a project and its goals |
+| Workspace access | `safe_workspace_path` refuses traversal/absolute/UNC paths |
+| RBAC | owner/member scope sets; `require`/`require_scope` refuse correctly |
+| SSRF | loopback/metadata/private/scheme/credential targets refused |
+| Unsafe command execution | only argument lists; no `shell=True` in any module |
+| Secret leaks in logs | the redaction filter scrubs env secrets and key shapes |
+| Unsafe archive unpacking | Zip-Slip and absolute members refused |
+| Cross-project access | another project's resource is not reachable (RBAC + 404) |
+| MCP tool permissions | every tool declares a scope; an undeclared tool is refused |
+
+The HTTP cases run against the real web server: the policy route needs a token
+and returns no secret, and adding an account with a metadata base URL is a 400
+before any key is stored.
+
+## 8. Open items (real, not exhaustive)
 
 1. Legacy tables use permissive RLS (`USING (true)`). New `nexus_*` tables and
    the secret tables (`conversation_routes`, `cloud_sandboxes`, migration `0016`)

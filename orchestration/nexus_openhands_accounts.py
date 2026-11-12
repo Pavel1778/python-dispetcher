@@ -34,6 +34,21 @@ from .secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret
 
 DEFAULT_BASE_URL = "https://app.all-hands.dev"
 
+
+def _safe_base_url(url: str | None) -> str:
+    """Validate a base URL as a client error, not a server error.
+
+    ``validate_base_url`` enforces the SSRF policy and raises ``CloudError``,
+    which the HTTP layer would report as a 502 (a server problem). A bad or
+    hostile base URL is the *caller's* mistake, so it is re-raised as a
+    ``ValueError`` and the route answers 400.
+    """
+    try:
+        return validate_base_url(url or DEFAULT_BASE_URL).rstrip("/")
+    except CloudError as e:
+        raise ValueError(str(e)) from e
+
+
 #: The key-free shape every read returns. Kept in one place so a new column
 #: cannot be returned by one query and forgotten by another. It never includes
 #: ``api_key_encrypted``; ``api_key_hint`` is the masked fragment instead.
@@ -86,7 +101,7 @@ class OpenHandsAccountService:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")
         api_key = api_key.strip()
-        base_url = validate_base_url(base_url or DEFAULT_BASE_URL).rstrip("/")
+        base_url = _safe_base_url(base_url)
         if transport not in ("direct", "app"):
             raise ValueError("transport must be 'direct' or 'app'")
         max_concurrent_tasks = _check_limit(max_concurrent_tasks, "max_concurrent_tasks")
@@ -143,7 +158,7 @@ class OpenHandsAccountService:
         if label is not None:
             label = _text(label, "label", maximum=120)
         if base_url is not None:
-            base_url = validate_base_url(base_url).rstrip("/")
+            base_url = _safe_base_url(base_url)
         if transport is not None and transport not in ("direct", "app"):
             raise ValueError("transport must be 'direct' or 'app'")
         if max_concurrent_tasks is not _UNSET:

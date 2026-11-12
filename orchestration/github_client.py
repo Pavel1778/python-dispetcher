@@ -118,6 +118,12 @@ class GitHubClient:
         parsed = urllib.parse.urlsplit(self.base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
             raise ValueError("invalid GitHub API URL")
+        from .nexus_policy import UnsafeTarget, check_outbound_url
+
+        try:
+            check_outbound_url(self.base_url)
+        except UnsafeTarget as e:
+            raise ValueError(f"invalid GitHub API URL: {e}") from e
         self._opener = urllib.request.build_opener(_NoRedirect())
         self._token = (
             token if token is not None else os.environ.get("GITHUB_TOKEN") or ""

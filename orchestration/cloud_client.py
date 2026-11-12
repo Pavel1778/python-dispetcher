@@ -44,6 +44,11 @@ def validate_base_url(url: str) -> str:
     ``OPENHANDS_CLOUD_URL`` is operator-supplied, so a typo or a hostile value
     must fail loudly at construction instead of letting the client read a local
     file or speak a non-HTTP protocol to something that is not the Cloud API.
+
+    It also enforces the NEXUS SSRF policy (:func:`nexus_policy.check_outbound_url`):
+    a URL that names a loopback, private-network or cloud-metadata target is
+    refused unless the operator explicitly permits private targets, so an
+    operator-supplied base cannot aim the server at its own network.
     """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -51,6 +56,12 @@ def validate_base_url(url: str) -> str:
             "OPENHANDS_CLOUD_URL must be an http(s) URL, got "
             f"{parsed.scheme or '(none)'}"
         )
+    from .nexus_policy import UnsafeTarget, check_outbound_url
+
+    try:
+        check_outbound_url(url)
+    except UnsafeTarget as e:
+        raise CloudError(f"OPENHANDS_CLOUD_URL is not a safe target: {e}") from e
     return url
 
 
