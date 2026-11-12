@@ -392,3 +392,62 @@ def test_a_paused_run_starts_nothing_and_continues_after_resume(harness):
     assert started == ["audit", "impl"]
     assert _detail(harness, pid, run_id)["run"]["state"] == "completed"
 
+
+
+def test_manual_executor_switch_over_http(harness):
+    """The operator can move a running task to another OpenHands account.
+
+    The task must be in flight (409 otherwise), the target must be the
+    principal's active account, and a non-member is refused. The switch is
+    recorded; the lab worker performs it on the next tick.
+    """
+    from orchestration.cloud_client import CloudClient
+    from tests.fake_cloud import FakeCloudServer
+
+    app = harness["app"]
+    pid = _project(harness)
+    _, goal = request(harness["base"], f"/api/v1/projects/{pid}/goals", "POST",
+                      {"text": "Switch me"}, session=harness["alice"])
+    gid = goal["goal"]["id"]
+    _, payload = request(harness["base"], f"/api/v1/projects/{pid}/goals/{gid}/run",
+                         "POST", {}, session=harness["alice"])
+    run_id = payload["run"]["id"]
+    task = payload["tasks"][0] if payload.get("tasks") else _detail(
+        harness, pid, run_id)["tasks"][0]
+    task_id = task["id"]
+
+    with FakeCloudServer() as cloud:
+        cloud.cloud.settings = {"llm_api_key_set": True, "active_agent_profile_id": "p",
+                                "agent_settings": {"mcp_config": {}},
+                                "registered_marketplaces": [], "inherited_marketplaces": []}
+        app.openhands_accounts = __import__(
+            "orchestration.nexus_openhands_accounts",
+            fromlist=["OpenHandsAccountService"]).OpenHandsAccountService(
+            app.store, client_factory=lambda u, k: CloudClient(base_url=u, api_key=k,
+                                                               timeout=5.0))
+        os.environ["NEXUS_SECRET_KEY"] = "test-secret-key"
+        account = app.openhands_accounts.add("user:alice", label="B", api_key="sk-b",
+                                             base_url=cloud.base_url)
+
+        # A task that is only pending has no executor to switch from: 409.
+        status, _ = request(harness["base"],
+                            f"/api/v1/projects/{pid}/runs/{run_id}/tasks/{task_id}/switch",
+                            "POST", {"account_id": account["id"]}, session=harness["alice"])
+        assert status == 409, "a pending task has no executor to switch from"
+
+        # Put the task in flight, then switch it.
+        app.lab.claim_task(run_id, "w", lease_seconds=600)
+        status, out = request(
+            harness["base"],
+            f"/api/v1/projects/{pid}/runs/{run_id}/tasks/{task_id}/switch",
+            "POST", {"account_id": account["id"]}, session=harness["alice"])
+        assert status == 200, out
+        assert out["task"]["state"] == "pending"
+        assert out["task"]["preferred_account_id"] == account["id"]
+
+        # A malformed account id is a 400, not a crash.
+        status, _ = request(
+            harness["base"],
+            f"/api/v1/projects/{pid}/runs/{run_id}/tasks/{task_id}/switch",
+            "POST", {"account_id": "not-a-uuid"}, session=harness["alice"])
+        assert status == 400

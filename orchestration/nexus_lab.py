@@ -704,6 +704,11 @@ class LabScheduler:
                 continue
             else:
                 verdict = self.verifier.verify(task, report)
+            # The account produced a terminal result, so it is working: mark it
+            # healthy again. Without this an account excluded by one transient
+            # failure would never come back into the pool.
+            if self.router is not None and report.state in ("finished", "error", "stuck"):
+                self.router.note_success(task)
             self.store.record_verification(
                 task["id"], verdict=verdict.verdict,
                 evidence={"reason": verdict.reason, **verdict.evidence},

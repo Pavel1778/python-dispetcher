@@ -91,6 +91,40 @@ Blocked live: creating a *new* sandbox returned `429
 DAILY_SANDBOX_LIMIT_REACHED` (the account's daily quota). That is reported
 `BLOCKED`, and the probe reused a running sandbox instead.
 
+## Live verification (2026-11-12, this session)
+
+Against the real Cloud key and a local PostgreSQL:
+
+- `cloud_api`, `accounts`, `queues_leases` — **VERIFIED**.
+- The live probe on the `direct` transport with the account's own
+  `default_model` (`openhands/deepseek-v4.1-flash`) — **VERIFIED** for
+  `conversation_create`, `message_and_events`, `run_command` and `workspace_rw`.
+  This is what caught the defect the probe was supposed to catch: the probe used
+  to build the *process-wide* client, so with no `OPENHANDS_DEFAULT_MODEL` in the
+  environment the conversation ended `error` (LLM auth) even though the stored
+  account had a working model. The probe now builds the client from the selected
+  account. `tests/test_openhands_pool.py::test_live_probe_uses_the_selected_account_config`
+  fails if that regresses.
+- A real autonomous run through NEXUS (worker + account pool): the agent created
+  a Python module, ran pytest, introduced a controlled bug, observed the failure,
+  fixed it, re-ran the tests and committed. NEXUS recorded `completed_unverified`
+  because no repository was bound — an honest verdict.
+- `tests/test_backup_restore.py` and `tests/test_browser_e2e.py` were run with
+  the PostgreSQL client tools and Chromium installed (previously skipped here).
+
+## New regression tests (2026-11-12)
+
+| test | pins |
+| --- | --- |
+| `test_openhands_pool.py::test_execution_client_for_account_honours_transport_and_model` | an account's own transport and `default_model` build its execution client |
+| `test_openhands_pool.py::test_live_probe_uses_the_selected_account_config` | the live probe speaks to the selected account, not the process env |
+| `test_openhands_pool.py::test_load_balancing_reads_in_flight_tasks_from_the_store` | load balancing reads load from `nexus_run_tasks`, not a counter nobody maintains |
+| `test_openhands_pool.py::test_a_transient_failure_is_forgotten_when_the_account_works_again` | a finished conversation returns an account to `healthy` |
+| `test_openhands_failover.py::test_manual_switch_hands_a_running_task_to_a_named_account` | an operator can switch a running task's executor; the hand-off is used once |
+| `test_lab_http.py::test_manual_executor_switch_over_http` | the switch route: 409 for a non-in-flight task, 400 for a bad id |
+
+Each fails if its fix is reverted.
+
 ## What a mock would hide
 
 Do not replace the Cloud client with a mock in an integration test. The value of

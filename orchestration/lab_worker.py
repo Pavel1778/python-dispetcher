@@ -92,13 +92,11 @@ class LabWorker:
         """A client for one OpenHands account, built from its stored config.
 
         The transport is per account, so an account can be ``direct`` while the
-        process default is ``app`` (or the reverse). The key is decrypted here
-        and used immediately; it is never logged. The principal comes from the
-        task's project, because accounts are stored per principal and the worker
-        is not the account's owner.
+        process default is ``app`` (or the reverse). The key is decrypted inside
+        the account service and used immediately; it is never logged. The
+        principal comes from the task's project, because accounts are stored per
+        principal and the worker is not the account's owner.
         """
-        from .cloud_client import CloudClient
-        from .cloud_direct import build_direct_client
         from .nexus_openhands_accounts import OpenHandsAccountService
 
         service = OpenHandsAccountService(self.store)
@@ -106,13 +104,7 @@ class LabWorker:
                      if self.account_router and task
                      else (self.account_router.principal if self.account_router
                            else "machine:default"))
-        cfg = service.account_config(principal, account_id)
-        key = service._decrypt(principal, account_id)
-        cloud = CloudClient(base_url=cfg["base_url"], api_key=key)
-        if cfg["transport"] == "app":
-            return cloud
-        return build_direct_client(self.store, cloud=cloud,
-                                   llm_model=cfg.get("default_model"))
+        return service.execution_client_for_account(principal, account_id)
 
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,

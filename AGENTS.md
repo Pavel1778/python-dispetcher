@@ -1207,3 +1207,46 @@ Still true, and worth knowing before changing this:
   first message; a second attempt of the same task has the same id.
 - `delivery.mode = part` is weaker than a file: an agent cannot read what a
   cross-reference points at outside its part.
+## Diagnostics and account-pool defects fixed (this session)
+
+Three real defects were found by running the diagnostics against the live
+service and reading the pool code. Each has a regression test that fails if it
+is undone. Keep these invariants:
+
+- **The live probe runs on the account it selected, not on the process env.**
+  `OpenHandsDiagnostics._live_client` used `build_cloud_client(store)`, so the
+  probe exercised whatever `OPENHANDS_*` named. With no `OPENHANDS_DEFAULT_MODEL`
+  in the environment the conversation ended `error` (LLM auth) even though the
+  stored account had a working `default_model`. It now calls
+  `OpenHandsAccountService.execution_client_for_account`, which is the **single**
+  place an execution client is built (base URL + decrypted key + per-account
+  transport + `default_model`). `lab_worker._client_for_account` and
+  `AccountPool.client_for` delegate to it too. Do not add a second builder.
+- **Load is derived, not counted.** `begin_task`/`end_task` had no production
+  caller, so `active_tasks` stayed 0 and `load_balancing` could not balance.
+  `AccountPool._live_load` reads in-flight tasks from `nexus_run_tasks`
+  (`dispatched`/`running`/`verifying`, account-bound) and `select` ranks on that
+  plus the manual counter. A counter nobody decrements would drift after a crash.
+- **The pool must learn from success.** Nothing called `record_success`, so an
+  account marked `unavailable` by one transient failure stayed excluded forever.
+  `LabScheduler.tick` now calls `AccountRouter.note_success` when a poll observes
+  a terminal conversation (`finished`/`error`/`stuck`).
+- **Manual executor switch.** `POST /api/v1/projects/{p}/runs/{r}/tasks/{t}/switch`
+  (`{"account_id": ...}`), CLI `openhands switch`, backed by
+  `LabStore.switch_task_executor`. The task must be in flight (409 otherwise);
+  the current account is recorded tried and the target stored as
+  `preferred_account_id` (migration `0025`). `AccountRouter.select_for_task`
+  honours the preference when the target is usable; `mark_running` clears it once
+  the task is dispatched, so a switch applies to exactly one hand-off. The old
+  conversation is not stopped (its transcript is the record); the workspace lock
+  keeps two executors off one checkout.
+- **`REQUIRED_COLUMNS` names `nexus_run_tasks`** with the columns the store
+  depends on, including `preferred_account_id`. A new column the store reads must
+  be added there.
+- Verified live 2026-11-12: diagnostics `cloud_api`/`accounts`/`queues_leases`
+  and the full live probe (`conversation_create`, `message_and_events`,
+  `run_command`, `workspace_rw`) VERIFIED on the direct transport; a real
+  autonomous run through the worker + pool created a Python module, ran pytest,
+  broke and fixed it, and committed — recorded `completed_unverified` because no
+  repository was bound. `test_backup_restore.py` and `test_browser_e2e.py` were
+  run with the PostgreSQL client tools and Chromium installed.

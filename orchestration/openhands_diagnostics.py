@@ -361,9 +361,12 @@ class OpenHandsDiagnostics:
     def _live_client(self, principal: str, account: dict) -> Any:
         if self._live_factory is not None:
             return self._live_factory(account["id"])
-        from .cloud_direct import build_cloud_client
-
-        return build_cloud_client(self.store)
+        # The probe must run on the account it selected, with that account's
+        # base URL, key, transport and model. Building the process-wide client
+        # here would probe whatever OPENHANDS_* happens to name, not the account
+        # the report is about - a live probe that passes while the account is
+        # broken is worse than no probe at all.
+        return self.accounts.execution_client_for_account(principal, str(account["id"]))
 
     def _run_live_probe(self, report: Report, principal: str, account: dict,
                         client: Any) -> None:

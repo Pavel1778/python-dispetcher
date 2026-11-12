@@ -367,6 +367,10 @@ class PostgresStore:
         "nexus_lab_workers": ("worker_id", "kind", "state", "heartbeat_at"),
         "nexus_task_handoffs": ("id", "run_id", "task_id", "from_account_id",
                                 "to_account_id", "context"),
+        "nexus_run_tasks": ("id", "run_id", "project_id", "task_key", "state",
+                            "attempt", "max_attempts", "conversation_id",
+                            "openhands_account_id", "tried_accounts",
+                            "preferred_account_id"),
     }
 
     def verify_schema(self) -> list[str]:

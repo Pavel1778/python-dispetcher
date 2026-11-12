@@ -930,6 +930,35 @@ class App:
         task = self.store.retry_task(task_id)
         return {"task_id": task.id, "state": task.state.value}
 
+    def switch_task_executor(self, principal: str, project_id: str, run_id: str,
+                             task_id: str, account_id: str) -> dict[str, Any]:
+        """Hand a running task to another OpenHands account (manual switch).
+
+        The task must belong to *run_id* in *project_id* (a non-member gets a
+        404). The account must be one of the principal's active accounts. The
+        switch is prepared here; the lab worker performs it on its next tick,
+        passing the hand-off context. A task that is not in flight is refused.
+        """
+        if not UUID_RE.fullmatch(task_id) or not UUID_RE.fullmatch(account_id):
+            raise NotFound("task or account id")
+        # Membership + ownership: the task must be in this run and project.
+        run = self.lab.get_run(principal, project_id, run_id)
+        task = next((t for t in self.lab.list_tasks(principal, project_id, run_id)
+                     if str(t["id"]) == task_id), None)
+        if task is None:
+            raise NotFound("task not found in this run")
+        if run["state"] in ("completed", "failed", "cancelled"):
+            raise ValueError(f"cannot switch a task of a {run['state']} run")
+        account = next((a for a in self.openhands_accounts.list_accounts(principal)
+                        if str(a["id"]) == account_id), None)
+        if account is None:
+            raise NotFound("account not found")
+        if account["state"] != "active" or not account.get("enabled", True):
+            raise ValueError("the target account is not active and enabled")
+        updated = self.lab.switch_task_executor(task_id, target_account_id=account_id)
+        return {"task": updated, "target_account": {"id": account_id,
+                                                    "label": account["label"]}}
+
     def rename_sr(self, workflow_id: str, title: str) -> dict[str, Any]:
         """Rename the workflow's Sr conversation in Cloud.
 
@@ -1873,6 +1902,26 @@ class Handler(BaseHTTPRequestHandler):
             state = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[rest[2]]
             self._json(200, {"run": self.app.lab.set_run_state(
                 principal, project_id, rest[1], state)})
+            return True
+        # POST /api/v1/projects/{id}/runs/{run_id}/tasks/{task_id}/switch
+        #   {"account_id": "<uuid>"}  — hand the task to another account.
+        if (len(rest) == 5 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "tasks" and UUID_RE.fullmatch(rest[3])
+                and rest[4] == "switch"):
+            account_id = body.get("account_id")
+            if not (isinstance(account_id, str) and UUID_RE.fullmatch(account_id)):
+                self._json(400, {"error": "account_id must be a uuid"})
+                return True
+            try:
+                result = self.app.switch_task_executor(
+                    principal, project_id, rest[1], rest[3], account_id)
+            except NotFound as e:
+                self._json(404, {"error": str(e) or "not found"})
+                return True
+            except ValueError as e:
+                self._json(409, {"error": str(e)})
+                return True
+            self._json(200, result)
             return True
         # POST /api/v1/projects/{id}/conversations   (create)
         if rest == ["conversations"]:

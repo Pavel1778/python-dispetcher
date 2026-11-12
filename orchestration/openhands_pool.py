@@ -148,6 +148,12 @@ class AccountPool:
                         (health, error[:1000], account_id, principal))
 
     def begin_task(self, principal: str, account_id: str) -> None:
+        """Reserve capacity on an account (manual counter).
+
+        Production load is *derived* from the durable task rows (see
+        :meth:`_live_load`), so this counter is for a caller that wants to
+        reserve capacity ahead of a dispatch; the two are summed when selecting.
+        """
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_openhands_accounts SET active_tasks=active_tasks+1, "
                         "updated_at=now() WHERE id=%s AND principal=%s",
@@ -158,6 +164,32 @@ class AccountPool:
             cur.execute("UPDATE nexus_openhands_accounts "
                         "SET active_tasks=GREATEST(active_tasks-1, 0), updated_at=now() "
                         "WHERE id=%s AND principal=%s", (account_id, principal))
+
+    #: Task states that mean an account is actively running something for it.
+    _BUSY_STATES = ("dispatched", "running", "verifying")
+
+    def _live_load(self) -> dict[str, int]:
+        """In-flight tasks per account, read from the durable task table.
+
+        Load is *observed* here rather than tracked with an increment/decrement
+        pair: a counter that nothing decrements on a crash would drift, and a
+        load-balancing mode that balances on a stale number is worse than one
+        that balances on none. A task is in flight while it is dispatched,
+        running or verifying and is bound to an account.
+        """
+        try:
+            with self.store._tx() as cur:
+                cur.execute(
+                    "SELECT openhands_account_id AS id, count(*) AS n "
+                    "FROM nexus_run_tasks WHERE openhands_account_id IS NOT NULL "
+                    "AND state = ANY(%s) GROUP BY openhands_account_id",
+                    (list(self._BUSY_STATES),))
+                return {str(r["id"]): int(r["n"]) for r in cur.fetchall()}
+        except Exception:  # noqa: BLE001 - a pool must work before the lab schema exists
+            return {}
+
+    def _load_of(self, account: dict, live: dict[str, int]) -> int:
+        return int(account.get("active_tasks", 0) or 0) + live.get(str(account["id"]), 0)
 
     # ----------------------------------------------------------- selection
     def _usable(self, account: dict, exclude: set[str]) -> bool:
@@ -215,11 +247,12 @@ class AccountPool:
             candidates = self.candidates(principal, exclude=exclude)
             if not candidates:
                 raise PoolError("no usable OpenHands account for load balancing")
+            live = self._live_load()
             if bound and self._usable(bound, exclude):
-                fewest = min(a.get("active_tasks", 0) for a in candidates)
-                if bound.get("active_tasks", 0) == fewest:
+                fewest = min(self._load_of(a, live) for a in candidates)
+                if self._load_of(bound, live) == fewest:
                     return bound
-            candidates.sort(key=lambda a: (a.get("active_tasks", 0),
+            candidates.sort(key=lambda a: (self._load_of(a, live),
                                            a.get("priority", 100), str(a["id"])))
             return candidates[0]
 
@@ -258,7 +291,13 @@ class AccountPool:
 
     # --------------------------------------------------------------- client
     def client_for(self, principal: str, account_id: str):
-        """A client for one account, with its transport and model applied."""
+        """A ready-to-run client for one account, with its transport and model.
+
+        Delegates to :meth:`OpenHandsAccountService.execution_client_for_account`
+        so the pool, the diagnostics and the worker never build an execution
+        client differently. ``account_config`` is returned alongside for callers
+        that need the non-secret execution settings (e.g. the model to display).
+        """
         cfg = self.accounts.account_config(principal, account_id)
-        client = self.accounts.client_for_account(principal, account_id)
+        client = self.accounts.execution_client_for_account(principal, account_id)
         return client, cfg

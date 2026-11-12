@@ -211,6 +211,18 @@ NEXUS_URL=... NEXUS_TOKEN=... \
   python -m orchestration.cli openhands diagnostics --live    # + a real conversation
 ```
 
+Each check earns one of four statuses — `VERIFIED`, `FAILED`, `BLOCKED`,
+`UNVERIFIED` — so the report never claims a check passed that did not run. The
+live probe runs on the account it selected (that account's base URL, key,
+transport and model), so a `VERIFIED` is evidence about *that account*.
+
+To move a running task to another account by hand:
+
+```bash
+python -m orchestration.cli openhands switch \
+  --project <project> --run <run> --task <task> --account <account>
+```
+
 ## Deployment
 
 `requirements.txt`, `render.yaml`, `DEPLOY.md`. Start exactly one instance:

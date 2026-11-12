@@ -399,6 +399,17 @@ def cmd_openhands_pool_set(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_openhands_switch(args: argparse.Namespace) -> int:
+    """Hand a running task to a named OpenHands account (manual switch)."""
+    client = _client(args)
+    result = client.post(
+        f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/tasks/{args.task_id}/switch",
+        {"account_id": args.account_id})
+    _emit(args, result,
+          human=f"task {args.task_id} will run on {result['target_account']['label']}")
+    return EXIT["ok"]
+
+
 def cmd_qa_verify(args: argparse.Namespace) -> int:
     """Verify the evidence hash chain for a project."""
     client = _client(args)
@@ -529,6 +540,13 @@ def build_parser() -> argparse.ArgumentParser:
     pool_set.add_argument("--order", default=None,
                           help="comma-separated account ids, in failover order")
     pool_set.set_defaults(func=cmd_openhands_pool_set)
+    osw = oh.add_parser("switch", parents=[common],
+                        help="hand a running task to a named account")
+    osw.add_argument("--project", dest="project_id", required=True)
+    osw.add_argument("--run", dest="run_id", required=True)
+    osw.add_argument("--task", dest="task_id", required=True)
+    osw.add_argument("--account", dest="account_id", required=True)
+    osw.set_defaults(func=cmd_openhands_switch)
 
     qa = sub.add_parser("qa", parents=[common], help="QA and evidence reports").add_subparsers(dest="sub", required=True)
     qa.add_parser("report", parents=[common], help="real system report").set_defaults(func=cmd_qa_report)

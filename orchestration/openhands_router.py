@@ -69,6 +69,12 @@ class AccountRouter:
     def select_for_task(self, task: dict) -> dict:
         """The account to run *task*, never one that has failed it.
 
+        An operator's manual switch records ``preferred_account_id``; that
+        account is used when it is usable, so a switch the operator asked for is
+        honoured. It is only a preference: if the target is disabled, revoked or
+        unusable, the pool falls back to its normal policy rather than failing
+        the task.
+
         Raises :class:`NoUsableAccount` when the pool has nothing left for this
         task, so the caller can dead-letter it with a clear reason instead of
         looping.
@@ -82,7 +88,13 @@ class AccountRouter:
         exclude = {str(x) for x in (task.get("tried_accounts") or [])}
         project_id = str(task.get("project_id") or "") or None
         principal = self._principal_for_project(project_id)
+        preferred = str(task.get("preferred_account_id") or "") or None
         try:
+            if preferred:
+                for account in self.pool.accounts.list_accounts(principal):
+                    if str(account["id"]) == preferred and self.pool._usable(
+                            account, exclude):
+                        return account
             return self.pool.select(principal, exclude=exclude, project_id=project_id)
         except PoolError as e:
             raise NoUsableAccount(str(e)) from e
@@ -195,6 +207,19 @@ class AccountRouter:
                 (account_id, account_id, task["id"]))
         self.pool.record_failure(self.principal_for_task(task), account_id, error,
                                  unavailable=unavailable)
+
+    def note_success(self, task: dict) -> None:
+        """Mark the task's account healthy again after it produced a result.
+
+        Without this, an account that was marked ``unavailable`` by a single
+        transient failure would stay excluded from every future selection: the
+        pool only ever heard bad news. A conversation that reached a terminal
+        state on the account is the evidence that it works now.
+        """
+        account_id = task.get("openhands_account_id")
+        if not account_id:
+            return
+        self.pool.record_success(self.principal_for_task(task), str(account_id))
 
 
 def build_account_router(store: PostgresStore, *,

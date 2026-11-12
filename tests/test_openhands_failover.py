@@ -475,3 +475,65 @@ def test_every_account_refusing_is_a_wait_not_a_dead_end(store, service, clouds)
         if sched.tick(str(run["id"])).dispatched:
             break
     assert len(client_a.started) == 1 and client_b.started == []
+def test_manual_switch_hands_a_running_task_to_a_named_account(store, service, clouds):
+    """An operator can move a running task to a chosen account.
+
+    The switch prepares the move (the current account is recorded as tried, the
+    target is preferred); the next tick dispatches on the target with a hand-off
+    context. Nothing about the old conversation is trusted to carry over.
+    """
+    a, b = clouds
+    va = service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url,
+                     make_default=True)
+    vb = service.add(PRINCIPAL, label="B", api_key="sk-b", base_url=b.base_url)
+    pool = AccountPool(store, service)
+    pool.set_config(PRINCIPAL, selection_mode="failover")
+
+    client_a = AccountClient("A")
+    client_b = AccountClient("B")
+    clients = {va["id"]: client_a, vb["id"]: client_b}
+    lab = LabStore(store)
+    router = AccountRouter(store, pool=pool, lab=lab, principal=PRINCIPAL)
+    executor = OpenHandsExecutor(None, router=router,
+                                 client_factory=lambda account_id, task=None:
+                                 clients[account_id])
+    verifier = StubVerifier()
+    sched = LabScheduler(lab, executor, verifier, worker_id="w", router=router)
+    project, run, _ = _make_run(store)
+
+    # Tick 1: A (the default) starts the task.
+    sched.tick(str(run["id"]))
+    assert len(client_a.started) == 1
+    task = lab.list_tasks(PRINCIPAL, str(project["id"]), str(run["id"]))[0]
+    assert task["state"] == "running"
+
+    # The operator switches the task to B.
+    switched = lab.switch_task_executor(str(task["id"]), target_account_id=vb["id"])
+    assert switched["state"] == "pending"
+    assert switched["preferred_account_id"] == vb["id"]
+    assert va["id"] in switched["tried_accounts"]
+
+    # Tick 2: the target B starts it with a hand-off context, not a restart.
+    sched.tick(str(run["id"]))
+    assert len(client_b.started) == 1, "the named account must run the task"
+    message = client_b.started[0]["message"]
+    assert "continuing an interrupted task" in message
+    after = lab.list_tasks(PRINCIPAL, str(project["id"]), str(run["id"]))[0]
+    assert str(after["openhands_account_id"]) == vb["id"]
+    # The preference applied once and is cleared, so it cannot pin future work.
+    assert after["preferred_account_id"] is None
+
+
+def test_manual_switch_is_refused_for_a_task_that_is_not_in_flight(store, service, clouds):
+    """A pending task has no executor to switch from, and a terminal one is done."""
+    a, _b = clouds
+    service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url,
+                make_default=True)
+    lab = LabStore(store)
+    project, run, _ = _make_run(store)
+    task = lab.list_tasks(PRINCIPAL, str(project["id"]), str(run["id"]))[0]
+    assert task["state"] == "pending"
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        lab.switch_task_executor(str(task["id"]), target_account_id="00000000-0000-0000-0000-000000000000")

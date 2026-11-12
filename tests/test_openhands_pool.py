@@ -307,3 +307,210 @@ def test_diagnostics_live_probe_verified(store, service, clouds, monkeypatch):
     assert by["run_command"].status == VERIFIED
     assert by["workspace_rw"].status == BLOCKED  # transport cannot place files
     assert live.deleted == ["conv-0"], "the probe conversation must be deleted"
+
+
+# ------------------------------------------------- execution client per account
+def test_execution_client_for_account_honours_transport_and_model(store, service, clouds):
+    """The execution client is built from the account, not the process env.
+
+    A ``direct`` account yields a sandbox-driving client carrying the account's
+    ``default_model`` (a bare sandbox's default model may have no key); an
+    ``app`` account yields the plain app-conversation client. Building either
+    from ``OPENHANDS_*`` would silently run one account's work on another's
+    identity and transport.
+    """
+    from orchestration.cloud_client import CloudClient
+    from orchestration.cloud_direct import CloudDirectClient
+
+    a, _b, _c = clouds
+    direct = service.add(PRINCIPAL, label="direct", api_key="sk-a", base_url=a.base_url,
+                         transport="direct", default_model="openhands/deepseek-v4.1-flash",
+                         make_default=True)
+    app = service.add(PRINCIPAL, label="app", api_key="sk-b", base_url=a.base_url,
+                      transport="app")
+
+    dc = service.execution_client_for_account(PRINCIPAL, direct["id"])
+    assert isinstance(dc, CloudDirectClient)
+    assert dc.llm_model == "openhands/deepseek-v4.1-flash"
+    assert dc.base_url == a.base_url
+
+    ac = service.execution_client_for_account(PRINCIPAL, app["id"])
+    assert isinstance(ac, CloudClient) and not isinstance(ac, CloudDirectClient)
+    assert ac.base_url == a.base_url
+
+
+def test_live_probe_uses_the_selected_account_config(store, clouds, monkeypatch):
+    """The live probe runs on the account it selected, with that account's URL+key.
+
+    Regression: the probe used to build the process-wide client, so it exercised
+    whatever ``OPENHANDS_*`` named rather than the account under test. A probe
+    that can pass while the named account is misconfigured is worse than none.
+    """
+    monkeypatch.setenv("NEXUS_SECRET_KEY", "test-secret-key")
+    a, b, _c = clouds
+    seen: list[tuple[str, str]] = []
+
+    class ProbeClient:
+        """A client that satisfies both ``account_capabilities`` (add/verify)
+        and the conversation surface the live probe uses."""
+
+        supports_files = False
+
+        def account_capabilities(self):
+            return {"llm_api_key_set": True, "mcp_servers": []}
+
+        def start_conversation(self, *, initial_message, title=None, tags=None,
+                               selected_repository=None, selected_branch=None, **kw):
+            from orchestration.cloud_client import StartStatus, StartTask
+
+            import re
+
+            m = re.search(r"echo (NEXUS-DIAG-\d+)", initial_message)
+            self.marker = m.group(1) if m else ""
+            return StartTask(id="conv-x", status=StartStatus.READY.value,
+                             app_conversation_id="conv-x")
+
+        def get_conversation(self, conversation_id):
+            from orchestration.cloud_client import CloudConversation
+
+            return CloudConversation(id=conversation_id, title=None, sandbox_id="sb",
+                                     execution_status="finished", sandbox_status="RUNNING",
+                                     selected_repository=None, selected_branch=None,
+                                     conversation_url=None, raw={})
+
+        def final_response(self, conversation_id):
+            return self.marker
+
+        def delete_conversation(self, conversation_id):
+            return True
+
+    def recording_factory(base_url, api_key):
+        seen.append((base_url, api_key))
+        return ProbeClient()
+
+    service = OpenHandsAccountService(store, client_factory=recording_factory)
+    # The account lives on server B, with B's key.
+    account = service.add(PRINCIPAL, label="B", api_key="sk-b", base_url=b.base_url,
+                          transport="app", make_default=True)
+
+    diag = OpenHandsDiagnostics(
+        store, accounts=service, pool=AccountPool(store, service),
+        cloud_client=CloudClient(base_url=a.base_url, api_key="sk-a", timeout=5.0),
+        client_factory=recording_factory)
+    report = diag.run(PRINCIPAL, live=True, account_id=account["id"])
+    by = {c.name: c for c in report.checks}
+    assert by["conversation_create"].status == VERIFIED
+    assert by["message_and_events"].status == VERIFIED
+    # The probe spoke to the *account's* base URL with the *account's* key, and
+    # never to the process-wide server A.
+    assert (b.base_url, "sk-b") in seen
+    assert (a.base_url, "sk-a") not in seen
+
+
+# ------------------------------------------------- observed load and recovery
+def test_load_balancing_reads_in_flight_tasks_from_the_store(store, service, clouds):
+    """Load is derived from durable rows, not from a counter nobody maintains.
+
+    Regression: ``begin_task``/``end_task`` had no production caller, so the
+    ``active_tasks`` column stayed 0 and load balancing could not balance. The
+    in-flight count is now read from ``nexus_run_tasks`` directly.
+    """
+    va, vb, _vc = _three_accounts(service, clouds)
+    pool = AccountPool(store, service)
+    pool.set_config(PRINCIPAL, selection_mode="load_balancing")
+    # A (the default) is busy: two in-flight tasks bound to it in the store.
+    _seed_in_flight(store, va["id"], 2)
+    chosen = pool.select(PRINCIPAL)
+    assert chosen["id"] != va["id"], "the busy default must not be chosen"
+    # The two idle accounts tie; priority then id breaks the tie deterministically.
+    assert chosen["active_tasks"] == 0
+
+
+def _seed_in_flight(store, account_id: str, count: int) -> None:
+    """Create *count* tasks in an in-flight state bound to *account_id*."""
+    import uuid
+
+    from orchestration.nexus_lab_store import LabStore
+    from orchestration.nexus_projects import ProjectService
+
+    projects = ProjectService(store)
+    lab = LabStore(store)
+    project = projects.create(PRINCIPAL, f"load-{uuid.uuid4().hex[:6]}")
+    pid = str(project["id"])
+    goal, _ = projects.create_goal(PRINCIPAL, pid, "load probe")
+    run = lab.start_run(PRINCIPAL, pid, str(goal["id"]), max_iterations=10,
+                        plan=[{"id": f"T{i}", "title": f"t{i}", "description": "",
+                               "acceptance": [], "dependencies": []}
+                              for i in range(count)])
+    for _ in range(count):
+        task = lab.claim_task(str(run["id"]), "probe", lease_seconds=600)
+        lab.mark_running(task["id"], conversation_id=f"c-{task['id']}",
+                         account_id=account_id)
+
+
+def test_a_transient_failure_is_forgotten_when_the_account_works_again(store, service, clouds):
+    """A success returns an account to healthy, so a blip is not permanent.
+
+    Regression: nothing called ``record_success``, so an account marked
+    ``unavailable`` by one transient error was excluded from every later
+    selection even after it started working again.
+    """
+    from orchestration.nexus_lab import LabScheduler, OpenHandsExecutor, Verification
+    from orchestration.nexus_lab_store import LabStore
+    from orchestration.nexus_projects import ProjectService
+    from orchestration.openhands_router import AccountRouter
+
+    a, _b, _c = clouds
+    va = service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url,
+                     make_default=True)
+    pool = AccountPool(store, service)
+    pool.set_config(PRINCIPAL, selection_mode="failover")
+    # One transient failure marked the account unavailable.
+    pool.record_failure(PRINCIPAL, va["id"], "blip", unavailable=True)
+    assert service.list_accounts(PRINCIPAL)[0]["health"] == "unavailable"
+
+    lab = LabStore(store)
+    router = AccountRouter(store, pool=pool, lab=lab, principal=PRINCIPAL)
+
+    class WorkingClient:
+        supports_files = False
+
+        def start_conversation(self, *, initial_message, title=None, tags=None,
+                               selected_repository=None, selected_branch=None, **kw):
+            from orchestration.cloud_client import StartStatus, StartTask
+
+            return StartTask(id="c1", status=StartStatus.READY.value, app_conversation_id="c1")
+
+        def get_conversation(self, conversation_id):
+            from orchestration.cloud_client import CloudConversation
+
+            return CloudConversation(id=conversation_id, title=None, sandbox_id="sb",
+                                     execution_status="finished", sandbox_status="RUNNING",
+                                     selected_repository=None, selected_branch=None,
+                                     conversation_url=None, raw={})
+
+        def final_response(self, conversation_id):
+            return "done"
+
+    class Ok:
+        def verify(self, task, report):
+            return Verification("completed_verified", "ok", {})
+
+    executor = OpenHandsExecutor(None, router=router,
+                                 client_factory=lambda account_id, task=None: WorkingClient())
+    sched = LabScheduler(lab, executor, Ok(), worker_id="w", router=router)
+    # The account is unhealthy, so a dispatch is not even attempted; the task is
+    # requeued. Put it back to healthy via the real success path instead: a task
+    # already bound to the account that then finishes.
+    project = ProjectService(store).create(PRINCIPAL, "recovery")
+    pid = str(project["id"])
+    goal, _ = ProjectService(store).create_goal(PRINCIPAL, pid, "recover")
+    run = lab.start_run(PRINCIPAL, pid, str(goal["id"]), max_iterations=10,
+                        plan=[{"id": "T1", "title": "t", "description": "",
+                               "acceptance": [], "dependencies": []}])
+    # Bind the task to the account and put it in flight, then tick: the poll
+    # observes a finished conversation and must return the account to healthy.
+    task = lab.claim_task(str(run["id"]), "w", lease_seconds=600)
+    lab.mark_running(task["id"], conversation_id="c1", account_id=va["id"])
+    sched.tick(str(run["id"]))
+    assert service.list_accounts(PRINCIPAL)[0]["health"] == "healthy"

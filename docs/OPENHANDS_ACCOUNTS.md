@@ -61,8 +61,14 @@ clears the default and requires re-adding. Removing deletes the row.
 
 "Usable" means `state='active'`, `enabled`, and health not `unavailable`. An
 account marked `degraded` stays selectable: one transient error is not a reason
-to stop using it. Health and the active-task counter are recorded by the callers
-that make real calls, so "load" is observed, not guessed.
+to stop using it.
+
+**Load is observed, not guessed.** `load_balancing` ranks accounts by the number
+of tasks actually in flight for them — read from `nexus_run_tasks` where the
+task is `dispatched`/`running`/`verifying` and bound to the account — plus any
+capacity a caller reserved with `begin_task`. A task finishing on an account
+also marks that account `healthy` again (`AccountRouter.note_success`), so a
+single transient failure does not remove an account from the pool for good.
 
 `fallback_order` pins an explicit order (a list of account ids) that overrides
 priority for the failover ordering.

@@ -80,12 +80,29 @@ at the named branch first.
 
 ## Manual switch during a run
 
-The operator controls on the studio's «Агент» tab (cancel / resume / retry)
-still apply. To force a switch, disable the current account
-(`POST /api/openhands/accounts/{id}/enable {"enabled": false}`) and retry the
-task; the pool will select another. A switch is only safe when the task is not
-mid-write; the workspace lock (`uq_tasks_workspace_active`) and the lease keep
-two executors off one checkout.
+An operator can hand a running task to a named account directly:
+
+```
+POST /api/v1/projects/{project}/runs/{run}/tasks/{task}/switch
+{"account_id": "<uuid>"}
+```
+
+The task must be in flight (`dispatched`/`running`/`verifying`); a pending task
+has no executor to switch from and a terminal one is done, so both are a `409`.
+The target must be the principal's active, enabled account. The switch records
+the current account as tried and stores the target as the task's preference; the
+lab worker performs the move on its next tick, starting a **new** conversation on
+the target with the hand-off context. The old conversation is not stopped (its
+transcript is the record) and is simply never polled again. The preference
+applies to exactly one hand-off and is cleared once the task is dispatched, so a
+switch never pins a task to an account for good.
+
+The operator controls on the studio's «Агент» tab (cancel / resume / retry) still
+apply. To force a switch without the endpoint, disabling the current account
+(`POST /api/openhands/accounts/{id}/enable {"enabled": false}`) and retrying the
+task also works, because the pool then selects another. Either way a switch is
+only safe when the task is not mid-write; the workspace lock
+(`uq_tasks_workspace_active`) and the lease keep two executors off one checkout.
 
 ## Verification
 
@@ -93,3 +110,16 @@ two executors off one checkout.
 on account #1, #1 fails, the scheduler switches to #2, and #2 receives the
 hand-off context. The assertions are on real PostgreSQL rows and on the messages
 the clients actually received.
+
+## The pool learns from success, not only failure
+
+A dispatch failure records the account as `degraded` (retryable) or
+`unavailable` (a rejected key or unreachable endpoint). A **conversation that
+reaches a terminal state** on an account — `finished`, `error` or `stuck` — is
+evidence the account is reachable again, so the scheduler calls
+`AccountRouter.note_success` and returns it to `healthy`. Without that, an
+account excluded by one transient failure would never re-enter the pool.
+
+Load balancing reads in-flight tasks from `nexus_run_tasks` rather than a
+counter, so the number it balances on cannot drift after a crash (see
+`OPENHANDS_ACCOUNTS.md`).

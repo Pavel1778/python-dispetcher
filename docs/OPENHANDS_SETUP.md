@@ -83,6 +83,32 @@ Each check reports `VERIFIED`, `FAILED`, `BLOCKED` or `UNVERIFIED` (see
 `FAILOVER.md`). The live probe is the only check that proves a conversation
 really runs; without it, conversation checks are `UNVERIFIED`, never assumed.
 
+**The live probe runs on the account it selected.** It builds the client from
+that account's stored `base_url`, key, `transport` and `default_model`, not from
+the process-wide `OPENHANDS_*` variables. So a probe that says `VERIFIED` is
+evidence about *that account*; a probe that could pass on a working process
+default while the named account is misconfigured would be worse than no probe.
+When no account is configured the check is `BLOCKED`, not `FAILED`.
+
+## Verified live (2026-11-12)
+
+Against the real Cloud service with a valid `OPENHANDS_API_KEY`:
+
+- `cloud_api`: `VERIFIED` (`GET /api/v1/app-conversations/count` -> 200).
+- `accounts`: `VERIFIED` (key accepted; `llm_api_key_set` true).
+- `queues_leases`: `VERIFIED` (claim → release → re-claim round trip).
+- `live_conversation` / `message_and_events` / `run_command` / `workspace_rw`:
+  `VERIFIED` with `--live` on the `direct` transport and a stored
+  `default_model` of `openhands/deepseek-v4.1-flash`. Without a usable model the
+  conversation ends `error` (LLM auth) — which is exactly why the account's own
+  `default_model` must be the one the probe uses.
+- A real autonomous task driven through NEXUS (worker + account pool) created a
+  Python module, ran pytest, introduced a controlled bug, saw the failure, fixed
+  it, re-ran the tests and committed (`3514cec`). NEXUS recorded it
+  `completed_unverified` because the task had **no repository bound**, so the
+  Git verifier could not confirm a remote commit — an honest verdict, not a
+  failure.
+
 ## Common failures
 
 | symptom | cause | fix |

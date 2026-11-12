@@ -89,6 +89,7 @@ PROTECTED_POST = [
     f"/api/v1/projects/{UUID}/binding", f"/api/v1/projects/{UUID}/binding/branch",
     f"/api/v1/projects/{UUID}/repository", f"/api/v1/projects/{UUID}/context/refresh",
     f"/api/v1/projects/{UUID}/runs/{UUID}/pause", f"/api/v1/projects/{UUID}/runs/{UUID}/cancel",
+    f"/api/v1/projects/{UUID}/runs/{UUID}/tasks/{UUID}/switch",
     "/api/github/accounts", f"/api/github/accounts/{UUID}/revoke",
     f"/api/v1/projects/{UUID}/openhands-account",
     "/api/openhands/accounts",

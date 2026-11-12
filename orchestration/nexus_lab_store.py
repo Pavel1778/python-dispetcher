@@ -436,6 +436,8 @@ class LabStore:
         out["tried_accounts"] = _loads(out.get("tried_accounts")) or []
         if out.get("openhands_account_id") is not None:
             out["openhands_account_id"] = str(out["openhands_account_id"])
+        if out.get("preferred_account_id") is not None:
+            out["preferred_account_id"] = str(out["preferred_account_id"])
         return out
 
     def dependency_states(self, cur: Any, task: dict) -> dict[str, str]:
@@ -528,12 +530,15 @@ class LabStore:
                         "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
                         "conversation_id=COALESCE(%s, conversation_id), "
                         "openhands_account_id=COALESCE(%s, openhands_account_id), "
+                        "preferred_account_id = CASE WHEN %s::uuid IS NULL THEN "
+                        "  preferred_account_id ELSE NULL END, "
                         "spec_ref = CASE WHEN %s::jsonb IS NULL THEN spec_ref ELSE "
                         "  COALESCE(spec_ref, '{}'::jsonb) || jsonb_build_object("
                         "    'delivery', %s::jsonb || jsonb_build_object('at', now())) END, "
                         "updated_at=now() "
                         "WHERE id=%s RETURNING *",
-                        (conversation_id, account_id, proof, proof, task_id))
+                        (conversation_id, account_id, account_id,
+                         proof, proof, task_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("task not found")
@@ -684,6 +689,51 @@ class LabStore:
             if row is None:
                 raise NotFound("task not found")
             return [str(x) for x in (row["tried_accounts"] or [])]
+
+    def switch_task_executor(self, task_id: str, *, target_account_id: str) -> dict:
+        """Hand an in-flight task to a different account on the next tick.
+
+        A switch is a *new* conversation on the target account (a Cloud
+        conversation cannot move between accounts), so this only prepares the
+        move: the current account is added to ``tried_accounts`` so the pool will
+        not pick it again for this task, and the task is requeued to ``pending``
+        with its conversation unbound. The scheduler then dispatches it through
+        the target account with a context hand-off (the hand-off names the plan
+        and what is already done).
+
+        Refused (``ValueError``) unless the task is ``dispatched``, ``running``
+        or ``verifying``: a pending task has no executor to switch from, and a
+        terminal task is done. The old executor is not stopped here — a
+        conversation already running is left to finish; it is simply never
+        polled again, and the workspace lock keeps two executors off one
+        checkout.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT state, openhands_account_id FROM nexus_run_tasks "
+                        "WHERE id=%s FOR UPDATE", (task_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("task not found")
+            if row["state"] not in ("dispatched", "running", "verifying"):
+                raise ValueError(f"cannot switch a task that is {row['state']}")
+            current = row["openhands_account_id"]
+            # The current account is recorded as tried (the pool never picks it
+            # for this task again) and the target is stored as the preference
+            # for the next dispatch. The target is only a preference: if it is
+            # not usable the pool selects another, rather than failing the task.
+            cur.execute(
+                "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
+                "conversation_id=NULL, openhands_account_id=NULL, "
+                "preferred_account_id=%s, "
+                "tried_accounts = CASE WHEN %s::text IS NULL THEN tried_accounts "
+                "  WHEN tried_accounts ? %s::text THEN tried_accounts "
+                "  ELSE tried_accounts || to_jsonb(%s::text) END, "
+                "updated_at=now() WHERE id=%s RETURNING *",
+                (target_account_id,
+                 str(current) if current else None,
+                 str(current) if current else None,
+                 str(current) if current else None, task_id))
+            return self._task_row(cur.fetchone())
 
     def record_handoff(self, *, run_id: str, task_id: str,
                        from_account_id: str | None, to_account_id: str | None,

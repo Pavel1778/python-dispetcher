@@ -146,3 +146,19 @@ That is the default: the live probe is opt-in. Pass `--live` (CLI) or
 
 The probe could not run: no usable account, or a resource limit (a 429). Nothing
 is claimed about whether it would work.
+
+### `live_conversation: FAILED` while the process-wide key works
+
+Cause: the live probe runs on the account it selected, using that account's
+stored `base_url`, key, `transport` and `default_model` — not `OPENHANDS_*`. A
+`FAILED` here is about *that account*, and the most common reason is its
+`default_model` pointing at a model the sandbox cannot reach (LLM auth). Set the
+account's `default_model` (or `OPENHANDS_DEFAULT_MODEL` for the process default
+account) to one the sandbox can use, e.g. `openhands/deepseek-v4.1-flash`.
+
+### An account stays `unavailable` after it recovers
+
+A terminal conversation on the account marks it `healthy` again automatically
+(`AccountRouter.note_success`). If it does not, no task has completed on it since
+the failure — probe it with `openhands diagnostics --live --account <id>`, or
+rotate the key.

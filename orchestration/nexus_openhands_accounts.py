@@ -217,6 +217,30 @@ class OpenHandsAccountService:
         key = self._decrypt(principal, account_id)
         return self._client(row["base_url"], key)
 
+    def execution_client_for_account(self, principal: str, account_id: str):
+        """A ready-to-run client for an account, honouring its own config.
+
+        ``client_for_account`` returns the account-level Cloud API client, which
+        is the right thing for capability/health calls but not what executes a
+        task: a ``direct`` account must talk to its sandbox's agent-server, and a
+        conversation must be started with the account's ``default_model`` (a bare
+        sandbox defaults to a model whose key may be absent). Building the
+        execution client in exactly one place is what keeps the diagnostics
+        probe, the account pool and the worker from disagreeing about which
+        transport or model an account uses.
+
+        The key is decrypted here and used immediately; it is never logged.
+        """
+        from .cloud_direct import build_direct_client
+
+        cfg = self.account_config(principal, account_id)
+        key = self._decrypt(principal, account_id)
+        cloud = self._client(cfg["base_url"], key)
+        if cfg["transport"] == "app":
+            return cloud
+        return build_direct_client(self.store, cloud=cloud,
+                                   llm_model=cfg.get("default_model"))
+
     def client_for_project(self, principal: str, project_id: str) -> CloudClient:
         """The client for a project's bound account, or raise.
 
