@@ -60,7 +60,7 @@
     blocked: ['заблокировано', 'warn'], failed: ['ошибка', 'bad'],
     cancelled: ['отменено', 'idle'], dead_letter: ['остановлено после ошибок', 'bad'],
     paused: ['на паузе', 'warn'], waiting_for_approval: ['ждёт подтверждения', 'warn'],
-    retrying: ['повтор после ошибки', 'warn'],
+    waiting: ['ждёт повтора', 'warn'],
     pending: ['ожидает', 'idle'], dispatched: ['отправлена', 'run'],
     completed_verified: ['готово, проверено', 'ok'],
     completed_unverified: ['готово, без проверки', 'warn'],
@@ -69,7 +69,7 @@
   };
   var TOOLS = { start_workflow: 'Запуск задачи OpenHands', start_run: 'Запуск автономного прогона' };
   // States that change on their own, so they are worth polling.
-  var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1, retrying: 1 };
+  var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1, waiting: 1 };
 
   function stateLabel(state) { return (STATES[state] || [state || 'неизвестно'])[0]; }
   function stateTone(state) { return (STATES[state] || ['', 'idle'])[1]; }
@@ -1018,53 +1018,91 @@
       '<div class="work-foot">' + actions + '<span class="muted">Старший агент: ' + esc(wf.sr_status ? stateLabel(wf.sr_status) : 'не запущен') + '</span></div></section>';
   }
 
+  // When something that is waiting will be looked at again, in a few words.
+  function untilText(value) {
+    if (!value) return '';
+    var left = new Date(value).getTime() - Date.now();
+    if (isNaN(left)) return '';
+    if (left <= 0) return 'с минуты на минуту';
+    var minutes = Math.round(left / 60000);
+    if (minutes < 1) return 'меньше чем через минуту';
+    if (minutes < 90) return 'через ' + minutes + ' ' + plural(minutes, 'минуту', 'минуты', 'минут');
+    var hours = Math.round(minutes / 60);
+    return 'через ' + hours + ' ' + plural(hours, 'час', 'часа', 'часов');
+  }
+
+  // Which OpenHands a task is (or was last) run by: the newest line of its
+  // history. An empty label is the server's own key.
+  function taskExecutor(executions, taskId) {
+    var last = null, count = 0;
+    (executions || []).forEach(function (item) {
+      if (String(item.task_id) === String(taskId)) { last = item; count += 1; }
+    });
+    if (!last) return null;
+    return { label: last.executor_label || 'ключ сервера', starts: count, kind: last.kind };
+  }
+
   function runCard(entry, detail) {
     var run = detail.run, tasks = detail.tasks || [], report = detail.report;
+    var executions = detail.executions || [], stops = detail.stops || [];
     // "Will be taken in a few seconds" is said only of a run nothing has happened to
     // yet. A task that waits out a refused start says why on its own line.
     var waiting = tasks.length && run.state === 'running' &&
       tasks.every(function (task) { return task.state === 'pending' && !task.last_error; });
     var inline = !!(S.status && S.status.lab && S.status.lab.inline);
-    var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1, retrying: 1 }[run.state];
+    var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state];
+    var durable = run.policy === 'durable';
     var budget = 'запусков ' + esc(run.iteration) + ' из ' + esc(run.max_iterations) +
+      (run.cycle ? ' · цикл ' + esc(run.cycle + 1) : '') +
       (live && run.deadline_at ? ' · до ' + esc(fullTime(run.deadline_at)) : '');
-    if (run.state === 'retrying') {
-      budget += ' · циклов ' + esc(run.retry_attempt) + ' из ' + esc(run.max_retry_cycles);
-      if (run.retry_at) budget += ' · следующая попытка после ' + esc(fullTime(run.retry_at));
-    }
+    // A durable run that is between two tries says so, and when it goes on.
+    var pause = run.state === 'running' && run.resume_at && run.wait_reason
+      ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
     var steps = tasks.length ? '<ul class="steps">' + tasks.map(function (task) {
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
+      if (task.cycle) sub.push('цикл ' + (task.cycle + 1));
       if (verdict) sub.push('проверка: ' + verdict);
+      var who = taskExecutor(executions, task.id);
+      if (who) sub.push('исполнитель: ' + who.label + (who.starts > 1 ? ' (запусков: ' + who.starts + ')' : ''));
+      if (task.repository) sub.push(task.repository + (task.branch ? ' · ' + task.branch : ''));
       // Why it did not verify - without it "не подтверждено" sends a person to the database.
       var reason = task.verification && task.verification.reason;
       var settled = { completed_unverified: 1, partial: 1, failed: 1, blocked: 1 }[task.state];
+      // A task that waits says what for and until when; it will go on by itself.
+      var wait = (task.state === 'waiting' || (task.state === 'running' && task.retry_at)) && task.wait_reason
+        ? '<div class="step-sub">' + esc(clip(task.wait_reason, 320)) +
+          (task.retry_at ? ' · повтор ' + esc(untilText(task.retry_at)) : '') + '</div>' : '';
       return '<li class="step-row"><span class="dot is-' + stateTone(task.state) + '" title="' + esc(stateLabel(task.state)) + '"></span>' +
         '<div><div class="step-title">' + esc(clip(task.title || task.task_key, 260)) + '</div>' +
-        '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' +
+        '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' + wait +
         (settled && reason ? '<div class="step-sub">' + esc(clip(reason, 320)) + '</div>' : '') +
-        (task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div><span></span></li>';
+        (!wait && task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div><span></span></li>';
     }).join('') + '</ul>' : '<p class="step-sub">В плане нет задач.</p>';
     var actions = '';
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
-    if ({ paused: 1, blocked: 1, retrying: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
-    if ({ running: 1, paused: 1, blocked: 1, waiting_for_approval: 1, retrying: 1 }[run.state]) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
+    if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
     // The report is the run's own record: the same text delivered to the chat.
     // It is copied in full, never the truncated view.
-    var reportSection = report && report.content
+    var reportSection = report && report.body
       ? '<div class="work-section"><p class="work-section-title">Итоговый отчёт</p>' +
-        '<div class="md">' + MD.render(report.content) + '</div>' +
+        '<div class="md">' + MD.render(report.body) + '</div>' +
         '<div class="work-foot">' +
         '<button class="btn btn-sm" type="button" data-action="copy-report" data-id="' + esc(entry.id) + '">' +
         icon('copy', 'icon-sm') + 'Скопировать отчёт</button>' +
-        '<span class="muted">' + esc(report.status === 'sent' ? 'отправлен в чат'
-          : report.status === 'failed' ? 'доставка не удалась, отчёт сохранён'
+        '<span class="muted">' + esc(report.state === 'delivered' ? 'отправлен в чат'
+          : report.state === 'undeliverable' ? 'чата у прогона нет — отчёт хранится здесь'
           : 'ожидает отправки в чат') + '</span></div></div>'
       : '';
-    return '<section class="work"><div class="work-head">' + pill(run.state) +
+    var owed = stops.filter(function (stop) { return stop.state === 'requested'; }).length;
+    return '<section class="work" data-run="' + esc(entry.id) + '"><div class="work-head">' + pill(run.state) +
       '<span class="work-kind">Автономный прогон</span><span class="work-id">' + esc(shortId(entry.id)) + '</span>' +
-      '<span class="topbar-spacer"></span><span class="work-id" title="Сколько раз прогон запускал задачи и до какого времени он может их запускать">' + budget + '</span></div>' +
-      (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') +
+      '<span class="topbar-spacer"></span><span class="work-id" title="' +
+      (durable ? 'Сколько раз прогон запускал задачи в этом цикле. Когда запуски цикла кончаются, прогон делает паузу и продолжает сам.'
+               : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
+      (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
+      (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
       '<div class="work-section"><p class="work-section-title">План · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач') + '</p>' + steps +
       (waiting ? '<p class="step-sub">' + (inline
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
@@ -1986,7 +2024,7 @@
       var id = el.getAttribute('data-id');
       var record = S.work.data['run:' + id];
       var content = record && record.detail && record.detail.report
-        ? record.detail.report.content : '';
+        ? record.detail.report.body : '';
       if (!content) { toast('Отчёт ещё не готов.', 'bad'); return; }
       copied(copyText(content), 'Отчёт скопирован.');
     },

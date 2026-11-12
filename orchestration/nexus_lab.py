@@ -540,13 +540,26 @@ class OpenHandsExecutor:
         return stop(str(target["conversation_id"])) or {}
 
     def conversation_state(self, target: dict) -> str:
-        """The execution status of *target*'s conversation, ``missing`` when
-        it is gone."""
+        """What *target*'s conversation is doing: its execution status,
+        ``paused`` when the sandbox that would run it is not running, and
+        ``missing`` when it is gone.
+
+        A cloud conversation is stopped by pausing its sandbox, and the
+        service reports no execution status at all for a conversation whose
+        sandbox is not running - it has nothing to ask. Read alone, that
+        empty status would look like "still at work" for ever; the sandbox's
+        own status is what says the agent has stopped.
+        """
         client = self._client_for_task(target)
         try:
-            return client.get_conversation(str(target["conversation_id"])).execution_status or ""
+            conversation = client.get_conversation(str(target["conversation_id"]))
         except CloudNotFound:
             return "missing"
+        status = conversation.execution_status or ""
+        sandbox = (getattr(conversation, "sandbox_status", None) or "").upper()
+        if status not in _STOPPED and sandbox in ("PAUSED", "MISSING", "ERROR"):
+            return "paused"
+        return status
 
     def progress(self, task: dict, conversation_id: str) -> str | None:
         """A value that changes while the conversation moves, or ``None`` when

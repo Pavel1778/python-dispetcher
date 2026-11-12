@@ -22,6 +22,13 @@ class FakeCloud:
     """Mutable state backing the fake server."""
 
     def __init__(self):
+        # Stop signals: the sandboxes asked to pause, in order; sandboxes
+        # that take the call and go on all the same; a status to refuse the
+        # call with; and one to refuse a follow-up message with.
+        self.paused: list[str] = []
+        self.pause_ignored: set[str] = set()
+        self.pause_status = 0
+        self.send_message_status = 0
         # What /openapi.json says (read-only discovery): the version, and the
         # paths. ``None`` for the version means "publishes no description"
         # (404); ``api_paths_missing`` takes paths out of the description, the
@@ -318,10 +325,41 @@ class _Handler(BaseHTTPRequestHandler):
         if path.endswith("/send-message"):
             cid = path.split("/")[4]
             body = self._read_body()
+            if cid not in self.cloud.conversations:
+                return self._json(404, {"detail": "conversation not found"})
+            if self.cloud.send_message_status:
+                return self._json(self.cloud.send_message_status, {"detail": "refused"})
             text = "".join(c.get("text", "") for c in (body.get("content") or []))
             self.cloud.messages.setdefault(cid, []).append(text)
+            # A message with ``run`` wakes the agent: the conversation is at
+            # work again, as on the live service.
+            if body.get("run"):
+                self.cloud.conversations[cid]["execution_status"] = "running"
+                self.cloud.conversations[cid]["sandbox_status"] = "RUNNING"
             return self._json(200, {"success": True, "sandbox_status": "RUNNING",
                                     "message": None})
+
+        # POST /api/v1/sandboxes/{sandbox_id}/pause - how a cloud conversation
+        # is stopped: the sandbox that runs it is paused. A conversation whose
+        # sandbox is not running reports no execution status at all.
+        if path.startswith("/api/v1/sandboxes/") and path.endswith("/pause"):
+            self._read_body()
+            sid = path.split("/")[4]
+            if self.cloud.pause_status:
+                return self._json(self.cloud.pause_status, {"detail": "pause refused"})
+            known = sid in self.cloud.sandboxes
+            for conversation in self.cloud.conversations.values():
+                if conversation.get("sandbox_id") == sid:
+                    known = True
+                    if sid not in self.cloud.pause_ignored:
+                        conversation["sandbox_status"] = "PAUSED"
+                        conversation["execution_status"] = None
+            if not known:
+                return self._json(404, {"detail": "sandbox not found"})
+            if sid in self.cloud.sandboxes and sid not in self.cloud.pause_ignored:
+                self.cloud.sandboxes[sid]["status"] = "PAUSED"
+            self.cloud.paused.append(sid)
+            return self._json(200, {"success": True})
 
         return self._json(404, {"detail": "not found"})
 
