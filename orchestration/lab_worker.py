@@ -62,7 +62,8 @@ class LabWorker:
                  lease_seconds: int = 900, client: Any | None = None,
                  github: GitHubClient | None = None,
                  github_accounts: GitHubAccountService | None = None,
-                 heartbeat_seconds: int = 60, account_router: Any | None = None):
+                 heartbeat_seconds: int = 60, account_router: Any | None = None,
+                 discover_router: bool = True):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
@@ -72,6 +73,11 @@ class LabWorker:
         # switched out for another with a context hand-off. Without it the
         # process-wide client runs every task, as before.
         self.account_router = account_router
+        #: Whether a worker that has no router asks, on every pass, whether
+        #: the deployment has gained a stored connection since (see
+        #: ``_find_router``). Off for a caller that wants the server's own key
+        #: used whatever is stored.
+        self.discover_router = discover_router
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
         self.executor = OpenHandsExecutor(
@@ -112,8 +118,34 @@ class LabWorker:
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
                             router=self.account_router, reports=self.reports)
 
+    def _find_router(self) -> None:
+        """Start using stored connections once the deployment has any.
+
+        ``build_account_router`` answers "none" for a deployment with no
+        stored connection, and the worker then runs everything under the
+        server's own key. That answer used to be final for the life of the
+        process: a connection added in the studio an hour later was not used
+        until a restart. It is asked again here, cheaply, on every pass.
+        """
+        if self.account_router is not None or not self.discover_router:
+            return
+        from .openhands_router import build_account_router
+
+        try:
+            router = build_account_router(self.store)
+        except Exception:  # noqa: BLE001 - asked again on the next pass
+            log.debug("could not look for stored OpenHands connections", exc_info=True)
+            return
+        if router is None:
+            return
+        log.info("stored OpenHands connections found: tasks are routed through them")
+        self.account_router = router
+        self.executor.router = router
+        self.executor._client_factory = self._client_for_account
+
     def tick_once(self) -> dict[str, Any]:
         """One pass over every active run. Returns a small summary for logs."""
+        self._find_router()
         sched = self.scheduler()
         summary: dict[str, Any] = {"runs": 0, "advanced": 0, "errors": []}
         for run_id in active_run_ids(self.store):
