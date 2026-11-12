@@ -34,6 +34,12 @@ from .providers import (
 
 _MODES = ("ask", "code", "plan", "autonomous")
 
+#: The modes the *responder* can produce for a turn. ``analysis`` is not a
+#: stored conversation mode (the DB constraint keeps ``ask``/``code``/``plan``/
+#: ``autonomous``); it is what the intent router asks for when a turn is a
+#: request to explain a failure without changing code.
+_RESPOND_MODES = ("ask", "analysis", "code", "plan", "autonomous")
+
 #: Characters of earlier messages a prompt carries, newest first. History is
 #: background: it is shortened to fit, so that one long message does not make
 #: every later question in the conversation too large to ask. The request
@@ -47,6 +53,15 @@ _ASK_SYSTEM = (
     "developer's question about their project concisely and concretely. Use the "
     "provided project context and memory when relevant. Do not invent files or "
     "facts you were not given; say what you would need to check instead."
+)
+
+_ANALYSIS_SYSTEM = (
+    "You are NEXUS, an AI development assistant embedded in an IDE. The "
+    "developer asks you to explain something - why a failure happens, how a "
+    "part works, what is wrong. Answer with a diagnosis and reasoning, grounded "
+    "in the provided project context, memory and conversation. Do NOT claim to "
+    "have changed any code: you cannot, in this mode. If a fix is needed, say "
+    "what it would be and that the developer can ask for it to be applied."
 )
 
 _PLAN_SYSTEM = (
@@ -83,7 +98,8 @@ class ChatResponder:
                 project_id: str | None = None,
                 principal: str | None = None,
                 conversation_id: str | None = None,
-                spec_id: str | None = None) -> list[dict]:
+                spec_id: str | None = None,
+                clarifying: str = "") -> list[dict]:
         """Return the messages to append for this turn.
 
         Each message is ``{"role", "content", "meta"}``. A failure is raised as
@@ -99,10 +115,19 @@ class ChatResponder:
         was sent; the autonomous hook works from the stored copy, which is
         exact. *conversation_id* lets it recognise the same text sent twice.
         """
-        if mode not in _MODES:
-            raise ValueError("mode must be ask, code, plan or autonomous")
+        if mode not in _RESPOND_MODES:
+            raise ValueError("mode must be ask, analysis, code, plan or autonomous")
         if mode == "ask":
-            return [self._ask(goal, context, memory, history)]
+            answer = self._ask(goal, context, memory, history)
+            if clarifying:
+                # An ambiguous turn is answered, then asked about once: the
+                # person gets an answer now and a single question that decides
+                # whether work should be started.
+                answer["content"] = f"{answer['content']}\n\n**Уточните:** {clarifying}"
+                answer["meta"] = {**answer["meta"], "clarifying": True}
+            return [answer]
+        if mode == "analysis":
+            return [self._analysis(goal, context, memory, history)]
         if mode == "plan":
             return [self._plan(goal, context, memory)]
         scope = {"project_id": project_id, "principal": principal}
@@ -125,6 +150,30 @@ class ChatResponder:
         return {"role": "assistant", "content": response.data["text"],
                 "meta": {"provider": response.provider, "model": response.model,
                          "mode": "ask"}}
+
+    def _analysis(self, goal: str, context: dict | None, memory: list[dict] | None,
+                  history: list[dict] | None) -> dict:
+        """Explain what is wrong or how something works, **without** changing code.
+
+        This is the "разбери, почему падает" turn: the assistant reasons over the
+        project context, the stored run/verification records and the message,
+        and answers. It never dispatches: no conversation is started, no file is
+        touched. The reply ends by saying so, so the person knows nothing was
+        changed and how to ask for a change if that is what they want.
+        """
+        prompt = self._prompt(goal, context, memory, history)
+        try:
+            response = self.providers.text(prompt, _ANALYSIS_SYSTEM)
+        except AllProvidersFailed as e:
+            raise ChatError(self._failure(e, goal)) from e
+        except ProviderError as e:
+            raise ChatError(str(e)) from e
+        text = response.data["text"]
+        return {"role": "assistant",
+                "content": text + "\n\n_(анализ; код не менялся — чтобы поручить "
+                                  "исправление, включите режим «Автономно»)_",
+                "meta": {"provider": response.provider, "model": response.model,
+                         "mode": "analysis", "dispatched": False}}
 
     def _plan(self, goal: str, context: dict | None, memory: list[dict] | None) -> dict:
         prompt = self._prompt(goal, context, memory, None)

@@ -382,7 +382,8 @@ def stage_plan(data: Any, *, pieces: list[dict], count: int, earlier_keys: set[s
                     "earlier": list(dict.fromkeys(earlier))}
         prepared.append(task)
     tasks = (validate_tasks({"tasks": prepared}, max_tasks=max_tasks,
-                            keep=("requirements", "earlier")) if prepared else [])
+                            keep=("requirements", "earlier", "repository", "branch"))
+             if prepared else [])
 
     in_stage = {piece["ordinal"] for piece in pieces}
     obligations = {piece["ordinal"] for piece in pieces if piece["normative"]}
@@ -504,10 +505,17 @@ def merge(spec: dict, stages: list[dict]) -> tuple[list[dict[str, Any]], dict[st
                 ref["see"] = plan["see"]
             if task.get("verification"):
                 ref["verification"] = True
-            tasks.append({"id": task["key"], "title": task["title"],
-                          "description": task.get("description") or "",
-                          "acceptance": task.get("acceptance") or [],
-                          "dependencies": deps, "spec_ref": ref})
+            entry = {"id": task["key"], "title": task["title"],
+                     "description": task.get("description") or "",
+                     "acceptance": task.get("acceptance") or [],
+                     "dependencies": deps, "spec_ref": ref}
+            # A task may name its own repository/branch (a plan across several
+            # repositories of one project); it is carried to the stored task.
+            if task.get("repository"):
+                entry["repository"] = task["repository"]
+            if task.get("branch"):
+                entry["branch"] = task["branch"]
+            tasks.append(entry)
         known.update(final.values())
         waits_for = [task["key"] for task in stage_tasks if task["key"] not in depended]
     if not tasks:

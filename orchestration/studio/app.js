@@ -27,9 +27,10 @@
   /* ------------------------------------------------------------ vocabulary */
   var MODES = {
     ask: {
-      icon: 'message', label: 'Вопрос',
-      desc: 'Ответ ассистента по контексту проекта. Ничего не запускает.',
-      placeholder: 'Спросите о коде или проекте',
+      icon: 'message', label: 'Чат',
+      desc: 'Разговор: вопрос, анализ ошибки, обсуждение. Ничего не запускает. ' +
+            'Явную команду («исправь …», «запусти автономно …») NEXUS распознаёт сам.',
+      placeholder: 'Спросите о проекте или опишите задачу',
       thinking: 'Думаю над ответом', provider: true
     },
     plan: {
@@ -1036,6 +1037,9 @@
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
       if (verdict) sub.push('проверка: ' + verdict);
+      // Which OpenHands runs the task, when one is bound (an account pool).
+      if (task.account_label) sub.push('исполнитель: ' + task.account_label);
+      if (task.cycle) sub.push('цикл ' + task.cycle);
       // Why it did not verify - without it "не подтверждено" sends a person to the database.
       var reason = task.verification && task.verification.reason;
       var settled = { completed_unverified: 1, partial: 1, failed: 1, blocked: 1 }[task.state];

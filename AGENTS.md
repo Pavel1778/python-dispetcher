@@ -1320,3 +1320,45 @@ project may use several OpenHands and several GitHub repositories. Migration
   `tests/test_lab_http.py` (routes) and `tests/test_browser_e2e.py` (copy, cancel
   disappearance, report in chat, phone scroll). `tests/test_route_auth.py`
   probes every new endpoint. Full suite: 993 passed / 8 skipped.
+
+## NEXUS is conversational: the intent router (this increment)
+
+The most important rule: **a message is not a task.** NEXUS answers a question,
+analyses a failure, and starts an autonomous run only when the person clearly
+asks for work. `orchestration/nexus_intent.py` decides which.
+
+- **Deterministic first.** `IntentRouter.route` runs an explainable rule pass
+  before any model: an explicit non-default mode wins (`Автономно`/`Код` → run,
+  `План` → plan); a status question ("что готово?") is chat; "продолжи"/"повтори"
+  is a continuation when a run is in flight and chat otherwise; a work command in
+  the imperative ("исправь …", "добавь …") is autonomous; an analysis request
+  ("почему …", "объясни …") is analysis; a question is chat. The model is asked
+  **only** for a turn the rules cannot place, and only for a short message (a
+  long one is a specification). A missing/failing/uncertain model leaves the
+  safe default: **chat**. This is why the common cases never depend on a model.
+- **The default conversation mode is the router's job.** `ask` no longer
+  short-circuits; it is exactly the case the router exists for. An explicit
+  `code`/`plan`/`autonomous` mode is honoured and not re-routed. `analysis` is a
+  responder-only mode: the stored conversation mode stays one the DB constraint
+  allows (`ask`/`code`/`plan`/`autonomous`), and only a routed autonomous turn
+  switches the conversation to `autonomous`.
+- **Continuation never duplicates.** `_chat_turn` answers "продолжи" with
+  `_continue_active_run` (which makes a `retrying`/`blocked` run's wait due, or
+  reports a `running` one) **before** a provider is asked, so it works with no
+  model configured and creates no second run.
+- **Ambiguity is one question, not a guess.** A turn the rules cannot place and
+  that carries a weak work hint ("можешь …", "нужно …") is answered and then
+  asked about once; a plain message gets a plain answer with no question.
+- **Planner fallback (never "the plan has no tasks" for real work).** When the
+  model answers a stage with no usable task but the stage has obligations,
+  `stage_plan` adds one deterministic fallback task that carries the whole stage
+  and tells the agent to read the original text. A stage that is pure context
+  may legitimately be empty; a stage with obligations may not.
+- **A plan task may name its own repository/branch** (`validate_tasks` keeps
+  them, `merge` carries them, `start_run` stores them), so one run can span
+  several repositories of a project; without one a task uses the run's.
+- Tests: `tests/test_intent_router.py` (rules, safe defaults, model path),
+  `tests/test_planner_fallback.py` (the fallback task and the context-only case,
+  no DB), and the conversational journey in `tests/test_browser_e2e.py` (a
+  question starts nothing; an explicit command starts work; "продолжи" does not
+  create a second run).

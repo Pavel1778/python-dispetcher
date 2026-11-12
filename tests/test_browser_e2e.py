@@ -939,3 +939,75 @@ def test_a_long_dag_scrolls_and_details_open_and_close_on_a_phone(stack, chromiu
         assert watch.problems == []
     finally:
         ctx.close()
+
+
+# ------------------------------------------------------- NEXUS is conversational
+def test_a_plain_question_is_answered_and_starts_no_run(stack, chromium):
+    """The whole point of the intent router: a question is a question.
+
+    No mode is chosen (the default chat), and the message is a question. NEXUS
+    answers it and starts nothing - no run, no workflow. A later explicit
+    command in the same chat is what starts work.
+    """
+    stack.answers("Это проект на Python: точки входа в orchestration/.")
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        expect(page.locator("#mode-label")).to_have_text("Чат")
+        _send(page, "Как устроен этот проект?")
+        page.wait_for_selector(".msg.assistant .md")
+        expect(page.locator(".msg.assistant .md")).to_contain_text("точки входа")
+        # Nothing was started: no work chip, no workflow, no run.
+        assert page.locator(".work-chip").count() == 0
+        assert stack.app.store.list_workflows() == []
+        assert stack.app.lab.list_runs(_owner_principal(stack.app),
+                                       _first_project(stack.app)) == []
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_an_explicit_command_in_the_chat_starts_work(stack, chromium):
+    """In the same default chat, a clear command is recognised and starts a run."""
+    stack.answers(json.dumps({"tasks": [
+        {"id": "one", "title": "Исправить корзину", "description": "x",
+         "acceptance": ["готово"], "dependencies": []}]}))
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        # A clear work command, no mode chosen.
+        _send(page, "Исправь ошибку в корзине")
+        page.wait_for_selector(".work-chip")
+        runs = stack.app.lab.list_runs(_owner_principal(stack.app),
+                                       _first_project(stack.app))
+        assert len(runs) == 1
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_continue_does_not_create_a_second_run(stack, chromium):
+    """«Продолжи» continues the run in flight; it never starts a duplicate."""
+    stack.answers(json.dumps({"tasks": [
+        {"id": "one", "title": "Задача", "description": "x",
+         "acceptance": [], "dependencies": []}]}))
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        _send(page, "Запусти автономно: одна задача")
+        page.wait_for_selector(".work-chip")
+        before = stack.app.lab.list_runs(_owner_principal(stack.app),
+                                         _first_project(stack.app))
+        assert len(before) == 1
+        # "Продолжи" is answered as a continuation, not a new run.
+        _send(page, "Продолжи")
+        page.wait_for_selector(".msg.assistant .md >> nth=1")
+        after = stack.app.lab.list_runs(_owner_principal(stack.app),
+                                        _first_project(stack.app))
+        assert len(after) == 1, "a continuation created a second run"
+        assert watch.problems == []
+    finally:
+        ctx.close()

@@ -248,12 +248,16 @@ class LabStore:
             cur.execute("UPDATE nexus_goals SET state='running', active_run_id=%s, updated_at=now() "
                         "WHERE id=%s", (run["id"], goal_id))
             for position, task in enumerate(plan or []):
+                # A task may name its own repository and branch, so one run can
+                # span several repositories of the project (a plan task per
+                # repository). Without one it uses the run's - the common case.
                 self._insert_task(
                     cur, run["id"], project_id, task_key=task["id"], title=task["title"],
                     description=task.get("description") or "",
                     acceptance=task.get("acceptance") or [],
                     dependencies=task.get("dependencies") or [],
-                    repository=repository, branch=branch,
+                    repository=task.get("repository") or repository,
+                    branch=task.get("branch") or branch,
                     max_attempts=max_attempts_per_task, position=position,
                     spec_ref=task.get("spec_ref"))
             ProjectService._event(cur, project_id, principal, "run.started", run["id"])
@@ -788,8 +792,14 @@ class LabStore:
     def list_tasks(self, principal: str, project_id: str, run_id: str) -> list[dict]:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
-            cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s AND project_id=%s "
-                        "ORDER BY created_at, id", (run_id, project_id))
+            # The account that runs each task is joined so the interface can say
+            # which OpenHands executes it; the key is never selected.
+            cur.execute(
+                "SELECT t.*, a.label AS account_label "
+                "FROM nexus_run_tasks t "
+                "LEFT JOIN nexus_openhands_accounts a ON a.id = t.openhands_account_id "
+                "WHERE t.run_id=%s AND t.project_id=%s ORDER BY t.created_at, t.id",
+                (run_id, project_id))
             return [self._task_row(r) for r in cur.fetchall()]
 
     def get_task(self, principal: str, project_id: str, task_id: str) -> dict:
