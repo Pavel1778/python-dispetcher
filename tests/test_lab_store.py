@@ -243,7 +243,15 @@ def test_a_plan_stored_in_one_go_keeps_its_order(lab):
     assert [t["task_key"] for t in tasks] == keys
     assert {(t["repository"], t["branch"], t["max_attempts"]) for t in tasks} == {
         ("acme/repo", "main", 2)}
-    assert [lab["lab"].claim_task(run["id"], "w")["task_key"] for _ in range(3)] == keys[:3]
+    # Claimed in that order too. One task at a time works on a branch, so each
+    # is settled before the next is asked for.
+    order = []
+    for _ in range(3):
+        task = lab["lab"].claim_task(run["id"], "w")
+        assert lab["lab"].claim_task(run["id"], "w") is None, "two tasks on one branch"
+        order.append(task["task_key"])
+        lab["lab"].record_verification(task["id"], verdict="completed_verified", evidence={})
+    assert order == keys[:3]
 
 
 @pytest.mark.parametrize("options", [{"max_iterations": 0}, {"max_iterations": 501},

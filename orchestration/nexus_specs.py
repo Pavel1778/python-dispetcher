@@ -53,6 +53,11 @@ DEFAULT_MAX_SPEC_CHARS = 1_000_000
 #: a preview that points at the specification. ``NEXUS_SPEC_INLINE_CHARS``.
 DEFAULT_INLINE_CHARS = 20_000
 
+#: Where the agent cannot be given a file (the ``app`` transport), a text up to
+#: this long still travels whole in every task's first message; of a longer one
+#: each task is given the part it was planned from. ``NEXUS_SPEC_MESSAGE_CHARS``.
+DEFAULT_MESSAGE_CHARS = 60_000
+
 #: Characters of a specification kept in a chat message or a goal as a label.
 PREVIEW_CHARS = 2_000
 
@@ -74,6 +79,12 @@ def inline_chars() -> int:
     return _positive_env("NEXUS_SPEC_INLINE_CHARS", DEFAULT_INLINE_CHARS)
 
 
+def message_chars() -> int:
+    """Never less than :func:`inline_chars`: what always travels in a message
+    does so on every transport."""
+    return max(inline_chars(), _positive_env("NEXUS_SPEC_MESSAGE_CHARS", DEFAULT_MESSAGE_CHARS))
+
+
 class SpecError(ValueError):
     """The text cannot be accepted as it is. The message says exactly why."""
 
@@ -84,6 +95,12 @@ class SpecTooLarge(SpecError):
 
 class SpecCorrupted(RuntimeError):
     """Stored text no longer matches its fingerprint. Never served as if it did."""
+
+
+#: Characters of one chat message that is not a task (ask, plan and code
+#: modes). Such a message lives in the transcript and goes to a model in one
+#: request; a task text does neither, which is why it may be far longer.
+MESSAGE_CHARS = 200_000
 
 
 def check_text(value: Any) -> str:
@@ -102,6 +119,29 @@ def check_text(value: Any) -> str:
         raise SpecTooLarge(
             f"text is {len(value)} characters; this server accepts up to {limit} "
             "(NEXUS_SPEC_MAX_CHARS)")
+    return _storable(value)
+
+
+def check_message(value: Any, mode: str) -> str:
+    """:func:`check_text` for a chat message in a mode other than autonomous.
+
+    The same refusals, for the same reason, and the transcript's own limit. The
+    refusal of a long message says where a long text does go.
+    """
+    if not isinstance(value, str):
+        raise SpecError("text must be a string")
+    if not value.strip():
+        raise SpecError("text is required")
+    if len(value.strip()) > MESSAGE_CHARS:
+        raise SpecTooLarge(
+            f"text is {len(value.strip())} characters; a message in {mode} mode holds up to "
+            f"{MESSAGE_CHARS}. Send it in autonomous mode: there a text of up to "
+            f"{max_spec_chars()} characters is stored whole and planned in parts")
+    return _storable(value)
+
+
+def _storable(value: str) -> str:
+    """*value* if PostgreSQL and UTF-8 can hold it as it is, else raise."""
     nul = value.find("\x00")
     if nul >= 0:
         raise SpecError(
@@ -898,6 +938,27 @@ class SpecService:
         if row is None:
             raise NotFound("specification not found")
         return self._checked(row)
+
+    def request_internal(self, run_id: str) -> str | None:
+        """The text a run was planned from, read through the run's goal.
+
+        For a run whose tasks do not say which specification they came from -
+        one planned before specifications existed. Its goal then holds the
+        request itself; a goal that has a specification holds a label, and the
+        specification is read instead. ``None`` when there is nothing to read.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT g.text, g.spec_id FROM nexus_runs r "
+                        "JOIN nexus_goals g ON g.id = r.goal_id WHERE r.id=%s", (run_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        if row["spec_id"] is None:
+            return row["text"]
+        try:
+            return self.content_internal(str(row["spec_id"]))[1]
+        except (NotFound, SpecCorrupted):
+            return None
 
     def _checked(self, row: Any) -> tuple[dict, str]:
         row = dict(row)

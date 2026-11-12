@@ -17,6 +17,7 @@ from typing import Any
 
 from .cloud_store import NotFound, PostgresStore
 from .nexus_projects import _text
+from .nexus_specs import MESSAGE_CHARS
 
 _MODES = ("ask", "code", "plan", "autonomous")
 
@@ -145,7 +146,7 @@ class ConversationService:
                     role: str, content: str, meta: dict | None = None) -> dict:
         if role not in ("user", "assistant", "tool", "system"):
             raise ValueError("role must be user, assistant, tool or system")
-        content = _text(content, "content", maximum=200_000, required=False)
+        content = _text(content, "content", maximum=MESSAGE_CHARS, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
             cur.execute("SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s",
@@ -166,12 +167,21 @@ class ConversationService:
         transaction as the thing it announces, so the chat never says a run
         started that did not, and never stays silent about one that did.
         *run_id* links the conversation to a run; *state* sets its state.
+
+        A transcript is read in ``created_at`` order, and ``now()`` is one
+        instant for a whole transaction, so two messages appended together
+        would be listed in either order. Each message is therefore stamped
+        later than the newest one the conversation already has.
         """
         cur.execute(
-            "INSERT INTO nexus_conversation_messages(conversation_id, role, content, meta) "
-            "VALUES (%s,%s,%s,%s) "
+            "INSERT INTO nexus_conversation_messages(conversation_id, role, content, meta, "
+            "                                        created_at) "
+            "VALUES (%s,%s,%s,%s, GREATEST(clock_timestamp(), COALESCE("
+            "  (SELECT max(created_at) FROM nexus_conversation_messages "
+            "   WHERE conversation_id=%s), '-infinity'::timestamptz) "
+            "  + interval '1 microsecond')) "
             "RETURNING id, conversation_id, role, content, meta, created_at",
-            (conversation_id, role, content, _json(meta or {})))
+            (conversation_id, role, content, _json(meta or {}), conversation_id))
         row = dict(cur.fetchone())
         cur.execute("UPDATE nexus_conversations SET updated_at=now(), "
                     "run_id=COALESCE(%s, run_id), state=COALESCE(%s, state) WHERE id=%s",
@@ -327,10 +337,13 @@ class ConversationService:
         return out
 
     @staticmethod
-    def _mode(mode: str) -> str:
+    def check_mode(mode: Any) -> str:
+        """*mode* if it is one a conversation can be in, else ``ValueError``."""
         if mode not in _MODES:
             raise ValueError("mode must be ask, code, plan or autonomous")
         return mode
+
+    _mode = check_mode
 
     @staticmethod
     def _project(cur: Any, principal: str, project_id: str) -> None:

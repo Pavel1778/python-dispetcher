@@ -63,7 +63,8 @@ services:
   # a thread of the app, so a run continues when no browser is connected and
   # when the web process restarts. It talks to the same PostgreSQL, so it needs
   # no port of its own. Run one worker per deployment (or several: claims are
-  # leases, so extra workers only take more work).
+  # leases, so extra workers only take more work). The app advances runs too,
+  # on a thread of its own, unless NEXUS_LAB_INLINE=0 is set for it.
   worker:
     build: .
     depends_on:

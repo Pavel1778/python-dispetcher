@@ -631,10 +631,13 @@ Added on `nexus/mvp-integration`. These are the invariants to keep.
   `LabScheduler` (reclaim → claim → dispatch → poll → verify → record → decide).
   A run completes only when every task is `completed_verified`; an unverified
   dependency deadlocks the graph and the run is `blocked`, not left spinning.
-- `orchestration/lab_worker.py` — the durable worker, a **separate process**
-  (`python -m orchestration.lab_worker`). It holds no per-run state, so a restart
-  is a non-event: it re-reads the active runs and continues. Run it alongside the
-  web server; the web server only *starts* runs.
+- `orchestration/lab_worker.py` — the loop that advances runs. It holds no
+  per-run state, so a restart is a non-event: it re-reads the active runs and
+  continues. The web server runs it on a thread of its own (`App._run_lab`)
+  unless `NEXUS_LAB_INLINE` is `0`/`false`/`no`/`off`; `python -m
+  orchestration.lab_worker` runs the same loop as a separate process, and the two
+  may run side by side (every claim is a lease). See "Autonomous runs on the
+  deployed service" at the end of this file.
 - **Two-phase OpenHands start is awaited.** `POST /api/v1/app-conversations`
   returns a start task; the conversation id appears only at `READY`.
   `OpenHandsExecutor.dispatch` polls until READY and returns the real
@@ -821,7 +824,9 @@ There are no dashboards, section tabs or forms outside that.
   (nothing calls `openhands_accounts.client_for_project`). Files are read-only
   and come from the GitHub API at the bound branch; the tree stops at 500
   entries and a file at 200 KB. A reply arrives as one response, not a stream.
-  Autonomous runs advance only while `python -m orchestration.lab_worker` runs.
+  Autonomous runs are advanced by the server itself (see `lab.inline` in
+  `/api/studio`); with `NEXUS_LAB_INLINE=0` they wait for
+  `python -m orchestration.lab_worker`, and the run's card says so.
 - **Tests.** `tests/test_studio_ui.py` (structure, packaging, contrast; no
   database), `tests/studio_render_test.js` (Node), `tests/test_studio_api.py`
   (the server changes, with the fake GitHub recording which token each read
@@ -907,6 +912,15 @@ the part to read first: those defects were reproduced and are **not fixed**.
 
 ### Still open - reproduced, not fixed
 
+> **Status, 2026-11-12.** Items 1-4 and 6 were fixed in PR #27 (the gate is
+> `authorize_run_task`, called when a run is started and again before every
+> task; `LabScheduler.tick` reads the run's state; `claim_task` enforces the
+> iteration budget and the deadline; transitions go through
+> `_RUN_ENTERED_FROM`; the login-ceiling test no longer depends on the clock).
+> Item 5 is fixed by the section "Autonomous runs on the deployed service"
+> below. Item 7 is still open. The descriptions are kept as the record of what
+> was wrong.
+
 1. **An autonomous run may target a repository nobody allowed.**
    `POST /api/v1/projects/{id}/goals/{goal}/run` takes `repository` and `branch`
    from the request body and stores them on the run tasks; `LabScheduler` /
@@ -957,7 +971,10 @@ failure, and prove the integration with one command. The invariants to keep:
   guessed. Migration `0022` adds the columns and `nexus_openhands_pool`.
 - **`orchestration/openhands_router.py`** chooses an account per task and builds
   the hand-off context. `tried_accounts` (on the task) is what makes failover
-  terminate: an account that failed is never selected for that task again.
+  terminate: an account that failed is never selected for that task again. The
+  account a task last *ran* on is not excluded - a result that did not verify
+  is tried again there - and a start the service refuses (429) is not a
+  failure; both are item 13 of "Autonomous runs on the deployed service".
   `build_account_router` returns `None` when the principal has no stored
   account, so a single-key deployment keeps its exact previous behaviour.
 - **A Cloud conversation cannot move between accounts.** A switch is a *new*
@@ -981,12 +998,15 @@ failure, and prove the integration with one command. The invariants to keep:
 - **Worker heartbeat (migration `0023`).** `LabWorker` registers and heartbeats
   every tick (`register_worker`/`heartbeat`/`stop_worker`); `live_workers` is
   how the diagnostics tell a live worker from a dead one — a lease cannot.
-  `lab_worker: FAILED` means active runs exist with no fresh heartbeat.
+  `lab_worker: FAILED` means active runs exist with no fresh heartbeat. The web
+  server's own loop registers too, as kind `inline` (`App._run_lab`).
 - **`OPENHANDS_DEFAULT_MODEL` is required in practice.** Verified live: a bare
   sandbox fails with `LLMAuthenticationError` (`classification.kind=auth`,
   retryable=false); with `openhands/deepseek-v4.1-flash` the same task finishes.
 - **`render.yaml` and `docker-compose.yml` now define the worker service**, so a
   deployed autonomous run is not left queued (this closes the earlier open item).
+  The web service advances runs as well, by default; on the live service it is
+  the only one that does (`nexus_lab_workers` was empty on 2026-11-12).
 - New endpoints: `GET/POST /api/openhands/diagnostics` (`live` opt-in),
   `GET/POST /api/openhands/pool`, and per-account `enable`/`priority`/`remove`.
   CLI: `nexus openhands accounts|pool|diagnostics [--live]`.
@@ -1004,3 +1024,186 @@ failure, and prove the integration with one command. The invariants to keep:
   BLOCKED. No second OpenHands key is available, so a *two-live-account*
   failover is BLOCKED; the failover logic is proven end to end against real
   PostgreSQL with honest transport fakes.
+
+## Task texts of any size (PR #27, 2026-11-11)
+
+An autonomous run used to be refused above 20 000 characters
+(`text exceeds 20000 characters`: the limit of `nexus_goals.text`). The text of
+a task is now a **specification**, stored apart from the goal.
+
+- **Storage** (`migrations/0021_nexus_specs.sql`, `orchestration/nexus_specs.py`):
+  `nexus_specs` holds the text verbatim with its SHA-256 (the database checks
+  the pair), `nexus_spec_sections` / `nexus_spec_requirements` the index
+  (sections `S-NNN`, addressable pieces `R-NNNN`, every non-empty line in
+  exactly one piece), `nexus_spec_links` the cross-references,
+  `nexus_spec_stages` the parts it is planned in. `nexus_goals.spec_id` points
+  at it; the goal keeps a label. `nexus_run_tasks.spec_ref` says which lines,
+  bytes and pieces a task was planned from. 0021 is applied in production:
+  schema changes go into a new migration.
+- **Planning** (`orchestration/nexus_spec_planner.py`): one part is planned
+  inside the request; several are planned in the background (`App._run_planning`),
+  each a row with a 90-second lease, so the state survives a restart. A
+  transient provider failure is retried; "too large" or too many tasks splits
+  the part; a permanent failure stops with the reason in the chat. What is
+  covered is decided by the application, not the model: a piece that reads like
+  an obligation and that the model left out gets a `verify` task.
+- **Hand-over** (`orchestration/nexus_spec_delivery.py`): a task is not started
+  without the original. Up to `NEXUS_SPEC_INLINE_CHARS` it is in the first
+  message between `<<<NEXUS-TASK-TEXT <sha12>` and `NEXUS-TASK-TEXT <sha12>>>>`;
+  longer, it is a file in the sandbox (`spec-<sha12>.md` + index), read back and
+  compared before the conversation is created. A transport that cannot place a
+  file is covered in the next section.
+- **HTTP**: text routes take up to `NEXUS_SPEC_MAX_CHARS`; a body over the
+  route's cap is 413 (answered first, then drained - `Handler._linger`).
+  `POST .../goals/<id>/run`: 201 started, 202 planning in the background, 409
+  already running (with `run_id`), 422 no plan can be made, 503 no provider
+  gave a usable plan. `GET .../specs/<id>` and `/content`, `/sections`,
+  `/requirements`, `/stages`. `ask` / `plan` / `code` take 200 000 characters
+  per message and say which mode takes more.
+- **Settings**: `NEXUS_SPEC_MAX_CHARS` (1 000 000), `NEXUS_SPEC_INLINE_CHARS`
+  (20 000), `NEXUS_SPEC_MESSAGE_CHARS` (60 000), `NEXUS_SPEC_STAGE_TOKENS`
+  (24 000), `NEXUS_SPEC_SANDBOX_DIR`, `<PROVIDER>_CONTEXT_TOKENS`.
+- **Tests**: `tests/test_long_task.py` (eight sizes up to 1 000 000 characters,
+  compared byte for byte at the agent), `tests/test_long_task_cases.py` (what can
+  go wrong), `tests/long_task_kit.py` (a planning model that answers from the
+  prompt it is actually sent).
+
+## Autonomous runs on the deployed service (2026-11-12)
+
+On the live service every run was planned and none ever started a task: eight
+runs, 64 tasks, all `pending`, attempt 0. Then the loop was switched on there
+(`NEXUS_LAB_INLINE=1`, on the code of PR #27), and its first half hour is the
+evidence for several items below: of six runs one completed and one went on
+verifying task after task, two stopped on a task that "did not verify" (items 6
+and 12), two on the thirty-minute limit (item 11). What was found:
+
+1. **Nobody advanced runs.** `render.yaml` is one web process. The lab loop
+   ran only as `python -m orchestration.lab_worker` or with
+   `NEXUS_LAB_INLINE=1`, and neither was set. **The server now advances runs
+   unless `NEXUS_LAB_INLINE` says no** (`web_server.lab_inline_default`). Tests
+   keep it off for the session (`tests/conftest.py`) and turn it on where the
+   loop is the subject.
+2. **The live service is on the `app` transport** - by the evidence in its
+   database (two-phase starts on 2026-11-09, almost no `conversation_routes`
+   rows); the dashboard was not seen, and the code default is `direct`. That
+   transport cannot place a file, so a long text could not be handed over and
+   the task was refused. Now
+   (`nexus_spec_delivery.prepare(..., files=False)`): up to
+   `NEXUS_SPEC_MESSAGE_CHARS` the text is in the message whole; longer, each
+   task's message carries the part it was planned from between
+   `NEXUS-TASK-PART <sha12 of the part>` lines, with the outline of the whole,
+   and says that the rest is not in the conversation (`delivery.mode = part`).
+   Between them the tasks are given every byte; no single agent is. The
+   `direct` transport remains the one that gives every agent the whole text.
+3. **A run planned before specifications** has tasks with no `spec_ref`. Its
+   agent is now given the request its goal holds (`prepare_request`,
+   `delivery.source = goal`). This never refuses a start.
+4. **The agent's answer was read from messages only.** An agent also ends by
+   calling the `finish` tool, and then its report is the tool's `message`. On
+   the live service four of thirteen finished attempts were recorded as
+   "finished with no final response"; this is the likely cause (those
+   conversations were not inspected). `CloudClient.final_response`
+   now applies the SDK's own rule (`get_agent_final_response`) and reads the
+   events newest first (`recent_events`, `sort_order=TIMESTAMP_DESC`, with a
+   fallback for a server that ignores or refuses the parameter), so the end of
+   a conversation longer than a thousand events is reached.
+5. **A 429 cost a task its attempts.** The account has a daily conversation
+   limit (20 when it was last seen). Three refused starts within seconds made
+   the task `failed`, the run `blocked`, and "resume" answered "every task has
+   used all its attempts". `CloudRateLimited` (a `CloudUnavailable`) is now
+   handled by `LabStore.postpone_task`: the attempt and the iteration are given
+   back and the task waits (`refused_start_wait`: `Retry-After`, 15 minutes for
+   a daily limit, else a minute). The wait is a live lease on a `pending` task;
+   `has_claimable` ignores the lease, so a wait is not taken for a deadlock.
+6. **The agent was told "if configured to push".** `GitVerifier` accepts a task
+   only when the head of its branch on GitHub is a commit the report names. On
+   the live service one agent merged and committed and reported "complete
+   locally" (`reported commit is not the branch head`), another changed nothing
+   and named no commit (`no verifiable commit reported by the agent`); both
+   runs stopped. Rule 6 of `OpenHandsExecutor.instructions` now says what
+   counts: push to the task's branch, never force-push, unpushed work does not
+   count, and if nothing had to change, name the current head.
+7. **A start is waited for five minutes**, not eighty seconds
+   (`start_poll_attempts`). A start took 33 and 49 seconds when measured;
+   giving up early leaves a conversation nobody follows and starts another.
+8. **`direct` transport: a recorded sandbox was reused for ever.**
+   `cloud_sandboxes` said RUNNING for a sandbox three weeks old.
+   `CloudDirectClient._still_running` asks the Cloud before reuse.
+9. **Two tasks could work on one branch at once** - two runs, or two
+   independent tasks of one run. The verifier compares the branch head with
+   the commit the report names, so each moved the head under the other and the
+   one read second was "not the branch head". `LabStore.claim_task` now takes a
+   task only when nothing else is at work on its repository and branch
+   (`_BRANCH_FREE`, with an advisory lock on the branch against two workers
+   deciding at the same moment). Two live runs were waiting on one branch.
+10. **A conversation with no `execution_status`** (the service cannot ask the
+    sandbox at that moment) was settled as "did not finish" and the task
+    blocked. It is now asked again on the next pass, as the workflow dispatcher
+    always did; the task's time limit bounds the wait.
+11. **A task had thirty minutes.** `timeout_seconds` defaulted to 1800 and
+    nothing set another value. Two first tasks were still at work after that,
+    were recorded as `failed` ("timed out after 1800 s; the conversation was
+    left running"), and their runs stopped while the agents went on. The
+    default is two hours (`DEFAULT_TASK_TIMEOUT_SECONDS`,
+    `NEXUS_TASK_TIMEOUT_SECONDS`); migration 0025 changes the column default
+    and gives every task that may still run and carries the old default the
+    new one, without touching `updated_at` (the limit is counted from it).
+12. **A stopped run said "a dependency is not verified" and nothing else.**
+    `LabScheduler._why` now adds the first task that stopped it and the
+    verifier's reason (`LabStore.first_unverified`); the studio shows a task's
+    reason on its own line.
+13. **The account pool and these rules.** `main` gained the account pool
+    (previous section) while this was being written; three things did not hold
+    together when the two were merged, each shown by a test first
+    (`tests/test_openhands_failover.py`, `tests/test_lab_inline.py`):
+    - The server's own loop never registered in `nexus_lab_workers`, so the
+      diagnostics said "active run(s) exist but no worker heartbeat is fresh"
+      on the very deployment where that loop is the only thing advancing runs.
+      It registers as kind `inline` and marks itself stopped on the way out.
+    - A refused start (429) from a pool account took the failure path: an
+      attempt spent, the account marked `unavailable`, and with one account the
+      run blocked on "no usable OpenHands account". `DispatchError.refused`
+      now carries the 429 and `LabScheduler._start_refused` handles it with or
+      without a pool: nothing is spent and the account becomes `degraded`
+      (still selectable). If another account can take the task it does, at
+      once (`postpone_task(failed_account_id=)`); if none can, the task waits
+      and is then offered to the whole pool again (`forget_tried`).
+    - The account a task had run on was excluded from its next attempt, so
+      with one account in the pool "resume" after a result that did not verify
+      blocked the run. `AccountRouter.select_for_task` excludes only
+      `tried_accounts`, and the first message is a hand-off only when the
+      account really changes (`nexus_lab._last_account`). The hand-off message
+      now ends with rule 6 (where the work has to be pushed).
+
+    True of the pool as merged, and not changed here: `build_account_router`
+    asks for the accounts of `machine:default`, while an account added in the
+    studio belongs to `user:<login>`, so on a deployment with a login the pool
+    is never switched on (and the live service has no stored account). Nothing
+    in the loop calls `AccountPool.record_success`, so an account marked
+    `unavailable` by a failed start stays that way. The router is built once,
+    when the loop starts.
+
+Still true, and worth knowing before changing this:
+
+- **Render's free plan stops the process after about 15 minutes without a
+  request**, and the loop with it. Conversations already started go on in the
+  Cloud and are collected when the service wakes; nothing new starts until
+  then. The studio keeps the service awake only while it is open in a visible
+  tab on a working run (`scheduleWorkPoll`). A run that has to work unattended
+  needs a paid instance or an outside request to `/healthz` every few minutes.
+- Cancelling a run, its deadline, or a task's time limit does not stop a
+  conversation that is already running. "Resume" after a time-out starts a
+  second conversation; the first may still push.
+- A run on the branch a service deploys from redeploys that service on every
+  push. A run was started on `main` of this repository.
+- Nothing limits how many runs work at once on different branches. On one
+  branch tasks take turns, but the order between runs is whoever asks first,
+  and anything else that pushes to the branch (a person, a bot) still moves
+  the head under a task.
+- Not established on the live service: what `execution_status` a conversation
+  reports after its sandbox has been paused. If it is empty, a task whose
+  result was not read in time waits out its time limit and is started again.
+- On the `direct` transport a conversation's id is derived from its title and
+  first message; a second attempt of the same task has the same id.
+- `delivery.mode = part` is weaker than a file: an agent cannot read what a
+  cross-reference points at outside its part.

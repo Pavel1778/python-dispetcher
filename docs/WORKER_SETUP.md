@@ -1,9 +1,15 @@
 # Worker setup
 
-The autonomous lab advances runs in a **separate process**, `lab_worker`. The
-web server only *starts* runs; the worker claims tasks, dispatches them, polls,
-verifies and decides. A browser request never drives a run, and closing the
-browser never stops one.
+The autonomous lab advances runs in a loop of its own: it claims tasks,
+dispatches them, polls, verifies and decides. A browser request never drives a
+run, and closing the browser never stops one. The loop runs in two places:
+
+- **inside the web server**, on a thread, by default - so a deployment that is
+  one web process still runs what it accepts;
+- **as a separate process**, `lab_worker`, for a deployment that can run one.
+
+Both may run at once: every claim is a lease in PostgreSQL. `NEXUS_LAB_INLINE=0`
+on the web server leaves the work to the separate process alone.
 
 ## Run the worker
 
@@ -68,13 +74,14 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-## Inline mode (development only)
+## The web server's own loop
 
-`NEXUS_LAB_INLINE=1` runs the same loop on a thread inside the web server. It is
-allowed for development and diagnosis, but it must not **mask** the absence of a
-separate worker: an inline tick still registers a heartbeat (as kind `inline`),
-so the diagnostics can see it. Use it only when a second process is genuinely not
-possible.
+Unless `NEXUS_LAB_INLINE` is `0` (or `false` / `no` / `off`), the web server
+runs the same loop on a thread. It registers a heartbeat as kind `inline`, so
+the diagnostics see which kind of loop is alive, and `GET /api/studio` reports
+it as `lab.inline`. It lives and dies with the web process: on a host that
+stops an idle process it stops too, and a separate worker is what keeps runs
+moving then.
 
 ## Recovery
 

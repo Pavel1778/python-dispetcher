@@ -67,15 +67,19 @@ class AccountRouter:
         return row["principal"] if row else self.principal
 
     def select_for_task(self, task: dict) -> dict:
-        """The account to run *task*, never one it has already tried.
+        """The account to run *task*, never one that has failed it.
 
         Raises :class:`NoUsableAccount` when the pool has nothing left for this
         task, so the caller can dead-letter it with a clear reason instead of
         looping.
+
+        Only ``tried_accounts`` is excluded - the accounts a start failed on or
+        a conversation vanished from. The account the task last *ran* on is not:
+        a result that did not verify is tried again, and with one account in
+        the pool there is nowhere else to try it. (Excluding it blocked every
+        second attempt with "no usable OpenHands account".)
         """
-        exclude = set(task.get("tried_accounts") or [])
-        if task.get("openhands_account_id"):
-            exclude.add(str(task["openhands_account_id"]))
+        exclude = {str(x) for x in (task.get("tried_accounts") or [])}
         project_id = str(task.get("project_id") or "") or None
         principal = self._principal_for_project(project_id)
         try:

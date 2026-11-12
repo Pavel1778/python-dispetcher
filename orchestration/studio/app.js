@@ -981,7 +981,10 @@
 
   function runCard(entry, detail) {
     var run = detail.run, tasks = detail.tasks || [];
-    var waiting = tasks.length && tasks.every(function (task) { return task.state === 'pending'; }) && run.state === 'running';
+    // "Will be taken in a few seconds" is said only of a run nothing has happened to
+    // yet. A task that waits out a refused start says why on its own line.
+    var waiting = tasks.length && run.state === 'running' &&
+      tasks.every(function (task) { return task.state === 'pending' && !task.last_error; });
     var inline = !!(S.status && S.status.lab && S.status.lab.inline);
     var live = { running: 1, paused: 1, blocked: 1, waiting_for_approval: 1 }[run.state];
     var budget = 'запусков ' + esc(run.iteration) + ' из ' + esc(run.max_iterations) +
@@ -990,9 +993,13 @@
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
       if (verdict) sub.push('проверка: ' + verdict);
+      // Why it did not verify - without it "не подтверждено" sends a person to the database.
+      var reason = task.verification && task.verification.reason;
+      var settled = { completed_unverified: 1, partial: 1, failed: 1, blocked: 1 }[task.state];
       return '<li class="step-row"><span class="dot is-' + stateTone(task.state) + '" title="' + esc(stateLabel(task.state)) + '"></span>' +
         '<div><div class="step-title">' + esc(clip(task.title || task.task_key, 260)) + '</div>' +
         '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' +
+        (settled && reason ? '<div class="step-sub">' + esc(clip(reason, 320)) + '</div>' : '') +
         (task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div><span></span></li>';
     }).join('') + '</ul>' : '<p class="step-sub">В плане нет задач.</p>';
     var actions = '';
@@ -1005,8 +1012,8 @@
       (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') +
       '<div class="work-section"><p class="work-section-title">План · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач') + '</p>' + steps +
       (waiting ? '<p class="step-sub">' + (inline
-        ? 'Сервер возьмёт первую задачу в течение нескольких секунд.'
-        : 'Задачи ждут исполнителя. Сервер сам прогоны не ведёт: нужен NEXUS_LAB_INLINE=1 в его настройках или отдельный процесс python -m orchestration.lab_worker.') + '</p>' : '') + '</div>' +
+        ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
+        : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
   }
 
@@ -1534,7 +1541,7 @@
       '<dt>Шифрование</dt>' + line(crypto.encryption_key, crypto.encryption_key
         ? 'включено' : 'NEXUS_SECRET_KEY не задан — аккаунты не сохранятся') +
       '<dt>Автономные прогоны</dt>' + line(lab.inline, lab.inline
-        ? 'ведёт сам сервер' : 'сервер не ведёт — нужен NEXUS_LAB_INLINE=1 или процесс lab_worker') +
+        ? 'ведёт сам сервер' : 'выключено (NEXUS_LAB_INLINE=0) — нужен процесс lab_worker') +
       '<dt>Версия</dt><dd>' + esc(status.version || '—') + '</dd></dl></div>';
   }
 

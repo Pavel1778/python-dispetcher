@@ -21,6 +21,7 @@ _PART = re.compile(r"<<<PART\n(.*)\nPART>>>", re.S)
 _PIECE = re.compile(r"\[(R-\d+)\] ")
 _EARLIER = re.compile(r"^  (p\d{3}-\S+)  ", re.M)
 _AT_MOST = re.compile(r"Return at most (\d+) tasks\.")
+_WHICH = re.compile(r"This is part (\d+) of (\d+): lines (\d+)-(\d+)\.")
 
 
 def sha256(text: str) -> str:
@@ -102,6 +103,12 @@ class PlannerModel:
     ``faults`` are answers to give instead, one per request, first in first
     out: ``(status, payload)``. ``forget`` are piece ids the model leaves out
     of every answer; ``context`` are ids it declares to ask for nothing.
+    ``too_large_over`` makes it a model with a small window: a request whose
+    part of the text is more characters than that is refused with 413, the way
+    a provider refuses a request it cannot read.
+
+    Every task title carries the number of the request that produced it
+    (``#7``), so a test can tell which answer a stored plan came from.
     """
 
     def __init__(self, *, pieces_per_task: int = 30):
@@ -111,29 +118,52 @@ class PlannerModel:
         self.faults: list[tuple[int, object]] = []
         self.forget: set[str] = set()
         self.context: set[str] = set()
-        #: Called with the prompt before answering; a test blocks here to hold
-        #: a request open.
+        self.too_large_over: int | None = None
+        #: Called with ``(request number, prompt)`` before answering; a test
+        #: blocks here to hold a request open.
         self.before = None
         self.prompts: list[str] = []
         self.systems: list[str] = []
         self.answers: list[dict] = []
+        #: ``(first line, last line)`` of the part each request was about, and
+        #: the same for the requests that were answered with a plan. ``(0, 0)``
+        #: stands for "the whole text".
+        self.asked: list[tuple[int, int]] = []
+        self.planned: list[tuple[int, int]] = []
+        self.refused = 0
         self._lock = threading.Lock()
 
     def __call__(self, body: dict) -> tuple[int, object]:
         messages = body.get("messages") or []
         prompt = messages[-1]["content"] if messages else ""
+        which = self.lines_of(prompt)
         with self._lock:
             self.prompts.append(prompt)
+            number = len(self.prompts)
             self.systems.append(messages[0]["content"] if len(messages) > 1 else "")
+            self.asked.append(which)
             fault = self.faults.pop(0) if self.faults else None
         if self.before is not None:
-            self.before(prompt)
+            self.before(number, prompt)
         if fault is not None:
             return fault
-        answer = self.plan(prompt)
+        if (self.too_large_over is not None
+                and len(self.part_of(prompt)) > self.too_large_over):
+            with self._lock:
+                self.refused += 1
+            return 413, {"error": {"message": "Request too large for model",
+                                   "code": "request_too_large"}}
+        answer = self.plan(prompt, number)
         with self._lock:
             self.answers.append(answer)
+            self.planned.append(which)
         return 200, completion(answer)
+
+    @staticmethod
+    def lines_of(prompt: str) -> tuple[int, int]:
+        """Which lines of the specification a planning prompt is about."""
+        match = _WHICH.search(prompt.split("<<<PART")[0])
+        return (int(match.group(3)), int(match.group(4))) if match else (0, 0)
 
     @staticmethod
     def part_of(prompt: str) -> str:
@@ -141,7 +171,7 @@ class PlannerModel:
         match = _PART.search(prompt)
         return match.group(1) if match else ""
 
-    def plan(self, prompt: str) -> dict:
+    def plan(self, prompt: str, number: int = 0) -> dict:
         ids = [key for key in _PIECE.findall(self.part_of(prompt))]
         wanted = [key for key in ids if key not in self.forget and key not in self.context]
         earlier = _EARLIER.findall(prompt.split("<<<PART")[0])
@@ -154,7 +184,7 @@ class PlannerModel:
             group = wanted[i:i + per_task]
             name = f"t{len(tasks) + 1}"
             tasks.append({
-                "id": name, "title": f"Выполнить пункты {group[0]}–{group[-1]}",
+                "id": name, "title": f"Выполнить пункты {group[0]}–{group[-1]} #{number}",
                 "description": f"Сделать то, что требуют пункты с {group[0]} по {group[-1]}.",
                 "acceptance": ["пункты выполнены", "тесты проходят"],
                 "dependencies": ([f"t{len(tasks)}"] if tasks else earlier[-1:]),
@@ -200,6 +230,94 @@ def until(read, *, timeout: float = 30.0, what: str = "the condition"):
             return value
         time.sleep(0.05)
     raise AssertionError(f"timed out waiting for {what}")
+
+
+# ------------------------------------------------------------------- a project
+class Lab:
+    """One project wired for autonomous runs, and the questions tests ask of it.
+
+    Everything goes over HTTP, through whichever server the stack is running
+    at the moment (a test may restart it).
+    """
+
+    def __init__(self, studio, model: PlannerModel | None = None, *, repo: str,
+                 mode: str = "autonomous"):
+        self.studio, self.model = studio, model or PlannerModel()
+        studio.llm.respond = self.model
+        self.project = studio.project()
+        status, body = studio.api.post(f"/api/v1/projects/{self.project}/repository",
+                                       {"full_name": repo})
+        assert status == 200, body
+        studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+        self.conversation = studio.conversation(self.project, mode=mode)
+
+    # ------------------------------------------------------------- sending
+    def send(self, text: str, *, mode: str = "autonomous", conversation: str | None = None,
+             **options):
+        """One chat turn. Returns ``(status, body)``."""
+        return post_json(
+            self.studio,
+            f"/api/v1/projects/{self.project}/conversations/"
+            f"{conversation or self.conversation}/messages",
+            {"text": text, "mode": mode}, **options)
+
+    def post(self, path: str, body: dict | None = None, **options):
+        return post_json(self.studio, f"/api/v1/projects/{self.project}{path}",
+                         body or {}, **options)
+
+    # ------------------------------------------------------------- reading
+    def get(self, path: str):
+        status, body = self.studio.api.get(f"/api/v1/projects/{self.project}{path}")
+        assert status == 200, (path, status, body)
+        return body
+
+    def messages(self, conversation: str | None = None) -> list[dict]:
+        return self.get(f"/conversations/{conversation or self.conversation}/messages")[
+            "messages"]
+
+    def goals(self) -> list[dict]:
+        return self.get("/goals")["goals"]
+
+    def runs(self) -> list[dict]:
+        return self.get("/runs")["runs"]
+
+    def run(self, run_id: str) -> dict:
+        return self.get(f"/runs/{run_id}")
+
+    def spec(self, spec_id: str) -> dict:
+        return self.get(f"/specs/{spec_id}")["spec"]
+
+    def stages(self, spec_id: str) -> list[dict]:
+        return self.get(f"/specs/{spec_id}/stages")["stages"]
+
+    def stored(self, spec_id: str) -> bytes:
+        """The text as the server kept it, over the route a person downloads it by."""
+        status, data = get_bytes(
+            self.studio, f"/api/v1/projects/{self.project}/specs/{spec_id}/content")
+        assert status == 200, status
+        return data
+
+    def announcements(self) -> list[dict]:
+        """The ``start_run`` tool messages of the conversation: one per run started."""
+        return [m for m in self.messages()
+                if m["role"] == "tool" and (m.get("meta") or {}).get("tool") == "start_run"]
+
+    def announced_run(self) -> str | None:
+        """The run the conversation was told about, once it has been."""
+        told = self.announcements()
+        return told[0]["meta"]["run_id"] if told else None
+
+    def wait_run(self, timeout: float = 90.0) -> str:
+        return until(self.announced_run, timeout=timeout, what="the run to be announced")
+
+    def wait_spec(self, spec_id: str, state: str, timeout: float = 60.0) -> dict:
+        return until(lambda: (lambda s: s if s["state"] == state else None)(self.spec(spec_id)),
+                     timeout=timeout, what=f"the specification to be {state}")
+
+    def agent(self, task_key: str, run_id: str, timeout: float = 60.0):
+        """The conversation the lab created for a task, once it exists."""
+        return until(lambda: conversation_of(self.studio, task_key, run_id),
+                     timeout=timeout, what=f"task {task_key} to be started")
 
 
 # -------------------------------------------------------- what the agent got

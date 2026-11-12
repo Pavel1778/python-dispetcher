@@ -68,11 +68,35 @@ them behind a pooler. Reproduce only on a warm schema (a fresh schema hides it).
 
 ### An autonomous run stays `queued` and never advances
 
-Cause: no worker is running (and `NEXUS_LAB_INLINE` is off).
+Cause: nothing advances runs. The web server does it itself unless
+`NEXUS_LAB_INLINE` is `0`; with that set, a separate worker has to be running.
+On a host that stops an idle process (Render's free plan, after about 15
+minutes without a request) the loop stops with it until the next request.
 
-Fix: start `python -m orchestration.lab_worker`. Check
-`GET /api/openhands/diagnostics`: `lab_worker` reports FAILED when active runs
-exist but no worker heartbeat is fresh.
+Fix: remove `NEXUS_LAB_INLINE=0`, or start `python -m orchestration.lab_worker`.
+Check `GET /api/openhands/diagnostics`: `lab_worker` reports FAILED when active
+runs exist but no heartbeat is fresh, and `GET /api/studio` says whether the
+server advances runs (`lab.inline`).
+
+### A task of a run waits and says "OpenHands did not take the start"
+
+Cause: OpenHands answered 429 - a rate limit or the account's daily
+conversation limit. Nothing was started and the attempt is not counted; the
+task is tried again by itself (every 15 minutes for a daily limit).
+
+### A task ended `completed_unverified`
+
+Cause: the head of the task's branch on GitHub is not a commit the agent's
+report names - the agent did not push, named no commit, or something else
+pushed to the branch meanwhile. The reason is on the task's line in the
+«Агент» tab and in the run's error. «Продолжить» starts the task again.
+
+### A task ended `failed`: "timed out after N s; the conversation was left running"
+
+Cause: the conversation ran longer than the task's time limit
+(`NEXUS_TASK_TIMEOUT_SECONDS`, two hours by default). The agent is still
+working in OpenHands and may still push. «Продолжить» starts a second
+conversation beside it: wait for the first to end, or cancel it in OpenHands.
 
 ### A run is `blocked`
 

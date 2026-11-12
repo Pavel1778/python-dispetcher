@@ -186,9 +186,67 @@ def test_cancelling_from_the_studio_stops_the_server_starting_more(monkeypatch):
         assert len(_starts(studio)) == 1
 
 
-def test_without_the_switch_the_server_starts_a_run_and_does_not_advance_it(monkeypatch):
-    """The default. A run then waits for ``python -m orchestration.lab_worker``."""
+def test_left_alone_the_server_advances_runs_itself(monkeypatch):
+    """The default. A deployment that is one web process and sets nothing - the
+    Render blueprint - used to accept a run, plan it and never start a task."""
     monkeypatch.delenv("NEXUS_LAB_INLINE", raising=False)
+    with studio_stack(monkeypatch) as studio:
+        assert studio.app.lab_inline is True
+        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": True}
+        project, run = _start_run(studio)
+        first = _until(lambda: _task_conversation(studio, "audit"),
+                       what="the first task to start with nothing configured")
+        _finish(studio, first, f"Коммит {HEAD}")
+        second = _until(lambda: _task_conversation(studio, "change"),
+                        what="the second task to start")
+        _finish(studio, second, f"Коммит {HEAD}")
+        done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
+            _detail(studio, project, run)), what="the run to finish")
+        assert done["run"]["state"] == "completed"
+
+
+def _lab_worker_check(studio):
+    status, report = studio.api.get("/api/openhands/diagnostics")
+    assert status == 200, report
+    return next(c for c in report["checks"] if c["name"] == "lab_worker")
+
+
+def test_the_servers_own_loop_is_a_live_worker_to_the_diagnostics(monkeypatch):
+    """The diagnostics tell a live loop from a dead one by its heartbeat. The
+    server's own loop wrote none, so on the one-process deployment - where it
+    is the only thing advancing runs - the report read "active run(s) exist but
+    no worker heartbeat is fresh" while the runs were going."""
+    from orchestration.nexus_lab_store import LabStore
+
+    with studio_stack(monkeypatch, lab_inline=True) as studio:
+        lab = LabStore(studio.app.store)
+        live = _until(lambda: lab.live_workers(max_age_seconds=30),
+                      what="the server's loop to register")
+        assert [(w["kind"], w["state"]) for w in live] == [("inline", "running")]
+        assert live[0]["worker_id"] == studio.app._lab_worker_id
+
+        _start_run(studio)                                  # a run that needs someone
+        _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
+        check = _lab_worker_check(studio)
+        assert check["status"] == "VERIFIED", check
+        assert check["evidence"]["live_workers"] == [studio.app._lab_worker_id]
+        assert check["evidence"]["active_runs"] == 1
+
+        # The server goes away - its loop says so on the way out - and one that
+        # advances nothing comes up on the same database: the run now has
+        # nobody, and the report says exactly that.
+        studio.server.stop()
+        after = studio.boot(lab_inline=False)
+        assert LabStore(after.store).live_workers(max_age_seconds=30) == []
+        check = _lab_worker_check(studio)
+        assert check["status"] == "FAILED", check
+        assert check["evidence"]["active_runs"] == 1
+
+
+def test_switched_off_the_server_starts_a_run_and_does_not_advance_it(monkeypatch):
+    """``NEXUS_LAB_INLINE=0``: for a deployment where a separate
+    ``python -m orchestration.lab_worker`` does that work."""
+    monkeypatch.setenv("NEXUS_LAB_INLINE", "0")
     with studio_stack(monkeypatch) as studio:
         assert studio.app.lab_inline is False
         project, run = _start_run(studio)
@@ -200,11 +258,34 @@ def test_without_the_switch_the_server_starts_a_run_and_does_not_advance_it(monk
 
 
 @pytest.mark.parametrize("value, expected", [
+    ("0", False), ("false", False), ("No", False), (" OFF ", False),
     ("1", True), ("true", True), ("YES", True), (" on ", True),
-    ("0", False), ("", False), ("off", False), ("maybe", False),
+    # Not a clear "no": the loop stays on. A run that nobody advances is the
+    # worse of the two mistakes.
+    ("", True), ("maybe", True),
 ])
 def test_the_switch_is_read_from_the_environment(monkeypatch, value, expected):
     monkeypatch.setenv("NEXUS_LAB_INLINE", value)
     with studio_stack(monkeypatch) as studio:
         assert studio.app.lab_inline is expected
         assert studio.api.get("/api/studio")[1]["lab"] == {"inline": expected}
+
+
+def test_an_answer_given_through_the_finish_tool_is_the_report(monkeypatch):
+    """An agent may end by calling ``finish`` instead of writing a message. Its
+    report is then the tool's message, and the task verifies on it - it is not
+    "finished with no answer", started over from nothing."""
+    with studio_stack(monkeypatch, lab_inline=True) as studio:
+        project, run = _start_run(studio)
+        first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
+        cloud = studio.cloud.cloud
+        cloud.add_assistant_message(first, "Смотрю репозиторий.")     # earlier, not the report
+        cloud.add_finish(first, f"Готово. Коммит {HEAD}.")
+        cloud.conversations[first]["execution_status"] = "finished"
+        second = _until(lambda: _task_conversation(studio, "change"),
+                        what="the second task to start")
+        tasks = {t["task_key"]: t for t in _detail(studio, project, run)["tasks"]}
+        assert (tasks["audit"]["state"], tasks["audit"]["attempt"]) == ("completed_verified", 1)
+        assert tasks["audit"]["evidence"][-1]["final_text"] == f"Готово. Коммит {HEAD}."
+        assert len(_starts(studio)) == 2, "the first task was started again"
+        _finish(studio, second, f"Коммит {HEAD}")

@@ -26,6 +26,26 @@ old conversation said.
 The switch is recorded durably in `nexus_task_handoffs` (from account, to
 account, reason, context), so the history of an executor change is auditable.
 
+## A start the service refuses (429)
+
+A rate limit or a daily quota is not a failure of the account: it answered, and
+it will take work again. Nothing was started, so the task keeps its attempt and
+the run its iteration. The account is marked `degraded`, which leaves it
+selectable for other work, and then:
+
+- if another account can take the task, it does, at once, as a hand-off;
+- if none can, the task waits (`Retry-After` when the service sent one, 15
+  minutes for a daily limit, otherwise a minute) and is then offered to the
+  whole pool again. The run stays `running`; the task's line says what it is
+  waiting for.
+
+## Another attempt on the same account
+
+A task whose result did not verify, or that ran out of time, is started again
+when the run is resumed. The pool may choose the account it ran on - with one
+account there is no other - and that start is an ordinary one, not a hand-off:
+the agent gets the task's own instructions.
+
 ## What the hand-off context carries
 
 Built by `AccountRouter.handoff_context` from the run's rows:
@@ -52,7 +72,8 @@ at the named branch first.
 - **Completed work is not repeated.** The hand-off names the verified tasks.
 - **No infinite loop.** When the pool has nothing left for a task (every account
   tried or unusable), the run is **blocked** with the reason as evidence — never
-  spun.
+  spun. A refused start (above) is not that case: it waits, at the pace the
+  service asked for, until the run's deadline.
 - **A failed start does not increment `attempt` against the pool.** It is a
   transport problem, so the task is requeued for another account; the attempt
   budget still bounds the total.

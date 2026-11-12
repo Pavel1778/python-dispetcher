@@ -60,9 +60,10 @@ are manual and need a live LLM):
   plans (validated, owner-approved), and bounded project file uploads with a
   file laboratory (workspaces, archive safety, voice notes).
 - The **Autonomous Lab**: enter a goal, analyze the repository, plan via the
-  provider cascade, and let a **separate durable worker** dispatch tasks to
-  OpenHands, verify the real Git result, record evidence and decide the next
-  step. A task is completed only when independently verified.
+  provider cascade, and let a **durable loop** - inside the server by default,
+  or a separate worker process - dispatch tasks to OpenHands, verify the real
+  Git result, record evidence and decide the next step. A task is completed
+  only when independently verified.
 - **GitHub multi-account**: several accounts with encrypted PATs and an explicit
   per-project binding.
 - **OpenHands multi-account and failover**: any number of accounts with encrypted
@@ -195,8 +196,9 @@ independently, and can route work across several accounts. Start here:
   the four selection modes, and the per-account controls.
 - [docs/FAILOVER.md](docs/FAILOVER.md) — what happens when an account fails and
   how the context is handed to the next one.
-- [docs/WORKER_SETUP.md](docs/WORKER_SETUP.md) — running the autonomous worker
-  as a separate process, and the heartbeat that proves it is alive.
+- [docs/WORKER_SETUP.md](docs/WORKER_SETUP.md) — who advances autonomous runs
+  (the server itself, or a separate worker process), and the heartbeat that
+  proves the loop is alive.
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first fixes.
 - [docs/TESTING.md](docs/TESTING.md) — what is real in each test layer.
 

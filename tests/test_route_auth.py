@@ -207,6 +207,40 @@ def test_wrong_bearer_is_refused(base):
     assert status == 401
 
 
+def test_the_bearer_is_the_whole_token_or_nothing(base):
+    """Compared whole, as bytes, in constant time: nearly right is wrong, and a
+    header that is not ASCII gets an answer, not an exception."""
+    import http.client
+    from urllib.parse import urlparse
+
+    where = urlparse(base)
+
+    def status_for(header: bytes) -> int:
+        conn = http.client.HTTPConnection(where.hostname, where.port, timeout=10)
+        try:
+            conn.putrequest("GET", "/api/system")
+            conn.putheader("Authorization", header)
+            conn.endheaders()
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    right = f"Bearer {TOKEN}".encode()
+    assert status_for(right) == 200
+    for wrong in (
+        right + b"x",                                  # the token and more
+        right[:-1],                                    # all of it but the last character
+        right[:-1] + b"X",                             # the same length, one character off
+        b"Bearer  " + TOKEN.encode(),
+        b"Basic " + TOKEN.encode(),
+        b"Bearer",
+        right[:-1] + b"\xe9",                          # not ASCII
+        right + b"\xc3\xa9",
+        b"Bearer \xff\xfe\xfd",
+    ):
+        assert status_for(wrong) == 401, wrong
+
+
 def test_session_cookie_without_csrf_cannot_write(base, app):
     # A write with a session cookie but no CSRF header is 401 (no session seen
     # without the cookie) — the point is it is never accepted.

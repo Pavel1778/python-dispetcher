@@ -53,6 +53,12 @@ class FakeCloud:
         #: When set, ``app-conversations/search`` fails with this status code.
         #: Lets a test drive the "orphan lookup is down" path.
         self.search_status = 0
+        #: What the events search does with ``sort_order``: "honoured" (the
+        #: live service), "ignored" (a server that does not know the parameter
+        #: answers oldest-first all the same) or "refused" (answers 500).
+        self.events_sort = "honoured"
+        #: Every events search as it was asked: (conversation, sort_order, page).
+        self.event_searches: list[tuple[str, str, str]] = []
         self.calls: list[tuple[str, str]] = []
         # Sandboxes (``/api/v1/sandboxes``), for the direct transport: a sandbox
         # is provisioned here and then spoken to at its own agent-server URL.
@@ -86,6 +92,17 @@ class FakeCloud:
              "llm_message": {"role": "assistant",
                              "content": [{"type": "text", "text": text}]}}
         )
+
+    def add_finish(self, cid: str, message: str) -> None:
+        """The agent ends by calling the ``finish`` tool: an ActionEvent whose
+        action carries the answer. No message follows it."""
+        self.events[cid].append(
+            {"id": str(uuid.uuid4()), "kind": "ActionEvent", "source": "agent",
+             "tool_name": "finish",
+             "action": {"kind": "FinishAction", "message": message}})
+        self.events[cid].append(
+            {"id": str(uuid.uuid4()), "kind": "ObservationEvent", "source": "environment",
+             "tool_name": "finish", "observation": {"kind": "FinishObservation"}})
 
     def add_client_tool_action(self, cid: str, name: str, args: dict,
                                event_id: str | None = None) -> str:
@@ -192,9 +209,19 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/v1/conversation/") and path.endswith("/events/search"):
             cid = path.split("/")[4]
-            events = self.cloud.events.get(cid, [])
+            order = self._query("sort_order")
+            self.cloud.event_searches.append((cid, order, self._query("page_id")))
+            if order and self.cloud.events_sort == "refused":
+                return self._json(500, {"detail": "Internal Server Error"})
+            # Every event has a timestamp on the live service; here it is the
+            # event's place in the conversation.
+            events = [{**event, "timestamp": event.get("timestamp")
+                       or f"2026-01-01T00:00:00.{n:09d}"}
+                      for n, event in enumerate(self.cloud.events.get(cid, []))]
+            if order == "TIMESTAMP_DESC" and self.cloud.events_sort == "honoured":
+                events.reverse()
             page = int(self._query("page_id") or 0)
-            limit = int(self._query("limit") or 100)
+            limit = min(int(self._query("limit") or 100), 100)
             start = page * limit
             chunk = events[start:start + limit]
             nxt = str(page + 1) if start + limit < len(events) else None

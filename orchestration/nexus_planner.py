@@ -146,7 +146,7 @@ class Planner:
 
 def store_plan(lab_store: Any, principal: str, project_id: str, run_id: str, *,
                tasks: list[dict[str, Any]], repository: str = "", branch: str = "",
-               executor: str = "openhands", timeout_seconds: int = 1800,
+               executor: str = "openhands", timeout_seconds: int | None = None,
                max_attempts: int = 3) -> list[dict]:
     """Persist a validated plan as run tasks. Returns the stored rows."""
     stored = []

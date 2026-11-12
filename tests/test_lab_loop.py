@@ -621,3 +621,449 @@ def test_a_start_that_fails_after_a_cancel_does_not_requeue_the_task(env):
     back = env["lab"].release_task(claimed["id"], error="CloudError: 503", requeue=True)
     assert (back["state"], back["last_error"]) == ("pending", "CloudError: 503")
 
+
+
+# ------------------------------------------------- a start the service refused
+class RefusingExecutor(FakeExecutor):
+    """The service answers 429 until the test lets it through."""
+
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+        self.refusals = 0
+
+    def dispatch(self, task):
+        if self.error is not None:
+            self.refusals += 1
+            raise self.error
+        return super().dispatch(task)
+
+
+def _waits(env, run, key="a"):
+    """Seconds until *key* may be claimed again (negative once it may)."""
+    with env["store"]._tx() as cur:
+        cur.execute("SELECT EXTRACT(EPOCH FROM (lease_expires - now())) AS s "
+                    "FROM nexus_run_tasks WHERE run_id=%s AND task_key=%s", (run["id"], key))
+        return cur.fetchone()["s"]
+
+
+def test_a_start_the_service_refuses_is_not_an_attempt(env):
+    """A daily limit lasts for hours. It used to cost a task its three attempts
+    within seconds, and the run it stopped could not be resumed."""
+    from orchestration.cloud_client import CloudRateLimited
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A", "max_attempts": 3}])
+    limit = CloudRateLimited(
+        'POST /api/v1/app-conversations -> 429: {"detail": {"code": '
+        '"daily_conversation_limit_reached"}}', code="daily_conversation_limit_reached")
+    executor = RefusingExecutor(limit)
+    sched = LabScheduler(env["lab"], executor, FakeVerifier())
+
+    # Ten passes of the loop: one refusal, then the task waits.
+    for _ in range(10):
+        result = sched.tick(run["id"])
+        assert not result.finished
+    assert executor.refusals == 1
+    task = _tasks(env, run)["a"]
+    assert (task["state"], task["attempt"], task["conversation_id"]) == ("pending", 0, None)
+    assert "not counted as an attempt" in task["last_error"]
+    assert "trying again in 15 min" in task["last_error"]
+    assert "daily_conversation_limit_reached" in task["last_error"]
+    assert 890 < _waits(env, run) <= 900
+    waiting = _run(env, run)
+    # Still running, nothing spent: neither "blocked" nor out of iterations.
+    assert (waiting["state"], waiting["iteration"], waiting["last_error"]) == ("running", 0, None)
+
+    # The wait is over and the limit is still there: one more refusal, no more.
+    _sql(env, "UPDATE nexus_run_tasks SET lease_expires = now() - interval '1 second' "
+              "WHERE run_id=%s", run["id"])
+    for _ in range(5):
+        sched.tick(run["id"])
+    assert executor.refusals == 2 and _tasks(env, run)["a"]["attempt"] == 0
+
+    # The limit is lifted: the task starts, on its first attempt.
+    executor.error = None
+    _sql(env, "UPDATE nexus_run_tasks SET lease_expires = now() - interval '1 second' "
+              "WHERE run_id=%s", run["id"])
+    done = sched.run_until_done(run["id"])
+    assert done.finished and executor.dispatched == ["a"]
+    assert _tasks(env, run)["a"]["attempt"] == 1
+    finished = _run(env, run)
+    assert (finished["state"], finished["iteration"]) == ("completed", 1)
+
+
+def test_a_refused_start_does_not_bring_back_a_cancelled_task(env):
+    from orchestration.cloud_client import CloudRateLimited
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}])
+    task = env["lab"].claim_task(run["id"], "w1")
+    _set_run(env, run, "cancelled")
+    back = env["lab"].postpone_task(task["id"], error=str(CloudRateLimited("429")), seconds=60)
+    assert (back["state"], back["last_error"], back["attempt"]) == ("blocked", "run cancelled", 1)
+    assert _run(env, run)["iteration"] == 1          # nothing was given back either
+
+
+@pytest.mark.parametrize("retry_after, code, expected", [
+    (None, "daily_conversation_limit_reached", 900),   # nothing changes for hours
+    (None, None, 60),
+    (120.0, None, 120),                                # what the service asked for
+    (1.0, None, 30),                                   # ...but not every second
+    (86_400.0, "daily_conversation_limit_reached", 3600),   # ...and not once a day
+])
+def test_how_long_a_refused_start_waits(retry_after, code, expected):
+    from orchestration.cloud_client import CloudRateLimited
+    from orchestration.nexus_lab import refused_start_wait
+    error = CloudRateLimited("POST -> 429", code=code, retry_after=retry_after)
+    assert refused_start_wait(error) == expected
+
+
+def test_the_cloud_client_reports_a_429_as_a_refusal_with_its_reason(env):
+    from orchestration.cloud_client import CloudRateLimited, CloudUnavailable
+    with FakeCloudServer() as cloud:
+        cloud.cloud.start_status, cloud.cloud.start_status_times = 429, 1
+        client = CloudClient(cloud.base_url, api_key="k", timeout=10.0)
+        with pytest.raises(CloudRateLimited) as refused:
+            client.start_conversation(initial_message="hi")
+    # Still the transient kind the older callers handle.
+    assert isinstance(refused.value, CloudUnavailable)
+    assert "429" in str(refused.value) and "capacity full" in str(refused.value)
+
+
+# ------------------------------------------------------- what the agent is told
+def test_the_agent_is_told_where_the_work_has_to_end_up(env):
+    """The verifier accepts a task only when the head of its branch on GitHub
+    is a commit the report names. The agent has to be told that in so many
+    words: "if configured to push" left it free to commit and stop."""
+    told = OpenHandsExecutor.instructions(
+        {"task_key": "a", "title": "A", "repository": REPO, "branch": "release"})
+    assert f"push it to branch release of {REPO}" in told
+    assert "committed and not pushed does not count" in told
+    assert "never force-push" in told
+    assert "If configured to push" not in told
+    assert "push it to the default branch of" in OpenHandsExecutor.instructions(
+        {"task_key": "a", "title": "A", "repository": REPO, "branch": ""})
+    # No repository, nowhere to push.
+    bare = OpenHandsExecutor.instructions({"task_key": "a", "title": "A"})
+    assert "6. Commit your work.\n" in bare and "push it to" not in bare
+
+
+# ------------------------------------- a run planned before specifications were
+def test_a_task_with_no_specification_is_given_its_runs_request(env):
+    """Runs planned before specifications existed are still waiting on the
+    live service. Their tasks hold a title and a line of description; the
+    request itself is in the goal, and the agent is now given it whole."""
+    import hashlib
+
+    from orchestration.nexus_specs import SpecService
+    request = ("  MASTER TASK: собрать сервис.\r\n\r\n1. Система должна принимать заказ.\n"
+               "2. Проверь, что 👩🏽\u200d💻 и e\u0301 дошли как есть.\n")
+    goal = str(env["svc"].create_goal("user:alice", env["project"], request)[0]["id"])
+    stored = request.strip()                      # a goal of that time was stored trimmed
+    _allow(env)
+    run = env["lab"].start_run("user:alice", env["project"], goal)
+    env["lab"].add_task("user:alice", env["project"], run["id"], task_key="a",
+                        title="Принять заказ", description="Одна строка.",
+                        repository=REPO, branch="main")
+    assert _tasks(env, run)["a"]["spec_ref"] is None
+
+    with FakeCloudServer() as cloud:
+        client = CloudClient(cloud.base_url, api_key="k", timeout=10.0)
+        executor = OpenHandsExecutor(client, poll_interval=0.01, specs=SpecService(env["store"]))
+        LabScheduler(env["lab"], executor, FakeVerifier()).tick(run["id"])
+        (body,) = cloud.cloud.start_bodies.values()
+    message = body["initial_message"]["content"][0]["text"]
+    digest = hashlib.sha256(stored.encode("utf-8")).hexdigest()
+    opening, closing = f"<<<NEXUS-TASK-TEXT {digest[:12]}\n", f"\nNEXUS-TASK-TEXT {digest[:12]}>>>"
+    assert message.count(opening) == 1 and message.count(closing) == 1
+    assert message[message.index(opening) + len(opening):message.index(closing)] == stored
+    assert "Task: Принять заказ" in message and "do this step, not the whole request" in message
+    task = _tasks(env, run)["a"]
+    assert task["state"] == "running"
+    proof = task["spec_ref"]["delivery"]
+    assert {k: proof[k] for k in ("mode", "source", "sha256", "chars")} == {
+        "mode": "inline", "source": "goal", "sha256": digest, "chars": len(stored)}
+
+
+def test_a_task_with_no_specification_and_no_request_still_starts(env):
+    """Nothing to hand over is not a reason to refuse a start that was allowed
+    before: the executor has no access to specifications, or the goal is gone."""
+    _allow(env)
+    run = _run_with_tasks(env, REPO_TASKS)
+    with FakeCloudServer() as cloud:
+        client = CloudClient(cloud.base_url, api_key="k", timeout=10.0)
+        LabScheduler(env["lab"], OpenHandsExecutor(client, poll_interval=0.01),
+                     FakeVerifier()).tick(run["id"])
+        (body,) = cloud.cloud.start_bodies.values()
+    assert "NEXUS-TASK-TEXT" not in body["initial_message"]["content"][0]["text"]
+    assert _tasks(env, run)["a"]["state"] == "running"
+
+
+def test_a_conversation_with_no_status_yet_is_waited_for(env):
+    """The service leaves ``execution_status`` empty while it cannot ask the
+    sandbox. That is not "did not finish": the task is not settled on it."""
+    _allow(env)
+    run = _run_with_tasks(env, REPO_TASKS[:1])
+    with FakeCloudServer() as cloud:
+        client = CloudClient(cloud.base_url, api_key="k", timeout=10.0)
+        sched = LabScheduler(env["lab"], OpenHandsExecutor(client, poll_interval=0.01),
+                             FakeVerifier())
+        sched.tick(run["id"])
+        (cid,) = cloud.cloud.conversations
+        cloud.cloud.conversations[cid]["execution_status"] = None
+        for _ in range(3):
+            assert sched.tick(run["id"]).verified is None
+        assert _tasks(env, run)["a"]["state"] == "running"
+        assert _run(env, run)["state"] == "running"
+
+        cloud.cloud.add_assistant_message(cid, "done")
+        cloud.cloud.conversations[cid]["execution_status"] = "finished"
+        assert sched.tick(run["id"]).verdict == "completed_verified"
+    assert _run(env, run)["state"] == "completed"
+
+
+# --------------------------------------------------- the end of a conversation
+def _conversation(cloud, events):
+    cid = cloud.cloud.make_conversation(title="t")
+    cloud.cloud.events[cid] = list(events)
+    return cid
+
+
+def _says(role, text):
+    return {"kind": "MessageEvent", "source": "agent" if role == "assistant" else role,
+            "llm_message": {"role": role, "content": [{"type": "text", "text": text}]}}
+
+
+def _finish_tool(message):
+    return {"kind": "ActionEvent", "source": "agent", "tool_name": "finish",
+            "action": {"kind": "FinishAction", "message": message}}
+
+
+_NOISE = {"kind": "ObservationEvent", "source": "environment", "tool_name": "terminal"}
+
+
+@pytest.mark.parametrize("server", ["honoured", "ignored", "refused"])
+def test_the_final_answer_is_found_at_the_end_of_a_long_conversation(env, server):
+    """Read oldest-first and bounded, the end of a long conversation is the
+    part that was never reached: beyond a thousand events the report was lost
+    and the task recorded as finished with no answer. Whatever the server does
+    with the request for the newest page, the answer is the last one."""
+    with FakeCloudServer() as cloud:
+        cloud.cloud.events_sort = server
+        client = CloudClient(cloud.base_url, api_key="k", timeout=10.0)
+        events = [_says("user", "task"), _says("assistant", "an early remark")]
+        events += [_NOISE] * 1930 + [_says("assistant", "Готово. Коммит 0123abc.")] + [_NOISE] * 20
+        cid = _conversation(cloud, events)
+        assert client.final_response(cid) == "Готово. Коммит 0123abc."
+        asked = [(order, page) for c, order, page in cloud.cloud.event_searches if c == cid]
+    if server == "honoured":
+        assert asked == [("TIMESTAMP_DESC", "")], "one page from the end is enough"
+    else:
+        # Asked for the newest page, did not get it, read everything in order:
+        # 1 953 events are twenty pages.
+        assert asked[0] == ("TIMESTAMP_DESC", "") and len(asked) == 21
+        assert all(order == "" for order, _ in asked[1:])
+
+
+def test_what_counts_as_the_final_answer(env):
+    with FakeCloudServer() as cloud:
+        client = CloudClient(cloud.base_url, api_key="k", timeout=10.0)
+
+        def answer(*events):
+            return client.final_response(_conversation(cloud, events))
+
+        # The finish tool's message is the answer, not the remark before it.
+        assert answer(_says("user", "task"), _says("assistant", "Смотрю."),
+                      _finish_tool("Сделано: abc1234")) == "Сделано: abc1234"
+        # A message written after a finish (a later turn) is the later answer.
+        assert answer(_says("user", "task"), _finish_tool("Первый ответ"),
+                      _says("user", "ещё"), _says("assistant", "Второй ответ")) == "Второй ответ"
+        # An empty finish is answered by the text of the same turn...
+        assert answer(_says("user", "task"), _says("assistant", "Отчёт: def5678"),
+                      _finish_tool("")) == "Отчёт: def5678"
+        # ...and never by an earlier turn's.
+        assert answer(_says("user", "one"), _says("assistant", "Старый ответ"),
+                      _says("user", "two"), _finish_tool("  ")) is None
+        # Nothing said at all.
+        assert answer(_says("user", "task"), _NOISE) is None
+        assert answer() is None
+
+
+# ------------------------------------------------ one task at a time per branch
+def _second_run(env, tasks):
+    goal = str(env["svc"].create_goal("user:alice", env["project"], "Another goal")[0]["id"])
+    run = env["lab"].start_run("user:alice", env["project"], goal)
+    for t in tasks:
+        env["lab"].add_task("user:alice", env["project"], run["id"], **t)
+    return run
+
+
+def test_two_runs_take_turns_on_one_branch(env):
+    """A task is accepted when the head of its branch is the commit its agent
+    reports. Two agents pushing to one branch move the head under each other,
+    so only one task works on a branch at a time - across runs."""
+    _allow(env)
+    on_main = {"repository": REPO, "branch": "main"}
+    first = _run_with_tasks(env, [{"task_key": "a", "title": "A", **on_main},
+                                  {"task_key": "b", "title": "B", "dependencies": ["a"], **on_main}])
+    second = _second_run(env, [{"task_key": "x", "title": "X", **on_main}])
+    executor = HeldExecutor()
+    sched = LabScheduler(env["lab"], executor, FakeVerifier())
+
+    for _ in range(3):
+        sched.tick(first["id"])
+        waiting = sched.tick(second["id"])
+    assert executor.dispatched == ["a"]
+    # Waiting for its turn is not a deadlock: the second run is still running.
+    assert not waiting.finished and _run(env, second)["state"] == "running"
+    assert _states(env, second) == {"x": "pending"}
+
+    # A pass verifies what finished and then claims: the first run goes on to
+    # its next task in the same pass, and the second run goes on waiting.
+    executor.done.add("a")
+    sched.tick(first["id"])
+    assert _states(env, first) == {"a": "completed_verified", "b": "running"}
+    sched.tick(second["id"])
+    assert executor.dispatched == ["a", "b"] and _states(env, second) == {"x": "pending"}
+
+    # The first run is done with the branch: now the second takes it.
+    executor.done.add("b")
+    sched.tick(first["id"])
+    assert _run(env, first)["state"] == "completed"
+    sched.tick(second["id"])
+    assert executor.dispatched == ["a", "b", "x"]
+    executor.done.add("x")
+    sched.tick(second["id"])
+    assert _run(env, second)["state"] == "completed"
+
+
+def test_tasks_of_one_run_do_not_share_a_branch_either(env):
+    _allow(env, branches=("main", "next"))
+    run = _run_with_tasks(env, [
+        {"task_key": "a", "title": "A", "repository": REPO, "branch": "main"},
+        {"task_key": "b", "title": "B", "repository": REPO, "branch": "main"},
+        {"task_key": "c", "title": "C", "repository": REPO, "branch": "next"},
+        {"task_key": "d", "title": "D"}])                       # no repository at all
+    executor = HeldExecutor()
+    sched = LabScheduler(env["lab"], executor, FakeVerifier())
+    for _ in range(5):
+        sched.tick(run["id"])
+    # Another branch and "no repository" are not held back; the same branch is.
+    assert executor.dispatched == ["a", "c", "d"]
+    executor.done.add("a")
+    sched.tick(run["id"])
+    sched.tick(run["id"])
+    assert executor.dispatched == ["a", "c", "d", "b"]
+
+
+def test_two_workers_reaching_for_one_branch_at_once_get_one_task(env):
+    """Each worker's transaction sees the branch free. The lock on the branch
+    puts them in line, and the second looks again."""
+    import threading
+    _allow(env)
+    runs = [_run_with_tasks(env, [{"task_key": "a", "title": "A", "repository": REPO,
+                                   "branch": "main"}])]
+    runs += [_second_run(env, [{"task_key": f"x{n}", "title": "X", "repository": REPO,
+                                "branch": "main"}]) for n in range(5)]
+    stores = [PostgresStore(DSN) for _ in runs]
+    claimed: list[dict | None] = [None] * len(runs)
+    start = threading.Barrier(len(runs))
+
+    def claim(n):
+        start.wait()
+        claimed[n] = LabStore(stores[n]).claim_task(runs[n]["id"], f"w{n}")
+
+    threads = [threading.Thread(target=claim, args=(n,)) for n in range(len(runs))]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+    finally:
+        for store in stores:
+            store.close()
+    assert len([task for task in claimed if task is not None]) == 1
+
+
+# -------------------------------------------------------- a task's time limit
+def test_a_new_task_is_given_two_hours_not_thirty_minutes(env, monkeypatch):
+    """Thirty minutes was nobody's choice for any task, and not enough: on the
+    live service agents still at work were recorded as failed, and their runs
+    stopped."""
+    monkeypatch.delenv("NEXUS_TASK_TIMEOUT_SECONDS", raising=False)
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"}])
+    assert _tasks(env, run)["a"]["timeout_seconds"] == 7200
+    # A plan stored with its run gets the same.
+    planned = env["lab"].start_run(
+        "user:alice", env["project"],
+        str(env["svc"].create_goal("user:alice", env["project"], "Another")[0]["id"]),
+        plan=[{"id": "p", "title": "P", "acceptance": [], "dependencies": []}])
+    assert _tasks(env, planned)["p"]["timeout_seconds"] == 7200
+    # A row written by anything else gets it from the column.
+    _sql(env, "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title) "
+              "VALUES (%s, %s, 'raw', 'Raw')", run["id"], env["project"])
+    assert _tasks(env, run)["raw"]["timeout_seconds"] == 7200
+
+    monkeypatch.setenv("NEXUS_TASK_TIMEOUT_SECONDS", "600")
+    env["lab"].add_task("user:alice", env["project"], run["id"], task_key="b", title="B")
+    assert _tasks(env, run)["b"]["timeout_seconds"] == 600
+    for raw, expected in (("5", 60), ("999999", 86_400), ("soon", 7200)):
+        monkeypatch.setenv("NEXUS_TASK_TIMEOUT_SECONDS", raw)
+        from orchestration.nexus_lab_store import task_timeout_seconds
+        assert task_timeout_seconds() == expected
+
+
+def test_the_migration_lifts_the_limit_of_tasks_that_are_still_to_run(env):
+    """Runs were waiting, and at work, with the old thirty minutes when the
+    limit was raised. They are not cut short; what was verified stays as it
+    was, and a limit somebody chose is not touched."""
+    run = _run_with_tasks(env, [
+        {"task_key": "waiting", "title": "W"}, {"task_key": "working", "title": "R"},
+        {"task_key": "done", "title": "D"}, {"task_key": "chosen", "title": "C"},
+        {"task_key": "timed-out", "title": "T"}])
+    _sql(env, "UPDATE nexus_run_tasks SET timeout_seconds = 1800 WHERE run_id=%s", run["id"])
+    _sql(env, "UPDATE nexus_run_tasks SET timeout_seconds = 900 WHERE task_key='chosen'")
+    _sql(env, "UPDATE nexus_run_tasks SET state='completed_verified' WHERE task_key='done'")
+    _sql(env, "UPDATE nexus_run_tasks SET state='failed' WHERE task_key='timed-out'")
+    _sql(env, "UPDATE nexus_run_tasks SET state='running', conversation_id='c1', "
+              "updated_at = now() - interval '40 minutes' WHERE task_key='working'")
+    before = _tasks(env, run)["working"]["updated_at"]
+
+    _sql(env, open(os.path.join(_MIG, "0025_task_time_limit.sql")).read())
+
+    tasks = _tasks(env, run)
+    # "timed-out" already failed on the old limit; resumed, it gets the new one.
+    assert {key: task["timeout_seconds"] for key, task in tasks.items()} == {
+        "waiting": 7200, "working": 7200, "timed-out": 7200, "done": 1800, "chosen": 900}
+    # The limit is counted from the start of the conversation: that moment is kept.
+    assert tasks["working"]["updated_at"] == before
+    # Forty minutes in, the task that would have been given up goes on.
+    executor = HeldExecutor()
+    sched = LabScheduler(env["lab"], executor, FakeVerifier())
+    sched.tick(run["id"])
+    assert _tasks(env, run)["working"]["state"] == "running"
+
+
+# ------------------------------------------------- why a run stopped, in a line
+def test_a_stopped_run_says_which_task_stopped_it_and_why(env):
+    """"A dependency is not verified" was all a blocked run said. The task and
+    the verifier's reason are known, and are now part of the run's error."""
+    run = _run_with_tasks(env, [{"task_key": "a", "title": "A"},
+                                {"task_key": "b", "title": "B", "dependencies": ["a"]}])
+    sched = LabScheduler(env["lab"], FakeExecutor(),
+                         FakeVerifier({"a": "completed_unverified"}))
+    sched.run_until_done(run["id"])
+    stopped = _run(env, run)
+    assert stopped["state"] == "blocked"
+    assert stopped["last_error"] == (
+        "dependency graph deadlocked: a dependency is not verified. "
+        "Task a ended completed_unverified: fake verdict for a")
+
+    # A task that ran out of time is named the same way.
+    late = _second_run(env, [{"task_key": "x", "title": "X", "timeout_seconds": 60},
+                             {"task_key": "y", "title": "Y", "dependencies": ["x"]}])
+    held = LabScheduler(env["lab"], HeldExecutor(), FakeVerifier())
+    held.tick(late["id"])
+    _sql(env, "UPDATE nexus_run_tasks SET updated_at = now() - interval '2 minutes' "
+              "WHERE run_id=%s AND task_key='x'", late["id"])
+    held.tick(late["id"])
+    assert _run(env, late)["last_error"] == (
+        "dependency graph deadlocked: a dependency is not verified. Task x ended failed: "
+        "timed out after 60 s; the conversation was left running")
