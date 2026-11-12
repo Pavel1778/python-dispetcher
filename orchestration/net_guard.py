@@ -22,37 +22,38 @@ The rule, in one place:
   them already, so a public host cannot bounce a request inward either.
 
 A self-hosted OpenHands on a private network is a legitimate thing to connect.
-That is the operator's decision, not the caller's, and it is made in the
-server's environment:
+That is the operator's decision, not the caller's. It is made in the server's
+environment and read through :mod:`orchestration.nexus_policy`, which holds the
+policy for every outbound target - this module adds no switch of its own:
 
 * ``NEXUS_OPENHANDS_ALLOWED_HOSTS`` - a comma-separated list of ``host`` or
   ``host:port`` that may be private (``openhands.internal, 10.0.0.5:3000``);
-* ``NEXUS_OPENHANDS_ALLOW_PRIVATE=1`` - any private address may be used. For a
+* ``NEXUS_ALLOW_PRIVATE_TARGETS=1`` - any private address may be used. For a
   deployment that lives entirely on a trusted network, and for the tests,
   which talk to servers on 127.0.0.1.
 
-The server's own ``OPENHANDS_CLOUD_URL`` is not checked here: it comes from the
-same environment and is trusted for the same reason.
+A cloud metadata address is refused whatever was permitted.
+
+``nexus_policy.check_outbound_url`` looks at a URL as it is written, for every
+base URL the server is configured with. This module goes further for a URL a
+person supplied through the API: it looks the name up and checks the addresses,
+when the connection is saved and again when a socket is opened.
 """
 from __future__ import annotations
 
 import http.client
 import ipaddress
-import os
 import socket
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import nexus_policy
+
 
 class AddressRefused(ValueError):
     """A URL or an address this server will not connect to."""
-
-
-def _host_key(host: str, port: int | None) -> tuple[str, str]:
-    host = host.strip().strip("[]").lower().rstrip(".")
-    return host, f"{host}:{port}" if port else host
 
 
 @dataclass(frozen=True)
@@ -65,44 +66,58 @@ class AddressPolicy:
 
     @classmethod
     def from_env(cls) -> "AddressPolicy":
-        allow = os.environ.get("NEXUS_OPENHANDS_ALLOW_PRIVATE", "").strip().lower() in (
-            "1", "true", "yes", "on")
-        hosts = frozenset(
-            item.strip().strip("[]").lower().rstrip(".")
-            for item in os.environ.get("NEXUS_OPENHANDS_ALLOWED_HOSTS", "").split(",")
-            if item.strip())
-        return cls(allow_private=allow, allowed_hosts=hosts)
+        """The operator's decisions, read where the policy is kept
+        (``nexus_policy``): ``NEXUS_ALLOW_PRIVATE_TARGETS`` and
+        ``NEXUS_OPENHANDS_ALLOWED_HOSTS``."""
+        return cls(allow_private=nexus_policy.private_targets_allowed(),
+                   allowed_hosts=nexus_policy.allowed_private_hosts())
 
     def exempt(self, host: str, port: int | None) -> bool:
-        if self.allow_private:
-            return True
-        name, with_port = _host_key(host, port)
-        return name in self.allowed_hosts or with_port in self.allowed_hosts
+        return self.allow_private or nexus_policy.host_listed(self.allowed_hosts, host, port)
 
     def check_address(self, host: str, port: int | None, address: str) -> None:
         """Raise :class:`AddressRefused` unless *address* may be connected to
         on behalf of *host*."""
+        reason = private_reason(address)
+        if not reason:
+            return
+        ip = _unwrapped(address)
+        if ip is not None and nexus_policy.is_metadata_address(str(ip)):
+            # Never, whatever the operator permitted: nothing a connection is
+            # for lives there, and what does live there is the server's own
+            # credentials.
+            raise AddressRefused(
+                f"{host} resolves to {address}, which is a cloud metadata address; "
+                "this server never connects to it")
         if self.exempt(host, port):
             return
-        reason = private_reason(address)
-        if reason:
-            raise AddressRefused(
-                f"{host} resolves to {address}, which is {reason}; this server does not "
-                "connect to such addresses for a connection added through the API")
+        raise AddressRefused(
+            f"{host} resolves to {address}, which is {reason}; this server does not "
+            "connect to such addresses for a connection added through the API")
+
+
+def _unwrapped(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """*address* as an IP object, with an IPv4 address taken out of the IPv6
+    forms that carry one (mapped, 6to4, Teredo); ``None`` when it is not an IP
+    address."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address):
+        inner = ip.ipv4_mapped or ip.sixtofour
+        if inner is None and ip.teredo is not None:
+            inner = ip.teredo[1]
+        if inner is not None:
+            return inner
+    return ip
 
 
 def private_reason(address: str) -> str:
     """Why *address* is not a public one, or ``""`` when it is."""
-    try:
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
-    except ValueError:
+    ip = _unwrapped(address)
+    if ip is None:
         return "not an IP address"
-    if isinstance(ip, ipaddress.IPv6Address):
-        mapped = ip.ipv4_mapped or ip.sixtofour
-        if mapped is None and ip.teredo is not None:
-            mapped = ip.teredo[1]
-        if mapped is not None:
-            return private_reason(str(mapped))
     if ip.is_loopback:
         return "a loopback address"
     if ip.is_link_local:

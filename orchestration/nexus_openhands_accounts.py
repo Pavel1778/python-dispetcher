@@ -35,6 +35,21 @@ from .secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret
 
 DEFAULT_BASE_URL = "https://app.all-hands.dev"
 
+
+def _safe_base_url(url: str | None) -> str:
+    """Validate a base URL as a client error, not a server error.
+
+    ``validate_base_url`` enforces the SSRF policy and raises ``CloudError``,
+    which the HTTP layer would report as a 502 (a server problem). A bad or
+    hostile base URL is the *caller's* mistake, so it is re-raised as a
+    ``ValueError`` and the route answers 400.
+    """
+    try:
+        return validate_base_url(url or DEFAULT_BASE_URL).rstrip("/")
+    except CloudError as e:
+        raise ValueError(str(e)) from e
+
+
 #: The key-free shape every read returns. Kept in one place so a new column
 #: cannot be returned by one query and forgotten by another. It never includes
 #: ``api_key_encrypted``; ``api_key_hint`` is the masked fragment instead.
@@ -95,17 +110,23 @@ class OpenHandsAccountService:
 
     @staticmethod
     def _url(base_url: str | None) -> str:
-        """*base_url* when a connection may use it, else ``ValueError``.
+        """*base_url* when a connection may use it, else ``ValueError`` (the
+        caller's mistake: the route answers 400).
 
-        The form of the URL and the addresses it resolves to are checked here,
-        when the connection is saved; the address is checked again every time a
-        socket is opened (``net_guard``).
+        Two checks under one policy (``nexus_policy``). First the form of the
+        URL and every address its host resolves to (``net_guard.check_url``) -
+        it goes first because it says what is wrong in the words of the person
+        who typed the URL. Then the rule every outbound base URL of this server
+        obeys (``_safe_base_url``). The address is checked once more every time
+        a socket is opened.
         """
         try:
-            return check_url(validate_base_url(base_url or DEFAULT_BASE_URL)).rstrip("/")
+            url = check_url(base_url or DEFAULT_BASE_URL)
         except AddressRefused as e:
             raise ValueError(f"API URL is not allowed: {e}") from e
-        except CloudError as e:
+        try:
+            return _safe_base_url(url)
+        except ValueError as e:
             raise ValueError(f"API URL is not allowed: {e}") from e
 
     @staticmethod

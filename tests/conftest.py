@@ -9,8 +9,10 @@ import os
 # loop turns it on: ``App(..., lab_inline=True)``, or the variable itself.
 os.environ.setdefault("NEXUS_LAB_INLINE", "0")
 
-# Stored OpenHands connections may only point at public addresses
-# (``orchestration.net_guard``). The tests talk to servers on 127.0.0.1, which
-# is what ``NEXUS_OPENHANDS_ALLOW_PRIVATE`` exists for; the tests of the rule
-# itself take it away again.
-os.environ.setdefault("NEXUS_OPENHANDS_ALLOW_PRIVATE", "1")
+# The SSRF policy refuses loopback/private targets unless the operator opts in.
+# A test session's fake Cloud, GitHub and provider servers all listen on
+# 127.0.0.1, so the session opts in here; the security tests clear the variable
+# to prove the guard refuses a private target. A production deployment leaves it
+# unset, so a base URL aimed at its own network is refused. The same switch
+# governs the check of a stored connection's address (``net_guard``).
+os.environ.setdefault("NEXUS_ALLOW_PRIVATE_TARGETS", "1")

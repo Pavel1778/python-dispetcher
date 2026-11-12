@@ -179,8 +179,11 @@ is stored and again whenever a socket is opened to it (`net_guard`): `http` or
 must be a public one — not loopback, private, link-local, carrier-grade NAT or
 the like, for IPv4 and IPv6. Redirects are never followed. A self-hosted
 OpenHands on a private network is allowed by the operator, not the caller:
-`NEXUS_OPENHANDS_ALLOWED_HOSTS=host[,host:port…]`, or
-`NEXUS_OPENHANDS_ALLOW_PRIVATE=1` for a deployment on a trusted network.
+`NEXUS_OPENHANDS_ALLOWED_HOSTS=host[,host:port…]` for that host alone, or
+`NEXUS_ALLOW_PRIVATE_TARGETS=1` (every private address) for a deployment on a
+trusted network. Both are read through the permission policy
+(`nexus_policy`, see `SECURITY.md`), which `net_guard` enforces at the level
+of addresses; a cloud metadata address is refused whatever was permitted.
 
 ## Executors of a project
 

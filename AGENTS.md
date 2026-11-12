@@ -1703,8 +1703,11 @@ Full description: `docs/DURABLE-RUNS.md`. What a future change has to know:
   A worker with no router looks for stored connections on every pass
   (`_find_router`).
 - **Connections.** `net_guard` checks a URL a person supplied (public addresses
-  only, again at connect time; `NEXUS_OPENHANDS_ALLOWED_HOSTS`,
-  `NEXUS_OPENHANDS_ALLOW_PRIVATE`). `edit()` is the one way to change a
+  only, again at connect time). It has no switch of its own: what is permitted
+  is read from `nexus_policy` (`NEXUS_ALLOW_PRIVATE_TARGETS`, and
+  `NEXUS_OPENHANDS_ALLOWED_HOSTS` for one host), which
+  `check_outbound_url` obeys too - never add a second opt-in. A new MCP tool
+  needs an entry in `MCP_TOOL_SCOPES`. `edit()` is the one way to change a
   connection and also takes a new key; `remove` is refused while something
   depends on it; `verify` records `api_version` and `compatibility`.
 - **Project executors.** `nexus_project_executors` (position 0 = primary) and

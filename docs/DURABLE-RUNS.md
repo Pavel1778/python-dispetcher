@@ -161,7 +161,10 @@ returned, logged or shown; views carry a masked hint.
 the host resolves to must be public. The check is repeated when the socket is
 opened, so a name that later resolves to `127.0.0.1` is refused then; redirects
 are never followed. A private address is allowed only by the operator:
-`NEXUS_OPENHANDS_ALLOWED_HOSTS`, `NEXUS_OPENHANDS_ALLOW_PRIVATE`.
+`NEXUS_OPENHANDS_ALLOWED_HOSTS` (one host), `NEXUS_ALLOW_PRIVATE_TARGETS` (all
+of them); a cloud metadata address never. These are the settings of the
+permission policy (`nexus_policy`, `docs/SECURITY.md`): `net_guard` is the same
+policy enforced on addresses instead of on the URL as it is written.
 
 ## Executors of a project
 
@@ -232,7 +235,7 @@ of any repository is unverified.
 | `NEXUS_TASK_STALL_SECONDS` | 1800 | no activity for this long = hung (0 = off) |
 | `NEXUS_LAB_MAX_ACTIVE_TASKS` | 8 | tasks at work at once (0 = no limit) |
 | `NEXUS_OPENHANDS_ALLOWED_HOSTS` | - | hosts that may be private |
-| `NEXUS_OPENHANDS_ALLOW_PRIVATE` | off | any private address may be used |
+| `NEXUS_ALLOW_PRIVATE_TARGETS` | off | any private address may be used (the SSRF policy's own switch) |
 
 ## Migrations
 

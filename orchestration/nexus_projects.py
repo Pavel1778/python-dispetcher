@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from .cloud_store import NotFound, PostgresStore
+from .nexus_policy import SCOPE_PROJECT_ADMIN, PermissionDenied, require
 
 
 class IdempotencyConflict(ValueError):
@@ -74,6 +75,33 @@ class ProjectService:
             raise NotFound("project not found")
         return dict(row)
 
+    @staticmethod
+    def role(cur: Any, principal: str, project_id: str) -> str:
+        """The caller's role in a project, or ``NotFound`` if not a member."""
+        cur.execute("SELECT role FROM nexus_project_members "
+                    "WHERE project_id=%s AND principal=%s", (project_id, principal))
+        row = cur.fetchone()
+        if row is None:
+            raise NotFound("project not found")
+        return row["role"]
+
+    @classmethod
+    def require_scope(cls, cur: Any, principal: str, project_id: str,
+                      scope: str) -> str:
+        """Refuse unless the caller's role in *project_id* carries *scope*.
+
+        Membership is checked first, so a non-member gets ``NotFound`` (never a
+        disclosure that the project exists), and only then is the role's scope
+        consulted. This is the one RBAC gate: a service asks for a scope, it
+        never hard-codes "is this person an owner".
+        """
+        role = cls.role(cur, principal, project_id)
+        try:
+            require(role, scope)
+        except PermissionDenied:
+            raise NotFound("project not found") from None
+        return role
+
     def update(self, principal: str, project_id: str, changes: dict) -> dict:
         if not changes or set(changes) - {"name", "description"}:
             raise ValueError("provide name and/or description")
@@ -81,12 +109,13 @@ class ProjectService:
         description = (_text(changes["description"], "description", maximum=4000, required=False)
                        if "description" in changes else None)
         with self.store._tx() as cur:
+            # Only an owner may change what a project *is*.
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
             cur.execute("UPDATE nexus_projects p SET name=COALESCE(%s, p.name), "
                         "description=COALESCE(%s, p.description), updated_at=now() "
-                        "WHERE p.id=%s AND EXISTS (SELECT 1 FROM nexus_project_members m "
-                        "WHERE m.project_id=p.id AND m.principal=%s AND m.role='owner') "
+                        "WHERE p.id=%s "
                         "RETURNING p.id, p.name, p.description, p.created_at, p.updated_at",
-                        (name, description, project_id, principal))
+                        (name, description, project_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("project not found")

@@ -98,6 +98,7 @@ from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
 from .nexus_planning import PlanService
+from .nexus_policy import install_log_redaction, policy_report
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
 from .nexus_specs import (
     SpecCorrupted,
@@ -3086,6 +3087,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
                 return self._json(200, self.app.system_info())
+            if path == "/api/security/policy":
+                # The NEXUS permission policy: roles and their scopes, the scope
+                # every MCP tool needs, and the SSRF/redaction configuration.
+                # Names and booleans only; never a secret value.
+                return self._json(200, policy_report())
             if path == "/api/github/accounts":
                 # Token-free views only; the PAT never leaves the server.
                 return self._json(200, {"accounts": self.app.github_accounts.list_accounts(
@@ -3718,6 +3724,9 @@ def main() -> int:
     )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
+    # Scrub credential-looking values from every log record, so a stray key in a
+    # message or a traceback never reaches a log file.
+    install_log_redaction()
 
     dsn = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
     if not dsn:

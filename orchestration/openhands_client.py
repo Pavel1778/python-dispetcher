@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from .nexus_policy import UnsafeTarget, check_outbound_url
+
 
 #: Scheme default ports, so an omitted port and an explicit default compare equal.
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -144,6 +146,17 @@ class OpenHandsClient:
         address_policy: Any | None = None,
     ):
         self.base_url = base_url.rstrip("/")
+        # A sandbox/agent-server base URL is operator-supplied, so it obeys the
+        # SSRF policy: a loopback or private target is refused unless the
+        # operator explicitly permits private targets (the local runtime and the
+        # tests do; a Cloud deployment does not). An empty base URL is the
+        # documented placeholder the direct transport constructs and then points
+        # at a sandbox, so it is not a target yet.
+        if self.base_url:
+            try:
+                check_outbound_url(self.base_url)
+            except UnsafeTarget as e:
+                raise ApiUnavailable(f"refusing agent-server base URL: {e}") from e
         # Resolved from the environment when not passed explicitly. Never stored
         # in a log line or an exception message.
         self._api_key = api_key or os.environ.get("SESSION_API_KEY") or ""

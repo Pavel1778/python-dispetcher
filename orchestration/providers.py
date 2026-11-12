@@ -48,6 +48,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .nexus_policy import UnsafeTarget, check_outbound_url
+
 # --------------------------------------------------------------------- errors
 
 
@@ -247,6 +249,13 @@ class Provider:
                  backoff_base: float = 0.5, sleep: Callable[[float], None] = time.sleep,
                  context_tokens: int | None = None):
         self.api_key = api_key if api_key is not None else self._key_from_env()
+        # A provider base URL comes from the environment, so it obeys the same
+        # SSRF policy as every other outbound target: a private/metadata address
+        # is refused unless the operator explicitly permits private targets.
+        try:
+            check_outbound_url(base_url)
+        except UnsafeTarget as e:
+            raise ProviderError(f"{self.name}: {e}") from e
         self.base_url = base_url
         self.model = model
         self.timeout = timeout

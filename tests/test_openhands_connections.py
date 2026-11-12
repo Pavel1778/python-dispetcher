@@ -92,7 +92,7 @@ def test_public_addresses_pass(address):
     ("https://8.8.8.8/a b", "characters"), ("https://8.8.8.8/\r\nHost: x", "characters"),
     ("http://127.0.0.1:5432", "loopback"), ("http://localhost:8000", "loopback"),
     ("http://[::1]:8000", "loopback"), ("http://0.0.0.0", "unspecified"),
-    ("http://169.254.169.254/latest/meta-data", "link-local"),
+    ("http://169.254.169.254/latest/meta-data", "metadata"),
     ("http://10.1.2.3:3000", "private"), ("https://192.168.0.10", "private"),
     ("http://2130706433", "loopback"),                 # 127.0.0.1 as one number
     ("http://0x7f.0.0.1", "loopback"), ("http://127.1", "loopback"),
@@ -117,15 +117,70 @@ def test_a_url_that_is_allowed_comes_back_tidy():
 
 
 def test_the_policy_is_read_from_the_environment(monkeypatch):
-    monkeypatch.delenv("NEXUS_OPENHANDS_ALLOW_PRIVATE", raising=False)
+    monkeypatch.delenv("NEXUS_ALLOW_PRIVATE_TARGETS", raising=False)
     monkeypatch.delenv("NEXUS_OPENHANDS_ALLOWED_HOSTS", raising=False)
     assert AddressPolicy.from_env() == AddressPolicy()
     monkeypatch.setenv("NEXUS_OPENHANDS_ALLOWED_HOSTS", " OpenHands.Internal , 10.0.0.5:3000 ")
     policy = AddressPolicy.from_env()
     assert policy.exempt("openhands.internal", 443) and policy.exempt("10.0.0.5", 3000)
     assert not policy.exempt("10.0.0.5", 22) and not policy.allow_private
-    monkeypatch.setenv("NEXUS_OPENHANDS_ALLOW_PRIVATE", "yes")
+    monkeypatch.setenv("NEXUS_ALLOW_PRIVATE_TARGETS", "yes")
     assert AddressPolicy.from_env().allow_private
+
+
+def test_both_guards_obey_one_policy(monkeypatch):
+    """What the operator permits is decided once (``nexus_policy``). The check
+    of a URL as it is written and the check of the address a socket is opened
+    to give the same answer - a host cannot pass one and be stopped by the
+    other."""
+    from orchestration import nexus_policy
+
+    def written(url, **kwargs):          # the URL as it is written
+        return nexus_policy.check_outbound_url(url, **kwargs)
+
+    def address(url):                    # the address behind it
+        return check_url(url, resolve=False)
+
+    monkeypatch.delenv("NEXUS_ALLOW_PRIVATE_TARGETS", raising=False)
+    monkeypatch.delenv("NEXUS_OPENHANDS_ALLOWED_HOSTS", raising=False)
+    with pytest.raises(nexus_policy.UnsafeTarget):
+        written("http://10.0.0.5:3000")
+    with pytest.raises(nexus_policy.UnsafeTarget):
+        written("https://openhands.internal")
+    with pytest.raises(AddressRefused):
+        address("http://10.0.0.5:3000")
+
+    # A host the operator named is reachable; nothing else on that network is.
+    monkeypatch.setenv("NEXUS_OPENHANDS_ALLOWED_HOSTS", "10.0.0.5:3000, OpenHands.Internal")
+    assert written("http://10.0.0.5:3000") and written("https://openhands.internal/api")
+    assert address("http://10.0.0.5:3000") == "http://10.0.0.5:3000"
+    for url in ("http://10.0.0.5:22", "http://10.0.0.5", "http://10.0.0.6:3000",
+                "http://127.0.0.1:3000"):
+        with pytest.raises(nexus_policy.UnsafeTarget):
+            written(url)
+        with pytest.raises(AddressRefused):
+            address(url)
+    # A caller that insists on public targets is not overruled by the list.
+    with pytest.raises(nexus_policy.UnsafeTarget):
+        written("http://10.0.0.5:3000", allow_private=False)
+    # The names stay on the server: the policy report gives their number.
+    report = nexus_policy.policy_report()["ssrf"]
+    assert report["allowed_private_hosts"] == 2 and "10.0.0.5" not in str(report)
+
+    # The metadata address is never reachable: not with every private target
+    # permitted, and not behind a host the operator named.
+    monkeypatch.setenv("NEXUS_ALLOW_PRIVATE_TARGETS", "1")
+    monkeypatch.setenv("NEXUS_OPENHANDS_ALLOWED_HOSTS", "named.example")
+    policy = AddressPolicy.from_env()
+    assert policy.allow_private and written("http://192.168.1.10:3000")
+    with pytest.raises(nexus_policy.UnsafeTarget):
+        written("http://169.254.169.254/latest/meta-data")
+    for inner in ("169.254.169.254", "::ffff:169.254.169.254", "100.100.100.200",
+                  "fd00:ec2::254"):
+        with pytest.raises(AddressRefused, match="metadata"):
+            policy.check_address("named.example", 80, inner)
+    policy.check_address("named.example", 80, "10.0.0.5")       # private: permitted
+    policy.check_address("named.example", 80, "169.254.10.10")  # link-local, not metadata
 
 
 def test_a_name_that_changes_its_address_after_it_was_saved_is_refused_when_connecting(
@@ -210,7 +265,7 @@ def service(store):
 
 def test_a_connection_to_an_inner_address_is_refused_before_anything_is_sent(
         store, clouds, monkeypatch):
-    monkeypatch.delenv("NEXUS_OPENHANDS_ALLOW_PRIVATE", raising=False)
+    monkeypatch.delenv("NEXUS_ALLOW_PRIVATE_TARGETS", raising=False)
     a, _b, _c = clouds
     service = OpenHandsAccountService(store)
     for url in (a.base_url, "http://169.254.169.254/latest/meta-data", "http://localhost:5432",
