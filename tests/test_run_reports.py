@@ -225,6 +225,87 @@ def test_a_report_never_claims_more_than_was_seen(env):
     assert reports_in_chat(env)[0]["meta"]["outcome"] == "success_with_notes"
 
 
+def test_a_run_in_which_nothing_was_pushed_is_not_reported_as_done(env):
+    """What the live service did on the day this was deployed. The agent's push
+    was refused; it said so, and named the head of the branch as it had found
+    it. The rule of acceptance - the agent named the head of the branch - holds
+    for that, so the task verified and the run completed. The report must not
+    call it done: NEXUS saw no new commit."""
+    run_id = start(env, [TWO[0]])
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    sched.tick(run_id)
+    refused = ("## Report\n\n**Blocker: the push was refused.** Remote "
+               f"`{APP}@main` is still **`{BASE}`** — unchanged.\n\n"
+               f"remote: Permission to {APP}.git denied. The requested URL returned error: 403")
+    executor.finish(executor.of("api")[-1], refused)
+    assert sched.run_until_done(run_id).finished
+    # The rule of acceptance itself is as it was.
+    assert env["lab"].get_run(ALICE, env["project"], run_id)["state"] == "completed"
+
+    report = env["reports"].get(ALICE, env["project"], run_id)
+    assert report["outcome"] == "no_changes"
+    assert report["summary"]["changes"] == {"changed": [], "unchanged": [APP], "unknown": []}
+    text = report["body"]
+    assert "**Статус:** изменений в репозитории нет — результат не подтверждён." in text
+    assert "выполнено" not in text and "Блокеров не осталось" not in text
+    assert "ни одного нового коммита" in text and "она не доставлена" in text
+    assert "Вершина ветки не изменилась" in text
+    assert "Новых коммитов нет: подтверждать в репозитории нечего." in text
+    assert "Blocker: the push was refused." in text, "the agent's own words are there to read"
+    message = reports_in_chat(env)[0]
+    assert message["meta"]["outcome"] == "no_changes" and message["content"] == text
+
+
+def test_a_run_whose_starting_commit_is_not_known_claims_no_change(env):
+    """A run that was at work when the starting commit began to be recorded.
+    With one task there is nothing to tell from: whether the branch moved is
+    not known, and the report says that instead of "done"."""
+    run_id = start(env, [TWO[0]])
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    sched.tick(run_id)
+    # As the code before left it: no record of the attempt, no starting commit.
+    sql(env, "DELETE FROM nexus_task_executions WHERE run_id=%s", run_id)
+    sql(env, "UPDATE nexus_run_tasks SET base_sha=NULL WHERE run_id=%s", run_id)
+    executor.finish(executor.of("api")[-1], f"The push was refused. Remote is still {BASE}.")
+    assert sched.run_until_done(run_id).finished
+
+    report = env["reports"].get(ALICE, env["project"], run_id)
+    assert report["outcome"] == "unconfirmed"
+    assert report["summary"]["changes"] == {"changed": [], "unchanged": [], "unknown": [APP]}
+    text = report["body"]
+    assert "**Статус:** завершено, но изменения в репозитории не подтверждены." in text
+    assert "выполнено" not in text and "Блокеров не осталось" not in text
+    assert "С какого коммита прогон начал, установить не удалось" in text
+    assert "Начальный коммит неизвестен" in text
+    assert reports_in_chat(env)[0]["meta"]["outcome"] == "unconfirmed"
+
+
+def test_tasks_accepted_for_different_commits_show_that_the_branch_moved(env):
+    """...even when the starting commit is not known: a long run that was half
+    done when this was deployed did deliver, and is not told otherwise."""
+    tasks = [{"task_key": "api", "title": "Эндпоинт", "repository": APP},
+             {"task_key": "more", "title": "Тесты к нему", "repository": APP,
+              "dependencies": ["api"]}]
+    run_id = start(env, tasks)
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    do_task(env, sched, executor, run_id, "api", APP, sha(0xA1))
+    sched.tick(run_id)
+    do_task(env, sched, executor, run_id, "more", APP, sha(0xA2))
+    sql(env, "UPDATE nexus_task_executions SET base_sha=NULL WHERE run_id=%s", run_id)
+    assert sched.run_until_done(run_id).finished
+
+    report = env["reports"].get(ALICE, env["project"], run_id)
+    assert report["outcome"] == "success_with_notes"
+    assert report["summary"]["changes"] == {"changed": [APP], "unchanged": [], "unknown": []}
+    text = report["body"]
+    assert "**Статус:** выполнено и подтверждено в репозиториях, с замечаниями:" in text
+    assert "Ветка менялась за время прогона: задачи приняты по разным коммитам (2)." in text
+    assert f"список изменений в {APP} не построен" in text
+
+
 def test_a_long_task_is_quoted_by_its_beginning_and_named_by_its_size(env):
     from orchestration.nexus_specs import SpecService
 

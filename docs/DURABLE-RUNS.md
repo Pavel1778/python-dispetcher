@@ -81,6 +81,30 @@ from, as an assistant message (`meta.report`). Nobody has to open the runs tab.
   repository, the files GitHub lists as changed, what the repository's own
   checks say for the head commit, what remains, and the status. It separates
   what NEXUS observed itself from what the agents reported.
+- **The headline says "done" only when NEXUS saw new commits.** The report's
+  `outcome`:
+
+  | `outcome` | Headline | When |
+  |---|---|---|
+  | `success` | выполнено, все задачи проверены и подтверждены | new commits in the repositories, nothing to add |
+  | `success_with_notes` | выполнено … с замечаниями | the same, with a note: a repository's checks failed or are still running, one of several repositories did not change, a stop signal was not confirmed |
+  | `no_changes` | изменений в репозитории нет — результат не подтверждён | every branch is at the commit the work started from |
+  | `unconfirmed` | завершено, но изменения в репозитории не подтверждены | the starting commit is not known (a run that was at work when this was deployed; GitHub did not answer at the start) and the tasks were accepted for one and the same commit |
+
+### What a completed run does and does not prove
+
+A task is accepted when its conversation finished and the head of its branch on
+GitHub is a commit the agent named (`GitVerifier`). That rule holds for an
+agent that **pushed nothing and named the head it found** - one whose push was
+refused, for example. Such a task verifies, and a run of such tasks completes.
+
+This happened on the live service on the day durable runs were deployed: the
+agent reported "the push was refused (403)", named the unchanged head, the
+task was accepted, and the report said "выполнено". The report no longer says
+that (`no_changes` above). **The run still completes**: it is not held back
+and its tasks are not started again, because NEXUS cannot tell an agent that
+could not push from a task that needed no change. Telling them apart needs the
+agent to say which it is, in a form NEXUS can read; that is not built.
 
 `GET /api/v1/projects/<id>/runs/<run>/report` returns the same report;
 `GET …/runs/<run>` includes it together with `executions` (which connection

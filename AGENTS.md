@@ -1760,12 +1760,25 @@ Tests: `tests/test_durable_runs.py`, `test_run_reports.py`,
 `test_openhands_connections.py` (connections and project executors), the HTTP cases in
 `test_lab_inline.py`, and the studio journeys in `test_browser_e2e.py`.
 
-Not verified against the live services: nothing here was run against a real
-OpenHands Cloud account or a real GitHub repository - this was written without
-credentials for either. The Cloud's sandbox pause, `/interrupt` on an
-agent-server and the events query used for the stall check are taken from the
-OpenHands source and its OpenAPI description, and exercised only against the
-stand-in servers in `tests/`.
+Not verified against the live services before the merge: this was written
+without credentials for OpenHands; GitHub was exercised read-only. The Cloud's
+sandbox pause and `/interrupt` on an agent-server are taken from the OpenHands
+source and its OpenAPI description, and exercised only against the stand-in
+servers in `tests/`. Seen working on the live service after the deploy
+(2026-11-12): the events query of the stall check, a run completing with its
+report written and delivered to its chat once.
+
+**A report says "done" only of what NEXUS saw** (`nexus_reports.build_report`,
+`outcome`). The first report the live service produced said "выполнено" for a
+run whose agent had written "the push was refused (403)": the agent named the
+unchanged head, which is all `GitVerifier` asks for. The headline is now
+`no_changes` ("изменений в репозитории нет - результат не подтверждён") when no
+branch moved, and `unconfirmed` when the starting commit is not known. The run
+itself still completes in that case - the rule of acceptance is `main`'s and
+was not changed. Do not add a success wording to the report that does not
+depend on `moved`; and if acceptance is ever tightened ("the branch must have
+moved"), a task that legitimately changes nothing needs a way to say so, or a
+durable run will start it for ever.
 
 ## The acceptance suite, sections A-G (this session)
 
