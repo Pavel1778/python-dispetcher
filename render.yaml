@@ -5,13 +5,21 @@
 # background loop that drives Sr tool calls, Jr dispatch and workflow
 # verification, so run exactly one instance.
 #
+# The same process advances autonomous runs (the studio's "Автономно" mode), on
+# a thread of its own. Nothing has to be set for that. NEXUS_LAB_INLINE=0 turns
+# it off, for a deployment where `python -m orchestration.lab_worker` runs as a
+# service of its own.
+#
 # The schema is applied by the process on first start (idempotent, recorded in
 # ``schema_migrations``), because the free plan has no shell to run ``psql`` in.
 # Set ``AUTO_MIGRATE=false`` if migrations are applied by a release step instead.
 #
 # Free plan caveats:
 #   * The instance spins down after ~15 minutes idle and cold-starts on the
-#     next request, so the background loop is not continuously running.
+#     next request, so the background loops are not continuously running: an
+#     autonomous run starts no new task while the instance sleeps. For a run
+#     that has to work unattended use a paid plan, or have something outside
+#     request /healthz every few minutes.
 #   * There is no shell and no persistent disk; all state lives in PostgreSQL.
 #
 # Before the first deploy, generate the two secrets once (see DEPLOY.md):

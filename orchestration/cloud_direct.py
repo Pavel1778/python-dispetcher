@@ -60,6 +60,7 @@ from .cloud_client import (
     CloudConversation,
     CloudError,
     CloudNotFound,
+    CloudRateLimited,
     CloudUnavailable,
     DeliveryError,
     SandboxFile,
@@ -215,13 +216,14 @@ class CloudDirectClient:
         if reuse is None:
             reuse = self.reuse_sandboxes
         if reuse and not force_new:
-            row = self.store.running_sandbox()
-            if row:
-                return SandboxRoute(
-                    sandbox_id=row["sandbox_id"],
-                    agent_server_url=row["agent_server_url"],
-                    session_api_key=row["session_api_key"],
-                )
+            # Each pass either returns or takes one sandbox off the list.
+            while (row := self.store.running_sandbox()) is not None:
+                if self._still_running(row["sandbox_id"]):
+                    return SandboxRoute(
+                        sandbox_id=row["sandbox_id"],
+                        agent_server_url=row["agent_server_url"],
+                        session_api_key=row["session_api_key"],
+                    )
         info = self.cloud.start_sandbox(sandbox_spec_id=self.sandbox_spec_id)
         sandbox_id = info.get("id")
         if not sandbox_id:
@@ -237,6 +239,29 @@ class CloudDirectClient:
             sandbox_id, agent_server_url=url, session_api_key=key, status="RUNNING"
         )
         return SandboxRoute(sandbox_id=sandbox_id, agent_server_url=url, session_api_key=key)
+
+    def _still_running(self, sandbox_id: str) -> bool:
+        """Whether the Cloud still runs a sandbox this application recorded.
+
+        "RUNNING" in ``cloud_sandboxes`` is what was true when the sandbox was
+        started. The Cloud pauses an idle sandbox and removes an old one, and
+        nothing told this table: the row went on saying RUNNING, the sandbox
+        was handed out again for every new conversation, and every one of them
+        failed against a host that no longer answered. So the Cloud is asked
+        before a sandbox is reused, and a sandbox it does not report as running
+        is recorded as what it is and not offered again.
+
+        A Cloud that cannot be reached is not an answer: that error is raised,
+        and the start is tried again later.
+        """
+        try:
+            status = str(self.cloud.get_sandbox(sandbox_id).get("status") or "UNKNOWN")
+        except CloudNotFound:
+            status = "MISSING"
+        if status == "RUNNING":
+            return True
+        self.store.mark_sandbox_status(sandbox_id, status)
+        return False
 
     def _route_for(self, conversation_id: str) -> SandboxRoute:
         cached = self._cache.get(conversation_id)
@@ -361,7 +386,7 @@ class CloudDirectClient:
             }
         status, payload = self._send(route, "POST", "/api/conversations", body)
         if status == 429:
-            raise CloudUnavailable("sandbox conversation capacity full")
+            raise CloudRateLimited("sandbox conversation capacity full")
         if status == 422:
             raise CloudError(
                 f"create on sandbox rejected: {str(payload)[:300]}"

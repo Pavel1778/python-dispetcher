@@ -29,7 +29,7 @@ real external service was made and its result observed.
 | OpenHands dispatch + poll | **LIVE-VERIFIED** | `nexus_lab.py` (real conversation ran to `finished`) |
 | Independent Git verification | **LIVE-VERIFIED** | `GitVerifier` against the real repo |
 | Replanning decision (complete/block/deadlock) | **INTEGRATION-TESTED** | `LabScheduler.tick` |
-| Durable worker, separate process | **INTEGRATION-TESTED** | `lab_worker.py`, restart/recovery tests |
+| Durable loop: a thread of the web server by default, or a separate process | **INTEGRATION-TESTED** | `lab_worker.py`, `App._run_lab`, `tests/test_lab_inline.py`, restart/recovery tests |
 | Project context (versioned, observed) | **INTEGRATION-TESTED** + **LIVE-VERIFIED** analysis | `nexus_context.py`, `nexus_analysis.py` |
 | Unified memory with provenance | **INTEGRATION-TESTED** | `nexus_context.py` |
 | Notifications | **INTEGRATION-TESTED** | `nexus_lab_store.py`, UI |
@@ -89,7 +89,8 @@ shape; **no live LLM-provider call was made** because no provider key is set.
 pip install -r requirements.txt
 export SUPABASE_DB_URL=... WEB_AUTH_TOKEN=... AUTH_USERNAME=... AUTH_PASSWORD_HASH=... AUTH_SESSION_SECRET=... NEXUS_SECRET_KEY=...
 python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN
-python -m orchestration.lab_worker --worker-id lab-1
+# The server advances autonomous runs itself. A separate worker is optional:
+#   python -m orchestration.lab_worker --worker-id lab-1   (and NEXUS_LAB_INLINE=0 on the server)
 
 # Debian client
 sudo dpkg -i dist/nexus-client_2.0.0_all.deb && NEXUS_URL=https://nexus.example.com nexus-client

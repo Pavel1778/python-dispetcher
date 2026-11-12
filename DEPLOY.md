@@ -386,20 +386,62 @@ column. Verify migrations 0009–0011 separately before enabling these features.
 
 ## Render
 
-### Autonomous lab worker (run a second process)
+### Autonomous runs: who advances them
 
-The web server only *starts* autonomous runs; a separate worker advances them.
-On Render, add a second service (same image, different start command) so a run
-survives a browser close and a web-server restart:
+The web server advances autonomous runs itself, on a thread of its own. Nothing
+has to be configured: a run started from the studio begins its first task
+within seconds, and the «Агент» tab and `GET /api/studio` (`lab.inline`) say
+that the server does this.
+
+All state is in PostgreSQL and every claim is a lease, so a restart continues
+where the last pass stopped, and closing the browser stops nothing.
+
+**The free plan stops the process after about 15 minutes without a request.**
+The loop stops with it. Conversations already started go on in OpenHands Cloud
+and their results are collected when the service wakes; no new task starts
+until then. While the studio is open in a visible tab on the conversation of a
+working run, the page asks for the run's state every five seconds, and that
+keeps the service awake; a tab in the background does not ask. For a run that
+has to work unattended, use a paid instance, or have something outside request
+`/healthz` every few minutes.
+
+A separate worker is optional - for a deployment that wants the web process to
+serve requests only:
 
 ```
 python -m orchestration.lab_worker --worker-id lab-1 --poll-interval 5
 ```
 
-Both services share `SUPABASE_DB_URL`. The worker holds no per-run state, so it
-can be restarted or scaled to N workers at any time: claims are leases, and a
-dead worker's task is reclaimed by the next tick. `--once` runs a single pass
-(useful for a cron-style deployment).
+It shares `SUPABASE_DB_URL` with the web service, holds no per-run state and
+can be restarted or scaled to N at any time. Set `NEXUS_LAB_INLINE=0` on the
+web service if only the worker should advance runs; left as it is, both do, and
+the leases keep them apart. `--once` runs a single pass (a cron-style
+deployment).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NEXUS_LAB_INLINE` | on | `0`, `false`, `no` or `off`: the web server does not advance runs |
+| `OPENHANDS_TRANSPORT` | `direct` | `direct` gives every agent the whole task text as a file; `app` cannot place a file (see below) |
+| `NEXUS_TASK_TIMEOUT_SECONDS` | 7200 | how long one task's conversation may run before the task is given up (it was 1800) |
+| `NEXUS_SPEC_MAX_CHARS` | 1 000 000 | longest task text accepted |
+| `NEXUS_SPEC_INLINE_CHARS` | 20 000 | up to this, the text travels inside the agent's first message |
+| `NEXUS_SPEC_MESSAGE_CHARS` | 60 000 | `app` transport only: up to this, the whole text is still in the message; longer, each task gets the part it was planned from |
+| `NEXUS_SPEC_STAGE_TOKENS` | 24 000 | size of one planning part |
+| `NEXUS_SPEC_SANDBOX_DIR` | - | `direct` transport: the one directory to place the text in |
+| `<PROVIDER>_CONTEXT_TOKENS` | per provider | the model's window, used to size planning parts |
+
+**OpenHands limits.** The account has a daily limit on new conversations. A
+run that reaches it is not failed: the task waits and is tried again (every 15
+minutes for a daily limit), and its line in the «Агент» tab says so. A run of
+more tasks than the limit allows takes more than a day; its deadline is 24
+hours unless the request sets another.
+
+**What a run does to the repository.** Each task's agent is told to push to
+the run's branch, and a task counts only when the head of that branch on GitHub
+is a commit the agent's report names. Choose the branch with that in mind. One
+task at a time works on a branch: a second run on the same branch waits its
+turn task by task, and a push by anyone else while a task is at work can leave
+that task unverified.
 
 Client packages (`packaging/`): a `.deb` (Debian/Linux), a signed `.apk`
 (Android) and a `.exe` (Windows). All three are thin clients that open the same

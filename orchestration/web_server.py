@@ -230,9 +230,25 @@ def _json_body_cap(path: str) -> int | None:
     return _PROJECT_BODY_BYTES
 
 
-def _flag_env(name: str) -> bool:
-    """Whether an on/off setting is switched on. Unset or anything else is off."""
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+def lab_inline_default() -> bool:
+    """Whether this server advances autonomous runs itself. On unless switched off.
+
+    ``NEXUS_LAB_INLINE`` set to ``0``, ``false``, ``no`` or ``off`` switches it
+    off - for a deployment where ``python -m orchestration.lab_worker`` does
+    that work as its own process. Unset, empty or anything else leaves it on.
+
+    It used to be off unless asked for. A deployment that is one web process
+    (the Render blueprint here, and the free plan has no worker to add) then
+    accepted every run, planned it and never started a task: nothing said so
+    but a note in the run's card, and the runs sat at "pending, attempt 0"
+    until their deadline. A run that nobody advances is the worse default.
+    """
+    value = os.environ.get("NEXUS_LAB_INLINE", "").strip().lower()
+    if value in ("0", "false", "no", "off"):
+        return False
+    if value not in ("", "1", "true", "yes", "on"):
+        log.warning("NEXUS_LAB_INLINE=%r is not 0/1; the server advances runs itself", value)
+    return True
 
 
 def _int_env(name: str, default: int) -> int:
@@ -398,12 +414,12 @@ class App:
         # configured providers are used, and only their presence is reported.
         self.providers = ProviderCascade()
         # The autonomous lab: durable runs/tasks, project context and memory.
-        # The web server *starts* a run. What advances it is the lab loop:
-        # ``python -m orchestration.lab_worker`` as its own process, or - for a
-        # deployment that has only this one - a thread of this server when
-        # NEXUS_LAB_INLINE is on (see ``_run_lab``). Either way a browser
+        # The web server *starts* a run. What advances it is the lab loop: a
+        # thread of this server (``_run_lab``) unless NEXUS_LAB_INLINE switches
+        # it off, and ``python -m orchestration.lab_worker`` as its own process
+        # where there is one; both may run at once. Either way a browser
         # request never drives a run, and closing the browser never stops one.
-        self.lab_inline = (_flag_env("NEXUS_LAB_INLINE") if lab_inline is None
+        self.lab_inline = (lab_inline_default() if lab_inline is None
                            else bool(lab_inline))
         self._lab_worker_id = f"{worker_id}-lab"
         from .nexus_context import ContextService, MemoryService
@@ -549,12 +565,23 @@ class App:
         separate worker may run beside it.
         """
         from .lab_worker import LabWorker
-        worker = LabWorker(self.store, worker_id=self._lab_worker_id,
-                           client=self.client, github=self.github,
-                           github_accounts=self.github_accounts)
+        worker: LabWorker | None = None
+        log.info("this server advances autonomous runs itself (worker %s)",
+                 self._lab_worker_id)
         while not self._stop.is_set():
             try:
-                self.last_lab_tick = {"at": time.time(), **worker.tick_once()}
+                if worker is None:
+                    # Built here, not before the loop: if it cannot be built
+                    # now, the next pass tries again and the reason is in the
+                    # status. A thread that died on its first line would leave
+                    # a server that says it advances runs and does not.
+                    worker = LabWorker(self.store, worker_id=self._lab_worker_id,
+                                       client=self.client, github=self.github,
+                                       github_accounts=self.github_accounts)
+                summary = worker.tick_once()
+                self.last_lab_tick = {"at": time.time(), **summary}
+                if summary.get("advanced") or summary.get("errors"):
+                    log.info("lab pass: %s", summary)
             except Exception as e:  # noqa: BLE001 - the loop must survive
                 log.exception("lab tick failed")
                 self.last_lab_tick = {"at": time.time(),

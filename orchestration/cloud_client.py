@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -55,6 +56,23 @@ def validate_base_url(url: str) -> str:
 
 class CloudUnavailable(CloudError):
     """Transport failure or 5xx. Transient: retry with backoff."""
+
+
+class CloudRateLimited(CloudUnavailable):
+    """The service answered 429: it is working and will not take this now.
+
+    Nothing was started, so nothing failed: the caller waits and asks again,
+    and does not count the refusal against the work. *code* is the service's
+    own name for the limit when it gives one (``daily_conversation_limit_reached``
+    was seen on the live service); *retry_after* is its ``Retry-After`` header
+    in seconds, when it sent one.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None,
+                 retry_after: float | None = None):
+        super().__init__(message)
+        self.code = code
+        self.retry_after = retry_after
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -250,8 +268,15 @@ class CloudClient:
             if e.code == 429:
                 # Rate limit / daily quota: transient by nature, must not burn an
                 # attempt or dead-letter a task.
-                raise CloudUnavailable(
-                    f"{method} {path} -> 429: {json.dumps(payload)[:200]}"
+                detail = payload.get("detail") if isinstance(payload, dict) else None
+                code = detail.get("code") if isinstance(detail, dict) else None
+                try:
+                    retry_after: float | None = float(e.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    retry_after = None       # absent, or an HTTP date: not used
+                raise CloudRateLimited(
+                    f"{method} {path} -> 429: {json.dumps(payload, ensure_ascii=False)[:300]}",
+                    code=code if isinstance(code, str) else None, retry_after=retry_after,
                 ) from e
             if e.code >= 500:
                 raise CloudUnavailable(f"{method} {path} -> {e.code}") from e
@@ -539,19 +564,92 @@ class CloudClient:
                 break
         return collected
 
+    def recent_events(
+        self, conversation_id: str, *, limit: int = MAX_EVENTS_PER_PAGE,
+        max_pages: int = 10, fallback_pages: int = 50,
+    ) -> Iterator[dict[str, Any]]:
+        """The conversation's events, newest first, read a page at a time.
+
+        The end of a conversation is what a caller usually wants, and a long
+        conversation has thousands of events; read oldest-first and bounded,
+        the end is exactly the part that is never reached. This asks the server
+        for the newest page (``sort_order=TIMESTAMP_DESC``) and reads on only
+        while the caller keeps asking.
+
+        A server that does not take the parameter either refuses it or ignores
+        it. Both are seen here - a refusal as a status, an ignored parameter as
+        a page whose timestamps run forwards - and the events are then read the
+        old way, oldest first, and handed over reversed. That way has to read
+        everything to reach the end, so it is given more pages (*fallback_pages*
+        of a hundred events) than a caller who starts at the end needs.
+        """
+        limit = min(limit, self.MAX_EVENTS_PER_PAGE)
+        base = f"/api/v1/conversation/{conversation_id}/events/search?limit={limit}"
+        try:
+            status, payload = self._request("GET", base + "&sort_order=TIMESTAMP_DESC")
+        except (CloudNotFound, CloudAuthError):
+            raise
+        except CloudError:
+            status, payload = 0, None
+        items = payload.get("items") if status == 200 and isinstance(payload, dict) else None
+        page_id = payload.get("next_page_id") if isinstance(payload, dict) else None
+        stamps = [e.get("timestamp") for e in items or [] if isinstance(e.get("timestamp"), str)]
+        newest_first = len(stamps) >= 2 and stamps[0] > stamps[-1]
+        if items is None or (len(items) > 1 and not newest_first):
+            # Refused, or not in the order asked for.
+            yield from reversed(self.list_events(conversation_id, limit=limit,
+                                                 max_pages=fallback_pages))
+            return
+        yield from items
+        for _ in range(max_pages - 1):
+            if not page_id:
+                return
+            status, payload = self._request(
+                "GET", f"{base}&sort_order=TIMESTAMP_DESC&page_id={page_id}")
+            if status != 200 or not isinstance(payload, dict):
+                raise CloudError(f"list_events -> {status}")
+            yield from payload.get("items") or []
+            page_id = payload.get("next_page_id")
+
     def final_response(
         self, conversation_id: str, *, limit: int = MAX_EVENTS_PER_PAGE
     ) -> str | None:
-        """Last non-empty assistant text, or None when there is none.
+        """What the agent said last, or None when it said nothing.
+
+        An agent ends its work in one of two ways: it calls the ``finish`` tool,
+        whose ``message`` is the answer, or it writes a message and calls no
+        tool. Both are read here, whichever came last - the rule the agent
+        server itself applies (``get_agent_final_response`` in the OpenHands
+        SDK). Reading only messages lost every answer given through ``finish``.
+        On the live service four of thirteen finished attempts were recorded as
+        "finished with no final response"; this is the likely reason (those
+        conversations were not inspected).
+
+        A ``finish`` with an empty message may be answered by the text the
+        agent wrote just before it in the same turn, never by an earlier turn.
 
         A missing answer is never completion: the caller must treat None as
         "unverified", not as success.
         """
-        events = self.list_events(conversation_id, limit=limit)
-        for e in reversed(events):
-            if e.get("kind") != "MessageEvent":
+        empty_finish = False
+        for e in self.recent_events(conversation_id, limit=limit):
+            kind = e.get("kind")
+            if kind == "ActionEvent" and e.get("tool_name") == "finish":
+                if empty_finish:
+                    return None
+                action = e.get("action")
+                message = action.get("message") if isinstance(action, dict) else None
+                if isinstance(message, str) and message.strip():
+                    return message.strip()
+                empty_finish = True
+                continue
+            if kind != "MessageEvent":
                 continue
             lm = e.get("llm_message") or {}
+            if lm.get("role") == "user":
+                if empty_finish:
+                    return None
+                continue
             if lm.get("role") != "assistant":
                 continue
             text = " ".join(

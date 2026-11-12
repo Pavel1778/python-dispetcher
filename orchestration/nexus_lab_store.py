@@ -30,6 +30,7 @@ Membership is checked in the same query that touches a row.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
@@ -66,8 +67,37 @@ _RUN_ENTERED_FROM: dict[str, frozenset[str]] = {
 #: Task states that still expect work.
 UNFINISHED_TASK_STATES = ("pending", "dispatched", "running", "verifying")
 
+#: "Nothing else is at work on this task's branch." One task at a time per
+#: branch of a repository, across all runs and within one. A task is accepted
+#: only when the head of its branch is the commit its agent reports
+#: (``GitVerifier``); two agents pushing to one branch move that head under
+#: each other, and whichever is read second is "not the branch head" though it
+#: did its work. A task with no repository pushes nowhere and is not held.
+_BRANCH_FREE = (
+    "(t.repository = '' OR NOT EXISTS ("
+    "  SELECT 1 FROM nexus_run_tasks o "
+    "  WHERE o.repository = t.repository AND o.branch = t.branch AND o.id <> t.id "
+    "    AND o.state IN ('dispatched','running','verifying'))) ")
+
 #: Task states a person's "resume" may send back to the queue.
 _RETRYABLE_TASK_STATES = ("completed_unverified", "partial", "failed", "blocked")
+
+#: How long one task's conversation may run before the task is given up, in
+#: seconds, unless ``NEXUS_TASK_TIMEOUT_SECONDS`` says otherwise. It was thirty
+#: minutes; real tasks ran longer and were recorded as failed while their
+#: agents were still at work (see migration 0022).
+DEFAULT_TASK_TIMEOUT_SECONDS = 7200
+
+
+def task_timeout_seconds() -> int:
+    """The time limit a new task is given: between a minute and a day."""
+    raw = os.environ.get("NEXUS_TASK_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_TASK_TIMEOUT_SECONDS
+    except ValueError:
+        value = DEFAULT_TASK_TIMEOUT_SECONDS
+    return min(24 * 3600, max(60, value))
+
 
 #: Upper bounds for what a caller may ask of one run.
 MAX_RUN_ITERATIONS = 500
@@ -337,7 +367,8 @@ class LabStore:
     def add_task(self, principal: str, project_id: str, run_id: str, *,
                  task_key: str, title: str, description: str = "",
                  acceptance: list[str] | None = None, dependencies: list[str] | None = None,
-                 repository: str = "", branch: str = "", timeout_seconds: int = 1800,
+                 repository: str = "", branch: str = "",
+                 timeout_seconds: int | None = None,
                  max_attempts: int = 3, executor: str = "openhands") -> dict:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
@@ -354,9 +385,11 @@ class LabStore:
     def _insert_task(self, cur: Any, run_id: Any, project_id: str, *, task_key: str,
                      title: str, description: str = "", acceptance: list[str],
                      dependencies: list[str], repository: str = "", branch: str = "",
-                     timeout_seconds: int = 1800, max_attempts: int = 3,
+                     timeout_seconds: int | None = None, max_attempts: int = 3,
                      executor: str = "openhands", position: int = 0,
                      spec_ref: dict | None = None) -> dict:
+        if timeout_seconds is None:
+            timeout_seconds = task_timeout_seconds()
         # Tasks are listed and claimed in ``created_at`` order, and ``now()`` is
         # the same instant for every row of one transaction. *position* keeps a
         # plan stored in one go in the order it was written.
@@ -415,10 +448,13 @@ class LabStore:
         """Atomically claim the next claimable task of a run, or ``None``.
 
         A task is claimable when it is ``pending`` with attempts left, no live
-        lease, and **every dependency is completed_verified**. Claimability is
-        computed in SQL and the row is locked with ``FOR UPDATE SKIP LOCKED``
-        one at a time, so N workers claim N distinct tasks rather than one
-        worker locking the whole queue (the bug the concurrency test caught).
+        lease, **every dependency is completed_verified**, and no other task is
+        at work on its branch (``_BRANCH_FREE``). Claimability is computed in
+        SQL and the row is locked with ``FOR UPDATE SKIP LOCKED`` one at a
+        time, so N workers claim N distinct tasks rather than one worker
+        locking the whole queue (the bug the concurrency test caught). Two
+        workers that reach for one branch at the same moment are put in line by
+        an advisory lock on the branch; the second looks again and waits.
 
         The run itself is part of the claim: nothing is claimed unless the run
         is ``running``, has iterations left and is inside its deadline. That is
@@ -444,12 +480,22 @@ class LabStore:
                 "    SELECT 1 FROM nexus_run_tasks dep "
                 "    WHERE dep.run_id = t.run_id AND dep.task_key = d.dep "
                 "      AND dep.state = 'completed_verified')) "
+                f"AND {_BRANCH_FREE}"
                 "ORDER BY t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED",
                 (run_id,))
             row = cur.fetchone()
             if row is None:
                 return None
             task = self._task_row(row)
+            if task.get("repository"):
+                # The branch looked free to this transaction; another may be
+                # taking it right now. One at a time, then look again.
+                cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                            (f"nexus-branch:{task['repository']}#{task.get('branch') or ''}",))
+                cur.execute(f"SELECT 1 FROM nexus_run_tasks t WHERE t.id=%s AND {_BRANCH_FREE}",
+                            (task["id"],))
+                if cur.fetchone() is None:
+                    return None
             cur.execute("UPDATE nexus_runs SET iteration=iteration+1, updated_at=now() "
                         "WHERE id=%s", (run_id,))
             cur.execute(
@@ -542,6 +588,41 @@ class LabStore:
                 raise NotFound("task not found")
             return self._task_row(row)
 
+    def postpone_task(self, task_id: str, *, error: str, seconds: float) -> dict:
+        """Put a claimed task back because the start was refused, not failed.
+
+        The service said "not now" (a rate limit, a daily quota). No
+        conversation exists, so the claim is undone rather than spent: the
+        task's attempt and the run's iteration are given back, and the task
+        waits *seconds* before it can be claimed again (a pending task with a
+        live lease is not claimable). Without this a quota that lasts until
+        tomorrow used up all three attempts within seconds, and a run stopped
+        that way could not be resumed: "every task has used all its attempts".
+
+        Like ``release_task``, only a task that is still ``dispatched`` is
+        touched; one settled meanwhile keeps the state it was given.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT run_id FROM nexus_run_tasks WHERE id=%s", (task_id,))
+            found = cur.fetchone()
+            if found is None:
+                raise NotFound("task not found")
+            # The run row first, as everywhere else that locks both.
+            cur.execute("SELECT id FROM nexus_runs WHERE id=%s FOR UPDATE", (found["run_id"],))
+            cur.execute(
+                "UPDATE nexus_run_tasks SET state='pending', attempt=GREATEST(attempt - 1, 0), "
+                "lease_expires=now() + (%s || ' seconds')::interval, last_error=%s, "
+                "updated_at=now() WHERE id=%s AND state='dispatched' RETURNING *",
+                (max(0.0, float(seconds)), error, task_id))
+            row = cur.fetchone()
+            if row is not None:
+                cur.execute("UPDATE nexus_runs SET iteration=GREATEST(iteration - 1, 0), "
+                            "updated_at=now() WHERE id=%s", (found["run_id"],))
+            else:
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
+            return self._task_row(row)
+
     def reclaim_expired(self, run_id: str) -> list[dict]:
         """Requeue tasks a worker claimed and never started (it died in between).
 
@@ -606,6 +687,18 @@ class LabStore:
             row = cur.fetchone()
             return dict(row) if row else None
 
+    def first_unverified(self, run_id: str) -> dict | None:
+        """The earliest task of the run that was started and did not verify,
+        with the verifier's reason: what the rest of the run is waiting on."""
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT task_key, state, verification->>'reason' AS reason "
+                "FROM nexus_run_tasks WHERE run_id=%s AND state = ANY(%s) "
+                "AND COALESCE(verification->>'reason', '') <> '' "
+                "ORDER BY created_at, id LIMIT 1", (run_id, list(_RETRYABLE_TASK_STATES)))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
     def count_tasks(self, run_id: str) -> dict[str, int]:
         """How many of the run's tasks are in each state (absent = none)."""
         with self.store._tx() as cur:
@@ -636,19 +729,19 @@ class LabStore:
             return cur.fetchone()["n"] > 0
 
     def has_claimable(self, run_id: str) -> bool:
-        """Whether any pending task could be claimed right now.
+        """Whether any pending task can be claimed, now or once its wait is over.
 
-        Same predicate as ``claim_task`` (attempts left, no live lease, every
-        dependency completed_verified), without taking a lock. Used to tell a
-        run that is *waiting* from one that is *deadlocked*: a pending task
-        whose dependency ended `completed_unverified`/`failed`/`blocked` can
-        never become claimable.
+        The predicate of ``claim_task`` (attempts left, every dependency
+        completed_verified) without the lease and without taking a lock. Used
+        to tell a run that is *waiting* from one that is *deadlocked*: a
+        pending task whose dependency ended `completed_unverified`/`failed`/
+        `blocked` can never become claimable. A task that waits out a refused
+        start (``postpone_task``) will be - that is a wait, not a deadlock.
         """
         with self.store._tx() as cur:
             cur.execute(
                 "SELECT count(*) AS n FROM nexus_run_tasks t "
                 "WHERE t.run_id=%s AND t.state='pending' AND t.attempt < t.max_attempts "
-                "AND (t.lease_expires IS NULL OR t.lease_expires < now()) "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM jsonb_array_elements_text(t.dependencies) AS d(dep) "
                 "  WHERE NOT EXISTS ("

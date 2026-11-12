@@ -96,6 +96,11 @@ class FakeCloudAccount:
                 return entry["url"]
         return None
 
+    def get_sandbox(self, sandbox_id):
+        if sandbox_id not in self.sandboxes:
+            raise CloudNotFound(sandbox_id)
+        return dict(self.sandboxes[sandbox_id])
+
     def delete_sandbox(self, sandbox_id):
         self.sandboxes.pop(sandbox_id, None)
         return True
@@ -215,6 +220,37 @@ def test_reuse_disabled_provisions_a_fresh_sandbox():
 
         assert a.sandbox_id != b.sandbox_id
         assert account.start_count == 2
+    finally:
+        store.close()
+
+
+def test_a_sandbox_the_cloud_no_longer_runs_is_not_reused():
+    """``cloud_sandboxes`` remembers a sandbox as RUNNING for ever; the Cloud
+    pauses and removes them. A stale row was handed out for every new
+    conversation, and each one failed against a host that no longer answered
+    (the live table held one such row, three weeks old)."""
+    store = PostgresStore(DSN)
+    try:
+        account = FakeCloudAccount()
+        client, _ = _client(store, account)
+        first = client.start_conversation(initial_message="one", title="a")
+        # Still running: the next conversation shares it.
+        assert client.start_conversation(initial_message="two", title="b").sandbox_id \
+            == first.sandbox_id
+        assert account.start_count == 1
+
+        account.sandboxes[first.sandbox_id]["status"] = "PAUSED"
+        second = client.start_conversation(initial_message="three", title="c")
+        assert second.sandbox_id != first.sandbox_id and account.start_count == 2
+        statuses = {row["sandbox_id"]: row["status"] for row in store.list_sandboxes()}
+        assert statuses == {first.sandbox_id: "PAUSED", second.sandbox_id: "RUNNING"}
+
+        # Gone altogether: recorded as missing, and a third one is started.
+        account.delete_sandbox(second.sandbox_id)
+        third = client.start_conversation(initial_message="four", title="d")
+        assert account.start_count == 3
+        statuses = {row["sandbox_id"]: row["status"] for row in store.list_sandboxes()}
+        assert statuses[second.sandbox_id] == "MISSING" and statuses[third.sandbox_id] == "RUNNING"
     finally:
         store.close()
 

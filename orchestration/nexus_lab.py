@@ -30,13 +30,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .cloud_client import CloudError, CloudNotFound, DeliveryError
+from .cloud_client import CloudError, CloudNotFound, CloudRateLimited, DeliveryError
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
 from .nexus_binding import AuthorizationError, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
-from .nexus_spec_delivery import Delivery, prepare
+from .nexus_spec_delivery import Delivery, prepare, prepare_request
 from .nexus_specs import SpecService
 
 log = logging.getLogger("nexus_lab")
@@ -111,14 +111,22 @@ class OpenHandsExecutor:
 
     A task is a planner's summary of part of what the user asked for. With
     *specs* the agent is also given the original: inside the message when it is
-    short, as a file in the sandbox when it is long. A task that refers to a
-    specification is never started without it - ``dispatch`` raises
+    short, as a file in the sandbox when it is long, and part by part where the
+    transport cannot place a file (``nexus_spec_delivery``). A task that refers
+    to a specification is never started without it - ``dispatch`` raises
     :class:`~orchestration.cloud_client.DeliveryError` and the scheduler puts
     the task back with that reason.
+
+    A conversation that is created in two steps (the ``app`` transport: a start
+    task, then the conversation) is waited for here, up to
+    ``start_poll_attempts * poll_interval`` seconds - five minutes. On the live
+    service a start took 33 and 49 seconds when it was measured (2026-11-09).
+    Giving up early is not cheap: the start task goes on to become a
+    conversation nobody follows, and the task is started again beside it.
     """
 
     def __init__(self, client: Any, *, poll_interval: float = 2.0,
-                 start_poll_attempts: int = 40, specs: SpecService | None = None):
+                 start_poll_attempts: int = 150, specs: SpecService | None = None):
         self.client = client
         self.poll_interval = poll_interval
         self.start_poll_attempts = start_poll_attempts
@@ -149,30 +157,49 @@ class OpenHandsExecutor:
             "3. Follow the repository's own instructions (README, AGENTS.md).\n"
             "4. Implement the acceptance criteria.\n"
             "5. Run the relevant tests and report their output.\n"
-            "6. If configured to push, commit and push to the authorized branch.\n"
-            "7. Finish with a short report: exact commits (SHA), files changed, "
-            "tests run and their result, and any blocker. Do not claim success "
-            "you did not verify."
+            + OpenHandsExecutor._hand_in(task) +
+            "7. Finish with a short report: the full SHA of the branch head after your "
+            "push, files changed, tests run and their result, and any blocker. Do not "
+            "claim success you did not verify."
         )
 
+    @staticmethod
+    def _hand_in(task: dict) -> str:
+        """Rule 6: where the work has to end up for it to count.
+
+        ``GitVerifier`` accepts a task only when the head of the task's branch
+        on GitHub is a commit the report names. The rule used to read "if
+        configured to push, commit and push": an agent that judged it was not
+        configured committed in its sandbox, reported that honestly, and its
+        task could never verify - nor could anything that depended on it.
+        """
+        if not task.get("repository"):
+            return "6. Commit your work.\n"
+        branch = (f"branch {task['branch']}" if task.get("branch")
+                  else "the default branch")
+        return (
+            f"6. Commit your work and push it to {branch} of {task['repository']} - the "
+            "branch this task is authorized for. If the branch has moved, pull and push "
+            "again; never force-push. Your result is checked on GitHub, not in your "
+            "sandbox: it is accepted only when the head of that branch is a commit your "
+            "report names. Work that is committed and not pushed does not count. If "
+            "nothing had to change, name the current head. If the push is refused, say "
+            "so and quote the error.\n")
+
     def delivery(self, task: dict) -> Delivery | None:
-        """How *task*'s original text reaches the agent, or ``None`` if the task
-        was planned from none (a row older than specifications)."""
+        """How *task*'s original text reaches the agent, or ``None`` when there
+        is none to give."""
         if not (task.get("spec_ref") or {}).get("spec_id"):
-            return None
+            # A run planned before specifications existed: its goal holds the
+            # request, and the agent is given that.
+            return prepare_request(self.specs, task) if self.specs is not None else None
         if self.specs is None:
             raise DeliveryError(
                 "the task was planned from a specification, and this executor was built "
                 "without access to specifications; the agent would not get the task",
                 permanent=True)
-        delivery = prepare(self.specs, task)
-        if delivery is not None and delivery.files and not getattr(
-                self.client, "supports_files", False):
-            raise DeliveryError(
-                f"the task's original text is {delivery.proof['chars']} characters and has to "
-                "reach the agent as a file, and this OpenHands transport cannot place a file "
-                "in the sandbox. Use OPENHANDS_TRANSPORT=direct", permanent=True)
-        return delivery
+        return prepare(self.specs, task,
+                       files=bool(getattr(self.client, "supports_files", False)))
 
     def dispatch(self, task: dict) -> str:
         delivery = self.delivery(task)
@@ -228,8 +255,14 @@ class OpenHandsExecutor:
         except CloudNotFound:
             return TaskReport(state="missing", conversation_id=conversation_id,
                               detail="conversation not found")
-        status = conv.execution_status or "unknown"
-        if status in _RUNNING:
+        status = conv.execution_status
+        if not status or status in _RUNNING:
+            # No status is not a verdict. The service leaves the field empty
+            # while it cannot ask the sandbox (it is still starting, or cannot
+            # be reached for a moment); settling the task on that would end it
+            # seconds after it began. It is asked again on the next pass, and
+            # the task's own time limit bounds the wait - the rule the workflow
+            # dispatcher has always applied (``CloudDispatcher._outcome``).
             return TaskReport(state="running", conversation_id=conversation_id)
         if status in _BAD:
             return TaskReport(state=status, conversation_id=conversation_id,
@@ -372,6 +405,25 @@ def _extract_sha(text: str) -> str | None:
 # -------------------------------------------------------------------- scheduler
 
 
+def refused_start_wait(error: CloudRateLimited) -> float:
+    """Seconds to wait before asking again after a 429.
+
+    What the service asked for (``Retry-After``), kept between half a minute
+    and an hour. Where it named a daily limit - nothing will change for hours -
+    a quarter of an hour, so the task starts soon after the limit is lifted
+    without asking every minute until then. Otherwise a minute.
+    """
+    if error.retry_after is not None:
+        return min(3600.0, max(30.0, error.retry_after))
+    if "daily" in (error.code or "").lower() or "daily" in str(error).lower():
+        return 900.0
+    return 60.0
+
+
+def _span(seconds: float) -> str:
+    return f"{round(seconds / 60)} min" if seconds >= 90 else f"{round(seconds)} s"
+
+
 @dataclass
 class TickResult:
     """What one scheduler tick did. Small and honest for the UI/logs."""
@@ -410,13 +462,16 @@ class LabScheduler:
 
     def __init__(self, store: LabStore, executor: Executor, verifier: Verifier, *,
                  principal: str = "machine:default", worker_id: str = "lab",
-                 lease_seconds: int = 900):
+                 lease_seconds: int = 900,
+                 start_wait: Callable[[CloudRateLimited], float] | None = None):
         self.store = store
         self.executor = executor
         self.verifier = verifier
         self.principal = principal
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        #: How long a task waits after the service refused to start it.
+        self.start_wait = start_wait or refused_start_wait
 
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
@@ -489,6 +544,18 @@ class LabScheduler:
                 return result
             try:
                 conversation_id = self.executor.dispatch(task)
+            except CloudRateLimited as e:
+                # The service is working and will not take this now. Nothing
+                # was started, so nothing is spent: the task waits and is
+                # claimed again, with the attempt it had.
+                wait = self.start_wait(e)
+                self.store.postpone_task(
+                    task["id"], seconds=wait,
+                    error=(f"OpenHands did not take the start; trying again in "
+                           f"{_span(wait)} (this is not counted as an attempt). "
+                           f"{type(e).__name__}: {e}"))
+                result.note = "start refused: rate limited"
+                return result
             except (CloudError, GitHubError) as e:
                 # A dispatch failure is a provider/transport problem: release the
                 # task so another attempt (or worker) can try, and keep the lease
@@ -544,16 +611,22 @@ class LabScheduler:
         return None
 
     def _why(self, run_id: str) -> str:
-        """The first task that could not be started, and why, for the run's error.
+        """The first task that stopped the run, and why, for the run's error.
 
-        "Blocked" alone sends a person to look through the tasks. When a task
-        never started - the specification could not be put in the sandbox, the
-        Cloud refused - that reason is the run's reason, and it is said here.
+        "Blocked: a dependency is not verified" alone sends a person to look
+        through the tasks. The reason is known: a task never started (the
+        specification could not be put in the sandbox, the Cloud refused), or
+        it ran and did not verify (its commit is not the branch head, it ran
+        out of time). That reason is the run's reason, and it is said here.
         """
         failed = self.store.first_start_failure(run_id)
-        if failed is None:
-            return ""
-        return f". Task {failed['task_key']} was not started: {failed['last_error']}"
+        if failed is not None:
+            return f". Task {failed['task_key']} was not started: {failed['last_error']}"
+        unverified = self.store.first_unverified(run_id)
+        if unverified is not None:
+            return (f". Task {unverified['task_key']} ended {unverified['state']}: "
+                    f"{unverified['reason']}")
+        return ""
 
     def _project_of(self, run_id: str) -> str:
         with self.store.store._tx() as cur:

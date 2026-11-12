@@ -861,34 +861,96 @@ def test_an_upload_that_fails_once_is_tried_again(lab):
     assert agent_bytes(conversation, sha256(text)) == ("file", text.encode("utf-8"))
 
 
-def test_a_transport_that_cannot_place_files_says_so_and_does_not_retry(monkeypatch):
-    """The app-conversation transport has no way to put a file in the sandbox.
-    A long text is then not started at all - and not three times over."""
+# ------------------------------------- a transport that cannot place a file
+def _through_the_run(studio, lab, run_id, *, timeout=120.0):
+    """Let every task of a run on the app transport finish, and return the first
+    message each one was started with, by task key."""
+    cloud = studio.cloud.cloud
+    messages: dict[str, str] = {}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for cid, conversation in list(cloud.conversations.items()):
+            tags = conversation.get("tags") or {}
+            if tags.get("nexusrun") != run_id[:40] or tags["nexustask"] in messages:
+                continue
+            messages[tags["nexustask"]] = (
+                cloud.start_bodies[cid]["initial_message"]["content"][0]["text"])
+            cloud.add_assistant_message(cid, f"Готово. Коммит {HEAD}.")
+            conversation["execution_status"] = "finished"
+        detail = lab.run(run_id)
+        if detail["run"]["state"] != "running":
+            return detail, messages
+        time.sleep(0.05)
+    raise AssertionError(f"the run did not end: {lab.run(run_id)['run']}")
+
+
+def _between(message: str, kind: str, digest: str) -> str:
+    """What stands between the two marker lines, cut out by the documented rule."""
+    opening, closing = f"<<<NEXUS-TASK-{kind} {digest[:12]}\n", f"\nNEXUS-TASK-{kind} {digest[:12]}>>>"
+    assert message.count(opening) == 1 and message.count(closing) == 1, (kind, digest[:12])
+    return message[message.index(opening) + len(opening):message.index(closing)]
+
+
+def test_where_no_file_can_be_placed_a_text_that_fits_a_message_travels_whole(monkeypatch):
+    """The app-conversation transport starts a conversation and nothing else:
+    there is no way to put a file in its sandbox. A text too long for the usual
+    inline limit is then still given whole, in the message, to every task."""
     monkeypatch.setenv("NEXUS_SPEC_STAGE_TOKENS", "3000")
     with studio_stack(monkeypatch, transport="app", lab_inline=True) as studio:
         lab = Lab(studio, repo=REPO)
-        text = specification(STAGED_CHARS)
+        text = specification(STAGED_CHARS)                 # above the 20 000 inline limit
         assert lab.send(text)[0] == 200
         run_id = lab.wait_run()
-        task = first_task(lab, run_id)
-        assert (task["state"], task["attempt"], task["conversation_id"]) == ("failed", 1, None)
-        assert "OPENHANDS_TRANSPORT=direct" in task["last_error"]
-        assert task["run"]["state"] == "blocked"
-        assert "OPENHANDS_TRANSPORT=direct" in task["run"]["last_error"]
-        assert studio.cloud.cloud.conversations == {}
+        detail, messages = _through_the_run(studio, lab, run_id)
+        assert detail["run"]["state"] == "completed", detail["run"]
+        assert len(messages) == len(detail["tasks"]) == 17
+        digest = sha256(text)
+        for task in detail["tasks"]:
+            message = messages[task["task_key"][:40]]
+            assert _between(message, "TEXT", digest) == text, task["task_key"]
+            assert (task["attempt"], task["spec_ref"]["delivery"]["mode"]) == (1, "inline")
+            # Its own part is named, so it knows where its work is.
+            first, last = task["spec_ref"]["lines"]
+            assert f"its part of the text is lines {first}-{last}" in message
 
-        # A text short enough for the message itself needs no file and starts.
-        short = "  Цель: покрыть модуль тестами.\n"
-        status, reply = lab.send(short)
-        assert status == 200, reply
-        second = reply["messages"][2]["meta"]["run_id"]
-        started = until(lambda: next(iter(studio.cloud.cloud.conversations), None),
-                        timeout=30, what="the short task to start")
-        message = studio.cloud.cloud.start_bodies[started]["initial_message"]["content"][0]["text"]
-        digest = sha256(short)
-        assert f"<<<NEXUS-TASK-TEXT {digest[:12]}\n{short}\nNEXUS-TASK-TEXT {digest[:12]}>>>" \
-            in message
-        assert lab.run(second)["tasks"][0]["spec_ref"]["delivery"]["mode"] == "inline"
+
+def test_where_no_file_can_be_placed_a_longer_text_travels_part_by_part(monkeypatch):
+    """Beyond what one message should carry, each task is given the part it
+    was planned from, byte for byte, and is told that the rest is elsewhere.
+    Between them the tasks are given every byte of the text."""
+    monkeypatch.setenv("NEXUS_SPEC_STAGE_TOKENS", "3000")
+    monkeypatch.setenv("NEXUS_SPEC_MESSAGE_CHARS", "20000")    # 30 000 no longer fits
+    with studio_stack(monkeypatch, transport="app", lab_inline=True) as studio:
+        lab = Lab(studio, repo=REPO)
+        text = specification(STAGED_CHARS)
+        data = text.encode("utf-8")
+        assert lab.send(text)[0] == 200
+        run_id = lab.wait_run()
+        detail, messages = _through_the_run(studio, lab, run_id)
+        assert detail["run"]["state"] == "completed", detail["run"]
+        assert len(messages) == len(detail["tasks"]) == 17
+
+        given: dict[tuple[int, int], bytes] = {}
+        for task in detail["tasks"]:
+            ref, message = task["spec_ref"], messages[task["task_key"][:40]]
+            proof = ref["delivery"]
+            assert (proof["mode"], proof["sha256"], proof["bytes"]) == ("part", sha256(text), len(data))
+            first, end = ref["bytes"]
+            own = data[first:end]
+            part = proof["part"]
+            assert part == {"stage": ref["stage"], "stages": 5, "lines": ref["lines"],
+                            "bytes": [first, end], "chars": len(own.decode("utf-8")),
+                            "sha256": sha256(own.decode("utf-8"))}
+            assert _between(message, "PART", part["sha256"]).encode("utf-8") == own
+            assert "NEXUS-TASK-TEXT" not in message
+            assert "The rest of the specification is NOT in this conversation" in message
+            assert f"part {ref['stage']} of 5: lines {ref['lines'][0]}-{ref['lines'][1]}" in message
+            assert "Outline of the whole specification" in message
+            given[(first, end)] = own
+        # Five parts, in order, with no gap and no overlap: the whole text.
+        assert [ref for ref in sorted(given)][0][0] == 0
+        assert b"".join(given[key] for key in sorted(given)) == data
+        assert len(given) == 5
 
 
 # ------------------------------------------------ the modes that do not plan
