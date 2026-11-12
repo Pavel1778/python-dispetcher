@@ -583,7 +583,8 @@ class App:
                     built = LabWorker(self.store, worker_id=self._lab_worker_id,
                                       client=self.client, github=self.github,
                                       github_accounts=self.github_accounts,
-                                      account_router=build_account_router(self.store))
+                                      account_router=build_account_router(self.store),
+                                      evidence=self.evidence)
                     # Known to the diagnostics as a live worker (migration 0023):
                     # a server that advances runs is one. Its heartbeat is
                     # written by every pass.

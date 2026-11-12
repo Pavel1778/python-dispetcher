@@ -120,6 +120,43 @@ class EvidenceService:
             self._event(project_id, created_by, "evidence.recorded", stored["id"])
         return stored
 
+    # ------------------------------------------------------- lab task results
+    def record_task_result(self, task: dict, verdict: Any, report: Any) -> dict:
+        """Sign one evidence record for a settled autonomous-lab task.
+
+        This is the EVIDENCE stage of the lab pipeline (``nexus_lab``): a task
+        that reached a terminal verdict is recorded through the Trust Engine, so
+        its result is a signed, independently re-verifiable record rather than
+        only a column on the task row. The commit the verifier observed
+        (``remote_sha``) is what the record binds, so re-verification with
+        ``expected_commit`` is meaningful.
+
+        Called by the scheduler as a side effect; it must never change the
+        task's own state, which is already written when it runs.
+        """
+        evidence = dict(getattr(verdict, "evidence", {}) or {})
+        commit = evidence.get("remote_sha") or None
+        detail = {
+            "verdict": getattr(verdict, "verdict", None),
+            "reason": getattr(verdict, "reason", ""),
+            "task_key": task.get("task_key"),
+            "run_id": str(task.get("run_id") or ""),
+            "conversation_id": task.get("conversation_id"),
+            "final_text": (getattr(report, "final_text", "") or "")[:2000],
+            **{k: evidence[k] for k in ("branch", "named_sha", "state") if k in evidence},
+        }
+        return self.record(
+            subject_kind="task",
+            subject_id=str(task["id"]),
+            project_id=str(task["project_id"]) if task.get("project_id") else None,
+            repository_full_name=task.get("repository") or None,
+            commit_sha=commit,
+            branch=task.get("branch") or None,
+            summary=getattr(verdict, "reason", "") or "task result",
+            detail=detail,
+            created_by="lab:verifier",
+        )
+
     # ------------------------------------------------------------------- read
     def get(self, evidence_id: str, *, project_id: str | None,
             allow_unscoped: bool = False) -> dict:

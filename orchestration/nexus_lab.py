@@ -204,8 +204,11 @@ class OpenHandsExecutor:
             "1. Inspect the repository before changing anything.\n"
             "2. Preserve unrelated user changes; do not revert others' work.\n"
             "3. Follow the repository's own instructions (README, AGENTS.md).\n"
-            "4. Implement the acceptance criteria.\n"
-            "5. Run the relevant tests and report their output.\n"
+            "4. Implement the acceptance criteria: read and change the files that are "
+            "needed, use Git, and install only the dependencies the repository already "
+            "allows (its lock file or manifest) - nothing else.\n"
+            "5. Run the relevant tests and report their output. If a test fails, read "
+            "the failure, find the cause and fix it, then run the tests again.\n"
             + OpenHandsExecutor._hand_in(task) +
             "7. Finish with a short report: the full SHA of the branch head after your "
             "push, files changed, tests run and their result, and any blocker. Do not "
@@ -638,7 +641,8 @@ class LabScheduler:
     def __init__(self, store: LabStore, executor: Executor, verifier: Verifier, *,
                  principal: str = "machine:default", worker_id: str = "lab",
                  lease_seconds: int = 900, router: AccountRouter | None = None,
-                 start_wait: Callable[[CloudRateLimited], float] | None = None):
+                 start_wait: Callable[[CloudRateLimited], float] | None = None,
+                 evidence: Any | None = None):
         self.store = store
         self.executor = executor
         self.verifier = verifier
@@ -650,6 +654,13 @@ class LabScheduler:
         #: When set, a dispatch failure is attributed to the account the task
         #: was bound to, so a failover excludes it on the next attempt.
         self.router = router
+        #: The EVIDENCE stage. When given an
+        #: :class:`~orchestration.nexus_evidence.EvidenceService`, every settled
+        #: task result is also signed into the Evidence Trust Engine, so a run's
+        #: outcome is independently re-verifiable and not only a task column.
+        #: ``None`` (a deployment with no evidence key) leaves the loop exactly
+        #: as it was - the record is skipped, never faked.
+        self.evidence = evidence
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -664,6 +675,24 @@ class LabScheduler:
             return str(named)
         account_id = task.get("openhands_account_id")
         return str(account_id) if account_id else None
+
+    def _record_evidence(self, task: dict, verdict: Verification, report: TaskReport) -> None:
+        """EVIDENCE stage: sign a settled task result into the Trust Engine.
+
+        Best effort and never fatal. The task's own verdict is already written;
+        this only *adds* a signed, re-verifiable record. A deployment without an
+        evidence key (``evidence is None``) skips it, and a signing failure is
+        logged, not raised - a broken key must not stall a run, and must not be
+        mistaken for a task failure. The record is never fabricated: when there
+        is no signer, nothing is stored.
+        """
+        if self.evidence is None:
+            return
+        try:
+            self.evidence.record_task_result(task, verdict, report)
+        except Exception as e:  # noqa: BLE001 - evidence must not stop the loop
+            log.warning("could not record evidence for task %s: %s",
+                        task.get("task_key"), type(e).__name__)
 
     def _start_refused(self, task: dict, error: Exception, refused: CloudRateLimited) -> None:
         """The service is working and will not take this start now (429).
@@ -799,6 +828,7 @@ class LabScheduler:
                 task["id"], verdict=verdict.verdict,
                 evidence={"reason": verdict.reason, **verdict.evidence},
                 detail=verdict.as_detail(), lease_token=task["lease_token"])
+            self._record_evidence(task, verdict, report)
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
 
@@ -828,6 +858,8 @@ class LabScheduler:
                     task["id"], verdict="blocked", evidence={"reason": reason},
                     detail={"verdict": "blocked", "reason": reason},
                     lease_token=task["lease_token"])
+                self._record_evidence(task, Verification("blocked", reason),
+                                      TaskReport(state="blocked"))
                 applied = self.store.set_run_state_internal(
                     run_id, "blocked",
                     last_error=f"task {task['task_key']} was not started: {e}")
@@ -851,6 +883,8 @@ class LabScheduler:
                     task["id"], verdict="blocked", evidence={"reason": str(e)},
                     detail={"verdict": "blocked", "reason": str(e)},
                     lease_token=task["lease_token"])
+                self._record_evidence(task, Verification("blocked", str(e)),
+                                      TaskReport(state="blocked"))
                 applied = self.store.set_run_state_internal(
                     run_id, "blocked",
                     last_error=f"task {task['task_key']}: no usable OpenHands account")

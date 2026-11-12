@@ -41,6 +41,23 @@ from .nexus_specs import SpecService
 log = logging.getLogger("lab_worker")
 
 
+def build_evidence_service(store: PostgresStore) -> Any | None:
+    """The Evidence Trust Engine wired for the lab, or ``None``.
+
+    Returns ``None`` when no signer is configured (``NEXUS_EVIDENCE_PRIVATE_KEY``
+    unset), so the worker's loop stays exactly as it was: no evidence is written
+    and none is faked. When a signer exists, task results are signed and can be
+    re-verified with the trusted keyring.
+    """
+    from .evidence_trust import EvidenceTrustEngine, Keyring, signer_from_env
+    from .nexus_evidence import EvidenceService
+
+    signer = signer_from_env()
+    if signer is None:
+        return None
+    return EvidenceService(store, EvidenceTrustEngine(Keyring.from_env(), signer))
+
+
 def active_run_ids(store: PostgresStore) -> list[str]:
     """Every run the worker should service, across all projects.
 
@@ -61,7 +78,8 @@ class LabWorker:
                  lease_seconds: int = 900, client: Any | None = None,
                  github: GitHubClient | None = None,
                  github_accounts: GitHubAccountService | None = None,
-                 heartbeat_seconds: int = 60, account_router: Any | None = None):
+                 heartbeat_seconds: int = 60, account_router: Any | None = None,
+                 evidence: Any | None = None):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
@@ -71,6 +89,11 @@ class LabWorker:
         # switched out for another with a context hand-off. Without it the
         # process-wide client runs every task, as before.
         self.account_router = account_router
+        # The EVIDENCE stage: when given, every settled task result is signed
+        # into the Evidence Trust Engine (``nexus_evidence``). Built from the
+        # environment by ``main`` (a signer only when the key is configured),
+        # so a deployment without one keeps the loop exactly as it was.
+        self.evidence = evidence
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
         self.executor = OpenHandsExecutor(
@@ -109,7 +132,7 @@ class LabWorker:
     def scheduler(self) -> LabScheduler:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
-                            router=self.account_router)
+                            router=self.account_router, evidence=self.evidence)
 
     def tick_once(self) -> dict[str, Any]:
         """One pass over every active run. Returns a small summary for logs."""
@@ -210,9 +233,11 @@ def main(argv: list[str] | None = None) -> int:
     router = build_account_router(store, principal="machine:default")
     worker = LabWorker(store, worker_id=args.worker_id,
                        poll_interval=args.poll_interval, lease_seconds=args.lease_seconds,
-                       account_router=router)
+                       account_router=router, evidence=build_evidence_service(store))
     if router is not None:
         log.info("OpenHands account pool is active")
+    if worker.evidence is not None:
+        log.info("Evidence Trust Engine is active: task results are signed")
 
     def _stop(signum, frame):  # graceful shutdown
         log.info("signal %s: stopping after the current pass", signum)
