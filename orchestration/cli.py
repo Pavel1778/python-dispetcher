@@ -410,6 +410,93 @@ def cmd_openhands_switch(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_openhands_add(args: argparse.Namespace) -> int:
+    """Add an OpenHands account. The key is verified, then stored encrypted."""
+    client = _client(args)
+    body: dict[str, Any] = {"label": args.label, "api_key": args.api_key}
+    if args.base_url:
+        body["base_url"] = args.base_url
+    if args.transport:
+        body["transport"] = args.transport
+    if args.default_model:
+        body["default_model"] = args.default_model
+    if args.max_concurrent is not None:
+        body["max_concurrent_tasks"] = args.max_concurrent
+    if args.daily_limit is not None:
+        body["daily_conversation_limit"] = args.daily_limit
+    if args.default:
+        body["make_default"] = True
+    result = client.post("/api/openhands/accounts", body)
+    account = result["account"]
+    _emit(args, result,
+          human=f"added {account['id']}  {account['label']}  key={account.get('api_key_hint', '')}")
+    return EXIT["ok"]
+
+
+def cmd_openhands_edit(args: argparse.Namespace) -> int:
+    """Edit an account's non-secret fields. The API key is not changed here."""
+    client = _client(args)
+    body: dict[str, Any] = {}
+    if args.label is not None:
+        body["label"] = args.label
+    if args.base_url is not None:
+        body["base_url"] = args.base_url
+    if args.transport is not None:
+        body["transport"] = args.transport
+    if args.default_model is not None:
+        # ``none`` clears the field, matching the server's explicit-null contract.
+        body["default_model"] = None if args.default_model == "none" else args.default_model
+    if args.max_concurrent is not None:
+        body["max_concurrent_tasks"] = None if args.max_concurrent == 0 else args.max_concurrent
+    if args.daily_limit is not None:
+        body["daily_conversation_limit"] = None if args.daily_limit == 0 else args.daily_limit
+    result = client.post(f"/api/openhands/accounts/{args.account_id}/edit", body)
+    account = result["account"]
+    _emit(args, result, human=f"edited {account['id']}  {account['label']}")
+    return EXIT["ok"]
+
+
+def cmd_openhands_connection(args: argparse.Namespace) -> int:
+    """Probe an account's endpoint reachability (distinct from authorization)."""
+    client = _client(args)
+    result = client.post(f"/api/openhands/accounts/{args.account_id}/connection", {})
+    account = result["account"]
+    state = "reachable" if account.get("reachable") else "unreachable"
+    _emit(args, result, human=f"{account['label']}: {state}")
+    return EXIT["ok"] if account.get("reachable") else EXIT["unavailable"]
+
+
+def cmd_openhands_account_action(args: argparse.Namespace) -> int:
+    """verify / default / enable / disable / remove an account by id."""
+    client = _client(args)
+    action = args.action
+    if action == "verify":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/verify", {})
+        account = out["account"]
+        _emit(args, out, human=f"{account['label']}: state={account['state']}")
+        return EXIT["ok"]
+    if action == "default":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/default", {})
+        _emit(args, out, human=f"default: {out['account']['label']}")
+        return EXIT["ok"]
+    if action in ("enable", "disable"):
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/enable",
+                          {"enabled": action == "enable"})
+        _emit(args, out, human=f"{out['account']['label']}: enabled={out['account']['enabled']}")
+        return EXIT["ok"]
+    if action == "remove":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/remove",
+                          {"force": bool(args.force)})
+        _emit(args, out, human=f"removed {out['removed']}")
+        return EXIT["ok"]
+    if action == "priority":
+        out = client.post(f"/api/openhands/accounts/{args.account_id}/priority",
+                          {"priority": args.priority})
+        _emit(args, out, human=f"{out['account']['label']}: priority={out['account']['priority']}")
+        return EXIT["ok"]
+    raise CliError(f"unknown action {action}", EXIT["usage"])
+
+
 def cmd_qa_verify(args: argparse.Namespace) -> int:
     """Verify the evidence hash chain for a project."""
     client = _client(args)
@@ -579,6 +666,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     oh = sub.add_parser("openhands", parents=[common], help="OpenHands accounts, pool and diagnostics").add_subparsers(dest="sub", required=True)
     oh.add_parser("accounts", parents=[common], help="list OpenHands accounts").set_defaults(func=cmd_openhands_accounts)
+    oha = oh.add_parser("add", parents=[common], help="add an account (verifies the key)")
+    oha.add_argument("--label", required=True)
+    oha.add_argument("--api-key", required=True, help="the API key (stored encrypted)")
+    oha.add_argument("--base-url", default=None)
+    oha.add_argument("--transport", choices=["direct", "app"], default=None)
+    oha.add_argument("--default-model", default=None)
+    oha.add_argument("--max-concurrent", type=int, default=None,
+                     help="maximum concurrent tasks (default: no limit)")
+    oha.add_argument("--daily-limit", type=int, default=None,
+                     help="the account's daily conversation ceiling (default: unknown)")
+    oha.add_argument("--default", action="store_true", help="make this the default account")
+    oha.set_defaults(func=cmd_openhands_add)
+    ohe = oh.add_parser("edit", parents=[common], help="edit an account's non-secret fields")
+    ohe.add_argument("--account", dest="account_id", required=True)
+    ohe.add_argument("--label", default=None)
+    ohe.add_argument("--base-url", default=None)
+    ohe.add_argument("--transport", choices=["direct", "app"], default=None)
+    ohe.add_argument("--default-model", default=None,
+                     help="a model name, or 'none' to clear it")
+    ohe.add_argument("--max-concurrent", type=int, default=None,
+                     help="a positive integer, or 0 to clear the limit")
+    ohe.add_argument("--daily-limit", type=int, default=None,
+                     help="a positive integer, or 0 to clear the limit")
+    ohe.set_defaults(func=cmd_openhands_edit)
+    ohc = oh.add_parser("connection", parents=[common], help="probe an account's endpoint reachability")
+    ohc.add_argument("--account", dest="account_id", required=True)
+    ohc.set_defaults(func=cmd_openhands_connection)
+    ohac = oh.add_parser("account", parents=[common], help="per-account action (verify/default/enable/disable/remove/priority)")
+    ohac.add_argument("action", choices=["verify", "default", "enable", "disable", "remove", "priority"])
+    ohac.add_argument("--account", dest="account_id", required=True)
+    ohac.add_argument("--priority", type=int, default=None, help="required for the priority action")
+    ohac.add_argument("--force", action="store_true", help="remove even with active tasks")
+    ohac.set_defaults(func=cmd_openhands_account_action)
     ohd = oh.add_parser("diagnostics", parents=[common], help="run the diagnostic report")
     ohd.add_argument("--live", action="store_true",
                      help="also run the end-to-end conversation probe (creates and deletes one conversation)")

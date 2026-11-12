@@ -1313,3 +1313,41 @@ Invariants to keep:
   remain). A pool that reports "no usable account" while a live `pytest` shares
   the same database is the test suite truncating tables, not a pool bug —
   reproduce on a private database.
+
+## Account pool: edit, connection, limits and masked values (this session)
+
+The pool already routed across accounts. This adds the four account fields a
+complete pool still lacked, each enforced in code, not in the UI:
+
+- **`max_concurrent_tasks`** (migration `0026_openhands_account_limits.sql`) is
+  the account's concurrency ceiling; `NULL` means no limit. `AccountPool._at_limit`
+  compares it with the *same observed load* `load_balancing` uses (in-flight
+  `nexus_run_tasks` bound to the account plus the reserved counter), and the
+  automatic modes (`auto`, `failover`, `load_balancing`) skip a full account. A
+  pool where every usable account is full raises a reason that names the cause
+  ("every usable OpenHands account is at its concurrency limit"), never a generic
+  "no account". **`manual` is the exception**: a limit steers automatic
+  selection, it does not veto an operator's explicit choice.
+- **`daily_conversation_limit`** records the account's daily ceiling for the
+  operator and the diagnostics. It is informational; the pool never guesses or
+  enforces a number the service did not report.
+- **`api_key_hint`** is the masked key fragment (`sk-o…onse`: first and last four
+  characters; a key under 12 characters is masked whole). It is what the
+  interface, the CLI and the diagnostics show, so they can say *which* key is
+  stored without holding it. The full key stays in `api_key_encrypted` and
+  `OpenHandsAccountService._view` still never returns it.
+- **`connection_ok` / `last_connection_at`** are the last reachability probe.
+  `CloudClient.ping()` (and `CloudDirectClient.ping`) answers *reachability*
+  separately from `health()`: any HTTP answer — including 401/403/429 — means the
+  endpoint is reachable, only a transport failure means it is not. An endpoint
+  can be reachable while the key is rejected, and the operator needs to tell
+  those apart (`check_connection` vs `verify`).
+
+Routes and CLI: `POST /api/openhands/accounts/{id}/edit` (a new `base_url`
+re-verifies the stored key against it before committing) and
+`.../connection`; `nexus openhands add|edit|connection|account
+verify|default|enable|disable|remove|priority`. `_VIEW_COLUMNS` in
+`nexus_openhands_accounts.py` is the single key-free shape every read returns —
+add a new column there and to `REQUIRED_COLUMNS` in `cloud_store.py`, or a read
+will silently omit it. Tests: `tests/test_openhands_account_admin.py` (16 cases)
+and the new cases in `tests/test_openhands_pool_http.py`.

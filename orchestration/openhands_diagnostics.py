@@ -178,7 +178,11 @@ class OpenHandsDiagnostics:
             state = account["state"]
             row = {"id": account["id"], "label": account["label"],
                    "state": state, "enabled": account.get("enabled", True),
-                   "health": account.get("health", "unknown")}
+                   "health": account.get("health", "unknown"),
+                   "api_key_hint": account.get("api_key_hint", ""),
+                   "max_concurrent_tasks": account.get("max_concurrent_tasks"),
+                   "daily_conversation_limit": account.get("daily_conversation_limit"),
+                   "connection_ok": account.get("connection_ok")}
             if state != "active" or not account.get("enabled", True):
                 row["auth"] = "skipped (not active/enabled)"
                 rows.append(row)

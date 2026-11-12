@@ -188,8 +188,24 @@ class AccountPool:
         except Exception:  # noqa: BLE001 - a pool must work before the lab schema exists
             return {}
 
-    def _load_of(self, account: dict, live: dict[str, int]) -> int:
+    @staticmethod
+    def _load_of(account: dict, live: dict[str, int]) -> int:
         return int(account.get("active_tasks", 0) or 0) + live.get(str(account["id"]), 0)
+
+    @staticmethod
+    def _at_limit(account: dict, live: dict[str, int]) -> bool:
+        """True when an account is already running as much as it is allowed to.
+
+        ``max_concurrent_tasks`` is the account's own ceiling; ``NULL`` means
+        "no limit". The count is the same observed load the load-balancing mode
+        uses, so an account is not offered work it has no capacity for. A limit
+        of 1 with one task in flight excludes it; the caller then falls through
+        to another account rather than over-committing this one.
+        """
+        limit = account.get("max_concurrent_tasks")
+        if limit is None:
+            return False
+        return AccountPool._load_of(account, live) >= int(limit)
 
     # ----------------------------------------------------------- selection
     def _usable(self, account: dict, exclude: set[str]) -> bool:
@@ -231,7 +247,10 @@ class AccountPool:
 
         if mode == "manual":
             # The operator's explicit choice, and only that. A bound account is
-            # explicit; otherwise the default. Manual never falls back.
+            # explicit; otherwise the default. Manual never falls back, and it
+            # honours the choice even when the account is at its concurrency
+            # limit: a limit steers automatic selection, it does not veto an
+            # operator's direct instruction.
             chosen = bound if (bound and self._usable(bound, exclude)) else \
                 (default if (default and self._usable(default, exclude)) else None)
             if chosen is None:
@@ -240,15 +259,22 @@ class AccountPool:
                     "mode never switches to another account")
             return chosen
 
+        live = self._live_load()
+
+        #: Usable *and* with capacity left. An account at its concurrency limit
+        #: is skipped here so automatic selection never over-commits it.
+        def selectable(account: dict) -> bool:
+            return self._usable(account, exclude) and not self._at_limit(account, live)
+
         if mode == "load_balancing":
             # Spread work: the usable account running the fewest active tasks.
             # The bound account is honoured only when it is also a valid choice;
             # the point of this mode is balance, so it is not forced.
-            candidates = self.candidates(principal, exclude=exclude)
+            candidates = [a for a in self.candidates(principal, exclude=exclude)
+                          if not self._at_limit(a, live)]
             if not candidates:
-                raise PoolError("no usable OpenHands account for load balancing")
-            live = self._live_load()
-            if bound and self._usable(bound, exclude):
+                raise PoolError(self._capacity_message(principal, exclude))
+            if bound and selectable(bound):
                 fewest = min(self._load_of(a, live) for a in candidates)
                 if self._load_of(bound, live) == fewest:
                     return bound
@@ -259,12 +285,21 @@ class AccountPool:
         # auto and failover: the bound account, then the default, then the best
         # candidate. failover differs only in the exclude set the caller passes.
         for preferred in (bound, default):
-            if preferred is not None and self._usable(preferred, exclude):
+            if preferred is not None and selectable(preferred):
                 return preferred
-        candidates = self.candidates(principal, exclude=exclude)
+        candidates = [a for a in self.candidates(principal, exclude=exclude)
+                      if not self._at_limit(a, live)]
         if not candidates:
-            raise PoolError("no usable OpenHands account")
+            raise PoolError(self._capacity_message(principal, exclude))
         return candidates[0]
+
+    def _capacity_message(self, principal: str, exclude: set[str]) -> str:
+        """A reason that names *why* nothing was selectable, not just "none"."""
+        any_usable = self.candidates(principal, exclude=exclude)
+        if not any_usable:
+            return "no usable OpenHands account"
+        return ("every usable OpenHands account is at its concurrency limit "
+                f"({len(any_usable)} account(s) busy)")
 
     def _default(self, principal: str) -> dict | None:
         for a in self.accounts.list_accounts(principal):
