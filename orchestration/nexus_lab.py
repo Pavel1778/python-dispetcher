@@ -42,6 +42,7 @@ from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubClient, GitHubError
 from .nexus_binding import AuthorizationError, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
+from .nexus_evidence import LabEvidence
 from .nexus_lab_store import TERMINAL_RUN_STATES, UNFINISHED_TASK_STATES, LabStore
 from .nexus_spec_delivery import Delivery, prepare, prepare_request
 from .nexus_specs import SpecService
@@ -642,7 +643,7 @@ class LabScheduler:
                  principal: str = "machine:default", worker_id: str = "lab",
                  lease_seconds: int = 900, router: AccountRouter | None = None,
                  start_wait: Callable[[CloudRateLimited], float] | None = None,
-                 evidence: Any | None = None):
+                 evidence: Any | None = None, acceptance: Any | None = None):
         self.store = store
         self.executor = executor
         self.verifier = verifier
@@ -661,6 +662,13 @@ class LabScheduler:
         #: ``None`` (a deployment with no evidence key) leaves the loop exactly
         #: as it was - the record is skipped, never faked.
         self.evidence = evidence
+        #: The ACCEPTANCE stage: the run's terminal decision is signed into the
+        #: same Trust Engine over the tasks' own verdicts (``LabEvidence``), so a
+        #: run's outcome is an attested ACCEPTED/REJECTED, not the scheduler's
+        #: word. Built on demand, so the loop always attests what it decided; it
+        #: records nothing without a signer.
+        self.acceptance = acceptance if acceptance is not None else LabEvidence(
+            store.store, principal=principal)
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -772,6 +780,11 @@ class LabScheduler:
             result.note = "run not found"
             return result
         if run["state"] in TERMINAL_RUN_STATES:
+            # A run an operator ended (cancelled) or one that failed is already
+            # terminal, so the loop stops touching it - but its ACCEPTANCE
+            # decision must still be attested, and this is the pass that sees
+            # it. Idempotent, so a settled run costs one read and no write.
+            self._record_run_acceptance(run_id, run["state"], run.get("last_error"))
             result.finished = True
             result.note = f"run is {run['state']}"
             return result
@@ -947,7 +960,31 @@ class LabScheduler:
             result.finished = applied is not None
             if applied is not None and note:
                 result.note = result.note or note
+            if applied is not None and state in TERMINAL_RUN_STATES:
+                # ACCEPTANCE: the run's terminal decision is attested over the
+                # tasks' own verdicts - ACCEPTED only when every task verified,
+                # otherwise REJECTED/NOT_READY - never asserted by the scheduler.
+                self._record_run_acceptance(run_id, state, last_error)
         return result
+
+    # ------------------------------------------------- evidence / acceptance
+    def _record_run_acceptance(self, run_id: str, state: str,
+                               last_error: str | None) -> None:
+        """Attest the run's terminal decision. Best effort; never fatal.
+
+        The task-level EVIDENCE records are written by ``_record_evidence``
+        (one per settled verdict). This is the stage after them: the run's own
+        ACCEPTANCE decision, earned from those verdicts rather than asserted.
+        """
+        try:
+            run = self.store.run_row(run_id)
+            if run is None:
+                return
+            tasks = self.store.list_tasks_internal(run_id)
+            self.acceptance.accept_run(run_id=run_id, project_id=str(run["project_id"]),
+                                       state=state, tasks=tasks, last_error=last_error)
+        except Exception:  # noqa: BLE001 - evidence is a record, not the work
+            log.exception("could not record acceptance for run %s", run_id)
 
     def _decide(self, run_id: str) -> tuple[str, str | None, str] | None:
         """The state the run should move to now, or ``None`` to keep going."""

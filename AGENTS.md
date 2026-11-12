@@ -1540,3 +1540,36 @@ also runs the same loop through the real `LabWorker` class with
 advances. `OpenHandsExecutor.instructions` is asserted to ask the agent for every
 capability the request lists (inspect, read/change files, Git, install allowed
 deps, run tests, analyze and fix errors, push, report).
+
+## The pipeline's ACCEPTANCE stage on the autonomous loop (this session)
+
+The EVIDENCE stage above signs every settled *task* result. What was still missing
+is the stage the pipeline names after it: **ACCEPTANCE**. A run that reached
+`completed` left no signed record of *why* it was accepted - only the scheduler's
+word on the run row - so the two stages `... → EVIDENCE → ACCEPTANCE →
+NOTIFICATION` ended at EVIDENCE.
+
+- **`nexus_evidence.LabEvidence`** records the run's terminal decision over the
+  tasks' own verdicts. `LabScheduler(acceptance=...)` calls it where it decides
+  the run's fate, and again for a terminal run it finds (an operator-cancelled run
+  never went through the decide step, so this is the pass that sees it).
+- **The decision is earned, not asserted.** `ACCEPTED` only when every task is
+  `completed_verified`; `NOT_READY` for a cancelled run; `REJECTED` otherwise.
+  `READY_WITH_CONDITIONS` is not used - a run has no partial-acceptance contract.
+  A blocked run is not terminal, so it is not decided yet; the task that stopped
+  it already has its own EVIDENCE record.
+- **`EvidenceService.record_once` is the exactly-once gate.** The lab names each
+  record with a deterministic uuid (`lab_evidence_id`), so the `nexus_evidence`
+  primary key absorbs a re-run of the step: a worker that crashes between the
+  decision and the record collides with its own row instead of appending a
+  second. `record()` gained `record_id` for this; the id is the row key, not a
+  signed field, so it cannot replace a signed record with a different one.
+- **No signer, no record - never a fake.** Without `NEXUS_EVIDENCE_PRIVATE_KEY`
+  `LabEvidence` records nothing and warns once (per process); the run is
+  unaffected. `/api/system` already reports signer presence.
+- `LabStore` gained `get_task_internal`/`list_tasks_internal` for the loop (it is
+  not a project member), mirroring the `*_internal` methods that already existed.
+- Tests: `tests/test_lab_evidence.py` (the ACCEPTED decision, a cancelled run as
+  NOT_READY, a blocked run leaving no decision, the id derivation, and a
+  whole-pipeline walk asserting a durable artifact per stage). Removing the
+  acceptance recording makes them fail.

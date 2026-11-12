@@ -443,6 +443,22 @@ class LabStore:
                 raise NotFound("task not found")
             return self._task_row(row)
 
+    def get_task_internal(self, task_id: str) -> dict | None:
+        """One task by id, for the scheduler (not a project member). ``None``
+        when it is gone. Used to attest a verdict just recorded; never returned
+        to a caller outside the process."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            return self._task_row(row) if row else None
+
+    def list_tasks_internal(self, run_id: str) -> list[dict]:
+        """Every task of a run, for the scheduler (not a project member)."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s "
+                        "ORDER BY created_at, id", (run_id,))
+            return [self._task_row(r) for r in cur.fetchall()]
+
     @staticmethod
     def _task_row(row: Any) -> dict:
         out = dict(row)
