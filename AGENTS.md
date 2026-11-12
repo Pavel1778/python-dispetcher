@@ -1004,3 +1004,35 @@ failure, and prove the integration with one command. The invariants to keep:
   BLOCKED. No second OpenHands key is available, so a *two-live-account*
   failover is BLOCKED; the failover logic is proven end to end against real
   PostgreSQL with honest transport fakes.
+
+## Long-task hardening integrated onto the account-pool main (2026-11-12)
+
+`arena/dcb992a2` (commit `bfcac69`, "Long tasks: failures that say why, and the
+cases that prove it") was merged into `main` on branch
+`nexus/continue-longtask-hardening`. It is the continuation of the long-text
+work and is orthogonal to the account pool, but it had never been merged.
+
+- **One textual conflict, in `nexus_lab.py`'s dispatch-failure branch.** main
+  added account-failover bookkeeping (`_failed_account`, `note_failure`,
+  `failed_account_id`); the branch added the `permanent` short-circuit. Both are
+  kept: a permanent failure ends the task at once, and a transient one is still
+  released with the failed account recorded so failover can exclude it.
+- **A real defect the integration exposed.** `OpenHandsExecutor.dispatch`
+  (main) wraps every `CloudError` in a `DispatchError` to attach the failed
+  account. That re-labelled the message, so a task's `last_error` read
+  `DispatchError: DeliveryError: ...` and the specific error name the long-task
+  work depends on ("failures that say why") was buried. `DispatchError` now
+  carries the wrapped error as its `cause`, and the scheduler records
+  `_error_text(e)` -- the cause's own type and message. `test_long_task_cases.py`
+  asserts `last_error.startswith("DeliveryError: ")` and fails without this.
+- **The account pool's `permanent` propagation.** `DispatchError.__init__` takes
+  `permanent` and `dispatch()` forwards `getattr(e, "permanent", False)`, so a
+  permanent delivery failure is not retried three times over the pool.
+- Tests: `tests/test_long_task_cases.py` (45 cases). Merged suite: **899 passed,
+  23 skipped** on a clean schema (baseline `main` was 854 passed / 23 skipped).
+- **Test isolation warning.** Running the whole suite against a schema that a
+  previous (differently-versioned) run left behind produces dozens of spurious
+  `UndefinedTable`/`UniqueViolation` errors, because the migration runner skips
+  files whose recorded checksum matches even when the tables are absent. Always
+  start from `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` before a full
+  run; the failures are residue, not regressions.
