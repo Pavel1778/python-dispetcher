@@ -73,6 +73,23 @@ class FakeGitHub:
             {"path": "tests/test_app.py", "type": "blob", "size": 210},
             {"path": "requirements.txt", "type": "blob", "size": 30},
         ]
+        #: A history of its own for a repository, oldest commit first:
+        #: ``{full_name: [{"sha", "message", "files": [{"filename", "status",
+        #: "additions", "deletions"}]}]}``. A repository that has one answers
+        #: ``/commits`` (newest first) and ``/compare/{base}...{head}`` from it;
+        #: one that has none answers ``/commits`` with ``self.commits`` as
+        #: before. ``push`` appends to it - what an agent's ``git push`` does.
+        self.history: dict[str, list[dict]] = {}
+        #: Check runs per commit: ``{sha: [{"name", "status", "conclusion"}]}``.
+        self.check_runs: dict[str, list[dict]] = {}
+        #: Which repositories a token can see: ``{token: {full_name, ...}}``.
+        #: A token that is not listed sees everything (as before); a listed
+        #: one gets 404 for anything else - what GitHub answers for a private
+        #: repository the token has no access to.
+        self.token_repos: dict[str, set[str]] = {}
+        #: What a token may do with a repository it sees, where that differs
+        #: from "everything": ``{(token, full_name): {"push": False, ...}}``.
+        self.token_permissions: dict[tuple[str, str], dict] = {}
         #: File contents, keyed by path, returned base64 from /contents/{path}.
         self.contents: dict[str, str] = {
             "README.md": "# Demo project\n\nA tiny service used by tests.\n",
@@ -80,6 +97,35 @@ class FakeGitHub:
             "src/app.py": "def add(a, b):\n    return a + b\n",
             "tests/test_app.py": "from src.app import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
         }
+
+
+    # ----------------------------------------------------------- for tests
+    def push(self, full_name: str, sha: str, message: str = "work",
+             files: list[dict] | None = None) -> str:
+        """A new head for *full_name*'s branch: what a ``git push`` leaves."""
+        self.history.setdefault(full_name, []).append(
+            {"sha": sha, "message": message, "files": files or []})
+        return sha
+
+    def head(self, full_name: str) -> str | None:
+        commits = self.history.get(full_name)
+        return commits[-1]["sha"] if commits else None
+
+    def sees(self, authorization: str | None, full_name: str) -> bool:
+        token = (authorization or "").split(" ", 1)[-1]
+        allowed = self.token_repos.get(token)
+        return allowed is None or full_name in allowed
+
+    def permissions(self, authorization: str | None, full_name: str) -> dict:
+        token = (authorization or "").split(" ", 1)[-1]
+        return {"admin": True, "push": True, "pull": True,
+                **self.token_permissions.get((token, full_name), {})}
+
+    @staticmethod
+    def _commit(item: dict) -> dict:
+        return {"sha": item["sha"],
+                "commit": {"message": item.get("message") or "work",
+                           "author": {"name": "agent", "date": "2026-01-04T00:00:00Z"}}}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -112,7 +158,10 @@ class _Handler(BaseHTTPRequestHandler):
             if gh.page_size:
                 per_page = gh.page_size
             start = (page - 1) * per_page
-            self._json(200, gh.repos[start:start + per_page])
+            # A token is shown only what it has access to, as on GitHub.
+            authorization = self.headers.get("Authorization")
+            visible = [repo for repo in gh.repos if gh.sees(authorization, repo["full_name"])]
+            self._json(200, visible[start:start + per_page])
             return
 
         if parsed.path == "/user":
@@ -128,18 +177,58 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) >= 3 and parts[0] == "repos":
             full_name = f"{parts[1]}/{parts[2]}"
             repo = next((r for r in gh.repos if r["full_name"] == full_name), None)
-            if repo is None:
+            if repo is None or not gh.sees(self.headers.get("Authorization"), full_name):
                 self._json(404, {"message": "Not Found"})
                 return
             if len(parts) == 3:
-                self._json(200, {**repo, "html_url": f"https://github.com/{full_name}"})
+                self._json(200, {**repo, "html_url": f"https://github.com/{full_name}",
+                                 "visibility": "private" if repo.get("private") else "public",
+                                 "permissions": gh.permissions(
+                                     self.headers.get("Authorization"), full_name)})
                 return
             section = parts[3]
             if section == "branches":
                 self._json(200, gh.branches)
                 return
+            # /repos/{owner}/{name}/commits/{sha}/check-runs
+            if section == "commits" and len(parts) == 6 and parts[5] == "check-runs":
+                runs = gh.check_runs.get(parts[4], [])
+                self._json(200, {"total_count": len(runs), "check_runs": runs})
+                return
             if section == "commits":
-                self._json(200, gh.commits)
+                own = gh.history.get(full_name)
+                self._json(200, [gh._commit(item) for item in reversed(own)]
+                           if own is not None else gh.commits)
+                return
+            # /repos/{owner}/{name}/compare/{base}...{head}
+            if section == "compare" and len(parts) == 5 and "..." in parts[4]:
+                base, head = parts[4].split("...", 1)
+                shas = [item["sha"] for item in gh.history.get(full_name, [])]
+
+                def index(prefix: str) -> int | None:
+                    found = [i for i, sha in enumerate(shas) if sha.startswith(prefix)]
+                    return found[0] if found else None
+
+                b, h = index(base), index(head)
+                if b is None or h is None:
+                    self._json(404, {"message": "Not Found"})
+                    return
+                between = gh.history[full_name][b + 1:h + 1]
+                files: dict[str, dict] = {}
+                for item in between:
+                    for change in item.get("files") or []:
+                        seen = files.setdefault(change["filename"], {
+                            "filename": change["filename"],
+                            "status": change.get("status") or "modified",
+                            "additions": 0, "deletions": 0})
+                        seen["additions"] += int(change.get("additions") or 0)
+                        seen["deletions"] += int(change.get("deletions") or 0)
+                self._json(200, {
+                    "status": "identical" if b == h else "ahead" if b < h else "behind",
+                    "ahead_by": max(0, h - b), "behind_by": max(0, b - h),
+                    "total_commits": len(between),
+                    "commits": [gh._commit(item) for item in between],
+                    "files": list(files.values())})
                 return
             if section == "issues":
                 self._json(200, gh.issues)

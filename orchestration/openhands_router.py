@@ -25,12 +25,23 @@ Context passed across a hand-off (the list the task text asks for):
   executor's final report, the last error, and the acceptance criteria.
 
 Nothing here is a secret: the context is derived from rows the caller may read.
+
+Which accounts a task may be given at all is decided in two layers:
+
+* a project that has its **own list of executors** (``nexus_executors``) is
+  served from that list and nothing else - in order under ``failover`` (the
+  primary while it is usable, and again as soon as it is back), by load under
+  ``distribute``;
+* a project without a list is served by its owner's account pool, as before;
+  and when the owner has stored no account at all, ``select_for_task`` returns
+  ``None``: the task runs under the server's own key.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from .cloud_store import PostgresStore
+from .nexus_executors import ProjectExecutorService
 from .nexus_lab_store import LabStore
 from .openhands_pool import AccountPool, PoolError
 
@@ -48,6 +59,7 @@ class AccountRouter:
         self.pool = pool
         self.lab = lab
         self.principal = principal
+        self.executors = ProjectExecutorService(store, pool.accounts)
 
     def _principal_for_project(self, project_id: str | None) -> str:
         """The principal whose accounts serve this project.
@@ -67,18 +79,22 @@ class AccountRouter:
             row = cur.fetchone()
         return row["principal"] if row else self.principal
 
-    def select_for_task(self, task: dict) -> dict:
-        """The account to run *task*, never one that has failed it.
+    def select_for_task(self, task: dict) -> dict | None:
+        """The account to run *task*, never one that has failed it; ``None``
+        when the task's project has no stored executor to choose from, which
+        means "the server's own key".
+
+        A project with its own list of executors is served from that list
+        only (``_from_project``). Otherwise the owner's pool decides, as
+        before.
 
         An operator's manual switch records ``preferred_account_id``; that
         account is used when it is usable, so a switch the operator asked for is
         honoured. It is only a preference: if the target is disabled, revoked or
-        unusable, the pool falls back to its normal policy rather than failing
-        the task.
+        unusable, the normal policy applies rather than failing the task.
 
-        Raises :class:`NoUsableAccount` when the pool has nothing left for this
-        task, so the caller can dead-letter it with a clear reason instead of
-        looping.
+        Raises :class:`NoUsableAccount` when there are executors and none can
+        take this task now, so the caller can say why instead of looping.
 
         Only ``tried_accounts`` is excluded - the accounts a start failed on or
         a conversation vanished from. The account the task last *ran* on is not:
@@ -88,11 +104,18 @@ class AccountRouter:
         """
         exclude = {str(x) for x in (task.get("tried_accounts") or [])}
         project_id = str(task.get("project_id") or "") or None
-        principal = self._principal_for_project(project_id)
         preferred = str(task.get("preferred_account_id") or "") or None
+        if project_id:
+            strategy, assigned = self.executors.assigned(project_id)
+            if assigned:
+                return self._from_project(assigned, strategy, exclude, preferred)
+        principal = self._principal_for_project(project_id)
+        accounts = self.pool.accounts.list_accounts(principal)
+        if not accounts:
+            return None
         try:
             if preferred:
-                for account in self.pool.accounts.list_accounts(principal):
+                for account in accounts:
                     if str(account["id"]) == preferred and self.pool._usable(
                             account, exclude):
                         return account
@@ -100,8 +123,53 @@ class AccountRouter:
         except PoolError as e:
             raise NoUsableAccount(str(e)) from e
 
+    def _from_project(self, assigned: list[dict], strategy: str, exclude: set[str],
+                      preferred: str | None) -> dict:
+        """Choose among a project's own executors.
+
+        Usable = on the project's list and switched on there, the connection
+        itself switched on, active, not marked unavailable, and not already
+        tried for this task. Nothing outside the list is ever considered.
+        """
+        usable = [item for item in assigned
+                  if item["usable"] and item["account_id"] not in exclude]
+        if not usable:
+            reasons = []
+            for item in assigned:
+                why = ("already tried for this task" if item["account_id"] in exclude
+                       else "switched off for this project" if not item["project_enabled"]
+                       else "switched off" if not item["enabled"]
+                       else f"is {item['state']}" if item["state"] != "active"
+                       else "unavailable" if item["health"] == "unavailable"
+                       else "not usable")
+                reasons.append(f"{item['label']}: {why}")
+            raise NoUsableAccount(
+                "none of the project's OpenHands executors can take the task now ("
+                + "; ".join(reasons) + ")")
+        if preferred:
+            for item in usable:
+                if item["account_id"] == preferred:
+                    return item
+        if strategy == "distribute" and len(usable) > 1:
+            live = self.pool._live_load()
+            usable.sort(key=lambda item: (live.get(item["account_id"], 0), item["position"]))
+        return usable[0]
+
     def principal_for_task(self, task: dict) -> str:
         return self._principal_for_project(str(task.get("project_id") or "") or None)
+
+    def _owner(self, account_id: str, task: dict | None = None) -> str:
+        """Whose connection *account_id* is. Health is recorded against the
+        owner; for a connection that is gone, the task's project owner stands
+        in so the call is still a harmless no-op."""
+        owner = self.pool.accounts.owner_of(str(account_id))
+        return owner or (self.principal_for_task(task) if task else self.principal)
+
+    def reprobe(self, task: dict | None = None) -> list[dict]:
+        """Ask the executors that were written off whether they are back -
+        those of *task*'s project when one is given."""
+        project_id = str((task or {}).get("project_id") or "") or None
+        return self.pool.accounts.reprobe_unavailable(project_id=project_id)
 
     def should_verify_authorization(self, task: dict, account_id: str) -> bool:
         """True when this start is a *switch*, so the account must be re-checked.
@@ -243,7 +311,7 @@ class AccountRouter:
                 "       ELSE tried_accounts || to_jsonb(%s::text) END, "
                 "  updated_at=now() WHERE id=%s",
                 (account_id, account_id, task["id"]))
-        self.pool.record_failure(self.principal_for_task(task), account_id, error,
+        self.pool.record_failure(self._owner(account_id, task), account_id, error,
                                  unavailable=unavailable)
 
     def note_success(self, task: dict) -> None:
@@ -257,7 +325,7 @@ class AccountRouter:
         account_id = task.get("openhands_account_id")
         if not account_id:
             return
-        self.pool.record_success(self.principal_for_task(task), str(account_id))
+        self.pool.record_success(self._owner(str(account_id), task), str(account_id))
 
 
 def build_account_router(store: PostgresStore, *,
@@ -273,13 +341,19 @@ def build_account_router(store: PostgresStore, *,
     ``list_accounts(principal)``: accounts are stored per principal, and the
     worker's ``machine:default`` owns none while an account added in the studio
     belongs to ``user:<login>``. A per-principal check returned ``None`` on every
-    deployment with a login, so the pool — and with it the automatic selection
-    modes — was never switched on. The router still *selects* per project
-    (``AccountRouter._principal_for_project``); only the on/off decision is
-    deployment-wide.
+    deployment with a login, so the pool - and with it the automatic selection
+    modes - was never switched on.
+
+    Whether a *task* goes to a stored account is decided per task
+    (``select_for_task``): from its project's own list of executors
+    (``nexus_executors``), else from its owner's pool, and for a project whose
+    owner has stored nothing it returns ``None`` - the server's own key.
+
+    The answer is for now, not for ever: the loop asks again on every pass
+    while it has no router (``LabWorker.tick_once``), so a connection added in
+    the studio comes into use without a restart.
     """
     from .nexus_openhands_accounts import OpenHandsAccountService
-    from .nexus_project_executors import ProjectExecutorService
 
     accounts = OpenHandsAccountService(store)
     try:
@@ -287,7 +361,7 @@ def build_account_router(store: PostgresStore, *,
             return None
     except Exception:  # noqa: BLE001 - a database that is not ready means "no pool"
         return None
-    # The project-scoped assignment service restricts the pool to the executors
-    # a project was assigned; without assignments the pool is unchanged.
-    pool = AccountPool(store, accounts, assignments=ProjectExecutorService(store))
+    # Which connections a project may use is decided in ``select_for_task``,
+    # from the project's own list of executors (``nexus_executors``).
+    pool = AccountPool(store, accounts)
     return AccountRouter(store, pool=pool, lab=LabStore(store), principal=principal)

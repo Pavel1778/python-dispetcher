@@ -199,6 +199,9 @@ independently, and can route work across several accounts. Start here:
   to verify a real conversation runs.
 - [docs/OPENHANDS_ACCOUNTS.md](docs/OPENHANDS_ACCOUNTS.md) — the account pool,
   the four selection modes, and the per-account controls.
+- [docs/DURABLE-RUNS.md](docs/DURABLE-RUNS.md) — runs that do not give up:
+  work cycles and waits, the report in the chat, cancelling and stopping an
+  agent for real, the executors of a project, several repositories per project.
 - [docs/FAILOVER.md](docs/FAILOVER.md) — what happens when an account fails and
   how the context is handed to the next one.
 - [docs/WORKER_SETUP.md](docs/WORKER_SETUP.md) — who advances autonomous runs

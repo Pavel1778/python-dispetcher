@@ -217,34 +217,46 @@ class McpServer:
         pid = args["project_id"]
         self._member(pid)
         from .nexus_lab_store import LabStore
+        from .nexus_reports import ReportService
         lab = LabStore(self.store)
         run = lab.get_run(self.principal, pid, args["run_id"])
         return {"run": run, "tasks": lab.list_tasks(self.principal, pid, args["run_id"]),
-                "report": lab.report_for_run(args["run_id"])}
+                "report": ReportService(self.store).for_run(args["run_id"])}
 
     def _cancel_run(self, args: dict) -> Any:
         pid = args["project_id"]
         self._member(pid)
         from .nexus_lab_store import LabStore
-        run = LabStore(self.store).cancel_run(self.principal, pid, args["run_id"])
+        # Settles the run, hides it and leaves a stop signal for every
+        # conversation at work for it; a second cancel changes nothing.
+        run = LabStore(self.store).set_run_state(self.principal, pid, args["run_id"],
+                                                 "cancelled")
         return {"run": run}
 
     def _list_project_executors(self, args: dict) -> Any:
         pid = args["project_id"]
         self._member(pid)
-        from .nexus_project_executors import ProjectExecutorService
-        return {"executors": ProjectExecutorService(self.store).list(self.principal, pid)}
+        return self._executors().get(self.principal, pid)
 
     def _assign_project_executor(self, args: dict) -> Any:
         pid = args["project_id"]
         self._member(pid)  # membership; the service re-checks ownership
-        from .nexus_project_executors import ProjectExecutorService
         role = args.get("role") or "fallback"
-        if role not in ("primary", "fallback"):
+        if role not in ("primary", "fallback", "backup"):
             raise McpError(-32602, "role must be 'primary' or 'fallback'")
-        executor = ProjectExecutorService(self.store).set_executor(
-            self.principal, pid, args["account_id"], role=role)
-        return {"executor": executor}
+        service = self._executors()
+        if role == "primary":
+            return service.make_primary(self.principal, pid, args["account_id"])
+        current = service.get(self.principal, pid)
+        entries = [{"account_id": e["account_id"], "enabled": e["enabled"]}
+                   for e in current["executors"] if e["account_id"] != args["account_id"]]
+        entries.append({"account_id": args["account_id"], "enabled": True})
+        return service.set(self.principal, pid, executors=entries)
+
+    def _executors(self):
+        from .nexus_executors import ProjectExecutorService
+        from .nexus_openhands_accounts import OpenHandsAccountService
+        return ProjectExecutorService(self.store, OpenHandsAccountService(self.store))
 
     def _list_evidence(self, args: dict) -> Any:
         pid = args["project_id"]

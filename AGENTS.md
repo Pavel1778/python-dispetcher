@@ -1310,132 +1310,6 @@ is undone. Keep these invariants:
   repository was bound. `test_backup_restore.py` and `test_browser_e2e.py` were
   run with the PostgreSQL client tools and Chromium installed.
 
-## Durable autonomy, reports, cancel/hide, multi-executor and multi-repo (branch `nexus/durable-autonomy-multiconn`)
-
-The run loop no longer gives up after a few failures, a finished run reports
-back into the chat that asked for it, a cancelled run leaves the interface, a
-project may use several OpenHands and several GitHub repositories. Migration
-`0026_durable_autonomy.sql` is additive. Invariants to keep:
-
-- **A run retries; it does not fail for good.** When a cycle ends with work left
-  (`_decide` returns `retrying`), `LabStore.schedule_retry` puts the run in
-  `retrying` with `retry_at = now() + retry_backoff_seconds(n)` and
-  `start_retry_cycle` (on the next tick after the wait) restarts every task that
-  did not verify with a fresh per-cycle `attempt` budget and bumps `cycle`. A
-  run's total work is bounded by `max_retry_cycles` and a lifetime
-  `total_iterations`; when the cycles are spent the run is **blocked**, never
-  failed silently. `NEXUS_MAX_RETRY_CYCLES` / `NEXUS_RETRY_BASE_SECONDS` /
-  `NEXUS_RETRY_MAX_SECONDS` tune it.
-- **A permanent failure blocks at once.** `release_task(..., permanent=True)`
-  records `{"permanent_failure": true}` in the task's evidence;
-  `has_retryable_failure` is what tells a run that a cycle cannot change the
-  outcome (a `DeliveryError` the transport cannot fix) from one that might. A
-  429 is not permanent: `postpone_task` gives the attempt and the iteration back.
-- **The state machine has no exit from a terminal state.** `_RUN_ENTERED_FROM`
-  never lists `completed`/`failed`/`cancelled` as a source. `retrying` is entered
-  from `running`/`blocked` and leaves for `running` (cycle restart) or `blocked`
-  (cycles spent). A person's "resume" of a `blocked` run requeues the retryable
-  tasks and resets `retry_attempt`/`iteration`; of a `retrying` run it restarts
-  the cycle at once.
-- **One run, one report** (`orchestration/nexus_reports.py`). A completed run's
-  report is built from its own rows and written by the pass that settled it
-  (`nexus_run_reports.run_id` is UNIQUE, so a second write is a no-op). Delivery
-  to the source chat is durable: a `pending` report is picked up by any later
-  pass, a failed delivery is retried with a backoff, and `status` only moves
-  forward from `pending`, so a report is never posted twice. The report is only
-  written for a **verified** finish; a blocked/failed run writes none.
-- **Cancel is terminal, idempotent and hides the run.** `LabStore.cancel_run`
-  settles the run and sets `hidden_at`, so `list_runs` (and the UI) drop it while
-  every row is kept; `cancel_requested_at` drives the loop's executor signal
-  (`LabWorker._signal_cancelled` → `pause`, or `delete_conversation` where there
-  is no pause), recorded once per conversation. Cancelling twice keeps the first
-  timestamps.
-- **`nexus_project_executors.py` is the project's executor allowlist.**
-  `ProjectExecutorService` holds one primary (a partial unique index) and ordered
-  fallbacks; `AccountPool` restricts a project to its assignments when it has
-  any, and keeps the old behaviour otherwise. An account of another principal is
-  refused.
-- **A project uses several repositories, each with its own account.**
-  `ProjectRepositoryService.link` takes `account_id`, `label` and `make_primary`
-  (one primary per project); `project_github` resolves the reading identity per
-  repository from the link, falling back to the project's single bound account,
-  then the server token.
-- **The mobile scroll fix is `flex: none` on `.work`.** A card is a flex item of
-  the column `.work-list` and carries `overflow: hidden`; without `flex: none` its
-  automatic minimum size collapses and it shrinks to clip its content instead of
-  making the list scroll. `tests/test_browser_e2e.py` asserts the list really
-  overflows and the last task is reachable.
-- **Copy reuses one mechanism.** `copyText`/`copied` serve a user message, an
-  assistant reply (`copyButton`) and the run report (`copy-report`); the full
-  stored text is copied, never the rendered DOM.
-- **HTTP/CLI/MCP.** `POST .../runs/{id}/{cancel|hide}`, `GET .../executors`,
-  `POST .../executors` and `.../executors/{id}/{enable|disable|remove}`,
-  `POST .../repositories/{owner}/{name}/{primary|account}`; the run detail now
-  carries `report`. CLI: `run show|cancel|hide`, `project executors show|set`,
-  `project repo primary`. MCP adds `list_runs`/`get_run`/`cancel_run`/
-  `list_project_executors`/`assign_project_executor`.
-- Tests: `tests/test_durable_autonomy.py` (retry cycles, reports, cancel/hide,
-  executor assignment, multi-repo, idempotent recovery), the new cases in
-  `tests/test_lab_http.py` (routes) and `tests/test_browser_e2e.py` (copy, cancel
-  disappearance, report in chat, phone scroll). `tests/test_route_auth.py`
-  probes every new endpoint. Full suite: 993 passed / 8 skipped.
-
-## Independent audit of PR #29 (durable autonomy, multi-connection)
-
-This records what an independent audit found and fixed. Read it before changing
-the chat turn, the run report delivery, or the planner's empty-plan path.
-
-- **Chat-first intent routing was missing entirely.** With a conversation's mode
-  set to `autonomous`, *any* message started a run - a question ("почему прогон
-  ломается?") launched agents. `orchestration/nexus_intent.py` is now the one
-  router: it classifies a message as `chat` / `analysis` / `autonomous` from its
-  *shape* (question vs order), not from a keyword, and `effective_mode` turns
-  that into the mode the turn runs in. Migration `0027` adds the `analysis` and
-  `auto` modes and makes `auto` the default; the studio has an "Авто" (default)
-  and a "Разбор" mode. Invariants: a question never starts a run; an ambiguous
-  message is answered with one clarifying question (and does not even call the
-  model); `analysis` mode never starts a run; "продолжи" continues the run the
-  conversation already started (resume, never a second run); a question asked
-  during a run does not change the run's state. `tests/test_intent_router.py`.
-- **A statement is not ambiguous.** Only a message that carries a work signal
-  but whose shape is unclear is flagged ambiguous. A plain "Вопрос без
-  провайдера" or a hostile HTML blob is a normal chat turn (answered, never
-  intercepted) - the browser tests depend on that.
-- **The planner recovered nothing from an empty plan.** "the planner found
-  nothing to do in the specification: the plan has no tasks" was terminal.
-  `SpecPlanner._fallback_plan` now decomposes by the specification's own index -
-  one task per section that holds at least one *normative* piece, chained in
-  document order - each task carrying the `spec_ref` the delivery path needs.
-  It never fabricates work: a text with no obligation still fails honestly, with
-  the reason. `coverage["fallback"]` marks it. `tests/test_long_task_cases.py`.
-- **Report delivery was not idempotent under two workers.** `deliver_pending`
-  read the pending rows and marked each `sent` only *after* posting, so the
-  inline lab loop and a standalone `lab_worker` (which the docs say may run side
-  by side) both posted the same report. Delivery now *claims* each report
-  atomically (`claim_pending_reports`, `FOR UPDATE SKIP LOCKED`, status
-  `sending`; migration `0028` widens the CHECK) and `reclaim_stale_report_sends`
-  returns a dead worker's claim. `tests/test_durable_autonomy.py`.
-- **`is_primary` was a label with no effect.** The docstring promised a
-  repository-less task runs against the project's primary repository, but
-  nothing read the column. `ProjectRepositoryService.primary_repository` now
-  resolves it (and treats a project's *single* linked repository as primary in
-  effect), and both run-start paths use it.
-- **Test-suite flakiness (not a product defect).** Running the whole suite can
-  fail with `psycopg.errors.UndefinedTable` when one module's server (with
-  `lab_inline=True`) still touches the database while the next module resets the
-  schema. Each module passes alone; a clean serial run passes. Do not "fix" this
-  by weakening a test.
-
-## Tasks across repositories and the run card (this increment)
-
-- **A plan task may name its own repository and branch.** `validate_tasks` keeps
-  them (`keep=("requirements", "earlier", "repository", "branch")`), `merge`
-  carries them onto the stored task, and `start_run` uses the task's when it has
-  one and the run's otherwise. So one run can span several repositories of a
-  project; a task with no repository uses the run's, the common case.
-- **The run card names the executor and the retry cycle.** `list_tasks` joins
-  `nexus_openhands_accounts.label` as `account_label` (the key is never
-  selected), and the studio shows `исполнитель: <label>` and `цикл N` per task.
 ## Safe restore points (the first safety rule)
 
 Before touching anything, a run takes a restore point. `orchestration/restore_point.py`
@@ -1800,3 +1674,95 @@ focused view was added on top of them, without changing their logic.
   (reusing its `_reset`, `clouds`, `app`, `base` helpers) plus the route-auth
   entry. The CLI/route report is asserted to be `UNVERIFIED` for the agent
   catalog when `live` is not requested.
+
+## Durable runs, reports, stop signals, project executors, several repositories (2026-11-12)
+
+Full description: `docs/DURABLE-RUNS.md`. What a future change has to know:
+
+- **A run has a `policy`.** `durable` (the chat, or REST without budgets) does
+  not give a task up; `bounded` (REST with `max_iterations`/`deadline_seconds`,
+  or `"policy": "bounded"`; also the default of `LabStore.start_run`) stops
+  where a run always stopped. Every rule below that says "waits" or "is tried
+  again" is the durable one; a test that builds a run through the store gets
+  the bounded behaviour unless it asks.
+- **Task state `waiting`** (+ `retry_at`, `wait_reason`, `cycle`). Attempts are
+  per work cycle; when they are used up the task waits
+  (`nexus_retry.cycle_wait`: a minute doubling to an hour) and starts the next
+  cycle. `nexus_retry` is the whole policy, as pure functions. A 429 is never
+  an attempt (`postpone_task`). `NEXUS_RETRY_MAX_CYCLES` (0 = none) is the
+  operator's ceiling.
+- **A result that does not verify is reworked** (`LabScheduler._retry`,
+  `LabStore.retry_task`): first in the same conversation
+  (`Verification.retry = followup`, `Dispatched.kind = "continue"`), then in a
+  new one, with the old one told to stop. `reverify` holds the result when
+  GitHub cannot be asked. An attempt that was not accepted is signed into
+  evidence as well.
+- **Completion is checked once more and reported in one transaction.**
+  `LabScheduler._complete` asks GitHub whether every accepted commit is still
+  in its branch (`GitVerifier.confirm`); a commit that left reopens its task
+  (`reopen_task`), and a GitHub that does not answer postpones completion. `ReportService.on_completed` is the `also` hook of
+  `set_run_state_internal(..., "completed")`: the report row exists exactly
+  when the run completed. `deliver_due` appends the chat message and marks the
+  row delivered in one transaction, on a locked row.
+- **Cancel = `cancelled` + `hidden_at` + stop signals, one transaction**
+  (`LabStore._apply_run_state`). Nothing is deleted; `list_runs` leaves hidden
+  runs out.
+- **Stopping a conversation.** Clients: `stop_conversation(id) -> bool` and
+  `supports_conversation_stop`. The `app` transport pauses the conversation's
+  own sandbox - it is how the Cloud's own client stops one, and a conversation
+  started here never shares a sandbox. `OpenHandsExecutor.stop(account,
+  conversation, project)` is the only way the loop stops one; a conversation
+  that is gone or already stopped counts as stopped. Two records of what is
+  owed: `nexus_run_tasks.abandoned` (a switch or failover of a live task;
+  drained by the run's pass, and by `deliver_stops` for a run that has ended)
+  and `nexus_executor_stops` (everything else; confirmed by looking at the
+  conversation, re-sent with a growing pause, given up after
+  `MAX_STOP_ATTEMPTS`). `_BRANCH_FREE` holds the branch for both.
+- **The fencing token covers the new transitions**: `retry_task`, `wait_task`
+  take `lease_token`; they and `reopen_task` move it on.
+- **`LabWorker.tick_once`** = runs, then stops, reports, and a re-probe of
+  connections written off. The web server's inline loop uses the same method.
+  A worker with no router looks for stored connections on every pass
+  (`_find_router`).
+- **Connections.** `net_guard` checks a URL a person supplied (public addresses
+  only, again at connect time). It has no switch of its own: what is permitted
+  is read from `nexus_policy` (`NEXUS_ALLOW_PRIVATE_TARGETS`, and
+  `NEXUS_OPENHANDS_ALLOWED_HOSTS` for one host), which
+  `check_outbound_url` obeys too - never add a second opt-in. A new MCP tool
+  needs an entry in `MCP_TOOL_SCOPES`. `edit()` is the one way to change a
+  connection and also takes a new key; `remove` is refused while something
+  depends on it; `verify` records `api_version` and `compatibility`.
+- **Project executors.** `nexus_project_executors` (position 0 = primary) and
+  `nexus_projects.executor_strategy` (`failover` | `distribute`);
+  `AccountRouter.select_for_task` uses only the project's list when it has one.
+- **Project repositories.** A link carries `github_account_id`, `is_primary`,
+  `working_branch`, `role_note`, `enabled`. `ProjectRepositoryService.context`
+  is what the planner and the agents are told; `account_for_repository` is what
+  the verifier and the report read with.
+- **Migrations** `0030_durable_runs.sql`, `0031_openhands_connections.sql`,
+  `0032_project_repositories.sql`. They also convert a database that carries
+  the draft schema of PR #29 (`0026_durable_autonomy.sql`), which was never
+  merged.
+- **What was reused.** PR #29 (draft, the same task, written by an agent run):
+  its studio interface (copy buttons, the mobile scroll fix, the settings
+  sections), routes, CLI/MCP additions and `nexus_binding` changes are merged
+  here; its scheduler, migration and executor module were not (this branch's
+  were further along and tested), and the migrations accept its schema.
+- **A test of `main` changed on purpose**:
+  `tests/test_pipeline_e2e.py::test_a_text_answer_is_never_proof_of_work`
+  expected a chat-started run to end `blocked` on the first unverified answer.
+  The rule stands (not accepted, the dependent not started, the attempt in the
+  evidence); the run now goes on. The bounded behaviour is in
+  `tests/test_lab_inline.py`.
+
+Tests: `tests/test_durable_runs.py`, `test_run_reports.py`,
+`test_durable_migrations.py`, `test_project_repositories.py`,
+`test_openhands_connections.py` (connections and project executors), the HTTP cases in
+`test_lab_inline.py`, and the studio journeys in `test_browser_e2e.py`.
+
+Not verified against the live services: nothing here was run against a real
+OpenHands Cloud account or a real GitHub repository - this was written without
+credentials for either. The Cloud's sandbox pause, `/interrupt` on an
+agent-server and the events query used for the stall check are taken from the
+OpenHands source and its OpenAPI description, and exercised only against the
+stand-in servers in `tests/`.

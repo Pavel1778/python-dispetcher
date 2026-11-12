@@ -36,9 +36,12 @@ real external service was made and its result observed.
 | Autonomous Lab web UI | **LIVE-VERIFIED** (Chromium journey) | `web_ui.py`, `tests/test_browser_e2e.py` |
 
 **Not implemented in the loop:** an LLM-driven *replanner* that authors new tasks
-after a failed verification (today a failed/deadlocked dependency blocks the run
-for a human); cost/token budgets (iteration/attempt/deadline budgets exist); and
-multi-run concurrency within one goal (one active run per goal by design).
+after a failed verification. A run started from the chat no longer stops there:
+the task is reworked - told what is missing, then started again, in work cycles
+with a growing wait - until it verifies (`docs/DURABLE-RUNS.md`); a run given
+explicit budgets still blocks for a person, as before. Also not implemented:
+cost/token budgets (iteration/attempt/deadline budgets exist) and multi-run
+concurrency within one goal (one active run per goal by design).
 
 ## Integrations
 

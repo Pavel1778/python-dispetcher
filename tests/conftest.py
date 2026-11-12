@@ -13,5 +13,6 @@ os.environ.setdefault("NEXUS_LAB_INLINE", "0")
 # A test session's fake Cloud, GitHub and provider servers all listen on
 # 127.0.0.1, so the session opts in here; the security tests clear the variable
 # to prove the guard refuses a private target. A production deployment leaves it
-# unset, so a base URL aimed at its own network is refused.
+# unset, so a base URL aimed at its own network is refused. The same switch
+# governs the check of a stored connection's address (``net_guard``).
 os.environ.setdefault("NEXUS_ALLOW_PRIVATE_TARGETS", "1")

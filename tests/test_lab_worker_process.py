@@ -171,6 +171,15 @@ def test_a_restarted_worker_process_continues_the_run(monkeypatch):
         first_worker = Worker(studio, worker_id="proc-lab-kill")
         first = _until(lambda: _task_conversation(studio, "audit"),
                        what="the first worker to dispatch the task")
+        # "Already started" means recorded as well: the conversation exists in
+        # the Cloud an instant before the worker has bound it to the task, and
+        # a kill inside that instant is another case - the task is then taken
+        # back when its claim runs out and the conversation is adopted
+        # (tests/test_durable_runs.py), which takes longer than this test waits.
+        _until(lambda: next((t for t in _detail(studio, project, run)["tasks"]
+                             if t["task_key"] == "audit"
+                             and t["conversation_id"] == first), None),
+               what="the first worker to record the conversation it started")
         # Kill it hard, as a crash or an OOM would: no graceful shutdown.
         first_worker.stop(sig=signal.SIGKILL)
 

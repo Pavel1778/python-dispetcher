@@ -24,7 +24,7 @@ guessed.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Iterable
 
 from .cloud_store import NotFound, PostgresStore
 from .nexus_openhands_accounts import OpenHandsAccountService
@@ -42,30 +42,9 @@ class PoolError(RuntimeError):
 class AccountPool:
     """Select and track OpenHands accounts for a principal."""
 
-    def __init__(self, store: PostgresStore, accounts: OpenHandsAccountService,
-                 *, assignments: Any | None = None):
+    def __init__(self, store: PostgresStore, accounts: OpenHandsAccountService):
         self.store = store
         self.accounts = accounts
-        #: Optional project-scoped allowlist. When set and a project has
-        #: assignments, the pool selects only from them: a project runs on the
-        #: executors it was assigned, never on another project's. With no
-        #: assignments (or no service), the pre-existing behaviour is kept.
-        self.assignments = assignments
-
-    def _assigned(self, project_id: str | None) -> list[str] | None:
-        """The account ids assigned to *project_id*, or ``None`` if none.
-
-        ``None`` (no assignment) means "not restricted": the caller keeps the
-        old policy. An empty list is impossible here - an assignment that was
-        cleared leaves no rows, which is ``None`` again.
-        """
-        if self.assignments is None or not project_id:
-            return None
-        try:
-            ids = self.assignments.assigned_account_ids(str(project_id))
-        except Exception:  # noqa: BLE001 - a pool must work before the table exists
-            return None
-        return ids or None
 
     # ------------------------------------------------------------- config
     def get_config(self, principal: str) -> dict:
@@ -127,23 +106,21 @@ class AccountPool:
         return self._account(principal, account_id)
 
     def remove(self, principal: str, account_id: str, *, force: bool = False) -> None:
-        """Delete an account. Refuses while it has active tasks, unless forced.
+        """Delete an account. Refuses while something depends on it, unless
+        forced.
 
-        Deleting an account that is running conversations would orphan them, so
-        the count is checked first and the operator has to force it explicitly.
+        What "depends" means is read from the durable rows - tasks at work on
+        the account, projects that list it as an executor, stop signals still
+        owed to its conversations (``OpenHandsAccountService.dependencies``) -
+        not from the ``active_tasks`` counter, which nothing in production
+        maintains. Raises :class:`PoolError` with the reason.
         """
-        with self.store._tx() as cur:
-            cur.execute("SELECT active_tasks FROM nexus_openhands_accounts "
-                        "WHERE id=%s AND principal=%s", (account_id, principal))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("account not found")
-            if row["active_tasks"] > 0 and not force:
-                raise PoolError(
-                    f"account has {row['active_tasks']} active task(s); "
-                    "pass force=true to remove it anyway")
-            cur.execute("DELETE FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
-                        (account_id, principal))
+        from .nexus_openhands_accounts import ConnectionInUse
+
+        try:
+            self.accounts.remove(principal, account_id, force=force)
+        except ConnectionInUse as e:
+            raise PoolError(f"{e}; pass force=true to remove it anyway") from e
 
     # ------------------------------------------------------------- health
     def record_success(self, principal: str, account_id: str) -> None:
@@ -255,31 +232,18 @@ class AccountPool:
                 and account.get("health", "unknown") in _USABLE_HEALTH
                 and str(account["id"]) not in exclude)
 
-    def candidates(self, principal: str, *, exclude: Iterable[str] = (),
-                   project_id: str | None = None) -> list[dict]:
+    def candidates(self, principal: str, *, exclude: Iterable[str] = ()) -> list[dict]:
         """Every selectable account, in failover order.
 
         The order is the operator's explicit ``fallback_order`` first, then
         ``priority`` (lower first), then age — so the ordering is deterministic
         even when two accounts share a priority.
-
-        With *project_id* and a project that has assignments, the list is
-        restricted to them: a project runs on the executors it was assigned,
-        never on another project's.
         """
         exclude = {str(x) for x in exclude}
-        assigned = self._assigned(project_id)
         order = self.get_config(principal)["fallback_order"]
         ranked = {str(x): i for i, x in enumerate(order)}
         usable = [a for a in self.accounts.list_accounts(principal)
-                  if self._usable(a, exclude)
-                  and (assigned is None or str(a["id"]) in assigned)]
-        if assigned is not None:
-            # The project's own order is authoritative for its accounts.
-            rank = {aid: i for i, aid in enumerate(assigned)}
-            usable.sort(key=lambda a: (rank.get(str(a["id"]), len(assigned)),
-                                       a.get("priority", 100), str(a["id"])))
-            return usable
+                  if self._usable(a, exclude)]
         usable.sort(key=lambda a: (ranked.get(str(a["id"]), len(order)),
                                    a.get("priority", 100), str(a.get("created_at")),
                                    str(a["id"])))
@@ -292,19 +256,10 @@ class AccountPool:
         *project_id*, when given, prefers the project's explicit binding: an
         operator who bound an account meant it. The binding is skipped only when
         it is not usable and the mode allows a fallback.
-
-        When the project has **assignments**, only they are candidates: a bound
-        account or a default that is not assigned to this project is not used.
         """
         exclude = {str(x) for x in exclude}
         mode = self.get_config(principal)["selection_mode"]
         accounts = {str(a["id"]): a for a in self.accounts.list_accounts(principal)}
-        assigned = self._assigned(project_id)
-
-        def allowed(account: dict | None) -> bool:
-            return (account is not None and self._usable(account, exclude)
-                    and (assigned is None or str(account["id"]) in assigned))
-
         bound_id = self._project_account(principal, project_id) if project_id else None
         bound = accounts.get(bound_id) if bound_id else None
         default = self._default(principal)
@@ -314,8 +269,9 @@ class AccountPool:
             # explicit; otherwise the default. Manual never falls back, and it
             # honours the choice even when the account is at its concurrency
             # limit: a limit steers automatic selection, it does not veto an
-            # operator's direct instruction. A project's assignments still apply.
-            chosen = bound if allowed(bound) else (default if allowed(default) else None)
+            # operator's direct instruction.
+            chosen = bound if (bound and self._usable(bound, exclude)) else \
+                (default if (default and self._usable(default, exclude)) else None)
             if chosen is None:
                 raise PoolError(
                     "manual mode: the selected account is not usable and manual "
@@ -327,17 +283,16 @@ class AccountPool:
         #: Usable *and* with capacity left. An account at its concurrency limit
         #: is skipped here so automatic selection never over-commits it.
         def selectable(account: dict) -> bool:
-            return (allowed(account) and not self._at_limit(account, live))
+            return self._usable(account, exclude) and not self._at_limit(account, live)
 
         if mode == "load_balancing":
             # Spread work: the usable account running the fewest active tasks.
             # The bound account is honoured only when it is also a valid choice;
             # the point of this mode is balance, so it is not forced.
-            candidates = [a for a in self.candidates(principal, exclude=exclude,
-                                                     project_id=project_id)
+            candidates = [a for a in self.candidates(principal, exclude=exclude)
                           if not self._at_limit(a, live)]
             if not candidates:
-                raise PoolError(self._capacity_message(principal, exclude, project_id))
+                raise PoolError(self._capacity_message(principal, exclude))
             if bound and selectable(bound):
                 fewest = min(self._load_of(a, live) for a in candidates)
                 if self._load_of(bound, live) == fewest:
@@ -351,22 +306,14 @@ class AccountPool:
         for preferred in (bound, default):
             if preferred is not None and selectable(preferred):
                 return preferred
-        candidates = [a for a in self.candidates(principal, exclude=exclude,
-                                                 project_id=project_id)
+        candidates = [a for a in self.candidates(principal, exclude=exclude)
                       if not self._at_limit(a, live)]
         if not candidates:
-            raise PoolError(self._capacity_message(principal, exclude, project_id))
+            raise PoolError(self._capacity_message(principal, exclude))
         return candidates[0]
 
-    def _capacity_message(self, principal: str, exclude: set[str],
-                          project_id: str | None = None) -> str:
+    def _capacity_message(self, principal: str, exclude: set[str]) -> str:
         """A reason that names *why* nothing was selectable, not just "none"."""
-        if self._assigned(project_id) is not None:
-            any_assigned = self.candidates(principal, exclude=exclude,
-                                           project_id=project_id)
-            if not any_assigned:
-                return ("no usable OpenHands account among the project's "
-                        "assigned executors")
         any_usable = self.candidates(principal, exclude=exclude)
         if not any_usable:
             return "no usable OpenHands account"

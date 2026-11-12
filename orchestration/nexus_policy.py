@@ -72,11 +72,12 @@ MCP_TOOL_SCOPES: dict[str, str] = {
     "create_task": SCOPE_PROJECT_WRITE,
     "dispatch_task": SCOPE_TASK_DISPATCH,
     "get_execution_status": SCOPE_PROJECT_READ,
+    # Autonomous runs and the executors of a project.
     "list_runs": SCOPE_PROJECT_READ,
     "get_run": SCOPE_PROJECT_READ,
     "cancel_run": SCOPE_RUN_CONTROL,
     "list_project_executors": SCOPE_PROJECT_READ,
-    "assign_project_executor": SCOPE_ACCOUNT_ADMIN,
+    "assign_project_executor": SCOPE_PROJECT_ADMIN,
 }
 
 
@@ -146,6 +147,53 @@ def _allow_private_targets() -> bool:
         "1", "true", "yes", "on")
 
 
+def private_targets_allowed() -> bool:
+    """Whether the operator permits private targets for this process
+    (``NEXUS_ALLOW_PRIVATE_TARGETS``). For the layers that enforce the policy
+    somewhere else than on a URL - ``net_guard`` checks the address a socket is
+    opened to - so that the decision is read in one place."""
+    return _allow_private_targets()
+
+
+def allowed_private_hosts() -> frozenset[str]:
+    """Hosts the operator named as permitted private targets.
+
+    ``NEXUS_OPENHANDS_ALLOWED_HOSTS`` is a comma-separated list of ``host`` or
+    ``host:port`` (``openhands.internal, 10.0.0.5:3000``). It is the narrow
+    form of ``NEXUS_ALLOW_PRIVATE_TARGETS``: a self-hosted OpenHands on the
+    private network becomes reachable and nothing else there does, where the
+    switch would open every private address to anyone who may add a connection.
+    """
+    return frozenset(
+        item.strip().strip("[]").lower().rstrip(".")
+        for item in os.environ.get("NEXUS_OPENHANDS_ALLOWED_HOSTS", "").split(",")
+        if item.strip())
+
+
+def host_listed(allowed: frozenset[str], host: str, port: int | None) -> bool:
+    """Whether *host* (or ``host:port``) is in *allowed*. A bare ``host`` entry
+    covers every port of it; ``host:port`` covers that port only."""
+    name = host.strip().strip("[]").lower().rstrip(".")
+    return name in allowed or (port is not None and f"{name}:{port}" in allowed)
+
+
+def is_metadata_address(address: str) -> bool:
+    """Whether *address* (a literal IP) is a cloud metadata endpoint: never a
+    legitimate target, whatever the operator permitted."""
+    try:
+        return str(ipaddress.ip_address(address)) in _METADATA_ADDRESSES
+    except ValueError:
+        return False
+
+
+def _effective_port(parts) -> int | None:
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return port or {"http": 80, "https": 443}.get(parts.scheme)
+
+
 def _is_internal_host(host: str) -> tuple[bool, str]:
     """Return ``(internal, why)`` for a host name or literal address."""
     name = host.strip().strip("[]").lower().rstrip(".")
@@ -178,6 +226,11 @@ def check_outbound_url(url: str, *, allow_private: bool | None = None) -> str:
     link-local or private-network host. ``urlopen`` would otherwise honour a
     ``file://`` URL, send the stored key to a metadata endpoint, or let an
     operator aim the server at its own network.
+
+    Private targets are permitted by ``NEXUS_ALLOW_PRIVATE_TARGETS`` (all of
+    them) or, for one host, by naming it in ``NEXUS_OPENHANDS_ALLOWED_HOSTS``.
+    A caller that passes *allow_private* has decided for itself and the
+    environment is not consulted.
     """
     if not isinstance(url, str) or not url.strip():
         raise UnsafeTarget("URL is required")
@@ -191,7 +244,11 @@ def check_outbound_url(url: str, *, allow_private: bool | None = None) -> str:
         raise UnsafeTarget("URL must not carry credentials")
     internal, why = _is_internal_host(parts.hostname)
     if internal:
-        permitted = _allow_private_targets() if allow_private is None else allow_private
+        if allow_private is None:
+            permitted = _allow_private_targets() or host_listed(
+                allowed_private_hosts(), parts.hostname, _effective_port(parts))
+        else:
+            permitted = allow_private
         # A metadata endpoint is never permitted, even with private targets on.
         if "metadata" in why or not permitted:
             raise UnsafeTarget(f"refusing to call {why}: {parts.hostname}")
@@ -257,17 +314,39 @@ class RedactingFilter(logging.Filter):
         if cleaned != message:
             record.msg = cleaned
             record.args = ()
+        # The traceback is text that will be written too. A formatter uses
+        # ``exc_text`` when it is already there, so it is rendered here, once,
+        # and scrubbed.
+        try:
+            if record.exc_info and not record.exc_text:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            if record.exc_text:
+                record.exc_text = redact_text(record.exc_text)
+        except Exception:  # noqa: BLE001 - a bad record must not break logging
+            pass
         return True
 
 
 def install_log_redaction(logger: logging.Logger | None = None) -> RedactingFilter:
-    """Attach the redaction filter to *logger* (root by default). Idempotent."""
+    """Attach the redaction filter to *logger* (root by default) and to its
+    handlers. Idempotent.
+
+    A filter on a logger sees only the records logged on that very logger: a
+    record of a descendant goes straight to the ancestors' *handlers* and never
+    passes the ancestors' filters. Nearly every record of this project is logged
+    on a named logger (``lab_worker``, ``web_server``, ``nexus_lab``...), so on
+    the root logger alone the filter would scrub next to nothing. The handlers
+    are where every record that is about to be written passes; call this after
+    the handlers are set up (``logging.basicConfig``).
+    """
     target = logger or logging.getLogger()
-    for existing in target.filters:
-        if isinstance(existing, RedactingFilter):
-            return existing
-    flt = RedactingFilter()
-    target.addFilter(flt)
+    flt = next((f for f in target.filters if isinstance(f, RedactingFilter)), None)
+    if flt is None:
+        flt = RedactingFilter()
+        target.addFilter(flt)
+    for handler in target.handlers:
+        if not any(isinstance(f, RedactingFilter) for f in handler.filters):
+            handler.addFilter(flt)
     return flt
 
 
@@ -296,6 +375,8 @@ def policy_report() -> dict:
         "mcp_tool_scopes": dict(MCP_TOOL_SCOPES),
         "ssrf": {
             "allow_private_targets": _allow_private_targets(),
+            # How many hosts the operator named; the names stay on the server.
+            "allowed_private_hosts": len(allowed_private_hosts()),
             "metadata_addresses": sorted(_METADATA_ADDRESSES),
             "internal_names": sorted(_INTERNAL_NAMES),
         },

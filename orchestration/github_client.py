@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -260,6 +261,30 @@ class GitHubClient:
             raise ValueError("full_name must be owner/name")
         return _repo_dict(self._request(repo_path(full_name)))
 
+    def repository_access(self, full_name: str) -> dict[str, Any]:
+        """What this identity may do with a repository: ``GET /repos/{repo}``.
+
+        Returns ``{full_name, private, default_branch, pull, push, admin}``.
+        GitHub reports ``permissions`` only to an authenticated caller; without
+        them (an anonymous read of a public repository) every permission but
+        ``pull`` is ``False`` - reading it is all that was shown. A repository
+        the identity cannot see raises :class:`GitHubError` (GitHub answers 404
+        for one that is private to somebody else, exactly as for one that does
+        not exist).
+        """
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        data = self._request(repo_path(full_name))
+        if not isinstance(data, dict) or not isinstance(data.get("full_name"), str):
+            raise GitHubError("github returned an invalid repository")
+        permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
+        return {"full_name": data["full_name"], "private": bool(data.get("private")),
+                "default_branch": data.get("default_branch") or "main",
+                "pull": permissions.get("pull") is not False,
+                "push": permissions.get("push") is True,
+                "admin": permissions.get("admin") is True}
+
     def list_branches(self, full_name: str, *, limit: int = 100) -> list[dict[str, Any]]:
         full_name = (full_name or "").strip()
         if full_name.count("/") != 1:
@@ -358,6 +383,84 @@ class GitHubClient:
         if isinstance(batch, list) and batch and isinstance(batch[0], dict):
             return batch[0].get("sha")
         return None
+
+    def compare(self, full_name: str, base: str, head: str, *,
+                max_commits: int = 100, max_files: int = 300) -> dict[str, Any]:
+        """What lies between two commits: ``GET /repos/{repo}/compare/{base}...{head}``.
+
+        Returns ``{status, ahead_by, behind_by, total_commits, commits, files}``.
+        ``status`` is GitHub's word for where *head* is relative to *base*:
+        ``identical``, ``ahead`` (*base* is an ancestor of *head*), ``behind``
+        or ``diverged``. ``commits`` are ``{sha, message, author, date}`` oldest
+        first and ``files`` are ``{path, status, additions, deletions}``; GitHub
+        itself lists at most 250 commits and 300 files here, and
+        ``total_commits`` says how many there are.
+
+        Both sides must be commit SHAs: a branch name may contain a slash, and
+        this path has no way to carry one unambiguously.
+        """
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        for side in (base, head):
+            if not isinstance(side, str) or not re.fullmatch(r"[0-9a-fA-F]{7,64}", side):
+                raise ValueError("compare takes commit SHAs")
+        data = self._request(repo_path(full_name, "compare") + f"/{base}...{head}")
+        if not isinstance(data, dict) or not isinstance(data.get("status"), str):
+            raise GitHubError("github returned an invalid comparison")
+        commits = []
+        for item in (data.get("commits") or [])[:max_commits]:
+            if not isinstance(item, dict):
+                continue
+            commit = item.get("commit") or {}
+            author = commit.get("author") or {}
+            commits.append({"sha": item.get("sha"),
+                            "message": (commit.get("message") or "").split("\n", 1)[0][:200],
+                            "author": author.get("name"), "date": author.get("date")})
+        files = []
+        for item in (data.get("files") or [])[:max_files]:
+            if isinstance(item, dict) and isinstance(item.get("filename"), str):
+                files.append({"path": item["filename"], "status": item.get("status") or "",
+                              "additions": int(item.get("additions") or 0),
+                              "deletions": int(item.get("deletions") or 0)})
+        return {"status": data["status"],
+                "ahead_by": int(data.get("ahead_by") or 0),
+                "behind_by": int(data.get("behind_by") or 0),
+                "total_commits": int(data.get("total_commits") or len(commits)),
+                "commits": commits, "files": files,
+                "files_listed": len(data.get("files") or [])}
+
+    def check_summary(self, full_name: str, sha: str) -> dict[str, Any]:
+        """What the repository's own checks say about a commit:
+        ``GET /repos/{repo}/commits/{sha}/check-runs``.
+
+        Returns ``{total, passed, failed, pending, names_failed}``. ``total`` 0
+        means the repository runs no checks on this commit (or none has been
+        reported yet) - not that they passed.
+        """
+        full_name = (full_name or "").strip()
+        if full_name.count("/") != 1:
+            raise ValueError("full_name must be owner/name")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{7,64}", sha):
+            raise ValueError("check_summary takes a commit SHA")
+        data = self._request(repo_path(full_name, "commits", sha, "check-runs"),
+                             {"per_page": 100})
+        runs = data.get("check_runs") if isinstance(data, dict) else None
+        out: dict[str, Any] = {"total": 0, "passed": 0, "failed": 0, "pending": 0,
+                               "names_failed": []}
+        for run in runs if isinstance(runs, list) else []:
+            if not isinstance(run, dict):
+                continue
+            out["total"] += 1
+            if run.get("status") != "completed":
+                out["pending"] += 1
+            elif run.get("conclusion") in ("success", "neutral", "skipped"):
+                out["passed"] += 1
+            else:
+                out["failed"] += 1
+                if isinstance(run.get("name"), str) and len(out["names_failed"]) < 10:
+                    out["names_failed"].append(run["name"][:100])
+        return out
 
     def list_tree(self, full_name: str, *, branch: str | None = None,
                   recursive: bool = True, limit: int = 500) -> list[dict[str, Any]]:

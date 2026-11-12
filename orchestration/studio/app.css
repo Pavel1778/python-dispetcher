@@ -388,6 +388,13 @@ a:hover { text-decoration: underline; }
 .msg-actions { display: flex; align-items: center; gap: 4px; flex: none; }
 .msg-actions .icon-btn { opacity: 0; }
 .msg:hover .msg-actions .icon-btn, .msg-actions .icon-btn:focus-visible { opacity: 1; }
+/* A touch screen has no hover: there the button is simply there, and large
+   enough for a finger (the icon stays the size it was). */
+@media (hover: none), (pointer: coarse) {
+  .msg-actions .icon-btn { opacity: 1; }
+  .msg-actions .icon-btn, .msg-meta .icon-btn { min-width: 40px; min-height: 40px; }
+}
+.copy-area { width: 100%; min-height: 200px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; resize: vertical; }
 .bubble { max-width: min(86%, 620px); padding: 10px 14px; border-radius: 18px 18px 6px 18px; background: var(--surface-2); font-size: 15px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg-avatar { width: 28px; height: 28px; flex: none; margin-top: 1px; border-radius: 8px; }
 .msg-body { min-width: 0; flex: 1; }
@@ -541,7 +548,10 @@ a:hover { text-decoration: underline; }
 .doc { flex: 1; min-height: 0; overflow: auto; padding: 20px 24px 32px; background: var(--bg); }
 .doc .md { max-width: 760px; }
 
-.work-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+/* The list is the one scroll container of the tab. It scrolls up and down
+   (``touch-action: pan-y``), does not hand a scroll that reached its end to
+   the page behind it, and ends above the system gesture bar of a phone. */
+.work-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-y; padding: 14px 14px calc(14px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 12px; }
 /* ``flex: none`` is load-bearing. A card is a flex item of the column list and
    carries ``overflow: hidden`` (to clip its rounded corners); with the default
    ``flex-shrink: 1`` its automatic minimum size collapses to 0, so it shrinks

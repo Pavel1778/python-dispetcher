@@ -437,17 +437,19 @@ class App:
         # OpenHands multi-account: an account is one row, the API key encrypted
         # with NEXUS_SECRET_KEY and never returned. A project may bind one.
         self.openhands_accounts = OpenHandsAccountService(self.store)
-        # The project-scoped executor assignment: which accounts a *project* may
-        # run on, in order. With assignments present the pool for that project is
-        # restricted to them; with none the previous behaviour is kept.
-        from .nexus_project_executors import ProjectExecutorService
-        self.project_executors = ProjectExecutorService(self.store)
+        # A project's own list of executors: which connections it may run on,
+        # in order. A project with a list is served from it and nothing else
+        # (``openhands_router``); one without keeps the previous behaviour.
+        from .nexus_executors import ProjectExecutorService
+        self.project_executors = ProjectExecutorService(self.store, self.openhands_accounts)
+        # A completed run's report: written with the completion, delivered to
+        # the chat the run was started from (``nexus_reports``).
+        from .nexus_reports import ReportService
+        self.reports = ReportService(self.store)
         # The account pool: which account runs work, and in what order, under a
-        # selection mode. The policy lives in the service, not the UI. The pool
-        # is restricted to a project's assigned executors when it has any.
+        # selection mode. The policy lives in the service, not the UI.
         from .openhands_pool import AccountPool
-        self.account_pool = AccountPool(self.store, self.openhands_accounts,
-                                        assignments=self.project_executors)
+        self.account_pool = AccountPool(self.store, self.openhands_accounts)
         # The persistent conversational surface. The responder needs the provider
         # cascade for ask/plan and the dispatch hooks for code/autonomous.
         from .nexus_chat import ChatResponder
@@ -566,7 +568,10 @@ class App:
         context = self.context.current(principal, project_id)
         return {"name": project["name"],
                 "context": (context or {}).get("summary") or {},
-                "memory": self.memory.retrieve(principal, project_id, limit=30)}
+                "memory": self.memory.retrieve(principal, project_id, limit=30),
+                # The repositories work may run on; with several, the planner
+                # assigns each task to one (``nexus_spec_planner``).
+                "repositories": self.project_repos.context(project_id)}
 
     def _run_lab(self) -> None:
         """Advance autonomous runs from inside this process.
@@ -828,47 +833,17 @@ class App:
             return self.github_accounts.client_for_project(principal, project_id)
         return self.github
 
-    def connect_repository(self, principal: str, project_id: str, *, full_name: Any,
-                           branch: Any = None, account_id: str | None = None,
-                           use_server_token: bool = False) -> dict[str, Any]:
-        """Connect a repository and branch to a project, checked against GitHub.
+    def _admit_repository(self, client: GitHubClient, full_name: str,
+                          branch: str | None) -> tuple[str, str, str]:
+        """Look a repository and a branch up on GitHub as *client* and make
+        them allowed here. Returns ``(canonical name, branch, default branch)``.
 
-        One explicit action replaces the three calls a client had to make in the
-        right order (allowlist, account, binding) and adds the check none of them
-        made: the repository and the branch are looked up on GitHub with the
-        identity that will read them. A typo or a repository that identity cannot
-        see is refused here, not discovered later when a task fails.
-
-        The identity is the caller's explicit choice, and it becomes the
-        project's identity for every later read:
-
-        * ``account_id`` - that stored account; it is bound to the project;
-        * ``use_server_token`` - the process ``GITHUB_TOKEN``; any bound account
-          is unbound, so the project does not keep reading as someone else;
-        * neither - whatever the project already uses.
-
-        Every GitHub check happens before the first write. The allowlist is only
-        ever extended: an unlisted repository is added, and the chosen branch is
-        added to a listed repository when the dispatch gate would otherwise
-        refuse it (an empty list there means "default branch only"). Nothing is
-        removed, and a disabled repository stays disabled and is refused.
+        Every GitHub check happens before the first write. The allowlist is
+        only ever extended: an unlisted repository is added, and the chosen
+        branch is added to a listed repository when the dispatch gate would
+        otherwise refuse it. Nothing is removed, and a disabled repository
+        stays disabled and is refused.
         """
-        full_name = full_name.strip() if isinstance(full_name, str) else ""
-        if not re.fullmatch(r"[\w.-]+/[\w.-]+", full_name):
-            raise ValueError("full_name must be owner/name")
-        if branch is not None and not isinstance(branch, str):
-            raise ValueError("branch must be a string")
-        branch = (branch or "").strip() or None
-        self.projects.get(principal, project_id)  # membership; NotFound otherwise
-        if account_id is not None and use_server_token:
-            raise ValueError("choose a GitHub account or the server token, not both")
-        if account_id is not None:
-            client = self.github_accounts.client_for_account(principal, account_id)
-        elif use_server_token:
-            client = self.github
-        else:
-            client = self.github_for_project(principal, project_id)
-
         try:
             details = client.get_repository(full_name)
         except (GitHubAuthError, GitHubUnavailable):
@@ -913,10 +888,135 @@ class App:
                     canonical, provider=existing["provider"],
                     default_branch=existing["default_branch"],
                     allowed_branches=(allowed or [existing["default_branch"]]) + [chosen])
+        return canonical, chosen, default_branch
+
+    def add_project_repository(self, principal: str, project_id: str, *, full_name: Any,
+                               branch: Any = None, account_id: str | None = None,
+                               use_server_token: bool = False,
+                               role_note: Any = None) -> dict[str, Any]:
+        """Add one more repository to a project, with its own GitHub account.
+
+        The project keeps its main repository and its own account; this one is
+        linked beside them (``account-A/frontend`` next to ``account-B/backend``)
+        and read with the identity chosen here:
+
+        * ``account_id`` - that stored account, for this repository only;
+        * ``use_server_token`` - the process ``GITHUB_TOKEN``;
+        * neither - the project's own identity.
+
+        As in :meth:`connect_repository`, the repository and the branch are
+        looked up on GitHub with that identity before anything is written, and
+        what it may do there (read, push, private or not) is recorded with the
+        link. A project's first repository becomes its main one.
+        """
+        full_name = full_name.strip() if isinstance(full_name, str) else ""
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", full_name):
+            raise ValueError("full_name must be owner/name")
+        if branch is not None and not isinstance(branch, str):
+            raise ValueError("branch must be a string")
+        branch = (branch or "").strip() or None
+        self.projects.get(principal, project_id)  # membership; NotFound otherwise
+        if account_id is not None and use_server_token:
+            raise ValueError("choose a GitHub account or the server token, not both")
+        if account_id is not None:
+            client = self.github_accounts.client_for_account(principal, account_id)
+        elif use_server_token:
+            client = self.github
+        else:
+            client = self.github_for_project(principal, project_id)
+        canonical, chosen, default_branch = self._admit_repository(client, full_name, branch)
+        from .nexus_binding import _KEEP, check_access
+        access = check_access(client, canonical, chosen)
+        self.project_repos.link(
+            principal, project_id, canonical,
+            account_id=account_id if (account_id is not None or use_server_token) else _KEEP,
+            branch="" if chosen == default_branch else chosen,
+            role_note=role_note if role_note is not None else _KEEP)
+        return self.project_repos.record_access(principal, project_id, canonical, access)
+
+    def repository_client(self, project_id: str, full_name: str) -> GitHubClient:
+        """The GitHub client one repository of a project is read with: the
+        account of its link, else the project's account, else the server's
+        token (``ProjectRepositoryService.account_for_repository``)."""
+        owner, account_id = self.project_repos.account_for_repository(project_id, full_name)
+        if account_id is None:
+            return self.github
+        return self.github_accounts.client_for_account(owner, account_id)
+
+    def check_project_repository(self, principal: str, project_id: str,
+                                 full_name: str) -> dict[str, Any]:
+        """Ask GitHub now what this project's identity for *full_name* may do
+        with it, and record the answer with the link."""
+        from .nexus_binding import check_access
+        from .nexus_github_accounts import SecretsError
+
+        link = next((item for item in self.project_repos.list(principal, project_id)
+                     if item["full_name"] == full_name), None)
+        if link is None:
+            raise NotFound("repository not linked to this project")
+        try:
+            client = self.repository_client(project_id, full_name)
+            access = check_access(client, full_name, link["working_branch"])
+        except (NotFound, ValueError, SecretsError) as e:
+            # The account the link names cannot be used: revoked, or its token
+            # cannot be read. That is the answer of the check.
+            access = {"readable": False, "push": False, "admin": False, "private": None,
+                      "default_branch": None, "branch": link["working_branch"],
+                      "branch_exists": None,
+                      "error": f"the GitHub account of this repository cannot be used: {e}"}
+        return self.project_repos.record_access(principal, project_id, full_name, access)
+
+    def connect_repository(self, principal: str, project_id: str, *, full_name: Any,
+                           branch: Any = None, account_id: str | None = None,
+                           use_server_token: bool = False) -> dict[str, Any]:
+        """Connect a repository and branch to a project, checked against GitHub.
+
+        One explicit action replaces the three calls a client had to make in the
+        right order (allowlist, account, binding) and adds the check none of them
+        made: the repository and the branch are looked up on GitHub with the
+        identity that will read them. A typo or a repository that identity cannot
+        see is refused here, not discovered later when a task fails.
+
+        The identity is the caller's explicit choice, and it becomes the
+        project's identity for every later read:
+
+        * ``account_id`` - that stored account; it is bound to the project;
+        * ``use_server_token`` - the process ``GITHUB_TOKEN``; any bound account
+          is unbound, so the project does not keep reading as someone else;
+        * neither - whatever the project already uses.
+
+        Every GitHub check happens before the first write. The allowlist is only
+        ever extended: an unlisted repository is added, and the chosen branch is
+        added to a listed repository when the dispatch gate would otherwise
+        refuse it (an empty list there means "default branch only"). Nothing is
+        removed, and a disabled repository stays disabled and is refused.
+        """
+        full_name = full_name.strip() if isinstance(full_name, str) else ""
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", full_name):
+            raise ValueError("full_name must be owner/name")
+        if branch is not None and not isinstance(branch, str):
+            raise ValueError("branch must be a string")
+        branch = (branch or "").strip() or None
+        self.projects.get(principal, project_id)  # membership; NotFound otherwise
+        if account_id is not None and use_server_token:
+            raise ValueError("choose a GitHub account or the server token, not both")
+        if account_id is not None:
+            client = self.github_accounts.client_for_account(principal, account_id)
+        elif use_server_token:
+            client = self.github
+        else:
+            client = self.github_for_project(principal, project_id)
+
+        canonical, chosen, _default = self._admit_repository(client, full_name, branch)
         if account_id is not None or use_server_token:
             self.github_accounts.bind_project(principal, project_id, account_id)
         self.project_binding.set_repository(principal, project_id,
                                             full_name=canonical, branch=chosen)
+        if account_id is not None or use_server_token:
+            # The identity chosen here is the project's, and the main
+            # repository is read with it: an account this repository's link
+            # carried from an earlier "add" must not go on overriding it.
+            self.project_repos.update(principal, project_id, canonical, account_id=None)
         return self.project_binding.get(principal, project_id)
 
     def cancel_workflow(self, workflow_id: str) -> dict[str, Any]:
@@ -1627,10 +1727,18 @@ class Handler(BaseHTTPRequestHandler):
             run = self.app.lab.get_run(principal, project_id, rest[1])
             tasks = self.app.lab.list_tasks(principal, project_id, rest[1])
             # The report is part of the run's record: the same text that was
-            # delivered to the source chat, so a person reading the run sees it
-            # too. ``None`` until the run verified.
-            report = self.app.lab.report_for_run(rest[1])
-            return (200, {"run": run, "tasks": tasks, "report": report}, None)
+            # delivered to the chat the run came from, so a person reading the
+            # run sees it too. ``None`` until the run has completed. And who
+            # ran what: one line per conversation a task was given.
+            return (200, {"run": run, "tasks": tasks,
+                          "report": self.app.reports.for_run(rest[1]),
+                          "executions": self.app.lab.executions(rest[1]),
+                          "stops": self.app.lab.stops(rest[1])}, None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/report
+        if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "report"):
+            return (200, {"report": self.app.reports.get(principal, project_id, rest[1])},
+                    None)
         # GET /api/v1/projects/{id}/specs/{spec_id}[/content|sections|requirements|stages]
         if rest and rest[0] == "specs" and len(rest) in (2, 3) and UUID_RE.fullmatch(rest[1]):
             return self._get_spec(principal, project_id, rest[1], rest[2] if len(rest) == 3 else "")
@@ -1805,6 +1913,14 @@ class Handler(BaseHTTPRequestHandler):
             except NotFound:
                 return self._json(404, {"error": "account not found"})
             return self._json(200, {"errors": errors})
+        # What still leans on the connection: asked before it is removed.
+        if len(parts) == 5 and parts[4] == "dependencies":
+            return self._json(200, {"dependencies": self.app.openhands_accounts.dependencies(
+                principal, parts[3])})
+        # Which tasks it ran, newest first: the history of its use.
+        if len(parts) == 5 and parts[4] == "executions":
+            return self._json(200, {"executions": self.app.openhands_accounts.usage(
+                principal, parts[3])})
         return self._json(404, {"error": "not found"})
 
     @staticmethod
@@ -1867,12 +1983,16 @@ class Handler(BaseHTTPRequestHandler):
                     default_model=body.get("default_model", _UNSET),
                     max_concurrent_tasks=body.get("max_concurrent_tasks", _UNSET),
                     daily_conversation_limit=body.get(
-                        "daily_conversation_limit", _UNSET))})
+                        "daily_conversation_limit", _UNSET),
+                    # New credentials: checked together with the (new) URL
+                    # before anything is saved. Never echoed back.
+                    api_key=(body.get("api_key") or None))})
             if action == "rotate":
                 return self._json(200, {"account": self.app.openhands_accounts.rotate(
                     principal, account_id, api_key=body.get("api_key"))})
             if action == "rename":
-                return self._json(200, {"account": self.app.openhands_accounts.rename(
+                # One way to change a connection: a rename is an edit of its name.
+                return self._json(200, {"account": self.app.openhands_accounts.edit(
                     principal, account_id, label=body.get("label"))})
             if action == "revoke":
                 return self._json(200, {"account": self.app.openhands_accounts.revoke(
@@ -1893,7 +2013,15 @@ class Handler(BaseHTTPRequestHandler):
         except NotFound:
             return self._json(404, {"error": "account not found"})
         except PoolError as e:
-            return self._json(409, {"error": str(e)})
+            answer: dict[str, Any] = {"error": str(e)}
+            if action == "remove":
+                # What stands in the way, so that the interface can say it.
+                try:
+                    answer["dependencies"] = self.app.openhands_accounts.dependencies(
+                        principal, account_id)
+                except NotFound:
+                    pass
+            return self._json(409, answer)
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         return self._json(404, {"error": "not found"})
@@ -2029,44 +2157,83 @@ class Handler(BaseHTTPRequestHandler):
                 project_id=project_id)
             self._json(201, {"action": action})
             return True
-        # POST /api/v1/projects/{id}/executors/{account_id}/{enable|disable|remove}
+        # POST /api/v1/projects/{id}/executors/check
+        #   Check every executor of the project now, each with its own key.
+        if rest == ["executors", "check"]:
+            self._json(200, self.app.project_executors.check(principal, project_id))
+            return True
+        # POST /api/v1/projects/{id}/executors/{account_id}/{enable|disable|remove|primary}
         if (len(rest) == 3 and rest[0] == "executors" and UUID_RE.fullmatch(rest[1])
-                and rest[2] in ("enable", "disable", "remove")):
+                and rest[2] in ("enable", "disable", "remove", "primary")):
             account_id = rest[1]
             try:
                 if rest[2] == "remove":
-                    self.app.project_executors.remove(principal, project_id, account_id)
-                    self._json(200, {"removed": account_id})
-                    return True
-                enabled = rest[2] == "enable"
-                self._json(200, {"executor": self.app.project_executors.set_enabled(
-                    principal, project_id, account_id, enabled)})
+                    out = self.app.project_executors.remove(principal, project_id, account_id)
+                elif rest[2] == "primary":
+                    out = self.app.project_executors.make_primary(
+                        principal, project_id, account_id)
+                else:
+                    out = self.app.project_executors.set_enabled(
+                        principal, project_id, account_id, rest[2] == "enable")
+                out["executor"] = next((item for item in out["executors"]
+                                        if item["account_id"] == account_id), None)
+                self._json(200, out)
             except NotFound as e:
                 self._json(404, {"error": str(e) or "not found"})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
             return True
-        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/primary
-        if (len(rest) == 4 and rest[0] == "repositories" and rest[3] == "primary"):
-            full_name = f"{rest[1]}/{rest[2]}"
-            try:
-                self._json(200, {"repository": self.app.project_repos.set_primary(
-                    principal, project_id, full_name)})
-            except NotFound as e:
-                self._json(404, {"error": str(e) or "not found"})
+        # POST /api/v1/projects/{id}/repositories/check
+        #   Ask GitHub about every repository of the project, each with the
+        #   identity that reads it.
+        if rest == ["repositories", "check"]:
+            checked = [self.app.check_project_repository(principal, project_id,
+                                                         item["full_name"])
+                       for item in self.app.project_repos.list(principal, project_id)]
+            self._json(200, {"repositories": checked})
             return True
-        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/account
-        #   {"account_id": uuid|null}
-        if (len(rest) == 4 and rest[0] == "repositories" and rest[3] == "account"):
-            full_name = f"{rest[1]}/{rest[2]}"
+        # POST /api/v1/projects/{id}/repositories/{owner}/{name}/{action}
+        #   primary            make it the project's main repository
+        #   account            {"account_id": uuid|null}: who reads it
+        #   update             {"branch", "role_note", "label", "enabled", "account_id"}
+        #   enable | disable   the link's own switch
+        #   check              ask GitHub what its identity may do with it
+        if (len(rest) == 4 and rest[0] == "repositories"
+                and rest[3] in ("primary", "account", "update", "enable", "disable", "check")):
+            from .nexus_binding import _KEEP
+            full_name, action = f"{rest[1]}/{rest[2]}", rest[3]
             account_id = body.get("account_id")
             if account_id is not None and not (isinstance(account_id, str)
                                                and UUID_RE.fullmatch(account_id)):
                 self._json(400, {"error": "account_id must be a uuid or null"})
                 return True
+            repos = self.app.project_repos
             try:
-                self._json(200, {"repository": self.app.project_repos.set_account(
-                    principal, project_id, full_name, account_id)})
+                if action == "primary":
+                    link = repos.set_primary(principal, project_id, full_name)
+                elif action == "account":
+                    link = repos.set_account(principal, project_id, full_name, account_id)
+                elif action in ("enable", "disable"):
+                    link = repos.update(principal, project_id, full_name,
+                                        enabled=action == "enable")
+                elif action == "check":
+                    link = self.app.check_project_repository(principal, project_id,
+                                                             full_name)
+                else:
+                    link = repos.update(
+                        principal, project_id, full_name,
+                        account_id=account_id if "account_id" in body else _KEEP,
+                        branch=body.get("branch", _KEEP),
+                        role_note=body.get("role_note", _KEEP),
+                        label=body.get("label", _KEEP),
+                        enabled=body.get("enabled", _KEEP))
             except NotFound as e:
                 self._json(404, {"error": str(e) or "not found"})
+                return True
+            except (ProjectBindingError, ValueError) as e:
+                self._json(400, {"error": str(e)})
+                return True
+            self._json(200, {"repository": link})
             return True
         # POST /api/v1/projects/{id}/context/refresh  (analyze the repository)
         if rest == ["context", "refresh"]:
@@ -2083,15 +2250,16 @@ class Handler(BaseHTTPRequestHandler):
         #   second cancel is a no-op, never an error.
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
                 and rest[2] in ("pause", "resume", "cancel", "hide")):
-            if rest[2] == "cancel":
-                self._json(200, {"run": self.app.lab.cancel_run(
-                    principal, project_id, rest[1])})
-                return True
             if rest[2] == "hide":
-                self._json(200, {"run": self.app.lab.hide_run(
-                    principal, project_id, rest[1])})
+                self._json(200, {"run": self.app.lab.set_hidden(
+                    principal, project_id, rest[1], True)})
                 return True
-            state = {"pause": "paused", "resume": "running"}[rest[2]]
+            # ``cancelled`` settles the run, takes it out of the lists and
+            # leaves a stop signal for every conversation at work for it - all
+            # in one transaction (``LabStore._apply_run_state``); the loop
+            # delivers the signals. A second cancel changes nothing.
+            state = {"pause": "paused", "resume": "running",
+                     "cancel": "cancelled"}[rest[2]]
             self._json(200, {"run": self.app.lab.set_run_state(
                 principal, project_id, rest[1], state)})
             return True
@@ -2137,11 +2305,21 @@ class Handler(BaseHTTPRequestHandler):
                                                and UUID_RE.fullmatch(account_id)):
                 self._json(400, {"error": "account_id must be a uuid or null"})
                 return True
+            server_token = "account_id" in body and account_id is None
             try:
+                if body.get("additional") is True:
+                    # One more repository beside the main one, read with the
+                    # identity chosen for it.
+                    link = self.app.add_project_repository(
+                        principal, project_id, full_name=body.get("full_name"),
+                        branch=body.get("branch"), account_id=account_id,
+                        use_server_token=server_token, role_note=body.get("role_note"))
+                    self._json(200, {"repository": link})
+                    return True
                 binding = self.app.connect_repository(
                     principal, project_id, full_name=body.get("full_name"),
                     branch=body.get("branch"), account_id=account_id,
-                    use_server_token="account_id" in body and account_id is None)
+                    use_server_token=server_token)
             except ProjectBindingError as e:
                 self._json(400, {"error": str(e)})
                 return True
@@ -2303,6 +2481,17 @@ class Handler(BaseHTTPRequestHandler):
         options = {name: value for name, value in (
             ("max_iterations", max_iterations), ("max_attempts_per_task", max_attempts),
             ("deadline_seconds", deadline_seconds)) if value is not None}
+        # A run nobody named a budget for keeps going until it is done or
+        # cancelled. Naming one - a number of task starts, a deadline - asks
+        # for a run that stops when it is spent; ``policy`` says it outright.
+        policy = body.get("policy")
+        if policy is None:
+            policy = ("bounded" if max_iterations is not None or deadline_seconds is not None
+                      else "durable")
+        if policy not in ("durable", "bounded"):
+            self._json(400, {"error": "policy must be durable or bounded"})
+            return
+        options["policy"] = policy
         try:
             # The goal's task is its specification. A goal from before
             # specifications existed gets one now, from its text.
@@ -2761,9 +2950,9 @@ class Handler(BaseHTTPRequestHandler):
         if resource == "repositories":
             return self._json(200, {"repositories": self.app.project_repos.list(principal, project_id)})
         if resource == "executors":
-            # The project's assigned OpenHands accounts (primary + fallbacks).
-            return self._json(200, {"executors": self.app.project_executors.list(
-                principal, project_id)})
+            # The project's executors in order (the first is the primary), its
+            # strategy, and the caller's connections that could be added.
+            return self._json(200, self.app.project_executors.get(principal, project_id))
         if resource == "tasks":
             if item_id is None:
                 tasks = self.app.store.list_tasks(project_id=project_id)
@@ -2800,31 +2989,49 @@ class Handler(BaseHTTPRequestHandler):
             full_name = (body.get("full_name") or "").strip() if isinstance(body, dict) else ""
             if not full_name:
                 return self._json(400, {"error": "full_name is required"})
-            removed = self.app.project_repos.unlink(principal, project_id, full_name)
+            try:
+                removed = self.app.project_repos.unlink(principal, project_id, full_name)
+            except AuthorizationError as e:
+                # Work is still under way on it: said, not a server error.
+                return self._json(409, {"error": str(e)})
             if not removed:
                 return self._json(404, {"error": "repository not linked to this project"})
             return self._json(200, {"unlinked": full_name})
-        # POST /api/v1/projects/{id}/executors  — set the whole assignment.
-        #   {"primary": uuid|null, "fallbacks": [uuid, ...]}
+        # POST /api/v1/projects/{id}/executors  — set the whole list, in order.
+        #   {"executors": [{"account_id": uuid, "enabled": bool} | uuid, ...],
+        #    "strategy": "failover" | "distribute"}
+        #   The first entry is the primary. {"primary": uuid|null,
+        #   "fallbacks": [uuid, ...]} is accepted as the same thing.
         if resource == "executors" and item_id is None:
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
-            primary = body.get("primary")
-            fallbacks = body.get("fallbacks") or []
-            if primary is not None and not (isinstance(primary, str)
-                                            and UUID_RE.fullmatch(primary)):
-                return self._json(400, {"error": "primary must be a uuid or null"})
-            if not isinstance(fallbacks, list) or not all(
-                    isinstance(x, str) and UUID_RE.fullmatch(x) for x in fallbacks):
-                return self._json(400, {"error": "fallbacks must be a list of uuids"})
+            executors = body.get("executors")
+            if executors is None and ("primary" in body or "fallbacks" in body):
+                primary, fallbacks = body.get("primary"), body.get("fallbacks") or []
+                if primary is not None and not isinstance(primary, str):
+                    return self._json(400, {"error": "primary must be a uuid or null"})
+                if not isinstance(fallbacks, list):
+                    return self._json(400, {"error": "fallbacks must be a list of uuids"})
+                if primary is None and fallbacks:
+                    return self._json(400, {"error": "a list of backups needs a primary"})
+                executors = ([primary] if primary else []) + list(fallbacks)
+            if executors is not None:
+                if not isinstance(executors, list):
+                    return self._json(400, {"error": "executors must be a list"})
+                for item in executors:
+                    account = item.get("account_id") if isinstance(item, dict) else item
+                    if not (isinstance(account, str) and UUID_RE.fullmatch(account)):
+                        return self._json(400, {"error": "each executor must name an "
+                                                         "account_id (a uuid)"})
             try:
-                assigned = self.app.project_executors.replace_all(
-                    principal, project_id, primary=primary, fallbacks=fallbacks)
+                assigned = self.app.project_executors.set(
+                    principal, project_id, executors=executors,
+                    strategy=body.get("strategy"))
             except NotFound as e:
                 return self._json(404, {"error": str(e) or "not found"})
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
-            return self._json(200, {"executors": assigned})
+            return self._json(200, assigned)
         if resource == "tasks" and item_id is None:
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})

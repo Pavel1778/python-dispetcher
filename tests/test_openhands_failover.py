@@ -372,18 +372,16 @@ def test_a_task_that_did_not_verify_is_started_again_on_the_only_account(store, 
     project, run, _ = _make_run(store)
 
     sched.tick(str(run["id"]))                       # started on A
-    # The poll records the unverified verdict and the run waits out a backoff.
     assert sched.tick(str(run["id"])).verdict == "completed_unverified"
-    assert lab.get_run(PRINCIPAL, str(project["id"]), str(run["id"]))["state"] == "retrying"
-    assert sched.tick(str(run["id"])).idle, "nothing new while waiting out the backoff"
+    sched.tick(str(run["id"]))                       # nothing left to start: the run stops
+    assert lab.get_run(PRINCIPAL, str(project["id"]), str(run["id"]))["state"] == "blocked"
 
-    # «Продолжить» makes the wait due; the next tick starts the retry cycle.
     lab.set_run_state(PRINCIPAL, str(project["id"]), str(run["id"]), "running")
     again = sched.tick(str(run["id"]))
     assert again.dispatched, f"the task was not started again: {again.note}"
     assert len(client_a.started) == 2
     task = _task(lab, project, run)
-    assert task["attempt"] == 1 and task["cycle"] == 1 and task["tried_accounts"] == []
+    assert task["attempt"] == 2 and task["tried_accounts"] == []
     # The same account, so nothing was handed over: the agent gets the task's
     # own instructions, not "the previous account is no longer available".
     assert "continuing an interrupted task" not in client_a.started[1]["message"]

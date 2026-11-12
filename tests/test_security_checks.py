@@ -289,6 +289,50 @@ class TestSecretLogRedaction:
         filters = [f for f in logger.filters if isinstance(f, policy.RedactingFilter)]
         assert len(filters) == 1
 
+    def test_records_of_named_loggers_are_cleaned_the_way_the_processes_install_it(
+            self, monkeypatch):
+        """The web server, the worker and the MCP server install the filter on
+        the root logger, and the project logs on named loggers. A logger's
+        filters never see the records of its descendants - only its handlers
+        do - so the filter has to sit on the handlers, and the traceback of a
+        record is text that is written as well."""
+        monkeypatch.setenv("OPENHANDS_API_KEY", "sk-openhands-live-key-9999")
+        root = logging.getLogger()
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        had = [f for f in root.filters if isinstance(f, policy.RedactingFilter)]
+        before = {h: list(h.filters) for h in root.handlers}
+        root.addHandler(handler)
+        try:
+            installed = policy.install_log_redaction()
+            assert policy.install_log_redaction() is installed
+            assert [f for f in handler.filters if isinstance(f, policy.RedactingFilter)] == [
+                installed]
+            child = logging.getLogger("lab_worker.security-test")
+            child.warning("stop not taken: Bearer abcdefghijklmnop1234, key %s",
+                          "sk-openhands-live-key-9999")
+            try:
+                raise RuntimeError("GET https://user:secretpw@host/x with "
+                                   "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            except RuntimeError:
+                child.exception("a pass failed")
+        finally:
+            root.removeHandler(handler)
+            for existing, filters in before.items():
+                for flt in list(existing.filters):
+                    if flt not in filters:
+                        existing.removeFilter(flt)
+            if not had:
+                for flt in [f for f in root.filters if isinstance(f, policy.RedactingFilter)]:
+                    root.removeFilter(flt)
+        output = stream.getvalue()
+        assert "stop not taken" in output and "a pass failed" in output
+        assert "RuntimeError" in output, "the traceback is still written"
+        for secret in ("sk-openhands-live-key-9999", "abcdefghijklmnop1234", "secretpw",
+                       "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"):
+            assert secret not in output
+        assert output.count("«redacted»") >= 4
+
 
 # ========================================================= 9. Archive safety
 class TestUnsafeArchiveUnpacking:

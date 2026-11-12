@@ -486,72 +486,6 @@ def cmd_openhands_switch(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
-def cmd_run_show(args: argparse.Namespace) -> int:
-    """Show an autonomous run with its tasks and its report, if any."""
-    client = _client(args)
-    data = client.get(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}")
-    run = data["run"]
-    lines = [f"{run['id']}  {run['state']}  "
-             f"cycles {run.get('retry_attempt', 0)}/{run.get('max_retry_cycles', 0)}  "
-             f"starts {run.get('total_iterations', 0)}"]
-    if run.get("last_error"):
-        lines.append(f"reason: {run['last_error']}")
-    for task in data.get("tasks", []):
-        lines.append(f"  {task['task_key']:>8}  {task['state']}  "
-                     f"attempt {task['attempt']}/{task['max_attempts']}  cycle {task.get('cycle', 0)}")
-    report = data.get("report")
-    if report and report.get("content"):
-        lines.append("")
-        lines.append(report["content"])
-    _emit(args, data, human="\n".join(lines))
-    return EXIT["ok"]
-
-
-def cmd_run_cancel(args: argparse.Namespace) -> int:
-    """Stop a run for good (terminal and idempotent)."""
-    client = _client(args)
-    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/cancel", {})
-    _emit(args, result, human=f"run {result['run']['id']} -> {result['run']['state']}")
-    return EXIT["ok"]
-
-
-def cmd_run_hide(args: argparse.Namespace) -> int:
-    """Hide a terminal run from the active lists without deleting it."""
-    client = _client(args)
-    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/hide", {})
-    _emit(args, result, human=f"run {result['run']['id']} hidden")
-    return EXIT["ok"]
-
-
-def cmd_project_executors_show(args: argparse.Namespace) -> int:
-    client = _client(args)
-    data = client.get(f"/api/v1/projects/{args.project_id}/executors")
-    human = "\n".join(
-        f"{e['account_id']}  {e['role']:<8}  {e['label']}"
-        f"{'' if e.get('enabled', True) else '  DISABLED'}" for e in data["executors"]) \
-        or "(no executors assigned)"
-    _emit(args, data, human=human)
-    return EXIT["ok"]
-
-
-def cmd_project_executors_set(args: argparse.Namespace) -> int:
-    """Set the whole executor assignment: one primary, ordered fallbacks."""
-    client = _client(args)
-    primary = args.primary or None
-    fallbacks = [x for x in (args.fallbacks or "").split(",") if x]
-    result = client.post(f"/api/v1/projects/{args.project_id}/executors",
-                         {"primary": primary, "fallbacks": fallbacks})
-    _emit(args, result, human=f"{len(result['executors'])} executor(s) assigned")
-    return EXIT["ok"]
-
-
-def cmd_project_repos_primary(args: argparse.Namespace) -> int:
-    client = _client(args)
-    owner, name = args.full_name.split("/", 1)
-    result = client.post(
-        f"/api/v1/projects/{args.project_id}/repositories/{owner}/{name}/primary", {})
-    _emit(args, result, human=f"{result['repository']['full_name']} is now primary")
-    return EXIT["ok"]
 def cmd_openhands_add(args: argparse.Namespace) -> int:
     """Add an OpenHands account. The key is verified, then stored encrypted."""
     client = _client(args)
@@ -637,6 +571,78 @@ def cmd_openhands_account_action(args: argparse.Namespace) -> int:
         _emit(args, out, human=f"{out['account']['label']}: priority={out['account']['priority']}")
         return EXIT["ok"]
     raise CliError(f"unknown action {action}", EXIT["usage"])
+
+
+def cmd_run_show(args: argparse.Namespace) -> int:
+    """Show an autonomous run with its tasks and its report, if any."""
+    client = _client(args)
+    data = client.get(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}")
+    run = data["run"]
+    lines = [f"{run['id']}  {run['state']}  {run.get('policy', 'bounded')}  "
+             f"cycle {run.get('cycle', 0)}  starts {run.get('total_iterations', 0)}"]
+    if run.get("wait_reason"):
+        lines.append(f"waiting: {run['wait_reason']}")
+    if run.get("last_error"):
+        lines.append(f"reason: {run['last_error']}")
+    for task in data.get("tasks", []):
+        lines.append(f"  {task['task_key']:>8}  {task['state']}  "
+                     f"attempt {task['attempt']}/{task['max_attempts']}  cycle {task.get('cycle', 0)}")
+    report = data.get("report")
+    if report and report.get("body"):
+        lines.append("")
+        lines.append(f"report: {report['state']} ({report.get('outcome')})")
+        lines.append(report["body"])
+    _emit(args, data, human="\n".join(lines))
+    return EXIT["ok"]
+
+
+def cmd_run_cancel(args: argparse.Namespace) -> int:
+    """Stop a run for good (terminal and idempotent)."""
+    client = _client(args)
+    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/cancel", {})
+    _emit(args, result, human=f"run {result['run']['id']} -> {result['run']['state']}")
+    return EXIT["ok"]
+
+
+def cmd_run_hide(args: argparse.Namespace) -> int:
+    """Hide a terminal run from the active lists without deleting it."""
+    client = _client(args)
+    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/hide", {})
+    _emit(args, result, human=f"run {result['run']['id']} hidden")
+    return EXIT["ok"]
+
+
+def cmd_project_executors_show(args: argparse.Namespace) -> int:
+    client = _client(args)
+    data = client.get(f"/api/v1/projects/{args.project_id}/executors")
+    human = "\n".join(
+        f"{e['account_id']}  {e['role']:<8}  {e['label']}"
+        f"{'' if e.get('enabled', True) else '  DISABLED'}"
+        f"{'' if e.get('usable', True) else '  (cannot take work now)'}"
+        for e in data["executors"]) \
+        or "(no executors assigned: the project uses the default rule)"
+    _emit(args, data, human=human)
+    return EXIT["ok"]
+
+
+def cmd_project_executors_set(args: argparse.Namespace) -> int:
+    """Set the whole executor assignment: one primary, ordered fallbacks."""
+    client = _client(args)
+    primary = args.primary or None
+    fallbacks = [x for x in (args.fallbacks or "").split(",") if x]
+    result = client.post(f"/api/v1/projects/{args.project_id}/executors",
+                         {"primary": primary, "fallbacks": fallbacks})
+    _emit(args, result, human=f"{len(result['executors'])} executor(s) assigned")
+    return EXIT["ok"]
+
+
+def cmd_project_repos_primary(args: argparse.Namespace) -> int:
+    client = _client(args)
+    owner, name = args.full_name.split("/", 1)
+    result = client.post(
+        f"/api/v1/projects/{args.project_id}/repositories/{owner}/{name}/primary", {})
+    _emit(args, result, human=f"{result['repository']['full_name']} is now primary")
+    return EXIT["ok"]
 
 
 def cmd_qa_verify(args: argparse.Namespace) -> int:
