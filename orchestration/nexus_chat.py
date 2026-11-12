@@ -28,10 +28,19 @@ from .providers import (
     AllProvidersFailed,
     ProviderCascade,
     ProviderError,
+    estimate_tokens,
     validate_plan_json,
 )
 
 _MODES = ("ask", "code", "plan", "autonomous")
+
+#: Characters of earlier messages a prompt carries, newest first. History is
+#: background: it is shortened to fit, so that one long message does not make
+#: every later question in the conversation too large to ask. The request
+#: itself is never shortened.
+HISTORY_CHARS = 24_000
+#: The least of an earlier message worth showing; below this it is left out.
+_HISTORY_MIN = 400
 
 _ASK_SYSTEM = (
     "You are NEXUS, an AI development assistant embedded in an IDE. Answer the "
@@ -110,7 +119,7 @@ class ChatResponder:
         try:
             response = self.providers.text(prompt, _ASK_SYSTEM)
         except AllProvidersFailed as e:
-            raise ChatError(f"no orchestrator provider succeeded: {e}") from e
+            raise ChatError(self._failure(e, goal)) from e
         except ProviderError as e:
             raise ChatError(str(e)) from e
         return {"role": "assistant", "content": response.data["text"],
@@ -122,7 +131,7 @@ class ChatResponder:
         try:
             result = self.providers.plan(prompt, _PLAN_SYSTEM)
         except AllProvidersFailed as e:
-            raise ChatError(f"no orchestrator provider succeeded: {e}") from e
+            raise ChatError(self._failure(e, goal)) from e
         except ProviderError as e:
             raise ChatError(str(e)) from e
         except ValueError as e:
@@ -214,6 +223,47 @@ class ChatResponder:
 
     # ----------------------------------------------------------------- helpers
     @staticmethod
+    def _failure(error: AllProvidersFailed, goal: str) -> str:
+        """Why nobody answered, in words the person who asked can act on.
+
+        These two modes send the whole message to a model in one request. When
+        every provider refuses it for its size, a retry cannot help and neither
+        can the operator: what helps is the mode that plans a long text in
+        parts. The message says that, and still carries every provider's reason.
+        """
+        if error.kinds and all(kind == "too_large" for kind in error.kinds):
+            return (
+                f"сообщение на {len(goal)} символов (примерно {estimate_tokens(goal)} токенов) "
+                "не помещается в окно модели, а в режимах «Вопрос» и «План» оно уходит модели "
+                "одним запросом. Отправьте этот текст в режиме «Автономно»: там он сохраняется "
+                f"целиком и планируется по частям. Ответ провайдеров: {error}")
+        return f"no orchestrator provider succeeded: {error}"
+
+    @staticmethod
+    def _recent(history: list[dict], budget: int = HISTORY_CHARS) -> list[str]:
+        """The last messages of *history* as prompt lines, within *budget* characters.
+
+        Newest first: the latest messages are kept whole while they fit; the
+        first one that does not is shown by its beginning, with a note of how
+        much was left out; anything older is dropped. At most ten messages.
+        """
+        lines: list[str] = []
+        left = budget
+        for message in reversed(history[-10:]):
+            content = message.get("content")
+            if not content:
+                continue
+            if len(content) > left:
+                if left >= _HISTORY_MIN:
+                    lines.append(f"{message['role']}: {content[:left]}"
+                                 f" [... {len(content) - left} more characters not shown]")
+                break
+            lines.append(f"{message['role']}: {content}")
+            left -= len(content)
+        lines.reverse()
+        return lines
+
+    @staticmethod
     def _prompt(goal: str, context: dict | None, memory: list[dict] | None,
                 history: list[dict] | None) -> str:
         parts: list[str] = []
@@ -228,8 +278,7 @@ class ChatResponder:
             if facts:
                 parts.append("Known facts:\n- " + "\n- ".join(facts))
         if history:
-            recent = [f"{m['role']}: {m['content']}" for m in history[-10:]
-                      if m.get("content")]
+            recent = ChatResponder._recent(history)
             if recent:
                 parts.append("Recent conversation:\n" + "\n".join(recent))
         parts.append("Request:\n" + goal)

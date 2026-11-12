@@ -113,7 +113,16 @@ class DeliveryError(CloudError):
     Raised before the conversation is created, so an agent is never started on
     a task it has only part of. The message says what was expected and what was
     found.
+
+    *permanent* says another attempt would end the same way - the transport
+    cannot place files at all, the stored text is gone or damaged - so the
+    task is not put back in the queue to fail again. A sandbox that would not
+    take the file is not permanent: the next attempt may get another one.
     """
+
+    def __init__(self, message: str, *, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 #: Written in an initial message where the directory of the delivered files

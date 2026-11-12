@@ -112,12 +112,17 @@ class DispatchError(CloudError):
 
     The scheduler uses ``account_id`` to exclude that account on the next
     attempt (failover). It carries the underlying ``CloudError`` message.
+    ``permanent`` is forwarded from the wrapped error when it says another
+    attempt would end the same way (see ``cloud_client.DeliveryError``), so the
+    scheduler can end the task at once instead of retrying it to no effect.
     """
 
-    def __init__(self, message: str, *, account_id: str | None, unavailable: bool):
+    def __init__(self, message: str, *, account_id: str | None, unavailable: bool,
+                 permanent: bool = False):
         super().__init__(message)
         self.account_id = account_id
         self.unavailable = unavailable
+        self.permanent = permanent
 
 
 class Verifier(Protocol):
@@ -195,14 +200,15 @@ class OpenHandsExecutor:
         if self.specs is None:
             raise DeliveryError(
                 "the task was planned from a specification, and this executor was built "
-                "without access to specifications; the agent would not get the task")
+                "without access to specifications; the agent would not get the task",
+                permanent=True)
         delivery = prepare(self.specs, task)
         if delivery is not None and delivery.files and not getattr(
                 self.client, "supports_files", False):
             raise DeliveryError(
                 f"the task's original text is {delivery.proof['chars']} characters and has to "
                 "reach the agent as a file, and this OpenHands transport cannot place a file "
-                "in the sandbox. Use OPENHANDS_TRANSPORT=direct")
+                "in the sandbox. Use OPENHANDS_TRANSPORT=direct", permanent=True)
         return delivery
 
     def _dispatch_client(self, task: dict) -> tuple[Any, str | None]:
@@ -243,9 +249,12 @@ class OpenHandsExecutor:
         except DispatchError:
             raise
         except CloudError as e:
-            # Attach the account that failed so the scheduler can exclude it.
+            # Attach the account that failed so the scheduler can exclude it,
+            # and keep the error's own "permanent" verdict so a failure another
+            # attempt would only repeat is not retried.
             raise DispatchError(f"{type(e).__name__}: {e}", account_id=account_id,
-                                unavailable=isinstance(e, (CloudAuthError, CloudUnavailable))) from e
+                                unavailable=isinstance(e, (CloudAuthError, CloudUnavailable)),
+                                permanent=bool(getattr(e, "permanent", False))) from e
 
     def _dispatch_with(self, client: Any, account_id: str | None, task: dict) -> str:
         delivery = self.delivery(task)
@@ -631,11 +640,15 @@ class LabScheduler:
                 # A dispatch failure is a provider/transport problem: record the
                 # account that failed (so a failover excludes it), release the
                 # task so another attempt - or another account - can try, and
-                # keep the lease short so recovery is fast.
+                # keep the lease short so recovery is fast. A failure another
+                # attempt would only repeat (``permanent``) ends the task now,
+                # with its reason, instead of being retried to no effect.
+                again = (task["attempt"] < task["max_attempts"]
+                         and not getattr(e, "permanent", False))
                 failed_account = self._failed_account(e, task)
                 unavailable = getattr(e, "unavailable", isinstance(e, CloudAuthError))
                 self.store.release_task(task["id"], error=f"{type(e).__name__}: {e}",
-                                        requeue=task["attempt"] < task["max_attempts"],
+                                        requeue=again,
                                         failed_account_id=failed_account)
                 if failed_account and self.router is not None:
                     self.router.note_failure(
@@ -690,7 +703,7 @@ class LabScheduler:
         if unfinished == 0:
             # Nothing left to do and not all verified: the run is blocked, not
             # complete. A person resumes it (retry) or cancels it.
-            return ("blocked", "no claimable tasks; some tasks not verified",
+            return ("blocked", "no claimable tasks; some tasks not verified" + self._why(run_id),
                     "blocked: tasks remain unverified")
         if unfinished - counts.get("pending", 0) > 0:
             return None                     # work is in flight; wait for it
@@ -702,9 +715,21 @@ class LabScheduler:
             # A pending task exists but can never be claimed: a dependency ended
             # unverified/failed/blocked. That is a deadlock, not progress, so the
             # run is blocked rather than left spinning.
-            return ("blocked", "dependency graph deadlocked: a dependency is not verified",
-                    "blocked: dependency not verified")
+            return ("blocked", "dependency graph deadlocked: a dependency is not verified"
+                    + self._why(run_id), "blocked: dependency not verified")
         return None
+
+    def _why(self, run_id: str) -> str:
+        """The first task that could not be started, and why, for the run's error.
+
+        "Blocked" alone sends a person to look through the tasks. When a task
+        never started - the specification could not be put in the sandbox, the
+        Cloud refused - that reason is the run's reason, and it is said here.
+        """
+        failed = self.store.first_start_failure(run_id)
+        if failed is None:
+            return ""
+        return f". Task {failed['task_key']} was not started: {failed['last_error']}"
 
     def _project_of(self, run_id: str) -> str:
         with self.store.store._tx() as cur:

@@ -22,15 +22,10 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.long_task_kit import (  # noqa: E402
-    HEAD,
-    PlannerModel,
+    Lab,
     agent_bytes,
-    conversation_of,
-    get_bytes,
-    post_json,
     sha256,
     specification,
-    until,
 )
 from tests.test_studio_api import DSN, REPO, studio_stack  # noqa: E402
 
@@ -39,65 +34,10 @@ pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run
 SIZES = [19_999, 20_000, 20_001, 50_000, 100_000, 200_000, 500_000, 1_000_000]
 
 
-class Lab:
-    """One project wired for autonomous runs, and the questions tests ask of it."""
-
-    def __init__(self, studio, model: PlannerModel):
-        self.studio, self.model = studio, model
-        studio.llm.respond = model
-        self.project = studio.project()
-        status, body = studio.api.post(f"/api/v1/projects/{self.project}/repository",
-                                       {"full_name": REPO})
-        assert status == 200, body
-        studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
-        self.conversation = studio.conversation(self.project, mode="autonomous")
-
-    # ------------------------------------------------------------- sending
-    def send(self, text: str, **options):
-        return post_json(
-            self.studio,
-            f"/api/v1/projects/{self.project}/conversations/{self.conversation}/messages",
-            {"text": text, "mode": "autonomous"}, **options)
-
-    # ------------------------------------------------------------- reading
-    def get(self, path: str):
-        status, body = self.studio.api.get(f"/api/v1/projects/{self.project}{path}")
-        assert status == 200, (path, status, body)
-        return body
-
-    def messages(self) -> list[dict]:
-        return self.get(f"/conversations/{self.conversation}/messages")["messages"]
-
-    def goals(self) -> list[dict]:
-        return self.get("/goals")["goals"]
-
-    def runs(self) -> list[dict]:
-        return self.get("/runs")["runs"]
-
-    def run(self, run_id: str) -> dict:
-        return self.get(f"/runs/{run_id}")
-
-    def spec(self, spec_id: str) -> dict:
-        return self.get(f"/specs/{spec_id}")["spec"]
-
-    def stored(self, spec_id: str) -> bytes:
-        status, data = get_bytes(
-            self.studio, f"/api/v1/projects/{self.project}/specs/{spec_id}/content")
-        assert status == 200, status
-        return data
-
-    def announced_run(self) -> str | None:
-        """The run the conversation was told about, once it has been."""
-        for message in self.messages():
-            if message["role"] == "tool" and (message.get("meta") or {}).get("tool") == "start_run":
-                return message["meta"]["run_id"]
-        return None
-
-
 @pytest.fixture
 def lab(monkeypatch):
     with studio_stack(monkeypatch, transport="direct", lab_inline=True) as studio:
-        yield Lab(studio, PlannerModel())
+        yield Lab(studio, repo=REPO)
 
 
 @pytest.mark.parametrize("chars", SIZES)
@@ -117,7 +57,7 @@ def test_a_text_of_this_size_starts_one_run_and_the_agent_has_all_of_it(lab, cha
 
     # One goal, one run - announced in the conversation, at once or when the
     # last part of the plan is ready.
-    run_id = until(lab.announced_run, timeout=90, what="the run to be announced")
+    run_id = lab.wait_run()
     assert [g["spec_id"] for g in lab.goals()] == [spec_id]
     assert [r["id"] for r in lab.runs()] == [run_id]
 
@@ -132,8 +72,7 @@ def test_a_text_of_this_size_starts_one_run_and_the_agent_has_all_of_it(lab, cha
     # The agent of the first task has the whole original.
     detail = lab.run(run_id)
     first = detail["tasks"][0]
-    conversation = until(lambda: conversation_of(lab.studio, first["task_key"], run_id),
-                         timeout=60, what="the first task to start")
+    conversation = lab.agent(first["task_key"], run_id)
     mode, data = agent_bytes(conversation, digest)
     assert mode == ("inline" if chars <= 20_000 else "file")
     assert data is not None, "the agent was started without the text"

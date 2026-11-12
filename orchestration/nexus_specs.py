@@ -86,6 +86,12 @@ class SpecCorrupted(RuntimeError):
     """Stored text no longer matches its fingerprint. Never served as if it did."""
 
 
+#: Characters of one chat message that is not a task (ask, plan and code
+#: modes). Such a message lives in the transcript and goes to a model in one
+#: request; a task text does neither, which is why it may be far longer.
+MESSAGE_CHARS = 200_000
+
+
 def check_text(value: Any) -> str:
     """Return *value* unchanged if it can be stored exactly, else raise.
 
@@ -102,6 +108,29 @@ def check_text(value: Any) -> str:
         raise SpecTooLarge(
             f"text is {len(value)} characters; this server accepts up to {limit} "
             "(NEXUS_SPEC_MAX_CHARS)")
+    return _storable(value)
+
+
+def check_message(value: Any, mode: str) -> str:
+    """:func:`check_text` for a chat message in a mode other than autonomous.
+
+    The same refusals, for the same reason, and the transcript's own limit. The
+    refusal of a long message says where a long text does go.
+    """
+    if not isinstance(value, str):
+        raise SpecError("text must be a string")
+    if not value.strip():
+        raise SpecError("text is required")
+    if len(value.strip()) > MESSAGE_CHARS:
+        raise SpecTooLarge(
+            f"text is {len(value.strip())} characters; a message in {mode} mode holds up to "
+            f"{MESSAGE_CHARS}. Send it in autonomous mode: there a text of up to "
+            f"{max_spec_chars()} characters is stored whole and planned in parts")
+    return _storable(value)
+
+
+def _storable(value: str) -> str:
+    """*value* if PostgreSQL and UTF-8 can hold it as it is, else raise."""
     nul = value.find("\x00")
     if nul >= 0:
         raise SpecError(

@@ -661,6 +661,20 @@ class LabStore:
                 out.append(task)
             return out
 
+    def first_start_failure(self, run_id: str) -> dict | None:
+        """The earliest task of the run that failed without ever being started.
+
+        Such a task has no conversation: nothing was run and nothing was
+        verified, and ``last_error`` is why the start itself failed.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT task_key, last_error FROM nexus_run_tasks WHERE run_id=%s "
+                "AND state='failed' AND conversation_id IS NULL "
+                "AND COALESCE(last_error, '') <> '' ORDER BY created_at, id LIMIT 1", (run_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
     def count_tasks(self, run_id: str) -> dict[str, int]:
         """How many of the run's tasks are in each state (absent = none)."""
         with self.store._tx() as cur:

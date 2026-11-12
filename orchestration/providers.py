@@ -549,6 +549,7 @@ class ProviderCascade:
         operator sees *why*, not just "failed".
         """
         failures: list[tuple[str, str]] = []
+        kinds: list[str] = []
         for provider in self.providers:
             if not provider.configured:
                 continue
@@ -557,12 +558,14 @@ class ProviderCascade:
                 plan = validate_plan_json(response.data)
             except ProviderError as e:
                 failures.append((provider.name, str(e)))
+                kinds.append(failure_kind(e))
                 continue
             except ValueError as e:
                 failures.append((provider.name, f"invalid plan: {e}"))
+                kinds.append("rejected")
                 continue
             return CascadeResult(response=response, plan=plan, failovers=list(failures))
-        raise AllProvidersFailed(failures)
+        raise AllProvidersFailed(failures, kinds)
 
     def text(self, prompt: str, system: str = "") -> ProviderResponse:
         """Ask each configured provider for prose until one answers.
@@ -574,6 +577,7 @@ class ProviderCascade:
         caller records the same provenance either way.
         """
         failures: list[tuple[str, str]] = []
+        kinds: list[str] = []
         for provider in self.providers:
             if not provider.configured:
                 continue
@@ -581,10 +585,12 @@ class ProviderCascade:
                 text = provider.complete_text(prompt, system)
             except ProviderError as e:
                 failures.append((provider.name, str(e)))
+                kinds.append(failure_kind(e))
                 continue
             if not text.strip():
                 failures.append((provider.name, "empty completion"))
+                kinds.append("rejected")
                 continue
             return ProviderResponse(provider=provider.name, model=provider.model,
                                     data={"text": text})
-        raise AllProvidersFailed(failures)
+        raise AllProvidersFailed(failures, kinds)

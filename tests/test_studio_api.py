@@ -98,6 +98,22 @@ class Studio:
     def __init__(self, api, app, cloud, github, llm, sandbox=None):
         self.api, self.app, self.cloud, self.github, self.llm = api, app, cloud, github, llm
         self.sandbox = sandbox
+        #: The running HTTP server, and every server this stack has started.
+        self.server = None
+        self.servers: list = []
+        self._boot = None
+
+    def boot(self, **app_options):
+        """Start one more server process on the same database and the same fakes.
+
+        ``api``, ``app`` and ``server`` then name the new one; the old one keeps
+        running until the caller stops it. This is how a test restarts the
+        service: nothing is carried over but what is in PostgreSQL.
+        """
+        self.app, self.server = self._boot(**app_options)
+        self.servers.append(self.server)
+        self.api = Api(f"http://127.0.0.1:{self.server.port}")
+        return self.app
 
     def project(self, name: str = "Studio") -> str:
         status, body = self.api.post("/api/v1/projects", {"name": name})
@@ -151,33 +167,43 @@ def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
 
     with (FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server,
           FakeServer() as sandbox):
-        app = App(DSN, poll_interval=0.2, token=TOKEN, **app_options)
-        app.client = CloudClient(cloud.base_url, api_key="cloud-key-value", timeout=10.0)
-        if transport == "direct":
-            cloud.cloud.agent_server_url = sandbox.base_url
-            cloud.cloud.sandbox_session_key = sandbox.runtime.expected_key
-            app.client = CloudDirectClient(app.client, app.store, wait_interval=0.01,
-                                           timeout=10.0)
-        app.dispatcher.client = app.client
-        app.runtime.client = app.client
-        app.verifier.client = app.client
-        app.github = GitHubClient(base_url=github_server.base_url, token=SERVER_GITHUB_TOKEN)
-        app.github_accounts._client_factory = lambda token: GitHubClient(
-            base_url=github_server.base_url, token=token)
-        app.providers = ProviderCascade([GroqProvider(
-            base_url=f"http://127.0.0.1:{llm.server_port}", api_key="llm-key-value",
-            model="test-model", sleep=lambda _seconds: None)])
-        app.chat = ChatResponder(app.providers, dispatch_code=app._chat_dispatch_code,
-                                 start_autonomous=app._chat_start_autonomous)
-        app.planner = Planner(app.providers)
-        server = WebServer(app, "127.0.0.1", 0)
-        server.start()
+        def boot(**options):
+            app = App(DSN, poll_interval=0.2, token=TOKEN, **{**app_options, **options})
+            app.client = CloudClient(cloud.base_url, api_key="cloud-key-value", timeout=10.0)
+            if transport == "direct":
+                cloud.cloud.agent_server_url = sandbox.base_url
+                cloud.cloud.sandbox_session_key = sandbox.runtime.expected_key
+                app.client = CloudDirectClient(app.client, app.store, wait_interval=0.01,
+                                               timeout=10.0)
+            app.dispatcher.client = app.client
+            app.runtime.client = app.client
+            app.verifier.client = app.client
+            app.github = GitHubClient(base_url=github_server.base_url,
+                                      token=SERVER_GITHUB_TOKEN)
+            app.github_accounts._client_factory = lambda token: GitHubClient(
+                base_url=github_server.base_url, token=token)
+            app.providers = ProviderCascade([GroqProvider(
+                base_url=f"http://127.0.0.1:{llm.server_port}", api_key="llm-key-value",
+                model="test-model", sleep=lambda _seconds: None)])
+            app.chat = ChatResponder(app.providers, dispatch_code=app._chat_dispatch_code,
+                                     start_autonomous=app._chat_start_autonomous)
+            app.planner = Planner(app.providers)
+            server = WebServer(app, "127.0.0.1", 0)
+            server.start()
+            return app, server
+
+        stack = Studio(None, None, cloud, github, llm, sandbox.runtime)
+        stack._boot = boot
+        stack.boot()
         try:
-            yield Studio(Api(f"http://127.0.0.1:{server.port}"), app, cloud, github, llm,
-                         sandbox.runtime)
+            yield stack
         finally:
-            server.stop()
-            app.store.close()
+            for server in stack.servers:
+                try:
+                    server.stop()
+                except Exception:  # noqa: BLE001 - a server a test already stopped
+                    pass
+                server.app.store.close()
             llm.shutdown()
             llm.server_close()
 
