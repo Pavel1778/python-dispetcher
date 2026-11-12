@@ -133,6 +133,45 @@ def test_remove_refuses_while_active_then_forces(base, fake):
     assert listing["accounts"] == []
 
 
+def test_edit_connection_and_limits_over_http(base, fake):
+    a, _b = fake
+    va = _add_account(base, "A", a)
+    # Edit the non-secret fields; the key is untouched and never echoed.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{va['id']}/edit",
+                       {"label": "renamed", "max_concurrent_tasks": 2,
+                        "daily_conversation_limit": 10})
+    assert status == 200, out
+    account = out["account"]
+    assert account["label"] == "renamed"
+    assert account["max_concurrent_tasks"] == 2
+    assert account["daily_conversation_limit"] == 10
+    assert KEY not in json.dumps(out)
+    # Clearing a limit with an explicit null.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{va['id']}/edit",
+                       {"max_concurrent_tasks": None})
+    assert status == 200 and out["account"]["max_concurrent_tasks"] is None
+    # The connection probe reports reachability against the real fake server.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{va['id']}/connection", {})
+    assert status == 200 and out["account"]["reachable"] is True
+    assert KEY not in json.dumps(out)
+    # The pool view exposes the masked hint and never the key.
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert status == 200
+    assert KEY not in json.dumps(pool)
+    assert pool["candidates"][0]["api_key_hint"] == "sk-o…onse"
+
+
+def test_add_with_limits_over_http(base, fake):
+    a, _b = fake
+    status, body = _req("POST", base, "/api/openhands/accounts",
+                        {"label": "capped", "api_key": KEY, "base_url": a.base_url,
+                         "max_concurrent_tasks": 1, "daily_conversation_limit": 5})
+    assert status == 201, body
+    assert body["account"]["max_concurrent_tasks"] == 1
+    assert body["account"]["daily_conversation_limit"] == 5
+    assert KEY not in json.dumps(body)
+
+
 def test_diagnostics_over_http(base, fake):
     a, _b = fake
     _add_account(base, "A", a)
@@ -146,3 +185,27 @@ def test_diagnostics_over_http(base, fake):
     assert names["live_conversation"] == "UNVERIFIED"
     # No key value anywhere in the report.
     assert KEY not in json.dumps(report)
+
+
+def test_account_error_history_over_http(base, fake, app):
+    """The error history is reachable over HTTP and never carries the key."""
+    a, _b = fake
+    va = _add_account(base, "A", a)
+    # Empty to begin with.
+    status, out = _req("GET", base, f"/api/openhands/accounts/{va['id']}/errors")
+    assert status == 200 and out["errors"] == []
+    # Record a failure through the real pool path, then read it back. A degraded
+    # failure (not ``unavailable``) keeps the account selectable, so the pool
+    # listing still shows it.
+    app.account_pool.record_failure("machine:default", va["id"], "transport reset",
+                                    unavailable=False)
+    status, out = _req("GET", base, f"/api/openhands/accounts/{va['id']}/errors")
+    assert status == 200
+    assert out["errors"][0]["kind"] == "error"
+    assert out["errors"][0]["detail"] == "transport reset"
+    assert KEY not in json.dumps(out)
+    # The count is on the account view and in the pool listing.
+    status, listing = _req("GET", base, "/api/openhands/accounts")
+    assert listing["accounts"][0]["error_count"] == 1
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert pool["candidates"][0]["error_count"] == 1

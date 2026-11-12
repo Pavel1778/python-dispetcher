@@ -1680,6 +1680,12 @@ class Handler(BaseHTTPRequestHandler):
             except CloudError as e:
                 return self._json(502, {"error": f"cloud: {e}"})
             return self._json(200, {"capabilities": caps})
+        if len(parts) == 5 and parts[4] == "errors":
+            try:
+                errors = self.app.openhands_accounts.error_history(principal, parts[3])
+            except NotFound:
+                return self._json(404, {"error": "account not found"})
+            return self._json(200, {"errors": errors})
         return self._json(404, {"error": "not found"})
 
     @staticmethod
@@ -1718,6 +1724,7 @@ class Handler(BaseHTTPRequestHandler):
         Pool actions (enable / disable / priority / remove) go through the pool
         service, so the selection policy and the account controls stay together.
         """
+        from .nexus_openhands_accounts import _UNSET
         from .openhands_pool import PoolError
 
         parts = path.strip("/").split("/")
@@ -1729,6 +1736,19 @@ class Handler(BaseHTTPRequestHandler):
             if action == "verify":
                 return self._json(200, {"account": self.app.openhands_accounts.verify(
                     principal, account_id)})
+            if action == "connection":
+                return self._json(200, {"account": self.app.openhands_accounts.check_connection(
+                    principal, account_id)})
+            if action == "edit":
+                return self._json(200, {"account": self.app.openhands_accounts.edit(
+                    principal, account_id,
+                    label=body.get("label"),
+                    base_url=(body.get("base_url") or None),
+                    transport=(body.get("transport") or None),
+                    default_model=body.get("default_model", _UNSET),
+                    max_concurrent_tasks=body.get("max_concurrent_tasks", _UNSET),
+                    daily_conversation_limit=body.get(
+                        "daily_conversation_limit", _UNSET))})
             if action == "rotate":
                 return self._json(200, {"account": self.app.openhands_accounts.rotate(
                     principal, account_id, api_key=body.get("api_key"))})
@@ -2725,7 +2745,13 @@ class Handler(BaseHTTPRequestHandler):
                     "candidates": [
                         {"id": a["id"], "label": a["label"], "priority": a.get("priority"),
                          "health": a.get("health"), "active_tasks": a.get("active_tasks", 0),
-                         "enabled": a.get("enabled", True), "is_default": a.get("is_default")}
+                         "enabled": a.get("enabled", True), "is_default": a.get("is_default"),
+                         "max_concurrent_tasks": a.get("max_concurrent_tasks"),
+                         "daily_conversation_limit": a.get("daily_conversation_limit"),
+                         "api_key_hint": a.get("api_key_hint", ""),
+                         "connection_ok": a.get("connection_ok"),
+                         "last_connection_at": a.get("last_connection_at"),
+                         "error_count": a.get("error_count", 0)}
                         for a in self.app.account_pool.candidates(principal)],
                 })
             if path.startswith("/api/github/accounts/"):
@@ -2972,7 +2998,9 @@ class Handler(BaseHTTPRequestHandler):
                         base_url=(body.get("base_url") or None),
                         transport=(body.get("transport") or "direct"),
                         default_model=(body.get("default_model") or None),
-                        make_default=bool(body.get("make_default")))
+                        make_default=bool(body.get("make_default")),
+                        max_concurrent_tasks=body.get("max_concurrent_tasks"),
+                        daily_conversation_limit=body.get("daily_conversation_limit"))
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(201, {"account": account})

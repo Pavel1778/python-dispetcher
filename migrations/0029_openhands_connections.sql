@@ -63,7 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_nexus_project_executors_account
 
 -- A project that had one connection bound has it as its primary executor.
 INSERT INTO nexus_project_executors(project_id, account_id, position, created_by)
-SELECT p.id, p.openhands_account_id, 0, 'migration:0027'
+SELECT p.id, p.openhands_account_id, 0, 'migration:0029'
   FROM nexus_projects p
  WHERE p.openhands_account_id IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM nexus_project_executors e WHERE e.project_id = p.id);

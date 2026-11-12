@@ -37,6 +37,11 @@ agent-server.
   (start task → poll → bind), allowlist, bounded retry, recovery.
 - `orchestration/sr_tools.py` — Sr operations (create/list/status/report/
   revise/accept/cancel) with real, durable effects.
+- `orchestration/restore_point.py` — safe restore points. A restore point is a
+  **git bundle** of every ref plus a JSON record (HEAD, branch, dirty state,
+  SHA-256) under `.restore-points/` (gitignored, never pushed). Create, list and
+  verify through `nexus restore-point …`; it is local and needs no API. See
+  "Safe restore points" below.
 - `migrations/0001_init.sql` — Supabase schema. Idempotent; apply with `psql`.
 - `tests/fake_cloud.py` — a real local HTTP server speaking the Cloud V1
   surface. Cloud tests use it, not mocks of the client.
@@ -1250,3 +1255,125 @@ is undone. Keep these invariants:
   broke and fixed it, and committed — recorded `completed_unverified` because no
   repository was bound. `test_backup_restore.py` and `test_browser_e2e.py` were
   run with the PostgreSQL client tools and Chromium installed.
+
+## Safe restore points (the first safety rule)
+
+Before touching anything, a run takes a restore point. `orchestration/restore_point.py`
+writes a **git bundle** (`git bundle create --all`, every ref) plus a JSON record
+under `.restore-points/` (gitignored). The record names the exact `head`, `branch`,
+whether the tree was `dirty`, the `untracked` paths, the bundle's SHA-256 and size.
+Invariants to keep:
+
+- **Non-destructive.** Creating one only reads the repository and writes new files
+  into the output directory. It never resets, checks out, stashes or deletes. A test
+  asserts HEAD, branches and tracked status are unchanged.
+- **Self-contained and offline.** `--all` packs every ref, so the whole history
+  restores from the one file with no network. `verify` re-checks the SHA-256, runs
+  `git bundle verify`, and confirms the recorded HEAD is among the bundle's refs;
+  `restore` clones it into a scratch directory to prove it comes back.
+- **Honest about the working tree.** A bundle cannot carry uncommitted changes, so a
+  dirty tree also records the patch of tracked changes (`git diff --binary HEAD`) and
+  the *names* of untracked paths. Untracked contents are deliberately not copied:
+  they may hold secrets and can be large. The `dirty`/`untracked`/`notes` fields say
+  what was and was not captured.
+- **CLI:** `nexus restore-point create|list|verify` (`orchestration/cli.py`). It is
+  local, needs no `NEXUS_URL`/token, and never prints a secret.
+- Tests: `tests/test_restore_point.py` (13 cases; a real git repository, a real
+  bundle, a real restore, tamper detection, and the CLI).
+
+## OpenHands inventory and current versions (2026-11-12)
+
+- **`docs/OPENHANDS_INVENTORY.md` is the dated inventory** of the OpenHands
+  surface NEXUS depends on (Cloud V1 + the sandbox agent-server): API paths,
+  authorization, conversation lifecycle, events, status, runtime, workspace,
+  tools, limits, errors, timeouts, availability, and the NEXUS↔OpenHands
+  compatibility matrix. Read it before changing an adapter.
+- **Live versions drift from the two evidence maps.** On 2026-11-12 the live
+  Cloud was **1.87.1** (OpenAPI 3.1.0, sdk 1.60.1) and the sandbox agent-server
+  **1.60.1** (`refs/tags/v1.60.1`); `INTEGRATION-MAP.md` still names `v1.50.1`
+  and `CLOUD-INTEGRATION-MAP.md` implies older. Both maps now carry a pointer to
+  the inventory; do not treat their version lines as current.
+- **The live probe is green at those versions.** `OpenHandsDiagnostics.run(live=True)`
+  with a working `default_model` gave **10 VERIFIED / 0 FAILED / 0 BLOCKED**
+  (`conversation_create`, `message_and_events`, `run_command`, `workspace_rw`).
+  Without `OPENHANDS_DEFAULT_MODEL` the same probe ends `error` (LLM auth) —
+  the documented trap, unchanged.
+- **The app-transport 500 was not reproduced.** A `POST /api/v1/app-conversations`
+  start with an initial message reached `READY` (~45 s) and `finished`. This is a
+  dated observation, not proof the account-side failure is gone; `direct`
+  remains the default and never depended on it.
+- **`events/search` still caps `limit` at 100** (`limit=200` → 422), and a
+  missing/invalid key is `401` on both Cloud (Bearer) and the agent-server
+  (`X-Session-API-Key`). Confirmed live.
+- **A two-live-account failover stays BLOCKED** here: only one OpenHands key is
+  available, so the switch is proven only against the local fakes +
+  PostgreSQL (`tests/test_openhands_failover.py`).
+- **Do not read a probe conversation back as a defect.** The live probe creates
+  and deletes exactly one conversation; all were deleted (0 `nexus-diagnostics`
+  remain). A pool that reports "no usable account" while a live `pytest` shares
+  the same database is the test suite truncating tables, not a pool bug —
+  reproduce on a private database.
+
+## Account pool: edit, connection, limits and masked values (this session)
+
+The pool already routed across accounts. This adds the four account fields a
+complete pool still lacked, each enforced in code, not in the UI:
+
+- **`max_concurrent_tasks`** (migration `0026_openhands_account_limits.sql`) is
+  the account's concurrency ceiling; `NULL` means no limit. `AccountPool._at_limit`
+  compares it with the *same observed load* `load_balancing` uses (in-flight
+  `nexus_run_tasks` bound to the account plus the reserved counter), and the
+  automatic modes (`auto`, `failover`, `load_balancing`) skip a full account. A
+  pool where every usable account is full raises a reason that names the cause
+  ("every usable OpenHands account is at its concurrency limit"), never a generic
+  "no account". **`manual` is the exception**: a limit steers automatic
+  selection, it does not veto an operator's explicit choice.
+- **`daily_conversation_limit`** records the account's daily ceiling for the
+  operator and the diagnostics. It is informational; the pool never guesses or
+  enforces a number the service did not report.
+- **`api_key_hint`** is the masked key fragment (`sk-o…onse`: first and last four
+  characters; a key under 12 characters is masked whole). It is what the
+  interface, the CLI and the diagnostics show, so they can say *which* key is
+  stored without holding it. The full key stays in `api_key_encrypted` and
+  `OpenHandsAccountService._view` still never returns it.
+- **`connection_ok` / `last_connection_at`** are the last reachability probe.
+  `CloudClient.ping()` (and `CloudDirectClient.ping`) answers *reachability*
+  separately from `health()`: any HTTP answer — including 401/403/429 — means the
+  endpoint is reachable, only a transport failure means it is not. An endpoint
+  can be reachable while the key is rejected, and the operator needs to tell
+  those apart (`check_connection` vs `verify`).
+
+Routes and CLI: `POST /api/openhands/accounts/{id}/edit` (a new `base_url`
+re-verifies the stored key against it before committing) and
+`.../connection`; `nexus openhands add|edit|connection|account
+verify|default|enable|disable|remove|priority`. `_VIEW_COLUMNS` in
+`nexus_openhands_accounts.py` is the single key-free shape every read returns —
+add a new column there and to `REQUIRED_COLUMNS` in `cloud_store.py`, or a read
+will silently omit it. Tests: `tests/test_openhands_account_admin.py` (16 cases)
+and the new cases in `tests/test_openhands_pool_http.py`.
+
+## Account error history: "ошибки" as a list, not a line (this session)
+
+The account view kept only `last_error`, the *latest* failure. The task's
+per-account field "ошибки" (the account's errors) needs the history, so
+migration `0027_openhands_account_error_history.sql` (additive) adds
+`error_count` and `nexus_openhands_account_events`.
+
+- **`error_count`** is the running total of observed failures, so a flapping
+  account can be ranked without reading the history.
+- **`nexus_openhands_account_events`** is one row per observed failure or
+  recovery: `kind` is `auth` (a rejected key), `transport` (unreachable),
+  `error`, or `recovered`; `detail` is the message and is never a secret.
+  `AccountPool.record_failure`/`record_success` append to it, so
+  `OpenHandsAccountService.error_history` returns the account's failures
+  newest-first. `_append_event` swallows its own errors on purpose: the history
+  is a side record and must never fail the dispatch it observes.
+- **HTTP `GET /api/openhands/accounts/{id}/errors`** and CLI
+  `openhands errors --account <id>`; `error_count` is on the account view and in
+  the pool listing.
+- `error_count` is in `_VIEW_COLUMNS` and both it and the new table are in
+  `REQUIRED_COLUMNS` in `cloud_store.py`.
+- Routes `edit`, `connection` and `errors` are now in `tests/test_route_auth.py`
+  (the `edit`/`connection` routes were added without that coverage). Tests:
+  the error-history cases in `tests/test_openhands_account_admin.py` and
+  `tests/test_openhands_pool_http.py`.

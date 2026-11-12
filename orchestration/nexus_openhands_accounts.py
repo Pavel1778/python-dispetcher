@@ -35,11 +35,16 @@ from .secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret
 
 DEFAULT_BASE_URL = "https://app.all-hands.dev"
 
-#: The columns of an account as callers see it. Never the key.
-_COLUMNS = ("id, principal, label, base_url, transport, default_model, identity, state, "
-            "is_default, capabilities, last_checked_at, last_error, created_at, updated_at, "
-            "enabled, priority, health, active_tasks, last_error_at, api_version, "
-            "compatibility, compatibility_detail, health_checked_at")
+#: The key-free shape every read returns. Kept in one place so a new column
+#: cannot be returned by one query and forgotten by another. It never includes
+#: ``api_key_encrypted``; ``api_key_hint`` is the masked fragment instead.
+_VIEW_COLUMNS = (
+    "id, principal, label, base_url, transport, default_model, identity, state, "
+    "is_default, capabilities, last_checked_at, last_error, created_at, updated_at, "
+    "enabled, priority, health, active_tasks, last_error_at, max_concurrent_tasks, "
+    "daily_conversation_limit, api_key_hint, connection_ok, last_connection_at, "
+    "error_count, api_version, compatibility, compatibility_detail, health_checked_at"
+)
 
 
 class ConnectionInUse(RuntimeError):
@@ -52,6 +57,24 @@ class ConnectionInUse(RuntimeError):
     def __init__(self, message: str, dependencies: dict):
         super().__init__(message)
         self.dependencies = dependencies
+
+
+#: A caller that wants "leave this field alone". Distinct from ``None``, which
+#: means "clear it" (an operator removing a default model, say).
+_UNSET = object()
+
+
+def _mask_key(api_key: str) -> str:
+    """A masked fragment of a key, safe to show and log.
+
+    Never enough to reconstruct the key: the first few characters and the last
+    few, with the middle replaced. A short key is masked whole, so a truncated
+    key does not become legible by accident.
+    """
+    key = api_key.strip()
+    if len(key) < 12:
+        return "•" * len(key)
+    return f"{key[:4]}…{key[-4:]}"
 
 
 class OpenHandsAccountService:
@@ -103,10 +126,13 @@ class OpenHandsAccountService:
             return {"api_version": None, "compatibility": "unknown",
                     "detail": f"the API description could not be read: {e}"}
 
+
     # ------------------------------------------------------------------- add
     def add(self, principal: str, *, label: str, api_key: str,
             base_url: str | None = None, transport: str = "direct",
-            default_model: str | None = None, make_default: bool = False) -> dict:
+            default_model: str | None = None, make_default: bool = False,
+            max_concurrent_tasks: int | None = None,
+            daily_conversation_limit: int | None = None) -> dict:
         """Verify the key, then store it encrypted. Returns a key-free view."""
         label = _text(label, "label", maximum=120)
         if not isinstance(api_key, str) or not api_key.strip():
@@ -118,6 +144,9 @@ class OpenHandsAccountService:
         if default_model is not None:
             default_model = _text(default_model, "default_model", maximum=200,
                                   required=False) or None
+        max_concurrent_tasks = _check_limit(max_concurrent_tasks, "max_concurrent_tasks")
+        daily_conversation_limit = _check_limit(daily_conversation_limit,
+                                                "daily_conversation_limit")
         client = self._client(base_url, api_key)
         try:
             capabilities = client.account_capabilities()
@@ -132,21 +161,29 @@ class OpenHandsAccountService:
             cur.execute(
                 "INSERT INTO nexus_openhands_accounts"
                 "(principal, label, base_url, transport, default_model, api_key_encrypted, "
-                " identity, capabilities, last_checked_at, health, health_checked_at, "
-                " api_version, compatibility, compatibility_detail) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),'healthy',now(),%s,%s,%s) "
+                " identity, capabilities, last_checked_at, api_key_hint, "
+                " max_concurrent_tasks, daily_conversation_limit, health, health_checked_at, "
+                " connection_ok, last_connection_at, api_version, compatibility, "
+                " compatibility_detail) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s,%s,'healthy',now(),true,now(),"
+                "        %s,%s,%s) "
                 "ON CONFLICT (principal, label) DO UPDATE SET "
                 "  base_url=EXCLUDED.base_url, transport=EXCLUDED.transport, "
                 "  default_model=EXCLUDED.default_model, "
                 "  api_key_encrypted=EXCLUDED.api_key_encrypted, "
+                "  api_key_hint=EXCLUDED.api_key_hint, "
+                "  max_concurrent_tasks=EXCLUDED.max_concurrent_tasks, "
+                "  daily_conversation_limit=EXCLUDED.daily_conversation_limit, "
                 "  identity=EXCLUDED.identity, capabilities=EXCLUDED.capabilities, "
                 "  state='active', last_error=NULL, last_checked_at=now(), "
                 "  health='healthy', health_checked_at=now(), "
+                "  connection_ok=true, last_connection_at=now(), "
                 "  api_version=EXCLUDED.api_version, compatibility=EXCLUDED.compatibility, "
                 "  compatibility_detail=EXCLUDED.compatibility_detail, updated_at=now() "
-                f"RETURNING {_COLUMNS}",
+                f"RETURNING {_VIEW_COLUMNS}",
                 (principal, label, base_url, transport, default_model, ciphertext,
-                 identity, _json(capabilities), probe.get("api_version"),
+                 identity, _json(capabilities), _mask_key(api_key),
+                 max_concurrent_tasks, daily_conversation_limit, probe.get("api_version"),
                  probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500]))
             view = self._view(cur.fetchone())
             if make_default:
@@ -154,12 +191,190 @@ class OpenHandsAccountService:
                 view["is_default"] = True
         return view
 
+    def edit(self, principal: str, account_id: str, *,
+             label: str | None = None, base_url: str | None = None,
+             transport: str | None = None, default_model: object = _UNSET,
+             max_concurrent_tasks: object = _UNSET,
+             daily_conversation_limit: object = _UNSET,
+             api_key: str | None = None) -> dict:
+        """Edit a connection: its name, where it points, what it signs with.
+
+        Only the fields passed are changed; ``default_model`` and the limits
+        accept an explicit ``None`` to clear them, which is why "unset" is a
+        distinct sentinel rather than ``None``.
+
+        A new ``base_url`` and/or a new ``api_key`` is checked before anything
+        is saved, with exactly the settings the connection would have: the
+        (new) key against the (new) URL. So an edit cannot leave a connection
+        pointing somewhere its key is rejected, and moving a connection to
+        another instance with another key is one change, not two that each
+        fail on their own. The key is never returned.
+        """
+        if label is not None:
+            label = _text(label, "label", maximum=120)
+        if base_url is not None:
+            base_url = self._url(base_url)
+        if transport is not None and transport not in ("direct", "app"):
+            raise ValueError("transport must be 'direct' or 'app'")
+        if api_key is not None:
+            if not isinstance(api_key, str) or not api_key.strip():
+                raise ValueError("api_key must not be empty")
+            api_key = api_key.strip()
+        if default_model is not _UNSET and default_model is not None:
+            default_model = _text(default_model, "default_model", maximum=200,
+                                  required=False) or None
+        if max_concurrent_tasks is not _UNSET:
+            max_concurrent_tasks = _check_limit(max_concurrent_tasks,
+                                                "max_concurrent_tasks")
+        if daily_conversation_limit is not _UNSET:
+            daily_conversation_limit = _check_limit(daily_conversation_limit,
+                                                    "daily_conversation_limit")
+        with self.store._tx() as cur:
+            cur.execute("SELECT base_url, state FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+            old_base, old_state = row["base_url"], row["state"]
+            if label is not None:
+                cur.execute("SELECT 1 FROM nexus_openhands_accounts WHERE principal=%s "
+                            "AND label=%s AND id<>%s", (principal, label, account_id))
+                if cur.fetchone() is not None:
+                    raise ValueError(f"another connection is already named {label!r}")
+        moved = base_url is not None and base_url != old_base
+        checked: dict | None = None
+        if moved or api_key is not None:
+            target = base_url if base_url is not None else old_base
+            if api_key is not None:
+                key = api_key
+            elif old_state != "active":
+                raise ValueError(f"the connection is {old_state}; give a key to bring it back")
+            else:
+                key = self._decrypt(principal, account_id)
+            client = self._client(target, key)
+            try:
+                capabilities = client.account_capabilities()
+            except CloudAuthError as e:
+                raise ValueError(
+                    (f"the new key is rejected by {target}: {e}" if api_key is not None
+                     else f"the stored key is rejected by {target}: {e}")) from e
+            except (CloudUnavailable, CloudError) as e:
+                raise ValueError(f"OpenHands is unavailable at {target}: {e}") from e
+            checked = {"capabilities": capabilities, "probe": self._probe(client)}
+        sets: list[str] = []
+        params: list[Any] = []
+        for column, value in (("label", label), ("base_url", base_url),
+                              ("transport", transport)):
+            if value is not None:
+                sets.append(f"{column}=%s")
+                params.append(value)
+        if default_model is not _UNSET:
+            sets.append("default_model=%s")
+            params.append(default_model)
+        if max_concurrent_tasks is not _UNSET:
+            sets.append("max_concurrent_tasks=%s")
+            params.append(max_concurrent_tasks)
+        if daily_conversation_limit is not _UNSET:
+            sets.append("daily_conversation_limit=%s")
+            params.append(daily_conversation_limit)
+        if api_key is not None:
+            sets.append("api_key_encrypted=%s")
+            params.append(_encrypt_secret(api_key))
+            sets.append("api_key_hint=%s")
+            params.append(_mask_key(api_key))
+        if checked is not None:
+            # What the check just found is what the connection is now.
+            probe = checked["probe"]
+            sets += ["capabilities=%s", "state='active'", "last_error=NULL",
+                     "last_error_at=NULL", "last_checked_at=now()", "health='healthy'",
+                     "health_checked_at=now()", "connection_ok=true",
+                     "last_connection_at=now()", "api_version=%s", "compatibility=%s",
+                     "compatibility_detail=%s"]
+            params += [_json(checked["capabilities"]), probe.get("api_version"),
+                       probe.get("compatibility") or "unknown",
+                       (probe.get("detail") or "")[:500]]
+        if not sets:
+            return self._account(principal, account_id)
+        sets.append("updated_at=now()")
+        params.extend([account_id, principal])
+        with self.store._tx() as cur:
+            cur.execute(
+                f"UPDATE nexus_openhands_accounts SET {', '.join(sets)} "
+                f"WHERE id=%s AND principal=%s RETURNING {_VIEW_COLUMNS}", params)
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+            return self._view(row)
+
+    def _account(self, principal: str, account_id: str) -> dict:
+        """One connection as its owner sees it, or ``NotFound``."""
+        with self.store._tx() as cur:
+            cur.execute(f"SELECT {_VIEW_COLUMNS} FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+            return self._view(row)
+
+    #: Read one connection (the name the HTTP layer uses).
+    get = _account
+
+    def check_connection(self, principal: str, account_id: str) -> dict:
+        """Probe reachability of the account's endpoint, separately from auth.
+
+        A connectivity check and an authorization check are different questions:
+        an endpoint can be unreachable while the key is fine, and reachable while
+        the key is rejected. This makes a plain request to the endpoint and
+        records whether the transport worked; the authorization verdict stays
+        :meth:`verify`'s job. The stored key is used but never returned.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT base_url FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("account not found")
+        key = self._decrypt(principal, account_id)
+        probe = self._client(row["base_url"], key).ping()
+        reachable = bool(probe.get("reachable"))
+        error = None if reachable else (probe.get("detail") or "endpoint unreachable")
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_openhands_accounts SET connection_ok=%s, last_error=%s, "
+                "last_connection_at=now(), updated_at=now() "
+                f"WHERE id=%s AND principal=%s RETURNING {_VIEW_COLUMNS}",
+                (reachable, (error or "")[:1000], account_id, principal))
+            view = self._view(cur.fetchone())
+        view["reachable"] = reachable
+        view["error"] = error
+        return view
+
     def list_accounts(self, principal: str) -> list[dict]:
         with self.store._tx() as cur:
-            cur.execute(f"SELECT {_COLUMNS} "
+            cur.execute(f"SELECT {_VIEW_COLUMNS} "
                         "FROM nexus_openhands_accounts WHERE principal=%s "
                         "ORDER BY is_default DESC, created_at DESC, id", (principal,))
             return [self._view(r) for r in cur.fetchall()]
+
+    def error_history(self, principal: str, account_id: str, *,
+                      limit: int = 50) -> list[dict]:
+        """The account's observed failures and recoveries, newest first.
+
+        The latest failure alone (``last_error``) says the account is broken
+        now; the history says whether it is *flapping* — failing, recovering,
+        failing again — which is what an operator needs to decide whether to
+        disable it. Never a secret: the rows carry the failure message only.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT 1 FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("account not found")
+            cur.execute(
+                "SELECT id, kind, detail, created_at FROM nexus_openhands_account_events "
+                "WHERE account_id=%s ORDER BY created_at DESC, id DESC LIMIT %s",
+                (account_id, max(1, min(int(limit), 200))))
+            return [{**dict(r), "id": str(r["id"])} for r in cur.fetchall()]
 
     def rotate(self, principal: str, account_id: str, *, api_key: str) -> dict:
         """Replace an account's key after re-verifying it."""
@@ -180,20 +395,19 @@ class OpenHandsAccountService:
         ciphertext = _encrypt_secret(api_key)
         with self.store._tx() as cur:
             cur.execute(
-                "UPDATE nexus_openhands_accounts SET api_key_encrypted=%s, "
+                "UPDATE nexus_openhands_accounts SET api_key_encrypted=%s, api_key_hint=%s, "
                 "capabilities=%s, state='active', last_error=NULL, "
                 "last_checked_at=now(), updated_at=now() "
-                "WHERE id=%s AND principal=%s "
-                f"RETURNING {_COLUMNS}",
-                (ciphertext, _json(capabilities), account_id, principal))
+                f"WHERE id=%s AND principal=%s RETURNING {_VIEW_COLUMNS}",
+                (ciphertext, _mask_key(api_key), _json(capabilities),
+                 account_id, principal))
             return self._view(cur.fetchone())
 
     def revoke(self, principal: str, account_id: str) -> dict:
         with self.store._tx() as cur:
             cur.execute("UPDATE nexus_openhands_accounts SET state='revoked', "
                         "is_default=false, updated_at=now() "
-                        "WHERE id=%s AND principal=%s "
-                        f"RETURNING {_COLUMNS}",
+                        f"WHERE id=%s AND principal=%s RETURNING {_VIEW_COLUMNS}",
                         (account_id, principal))
             row = cur.fetchone()
             if row is None:
@@ -237,7 +451,7 @@ class OpenHandsAccountService:
                 "compatibility = CASE WHEN %s THEN %s ELSE compatibility END, "
                 "compatibility_detail = CASE WHEN %s THEN %s ELSE compatibility_detail END, "
                 "updated_at=now() WHERE id=%s AND principal=%s "
-                f"RETURNING {_COLUMNS}",
+                f"RETURNING {_VIEW_COLUMNS}",
                 (state, error, _json(capabilities) if capabilities else None, health, error,
                  probe is not None, (probe or {}).get("api_version"),
                  probe is not None, (probe or {}).get("compatibility") or "unknown",
@@ -248,97 +462,22 @@ class OpenHandsAccountService:
     #: The same check under the name the connection screens use.
     check = verify
 
-    def rename(self, principal: str, account_id: str, label: str) -> dict:
-        """Give a connection another name. Names are unique per owner."""
-        label = _text(label, "label", maximum=120)
-        with self.store._tx() as cur:
-            cur.execute("SELECT 1 FROM nexus_openhands_accounts WHERE principal=%s "
-                        "AND label=%s AND id<>%s", (principal, label, account_id))
-            if cur.fetchone() is not None:
-                raise ValueError(f"another connection is already named {label!r}")
-            cur.execute("UPDATE nexus_openhands_accounts SET label=%s, updated_at=now() "
-                        f"WHERE id=%s AND principal=%s RETURNING {_COLUMNS}",
-                        (label, account_id, principal))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("account not found")
-            return self._view(row)
-
-    def update(self, principal: str, account_id: str, *, base_url: str | None = None,
-               api_key: str | None = None, transport: str | None = None,
-               default_model: str | None = None, clear_model: bool = False) -> dict:
-        """Change where a connection points or what it signs with.
-
-        Nothing is saved unless the service at the (new) URL takes the (new)
-        key: the connection is checked first, with exactly the settings it
-        would have. Whatever is not given stays as it is.
-        """
-        if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
-            raise ValueError("api_key must not be empty")
-        if transport is not None and transport not in ("direct", "app"):
-            raise ValueError("transport must be 'direct' or 'app'")
-        with self.store._tx() as cur:
-            cur.execute("SELECT base_url, transport, default_model, state "
-                        "FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
-                        (account_id, principal))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("account not found")
-        url = self._url(base_url) if base_url is not None else row["base_url"]
-        if api_key is not None:
-            key = api_key.strip()
-        elif row["state"] == "revoked":
-            raise ValueError("the connection is switched off; give a key to bring it back")
-        else:
-            key = _decrypt_secret(self._key_of(principal, account_id))
-        if default_model is not None:
-            default_model = _text(default_model, "default_model", maximum=200,
-                                  required=False) or None
-        client = self._client(url, key)
-        try:
-            capabilities = client.account_capabilities()
-        except CloudAuthError as e:
-            raise ValueError(f"OpenHands rejected the API key: {e}") from e
-        except (CloudUnavailable, CloudError) as e:
-            raise ValueError(f"OpenHands is unavailable: {e}") from e
-        probe = self._probe(client)
-        with self.store._tx() as cur:
-            cur.execute(
-                "UPDATE nexus_openhands_accounts SET base_url=%s, api_key_encrypted=%s, "
-                "transport=COALESCE(%s, transport), "
-                "default_model = CASE WHEN %s THEN NULL ELSE COALESCE(%s, default_model) END, "
-                "capabilities=%s, state='active', last_error=NULL, last_error_at=NULL, "
-                "last_checked_at=now(), health='healthy', health_checked_at=now(), "
-                "api_version=%s, compatibility=%s, compatibility_detail=%s, updated_at=now() "
-                f"WHERE id=%s AND principal=%s RETURNING {_COLUMNS}",
-                (url, _encrypt_secret(key), transport, bool(clear_model), default_model,
-                 _json(capabilities), probe.get("api_version"),
-                 probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500],
-                 account_id, principal))
-            return self._view(cur.fetchone())
-
-    def _key_of(self, principal: str, account_id: str) -> bytes:
-        with self.store._tx() as cur:
-            cur.execute("SELECT api_key_encrypted FROM nexus_openhands_accounts "
-                        "WHERE id=%s AND principal=%s", (account_id, principal))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("account not found")
-            return row["api_key_encrypted"]
-
     # ------------------------------------------------------------- removal
     def dependencies(self, principal: str, account_id: str) -> dict:
         """What still leans on a connection: tasks at work on it, projects
         that list it as an executor, stop signals owed to its conversations."""
         with self.store._tx() as cur:
-            cur.execute("SELECT 1 FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
-                        (account_id, principal))
-            if cur.fetchone() is None:
+            cur.execute("SELECT active_tasks FROM nexus_openhands_accounts "
+                        "WHERE id=%s AND principal=%s", (account_id, principal))
+            row = cur.fetchone()
+            if row is None:
                 raise NotFound("account not found")
             cur.execute("SELECT count(*) AS n FROM nexus_run_tasks "
                         "WHERE openhands_account_id=%s "
                         "AND state IN ('dispatched','running','verifying')", (account_id,))
-            active = int(cur.fetchone()["n"])
+            # The durable rows are the truth; the counter is kept for a caller
+            # that counts by hand (``AccountPool.begin_task``). Either holds.
+            active = max(int(cur.fetchone()["n"]), int(row["active_tasks"] or 0))
             cur.execute(
                 "SELECT p.id, p.name, e.position FROM nexus_project_executors e "
                 "JOIN nexus_projects p ON p.id = e.project_id "
@@ -459,8 +598,8 @@ class OpenHandsAccountService:
     def set_default(self, principal: str, account_id: str) -> dict:
         with self.store._tx() as cur:
             self._set_default(cur, principal, account_id)
-            cur.execute(f"SELECT {_COLUMNS} "
-                        "FROM nexus_openhands_accounts WHERE id=%s", (account_id,))
+            cur.execute(f"SELECT {_VIEW_COLUMNS} FROM nexus_openhands_accounts "
+                        "WHERE id=%s", (account_id,))
             return self._view(cur.fetchone())
 
     @staticmethod
@@ -608,6 +747,15 @@ def _renumber(cur: Any, project_id: Any) -> None:
                     (position, project_id, account_id))
     cur.execute("UPDATE nexus_projects SET openhands_account_id=%s, updated_at=now() "
                 "WHERE id=%s", (ordered[0] if ordered else None, project_id))
+
+
+def _check_limit(value: Any, name: str) -> int | None:
+    """Validate an optional positive-integer limit. ``None`` means "no limit"."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer or null")
+    return value
 
 
 def _json(value: Any) -> str:

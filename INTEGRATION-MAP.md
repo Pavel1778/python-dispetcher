@@ -4,6 +4,11 @@
 > only that the legacy dispatcher received a nonempty response, not that an
 > independent QA runner tested the result or verified a Git commit.
 
+> **Current version (2026-11-12):** the live agent-server is now **1.60.1**
+> (`build_git_ref refs/tags/v1.60.1`), not `v1.50.1` below. See
+> [docs/OPENHANDS_INVENTORY.md](docs/OPENHANDS_INVENTORY.md) for the dated
+> inventory.
+
 Every fact below was read from the live server at `http://127.0.0.1:60000`
 (`build_git_sha 1e1390a`, tag `v1.50.1`) via `GET /openapi.json` and from the
 installed source, not from other versions' docs.

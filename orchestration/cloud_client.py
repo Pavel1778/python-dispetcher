@@ -822,6 +822,27 @@ class CloudClient:
                            + f": all {len(self.REQUIRED_PATHS)} calls this server makes "
                              "are described")}
 
+    def ping(self) -> dict[str, Any]:
+        """Probe *reachability* of the endpoint, distinct from authorization.
+
+        Returns ``{"reachable": bool, "status": int | None, "detail": str}``. An
+        HTTP answer of any status — including 401/403/429 — means the endpoint is
+        reachable; only a transport failure (a refused connection, a DNS error, a
+        timeout) means it is not. This is deliberately not :meth:`health`, which
+        answers "is the account usable right now": an endpoint can be reachable
+        while the key is rejected, and the operator needs to tell those apart.
+        """
+        try:
+            status, _ = self._request("GET", "/api/v1/app-conversations/count")
+        except CloudUnavailable as e:
+            # A rate limit is an *answer*: the endpoint is up, it is declining.
+            if isinstance(e, CloudRateLimited):
+                return {"reachable": True, "status": 429, "detail": str(e)}
+            return {"reachable": False, "status": None, "detail": str(e)}
+        except CloudError as e:
+            return {"reachable": True, "status": None, "detail": str(e)}
+        return {"reachable": True, "status": status, "detail": ""}
+
     # -------------------------------------------------- account capabilities
     # These are read-only. They report what the account *has configured* and
     # what a conversation *has available*; neither is proof that a tool ran.

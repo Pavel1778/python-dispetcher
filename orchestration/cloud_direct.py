@@ -718,6 +718,10 @@ class CloudDirectClient:
         """Healthy when the Cloud account API answers (the app level)."""
         return self.cloud.health()
 
+    def ping(self) -> dict[str, Any]:
+        """Reachability of the account API, distinct from health/authorization."""
+        return self.cloud.ping()
+
     def get_settings(self) -> dict[str, Any]:
         return self.cloud.get_settings()
 
