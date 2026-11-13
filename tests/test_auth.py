@@ -7,12 +7,14 @@ lookup, CSRF check, logout) is exercised. Only the Cloud API is a local fake.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import http.cookiejar
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -312,6 +314,64 @@ def test_logout_clears_cookie(browser):
     assert "Max-Age=0" in hdr.get("Set-Cookie", "")
 
 
+# ------------------------------------------- signed in already, at the form
+def test_the_login_page_can_ask_whether_the_visitor_is_signed_in(server, browser):
+    """The cookie is ``SameSite=Strict``: a link on another site reaches the
+    studio without it, and the owner - signed in - is shown the login form. The
+    form's own script asks this, same-site, and leaves for the studio.
+
+    The answer is public and is never an error for a stranger: an anonymous
+    visitor to the login page must not get a failed request for being one."""
+    st, body, headers = browser.json("GET", "/login/state")
+    assert (st, body) == (200, {"signed_in": False})
+    assert headers.get("Cache-Control") == "no-store"
+    assert "Set-Cookie" not in headers, "asking is not a login"
+
+    st, page, _ = browser.request("GET", "/login")
+    assert st == 200 and re.search(r'<script defer src="/static/login\.js\?v=\w+">', page)
+    st, script, headers = browser.request("GET", "/static/login.js")
+    assert st == 200 and "/login/state" in script
+    assert headers["Content-Type"].startswith("application/javascript")
+
+    browser.login()
+    assert browser.json("GET", "/login/state")[1] == {"signed_in": True}
+    # What a navigation that began on another site looks like to the server:
+    # the same person, no cookie. The form is the right answer to *that*.
+    arriving = Browser(browser.base)
+    st, page, _ = arriving.request("GET", "/", follow=False)
+    assert st in (302, 303)
+    assert arriving.json("GET", "/login/state")[1] == {"signed_in": False}
+
+    browser.json("POST", "/logout")
+    assert browser.json("GET", "/login/state")[1] == {"signed_in": False}
+
+
+def test_only_a_live_browser_session_counts_as_signed_in(server, browser):
+    base = browser.base
+    forged = Browser(base).json(
+        "GET", "/login/state", headers={"Cookie": f"{SESSION_COOKIE}=not-a-session"})
+    assert forged[:2] == (200, {"signed_in": False})
+    # The machine token opens the API. It is not somebody at a login form.
+    machine = Browser(base).json(
+        "GET", "/login/state", headers={"Authorization": "Bearer machine-token"})
+    assert machine[:2] == (200, {"signed_in": False})
+
+    browser.login()
+    assert browser.json("GET", "/login/state")[1] == {"signed_in": True}
+    _time_passes("31 days")                      # unused for longer than a session lasts
+    assert browser.json("GET", "/login/state")[:2] == (200, {"signed_in": False})
+    assert browser.json("GET", "/api/session")[0] == 401
+
+
+def test_the_login_state_has_one_answer_and_takes_no_writes(server, browser):
+    browser.login()
+    for path in ("/login/state/", "/login/state/owner", "/login/states"):
+        assert browser.json("GET", path)[0] in (401, 404), path
+    csrf = browser.json("GET", "/api/session")[1]["csrf_token"]
+    st, _, _ = browser.json("POST", "/login/state", data={}, headers={"X-CSRF-Token": csrf})
+    assert st in (404, 405)
+
+
 # -------------------------------------------------------- session lifetime
 # A session lasts while it is used: 30 days from the last request, 90 days from
 # the login at most. Time passes here by moving a session's own times back in
@@ -358,6 +418,104 @@ def _answer(server, method: str, path: str, token: str, headers: dict | None = N
         return response.status, response.headers.get_all("Set-Cookie") or [], response.headers
     finally:
         conn.close()
+
+
+# ------------------------------------------- a session and its credentials
+# A session is good for the name and the password hash it was opened under.
+# "The password was changed" is, for this server, a deployment with another
+# AUTH_PASSWORD_HASH - so these start a second server on the same database, as
+# a deployment does, and show it the cookie the first one issued.
+@contextlib.contextmanager
+def _redeployed(fake, monkeypatch, **environment):
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    app = App(DSN, poll_interval=3600, token="machine-token")
+    app.client = CloudClient(fake.base_url, api_key="test-key", timeout=5.0)
+    app.dispatcher.client = app.runtime.client = app.client
+    ws = WebServer(app, "127.0.0.1", 0)
+    ws.start()
+    try:
+        yield ws
+    finally:
+        ws.stop()
+
+
+def _signed_in(server, token: str) -> bool:
+    status = _answer(server, "GET", "/api/session", token)[0]
+    assert status in (200, 401), status
+    return status == 200
+
+
+def test_a_new_password_ends_every_session_opened_with_the_old_one(
+        server, browser, fake, monkeypatch):
+    """What changing a password is for: whoever holds a session opened with
+    the old one - another device, a browser left signed in, a stolen cookie -
+    is out. Until now such a session lived on for up to ninety days."""
+    browser.login()
+    token = browser.cookie().value
+    assert _signed_in(server, token)
+    new_password = "another password altogether"
+    with _redeployed(fake, monkeypatch,
+                     AUTH_PASSWORD_HASH=hash_password(new_password, iterations=1000)) as new:
+        assert not _signed_in(new, token)
+        # Every door, not only the API: the page, the login page's own
+        # question, and a write.
+        status, _, headers = _answer(new, "GET", "/", token)
+        assert status in (302, 303) and headers["Location"].startswith("/login")
+        conn = http.client.HTTPConnection("127.0.0.1", new.port, timeout=10)
+        try:
+            conn.request("GET", "/login/state",
+                         headers={"Cookie": f"{SESSION_COOKIE}={token}"})
+            assert json.loads(conn.getresponse().read()) == {"signed_in": False}
+        finally:
+            conn.close()
+        assert _answer(new, "POST", "/logout", token)[0] in (401, 403)
+        # The old password opens nothing; the new one does, and its session
+        # is an ordinary one.
+        b = Browser(f"http://127.0.0.1:{new.port}")
+        assert b.login(password=PASSWORD)[0] == 401 and b.cookie() is None
+        assert b.login(password=new_password)[0] == 200
+        fresh = b.cookie().value
+        assert fresh != token and _signed_in(new, fresh)
+        # The session of the new password is nothing to a server that still
+        # has the old one (the process a deployment is about to stop).
+        assert not _signed_in(server, fresh)
+    # The old session's row is not honoured again by accident later: it is the
+    # same row, unreadable under the new key, and it expires like any other.
+    assert _session_rows() == 2
+
+
+def test_a_new_user_name_ends_the_sessions_of_the_old_one(server, browser, fake, monkeypatch):
+    browser.login()
+    token = browser.cookie().value
+    with _redeployed(fake, monkeypatch, AUTH_USERNAME="somebody-else") as new:
+        assert not _signed_in(new, token)
+
+
+def test_a_deployment_that_changes_no_credentials_ends_nothing(
+        server, browser, fake, monkeypatch):
+    """The other half, and the one that happens daily: a new process with the
+    same settings honours the sessions of the one before it - also when the
+    same hash was pasted again with a line break in it, or another setting
+    changed."""
+    browser.login()
+    token = browser.cookie().value
+    same = os.environ["AUTH_PASSWORD_HASH"]
+    with _redeployed(fake, monkeypatch) as new:
+        assert _signed_in(new, token)
+    wrapped = same[:30] + "\n" + same[30:] + "  \n"
+    with _redeployed(fake, monkeypatch, AUTH_PASSWORD_HASH=wrapped,
+                     AUTH_SESSION_TTL_SECONDS=str(7 * DAY), WEB_AUTH_TOKEN="another-token") as new:
+        assert new.app.auth.configured
+        assert _signed_in(new, token)
+    assert _signed_in(server, token)
+
+
+def test_a_new_session_secret_still_ends_every_session(server, browser, fake, monkeypatch):
+    browser.login()
+    token = browser.cookie().value
+    with _redeployed(fake, monkeypatch, AUTH_SESSION_SECRET="another-secret") as new:
+        assert not _signed_in(new, token)
 
 
 def test_the_default_limits_are_thirty_days_unused_and_ninety_at_most(server):
@@ -1311,15 +1469,103 @@ def test_expired_sessions_and_stale_attempts_are_swept(server):
     assert store.get_session("dead") is None
 
 
-def test_sweep_runs_from_the_loop(server):
-    """The background loop must actually invoke the sweep, not just define it."""
+def _session_rows() -> int:
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        return conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
+
+
+def _expired_session(store, name: str) -> None:
+    store.create_session(token_hash=name, username="owner", csrf_token="c", ttl_seconds=-1)
+
+
+def test_sweep_runs_from_the_loop(fake, monkeypatch):
+    """The background loop itself removes what has expired: nobody calls the
+    sweep for it. A server of its own here, with a loop that turns quickly."""
+    monkeypatch.setenv("OPENHANDS_API_KEY", "test-key")
+    monkeypatch.setenv("AUTH_USERNAME", "owner")
+    monkeypatch.setenv("AUTH_SESSION_SECRET", "unit-test-session-secret")
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", hash_password(PASSWORD, iterations=1000))
+    app = App(DSN, poll_interval=0.05, token="machine-token")
+    app.client = CloudClient(fake.base_url, api_key="test-key", timeout=5.0)
+    app.dispatcher.client = app.runtime.client = app.client
+    # Left there by a server that ran before: the first pass takes it away.
+    _expired_session(app.store, "left-by-the-last-process")
+    app._sweep_interval = 0.3
+    app.start()
+    try:
+        deadline = time.monotonic() + 10
+        while _session_rows() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _session_rows() == 0, "the first pass of a new server did not sweep"
+        # And again later, without a restart.
+        _expired_session(app.store, "expired-while-running")
+        deadline = time.monotonic() + 10
+        while _session_rows() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _session_rows() == 0, "the running loop did not sweep again"
+    finally:
+        app.stop()
+
+
+def test_the_sweep_goes_by_the_clock_not_by_passes_of_the_loop(server):
+    """Regression (production, 2026-11-13): a session that expired at 08:02 was
+    still in the table at 09:40. The sweep was due every sixtieth pass of the
+    loop, counted from the start of the process; a pass takes about two minutes
+    there and the server is replaced several times an hour, so the sixtieth
+    pass never came."""
     app = server.app
-    store = app.store
-    store.create_session(token_hash="loopdead", username="owner",
-                         csrf_token="c", ttl_seconds=-1)
-    app._sweep_every = 1          # sweep on the next tick
+    assert app._sweep_interval == 300.0, "five minutes, by the clock"
+    # The server sweeps when it starts (its first pass); from then on a pass
+    # inside the interval sweeps nothing, however many passes there are ...
+    deadline = time.monotonic() + 10
+    while app._swept_at is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app._swept_at is not None, "the first pass of the server did not sweep"
+    _expired_session(app.store, "dead-1")
+    for _ in range(200):
+        app._maybe_sweep()
+    assert _session_rows() == 1
+    # ... and the first pass after the interval does, whatever its number.
+    app._swept_at -= app._sweep_interval
     app._maybe_sweep()
-    assert store.get_session("loopdead") is None
+    assert _session_rows() == 0
+    # The interval is counted from that sweep, not from the start.
+    _expired_session(app.store, "dead-2")
+    app._maybe_sweep()
+    assert _session_rows() == 1
+
+
+def test_a_pass_that_fails_does_not_put_the_sweep_off(server, monkeypatch):
+    """The sweep is this server's own housekeeping; it was skipped whenever the
+    pass before it failed - for as long as the agent service was down."""
+    from orchestration.cloud_client import CloudUnavailable
+
+    app = server.app
+
+    def down():
+        raise CloudUnavailable("the agent service does not answer")
+
+    deadline = time.monotonic() + 10            # the server's own first pass
+    while app._swept_at is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    _expired_session(app.store, "dead-while-the-service-is-down")
+    assert _session_rows() == 1
+    # A loop of its own over the same app, with the first component of a pass
+    # failing as it does when the service is down.
+    monkeypatch.setattr(app.runtime, "tick", down)
+    app._swept_at = None
+    app.poll_interval = 0.05
+    loop = threading.Thread(target=app._run, daemon=True)
+    loop.start()
+    try:
+        deadline = time.monotonic() + 10
+        while _session_rows() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _session_rows() == 0
+        assert "cloud_error" in app.last_tick, app.last_tick
+    finally:
+        app.poll_interval = 3600
 
 
 def test_global_ceiling_holds_when_the_ip_is_untrustworthy(server):

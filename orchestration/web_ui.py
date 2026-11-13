@@ -39,6 +39,9 @@ _FONTS = "public, max-age=604800"
 _FILES: dict[str, tuple[str, str, str]] = {
     "/static/app.css": ("app.css", _CSS, _SHORT),
     "/static/boot.js": ("boot.js", _JS, _SHORT),
+    # The login page asks whether the visitor is signed in already (a link from
+    # another site arrives without the SameSite=Strict cookie).
+    "/static/login.js": ("login.js", _JS, _SHORT),
     "/static/markdown.js": ("markdown.js", _JS, _SHORT),
     "/static/highlight.js": ("highlight.js", _JS, _SHORT),
     "/static/app.js": ("app.js", _JS, _SHORT),

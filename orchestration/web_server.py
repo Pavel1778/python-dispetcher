@@ -62,6 +62,7 @@ import logging
 import os
 import re
 import socket
+import signal
 import threading
 import time
 import urllib.parse
@@ -166,6 +167,10 @@ UUID_RE = re.compile(
 #: allowed, markup that slipped through an escaping bug still cannot run code or
 #: send data anywhere. ``style-src 'self'`` is why the UI never emits a ``style``
 #: attribute and sets dynamic sizes through the CSSOM instead.
+#: How long a stopping server waits for the pass that advances runs. A
+#: platform gives a process about thirty seconds between SIGTERM and SIGKILL.
+LAB_STOP_GRACE = 20.0
+
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "
     "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; "
@@ -522,8 +527,10 @@ class App:
         self.last_plan_tick: dict[str, Any] = {}
         # Sweep expired sessions and stale rate-limit rows occasionally, not
         # every tick: they are housekeeping, not dispatch work.
-        self._sweep_every = 60
-        self._sweeps_done = 0
+        #: Seconds between two sweeps of expired sessions and stale rate-limit
+        #: rows, by the clock (see ``_maybe_sweep``).
+        self._sweep_interval = 300.0
+        self._swept_at: float | None = None
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
@@ -538,9 +545,18 @@ class App:
     def stop(self) -> None:
         self._stop.set()
         self.spec_planner.wake()
-        for loop in (self._loop, self._lab_loop, self._plan_loop):
+        # The pass that advances runs is given the time to finish what it has
+        # in hand: closing the store under it would lose what it was about to
+        # write (a start it has just been given, a verdict). It does not wait
+        # for a conversation to come up - that is left to the next process
+        # (``LabScheduler``) - so this is seconds. It is waited for first, and
+        # the whole stop stays inside ``LAB_STOP_GRACE``: a platform gives a
+        # stopping process about half a minute before it kills it.
+        deadline = time.monotonic() + LAB_STOP_GRACE
+        for loop in (self._lab_loop, self._loop, self._plan_loop):
             if loop:
-                loop.join(timeout=5)
+                left = max(0.2, deadline - time.monotonic())
+                loop.join(timeout=left if loop is self._lab_loop else min(5.0, left))
         self.store.close()
 
     def _run_planning(self) -> None:
@@ -598,7 +614,11 @@ class App:
                                       client=self.client, github=self.github,
                                       github_accounts=self.github_accounts,
                                       account_router=build_account_router(self.store),
-                                      evidence=self.evidence)
+                                      evidence=self.evidence,
+                                      # A start that is on its way when the
+                                      # server is stopped is left, recorded, to
+                                      # the process that replaces this one.
+                                      stopping=self._stop.is_set)
                     # Known to the diagnostics as a live worker (migration 0023):
                     # a server that advances runs is one. Its heartbeat is
                     # written by every pass.
@@ -626,12 +646,14 @@ class App:
                 jr = self.dispatcher.tick().as_dict()
                 vf = self.verifier.tick().as_dict()
                 self.last_tick = {"at": time.time(), "sr": sr, "jr": jr, "verify": vf}
-                self._maybe_sweep()
             except CloudError as e:
                 self.last_tick = {"at": time.time(), "cloud_error": str(e)}
             except Exception as e:  # noqa: BLE001 - the loop must survive
                 log.exception("tick failed")
                 self.last_tick = {"at": time.time(), "error": f"{type(e).__name__}: {e}"}
+            # After the pass whatever became of it: housekeeping of this
+            # server's own tables does not depend on the agent service.
+            self._maybe_sweep()
             self._stop.wait(self.poll_interval)
 
     def _maybe_sweep(self) -> None:
@@ -641,10 +663,18 @@ class App:
         bound: nothing else deletes an expired session row or a rate-limit row
         whose window has passed. A failure here must never stop the dispatch
         loop, so it is swallowed and logged.
+
+        It goes by the clock: once when the server starts, then every
+        ``_sweep_interval`` seconds. It used to go by passes of the loop -
+        every sixtieth, counted from the start of the process - which was five
+        minutes only on paper: a pass takes about two minutes in production,
+        so the sweep was due two hours after a start, and a server that is
+        redeployed more often than that never reached it.
         """
-        self._sweeps_done += 1
-        if self._sweeps_done % self._sweep_every:
+        now = time.monotonic()
+        if self._swept_at is not None and now - self._swept_at < self._sweep_interval:
             return
+        self._swept_at = now
         try:
             sessions = self.store.purge_expired_sessions()
             attempts = self.store.purge_stale_login_attempts()
@@ -3187,6 +3217,13 @@ class Handler(BaseHTTPRequestHandler):
                 if self._session() is not None:
                     return self._redirect("/")
                 return self._html(200, web_ui.login_page(""))
+            if path == "/login/state":
+                # Asked by the login page itself (studio/login.js). The cookie is
+                # SameSite=Strict, so a link from another site reaches /login
+                # without it and a signed-in owner is shown the form; the page's
+                # own request does carry it. Public, and never an error for a
+                # stranger: it says one thing, about the caller's own cookie.
+                return self._json(200, {"signed_in": self._session() is not None})
             if path == "/healthz":
                 return self._json(200, HEALTHZ)
             if path == "/readyz":
@@ -3987,13 +4024,23 @@ def main() -> int:
                 "at an empty database.")
         return 2
     server = WebServer(app, args.host, args.port)
+
+    def _terminate(signum, frame):
+        # How a platform stops a process - every deployment sends this to the
+        # one it replaces. Without a handler Python dies on the spot, in the
+        # middle of whatever the loops were writing. It is the same request as
+        # Ctrl-C: finish what is in hand, then leave.
+        raise KeyboardInterrupt
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate)
     server.start()
-    print(f"listening on http://{args.host}:{server.port}")
+    print(f"listening on http://{args.host}:{server.port}", flush=True)
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        pass
+        print("stopping: finishing the pass in hand", flush=True)
     finally:
         server.stop()
     return 0

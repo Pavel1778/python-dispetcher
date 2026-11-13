@@ -177,6 +177,61 @@ def test_cancel_route(app, fake, base):
     assert out["workflow_id"] == wid
 
 
+# ------------------------------------------------------------ state events
+def _state_events(app, wid) -> list[str]:
+    with app.store._tx() as cur:
+        cur.execute("SELECT detail->>'state' AS state FROM task_events "
+                    "WHERE kind='workflow_state' AND workflow_id=%s ORDER BY seq", (wid,))
+        return [row["state"] for row in cur.fetchall()]
+
+
+def _updated_at(app, wid):
+    with app.store._tx() as cur:
+        cur.execute("SELECT updated_at FROM workflows WHERE id=%s", (wid,))
+        return cur.fetchone()["updated_at"]
+
+
+def test_saying_the_state_a_workflow_is_in_writes_nothing(app, fake):
+    """The verifier names the state of every open workflow on every pass. A
+    workflow that stays where it is got one event per pass for ever (2 891 in
+    a day in production, from four idle workflows), and its ``updated_at``
+    moved with each, so it never said when the workflow had last changed."""
+    from orchestration.cloud_store import NotFound
+
+    wid, _ = _make_workflow(app, fake)
+    before = _state_events(app, wid)
+    app.store.set_workflow_state(wid, "blocked")
+    changed_at = _updated_at(app, wid)
+    assert _state_events(app, wid) == before + ["blocked"]
+    for _ in range(5):
+        app.store.set_workflow_state(wid, "blocked")
+    assert _state_events(app, wid) == before + ["blocked"]
+    assert _updated_at(app, wid) == changed_at
+
+    # A change is still a change, in either direction.
+    app.store.set_workflow_state(wid, "failed")
+    app.store.set_workflow_state(wid, "failed")
+    app.store.set_workflow_state(wid, "blocked")
+    assert _state_events(app, wid) == before + ["blocked", "failed", "blocked"]
+    assert _updated_at(app, wid) > changed_at
+    # And a workflow that does not exist is still an error, not a silent no-op.
+    with pytest.raises(NotFound):
+        app.store.set_workflow_state("00000000-0000-0000-0000-000000000000", "blocked")
+
+
+def test_the_verifier_passing_over_an_idle_workflow_leaves_no_trail(app, fake):
+    """The same through the loop that does it: several passes of the real
+    verifier over a workflow whose state does not change."""
+    wid, _ = _make_workflow(app, fake)
+    app.verifier.tick()
+    settled = _state_events(app, wid)
+    stamp = _updated_at(app, wid)
+    for _ in range(4):
+        app.verifier.tick()
+    assert _state_events(app, wid) == settled
+    assert _updated_at(app, wid) == stamp
+
+
 # ---------------------------------------------------------------- resume
 def test_resume_reopens_a_blocked_workflow(app, fake):
     wid, _ = _make_workflow(app, fake)

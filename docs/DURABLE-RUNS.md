@@ -47,10 +47,12 @@ code that creates runs directly is unchanged.
 - **No usable executor, or a repository the project may not use right now**:
   the task waits and asks again, each time after a longer wait.
 - **A restart changes nothing.** Waits are timestamps, claims are leases with a
-  fencing token, stop signals and reports are rows. Another process picks the
-  run up where the first one left it. A task claimed by a worker that died
-  before starting it is taken back when the lease runs out; a conversation that
-  such a worker did start is adopted, not started twice.
+  fencing token, stop signals and reports are rows, and a start the agent
+  service has accepted is on the task's row. Another process picks the run up
+  where the first one left it - a start that was on its way included (next
+  section). A task claimed by a worker that died before the service accepted
+  its start is taken back when the lease runs out; a conversation that such a
+  worker did start is adopted, not started twice.
 - **It stays governable.** `NEXUS_LAB_MAX_ACTIVE_TASKS` (8) bounds how many
   tasks are at work at once over all runs; one task at a time works on a branch
   of a repository; `NEXUS_RETRY_MAX_CYCLES` (0 = none) is the operator's
@@ -60,6 +62,71 @@ code that creates runs directly is unchanged.
 A run that is between two tries is still `running`. `GET …/runs/<id>` shows
 each waiting task as `waiting` with its `retry_at` and `wait_reason`, and the
 run's own `resume_at` and `wait_reason` when the run as a whole pauses.
+
+### A start outlives the worker that asked for it
+
+Starting a conversation takes two steps: the service accepts the start and
+names a *start task*, and the conversation exists when its sandbox is ready -
+about a minute later on the live service. For that minute the claim had
+nothing to show but its lease, and the start task was known only to the
+process that had asked. A worker replaced in that minute took it along: the
+conversation came up and went to work unfollowed, the task stood `dispatched`
+until the lease ran out (15 minutes), and only then was the conversation found
+by its tags and adopted - as attempt 2.
+
+On the deployed service this was not an accident but the rule. The server
+advances runs itself and is deployed from the branch the agents push to, so
+each task that ended with a push replaced the server just as it was starting
+the next one. Of the seven executions of one night (2026-11-13), five were
+`adopted` at attempt 2, each exactly 900 seconds after its claim.
+
+Now:
+
+- **The accepted start is recorded** (`nexus_run_tasks.pending_start`,
+  migration 0034): the start task's id, the connection that accepted it, the
+  kind of attempt, the commit it began from and how the task text was
+  delivered - with the claim's fencing token, so the record counts only for
+  that claim (`LabStore.record_start`).
+- **Any worker finishes it.** Every pass asks the recorded start task once how
+  it stands (`LabScheduler._follow_starts`, `OpenHandsExecutor.follow_start`).
+  A conversation is bound exactly as the worker that asked would have bound
+  it: kind `start`, the same attempt, one row in the task's history. A start
+  the service reports failed is handled as the failed dispatch it is, at once.
+  A start still on its way is asked again on the next pass, and so is one the
+  service could not be asked about just now.
+- **Two workers may be looking at the same start** - the one that asked, still
+  waiting, and one that found it on the row. Binding the conversation a task
+  already has changes nothing (`LabStore.mark_running`): no second history
+  row, no stop signal for the conversation at work. A failure is dealt with by
+  the one worker that takes the record off the row (`LabStore.take_start`), so
+  it is counted against the connection once.
+- **A worker told to stop leaves at once.** `SIGTERM` (both `web_server` and
+  `lab_worker`) means: finish the pass in hand, begin nothing new, and do not
+  wait for a conversation that is coming up - the record is there for the next
+  process. The web server gives the pass up to 20 seconds
+  (`LAB_STOP_GRACE`) before it closes the database.
+- **The lease still bounds everything.** A recorded start that has produced
+  nothing when the claim runs out is no longer followed; the task is taken
+  back and the old path applies (a new attempt that first looks for a
+  conversation with the task's tags).
+
+What it does not cover:
+
+- A process killed *before* the service answered the start request has
+  nothing to record. If the service did create the start, that is found the
+  old way, when the lease runs out.
+- A run cancelled while a start is on its way: the worker that asked binds the
+  conversation when it comes up and records its stop signal, as before. If
+  that worker is gone in the same minute, nobody follows the start of a
+  cancelled run (only starts of claimed tasks are followed), and the
+  conversation is not told to stop. Two things at once in one minute; not
+  seen, and not closed.
+
+`tests/test_start_handover.py` replaces real processes at that moment - the
+web server by `SIGTERM`, the worker by `SIGKILL` and `SIGTERM`, and two workers
+side by side - against PostgreSQL and the fake Cloud;
+`tests/test_openhands_failover.py` has the two-worker cases with a stored
+connection.
 
 ## The report in the chat
 
@@ -274,6 +341,10 @@ of any repository is unverified.
 
 Each can be applied twice. `tests/test_durable_migrations.py` applies them to a
 database that already holds runs, projects and links.
+
+`0034_pending_start.sql` adds one nullable column, `nexus_run_tasks.pending_start`
+(the start a claimed task is waiting for; see "A start outlives the worker that
+asked for it"). No existing row changes.
 
 ## What this does not do
 

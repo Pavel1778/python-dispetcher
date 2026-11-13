@@ -54,9 +54,12 @@ booleans only, never a value) and in `policy_report()`.
 Two independent paths, neither a substitute for the other:
 
 - **Browser session** (`orchestration/web_auth.py`): PBKDF2 password, a
-  server-side session row (only `HMAC(AUTH_SESSION_SECRET, token)` is stored, so
-  logout is immediate and a database leak yields no usable cookie), and a
-  double-submit CSRF token required on every write.
+  server-side session row (only an HMAC of the token is stored, so logout is
+  immediate and a database leak yields no usable cookie), and a double-submit
+  CSRF token required on every write. The HMAC key is `AUTH_SESSION_SECRET`
+  bound to the user name and the password hash in force
+  (`AuthService._session_key`): a session is good only for the credentials it
+  was opened with.
 
   A session is sliding with a hard end: 30 days from the last request, 90 days
   from the login (`AUTH_SESSION_TTL_SECONDS`, `AUTH_SESSION_MAX_SECONDS`;
@@ -66,8 +69,19 @@ Two independent paths, neither a substitute for the other:
   it: the cookie is `HttpOnly`, `Secure` and `SameSite=Strict`; the renewed
   cookie is only ever sent on an answer marked `no-store` or on a redirect,
   never on one a cache may keep; logout ends the session at once; changing
-  `AUTH_SESSION_SECRET` ends all of them. **Changing the password does not end
-  an open session** - rotate the secret too.
+  `AUTH_SESSION_SECRET`, **the password (`AUTH_PASSWORD_HASH`) or the user
+  name** ends all of them, on every device, as soon as the deployment with the
+  new value runs (`tests/test_auth.py`, "a session and its credentials").
+
+  `SameSite=Strict` has a cost that is paid in the open: a link from another
+  site arrives without the cookie, and the server cannot tell the owner from a
+  stranger on that request. The login page asks `GET /login/state` from its
+  own origin and leaves for the studio when the answer is yes. That route is
+  public by necessity and says one bit, `{"signed_in": true|false}`, about the
+  browser that asks - nothing about whether an account exists, never an error,
+  `no-store`, no cookie set, and only a live browser session counts (the
+  machine token does not). It is on the public allowlist of
+  `tests/test_route_auth.py`.
 - **Machine bearer** (`WEB_AUTH_TOKEN`): `Authorization: Bearer ...`, for the
   CLI and scripts.
 

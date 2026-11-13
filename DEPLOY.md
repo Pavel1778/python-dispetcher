@@ -34,9 +34,11 @@ There are two independent authentication paths, and neither weakens the other:
 * The owner's password is **never** stored; only a PBKDF2-SHA256 hash with a
   random salt (`pbkdf2_sha256$<iters>$<salt>$<hash>`). 600 000 iterations by
   default.
-* Sessions live server-side in the `sessions` table. Only
-  `HMAC-SHA256(AUTH_SESSION_SECRET, token)` is stored, so a database dump does
-  not yield usable cookies. Logout deletes the row, which is immediate.
+* Sessions live server-side in the `sessions` table. Only an HMAC-SHA256 of
+  the token is stored, so a database dump does not yield usable cookies. Its
+  key is `AUTH_SESSION_SECRET` bound to the user name and the password hash in
+  force, so a session is good only for the credentials it was opened with.
+  Logout deletes the row, which is immediate.
 * A session lasts while it is used: it ends 30 days after the last request
   made with it and, used or not, 90 days after the login
   (`AUTH_SESSION_TTL_SECONDS`, `AUTH_SESSION_MAX_SECONDS`). See
@@ -55,8 +57,9 @@ There are two independent authentication paths, and neither weakens the other:
   not the leftmost value, which a caller controls. Set `TRUSTED_PROXY_HOPS` to
   the number of proxies you actually run behind (default 1). A client that
   rotates or repeats the header therefore cannot pick its own rate-limit key.
-* Expired sessions and stale rate-limit rows are swept periodically by the
-  background loop, so neither table grows without bound.
+* Expired sessions and stale rate-limit rows are swept by the background loop
+  when the server starts and every five minutes after, so neither table grows
+  without bound.
 * A wrong username and a wrong password give the same status and the same
   message, and take the same time, so the login page cannot be used to discover
   whether an account exists.
@@ -270,9 +273,23 @@ What ends a session before its time:
 * **Changing `AUTH_SESSION_SECRET`** ends every session on every device: the
   stored hashes no longer match any cookie. This is the way to sign everything
   out after a lost phone.
-* **Changing the password (`AUTH_PASSWORD_HASH`) does not.** A session that is
-  already open stays open. After a password that may have leaked, change
-  `AUTH_SESSION_SECRET` as well.
+* **Changing the password (`AUTH_PASSWORD_HASH`) ends every session too**, and
+  so does changing `AUTH_USERNAME`: a session belongs to the credentials it
+  was opened with. Once the deployment with the new value is running, no
+  cookie issued before opens anything; sign in with the new password. (Until
+  2026-11-13 a session outlived a password change by up to 90 days.) Pasting
+  the *same* hash again, with or without a stray line break, ends nothing; a
+  hash generated anew for the same password is a new value and does.
+
+A deployment that changes none of these three ends nothing: the new process
+honours the sessions of the one it replaces.
+
+A link to the studio on another site (a chat, a mail, GitHub) reaches it
+without the cookie - the cookie is `SameSite=Strict` - so the server answers
+with the login page. The page asks the server, from the studio's own origin,
+whether this browser is signed in (`GET /login/state`) and goes on to the
+studio if it is, keeping the `#…` part of the link. The owner sees the form
+only when a sign-in is really needed.
 
 ### Regenerating AUTH_PASSWORD_HASH on Render
 
@@ -338,7 +355,7 @@ psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 for f in $(ls migrations/*.sql | sort); do psql "$SUPABASE_DB_URL" -f "$f"; done
 ```
 
-The migrations are `0001`–`0011`, `0014`–`0032`. `0012` and `0013` are
+The migrations are `0001`–`0011`, `0014`–`0034`. `0012` and `0013` are
 intentionally unused (reserved for the deferred File Lab, D-1). The runner
 applies every `*.sql` in lexical order and does not require a contiguous
 sequence, so the gap is safe. The set includes the auth tables (`0004`), the
@@ -349,7 +366,8 @@ the RLS on the sandbox session-key tables (`0016`), the context/memory tables
 `0022`, `0026`, `0027`), the specifications (`0021`), the worker heartbeat
 (`0023`), the task hand-off/preferred-account/time-limit columns (`0024`,
 `0025`), the lease fencing and abandoned-conversation columns (`0028`, `0029`),
-and the durable-run/connection/project-repository tables (`0030`–`0032`).
+the durable-run/connection/project-repository tables (`0030`–`0032`), the
+chat's intent record (`0033`) and the start a task is waiting for (`0034`).
 
 `0014_nexus_project_binding.sql` is additive: it adds the project↔repository
 link table, nullable `project_id` on `tasks`/`workflows`, the canonical
@@ -461,6 +479,21 @@ that the server does this.
 
 All state is in PostgreSQL and every claim is a lease, so a restart continues
 where the last pass stopped, and closing the browser stops nothing.
+
+**A deployment replaces the process, and that costs a run nothing.** Render
+starts the new process, and then sends the old one `SIGTERM`. The server
+finishes the pass it has in hand - seconds - records that its worker stopped
+and exits with status 0; it does not start anything new once it has been told
+to stop, and it does not wait for a conversation that is still coming up. A
+start the agent service has already accepted is written on the task
+(`nexus_run_tasks.pending_start`), so the new process binds the conversation
+when it is there, as the same first attempt. This matters here more than
+elsewhere: with `autoDeploy` on, every push an agent makes to the deployed
+branch replaces the server, about fifty seconds later - which is exactly when
+the server is starting the next task. Before 2026-11-13 that start was lost
+with the process: the task stood claimed for fifteen minutes and came back as
+a second attempt. See [docs/DURABLE-RUNS.md](docs/DURABLE-RUNS.md), "A start
+outlives the worker that asked for it".
 
 **The free plan stops the process after about 15 minutes without a request.**
 The loop stops with it. Conversations already started go on in OpenHands Cloud
