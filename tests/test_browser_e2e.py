@@ -1333,6 +1333,75 @@ def test_two_openhands_are_connected_and_given_to_the_project_in_the_settings(st
             ctx.close()
 
 
+def test_the_openhands_selection_mode_and_fallback_order_are_driven_from_the_settings(stack, chromium):
+    """The OpenHands settings tab carries the operator's controls the request
+    names: the default connection, the fallback order and the selection mode.
+    Each is changed in the interface and read back from the server, and no key
+    is in the page."""
+    keys = ("sk-first-openhands-key-0001", "sk-second-openhands-key-0002")
+    with FakeCloudServer() as second:
+        second.cloud.settings = dict(stack.cloud.cloud.settings)
+        ctx, page, watch = _open(chromium)
+        try:
+            _login(page, stack.base)
+            page.click("#user-menu")
+            page.click(".menu-item[data-action='open-settings']")
+            form = ".openhands-form"
+            for label, server, key in (("основной", stack.cloud, keys[0]),
+                                       ("запасной", second, keys[1])):
+                summary = page.locator("details.add summary", has_text="Подключить OpenHands")
+                summary.wait_for()
+                if not summary.evaluate("el => el.parentElement.open"):
+                    summary.click()
+                page.fill(f"{form} [name=label]", label)
+                page.fill(f"{form} [name=base_url]", server.base_url)
+                page.fill(f"{form} [name=api_key]", key)
+                page.click(f"{form} button[type=submit]")
+                expect(page.locator("[data-openhands]", has_text=label)).to_be_visible()
+
+            # The pool controls appear once a connection exists: the mode and
+            # the order, listing both connections.
+            page.wait_for_selector("#openhands-pool")
+            assert page.locator("#openhands-pool .step-title").all_inner_texts() == ["основной", "запасной"]
+
+            # Changing the selection mode is a real server setting.
+            page.select_option("#pool-mode", "load_balancing")
+            expect(page.locator(".toast", has_text="Режим выбора сохранён")).to_be_visible()
+            pool = stack.app.account_pool.get_config("user:owner")
+            assert pool["selection_mode"] == "load_balancing"
+
+            # Moving a connection up rewrites the fallback order on the server.
+            page.locator("#openhands-pool .step-row", has_text="запасной").locator(
+                "[data-dir='up']").click()
+            expect(page.locator(".toast", has_text="Порядок переключения сохранён")).to_be_visible()
+            order = stack.app.account_pool.get_config("user:owner")["fallback_order"]
+            accounts = stack.app.openhands_accounts.list_accounts("user:owner")
+            by_label = {a["label"]: a["id"] for a in accounts}
+            assert order == [by_label["запасной"], by_label["основной"]]
+
+            # Making a connection the default is one action, and it is durable.
+            page.locator("[data-openhands]", has_text="запасной").locator(
+                "[data-action='openhands-default']").click()
+            expect(page.locator(".toast", has_text="Основное подключение изменено")).to_be_visible()
+            defaults = [a["label"] for a in stack.app.openhands_accounts.list_accounts("user:owner")
+                        if a["is_default"]]
+            assert defaults == ["запасной"]
+
+            # The error history is reachable and honest about being empty.
+            page.locator("[data-openhands]", has_text="основной").locator(
+                "[data-action='openhands-errors']").click()
+            errors = page.locator(".dialog:not(.is-settings)").last
+            expect(errors).to_be_visible()
+            expect(errors.locator(".section-note")).to_contain_text("Ошибок не зафиксировано")
+            errors.locator("[data-action='close-dialog']").last.click()
+
+            for key in keys:
+                assert key not in page.content(), "a key came back to the page"
+            assert watch.problems == []
+        finally:
+            ctx.close()
+
+
 # ------------------------------- several repositories, each with its own account
 def test_a_project_gets_a_second_repository_from_another_github_account(stack, chromium):
     """Two private repositories, each visible to one GitHub account only. The

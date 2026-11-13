@@ -1415,6 +1415,75 @@ class LabStore:
                         "ORDER BY created_at, id", (task_id,))
             return [dict(r) for r in cur.fetchall()]
 
+    def run_handoffs(self, run_id: str) -> list[dict]:
+        """Every executor switch of a run, oldest first, with the account labels.
+
+        The account labels are joined here so the interface can name the
+        executor a task moved *from* and *to* without holding the account list;
+        a switch whose account was later removed keeps a ``NULL`` label and the
+        id, never a fabricated name.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT h.id, h.task_id, t.task_key, h.from_account_id, h.to_account_id, "
+                "  fa.label AS from_label, ta.label AS to_label, h.reason, h.created_at "
+                "FROM nexus_task_handoffs h "
+                "LEFT JOIN nexus_run_tasks t ON t.id = h.task_id "
+                "LEFT JOIN nexus_openhands_accounts fa ON fa.id = h.from_account_id "
+                "LEFT JOIN nexus_openhands_accounts ta ON ta.id = h.to_account_id "
+                "WHERE h.run_id=%s ORDER BY h.created_at, h.id", (run_id,))
+            out = []
+            for row in cur.fetchall():
+                item = dict(row)
+                for key in ("id", "task_id", "from_account_id", "to_account_id"):
+                    if item.get(key) is not None:
+                        item[key] = str(item[key])
+                out.append(item)
+            return out
+
+    def run_events(self, run_id: str, *, limit: int = 100) -> list[dict]:
+        """The run's recent events, newest first, for the progress view.
+
+        Two real sources are merged, both with a real timestamp: the project
+        events the run itself wrote (started, cancelled, hidden/shown) and one
+        entry per executor attempt - its start, and its settled outcome when it
+        has one, carrying the account, the conversation id and the reason.
+        Nothing is invented: a run with no attempts yet has only its own events.
+        """
+        limit = max(1, min(int(limit), 500))
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT kind, created_at AS at, actor FROM nexus_project_events "
+                "WHERE resource_id=%s ORDER BY seq DESC LIMIT %s", (run_id, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT e.task_key, e.kind, e.started_at, e.ended_at, "
+                "  e.executor_label AS account, e.conversation_id, e.outcome, e.reason "
+                "FROM nexus_task_executions e WHERE e.run_id=%s "
+                "ORDER BY e.started_at DESC, e.id DESC LIMIT %s", (run_id, limit))
+            executions = [dict(r) for r in cur.fetchall()]
+        events = [{"at": r["at"], "kind": r["kind"],
+                   "detail": {"actor": r["actor"]} if r.get("actor") else {}}
+                  for r in rows]
+        for row in executions:
+            base = {"task": row["task_key"]}
+            if row.get("account"):
+                base["account"] = row["account"]
+            if row.get("conversation_id"):
+                base["conversation_id"] = str(row["conversation_id"])
+            events.append({"at": row["started_at"], "kind": f"attempt.{row['kind']}",
+                           "detail": dict(base)})
+            if row.get("ended_at"):
+                settled = dict(base)
+                if row.get("outcome"):
+                    settled["outcome"] = row["outcome"]
+                if row.get("reason"):
+                    settled["reason"] = row["reason"]
+                events.append({"at": row["ended_at"],
+                               "kind": f"attempt.{row['kind']}.ended", "detail": settled})
+        events.sort(key=lambda e: e["at"], reverse=True)
+        return events[:limit]
+
     def reclaim_expired(self, run_id: str) -> list[dict]:
         """Requeue tasks a worker claimed and never started (it died in between).
 

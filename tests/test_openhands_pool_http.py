@@ -274,3 +274,62 @@ def test_diagnostics_report_carries_the_provider_checks(base, fake, app):
     assert names["providers"] == "VERIFIED"
     assert names["provider_probe"] == "UNVERIFIED"
     assert KEY not in json.dumps(report)
+
+
+# ------------------------- the operator's settings the interface drives directly
+def test_default_account_and_fallback_order_over_http(base, fake):
+    """The three controls the OpenHands settings tab drives: which connection is
+    the default, in what order the others are tried, and the selection mode."""
+    a, b = fake
+    va = _add_account(base, "A", a)
+    vb = _add_account(base, "B", b)
+    assert va["is_default"] is True and vb["is_default"] is False
+
+    # Make B the default: exactly one connection is default afterwards.
+    status, out = _req("POST", base, f"/api/openhands/accounts/{vb['id']}/default", {})
+    assert status == 200 and out["account"]["is_default"] is True
+    status, listing = _req("GET", base, "/api/openhands/accounts")
+    defaults = [acc["id"] for acc in listing["accounts"] if acc["is_default"]]
+    assert defaults == [vb["id"]]
+
+    # The fallback order is stored verbatim and read back the same way.
+    status, out = _req("POST", base, "/api/openhands/pool",
+                       {"fallback_order": [vb["id"], va["id"]]})
+    assert status == 200
+    assert out["config"]["fallback_order"] == [vb["id"], va["id"]]
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert pool["config"]["fallback_order"] == [vb["id"], va["id"]]
+    # Candidates are returned in that order.
+    assert [c["label"] for c in pool["candidates"]] == ["B", "A"]
+    # The mode is one of the four the pool enforces; a bad one is refused.
+    status, out = _req("POST", base, "/api/openhands/pool", {"selection_mode": "round_robin"})
+    assert status == 400 and "selection_mode" in out["error"]
+
+
+def test_pool_view_reports_the_observed_load(base, fake, app):
+    """The pool view exposes the same in-flight load the selection ranks on, so
+    the interface can show it without reading a counter nothing decrements."""
+    a, _b = fake
+    va = _add_account(base, "A", a)
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert status == 200
+    assert pool["candidates"][0]["load"] == 0
+    # A task in flight on the connection is observed and reported. The rows are
+    # written directly, exactly as the lab would leave them.
+    with app.store._tx() as cur:
+        cur.execute("INSERT INTO nexus_projects(name) "
+                    "VALUES ('P') RETURNING id")
+        pid = cur.fetchone()["id"]
+        cur.execute("INSERT INTO nexus_goals(project_id, text, created_by) "
+                    "VALUES (%s, 'G', 'machine:default') RETURNING id", (pid,))
+        gid = cur.fetchone()["id"]
+        cur.execute("INSERT INTO nexus_runs(project_id, goal_id, state, created_by) "
+                    "VALUES (%s, %s, 'running', 'machine:default') RETURNING id", (pid, gid))
+        run_id = cur.fetchone()["id"]
+        cur.execute(
+            "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title, state, "
+            "  openhands_account_id) VALUES (%s,%s,'t','T','running',%s)",
+            (run_id, pid, va["id"]))
+    status, pool = _req("GET", base, "/api/openhands/pool")
+    assert pool["candidates"][0]["load"] == 1
+    assert KEY not in json.dumps(pool)

@@ -15,12 +15,13 @@ something that was never tried is a lie; so is ``FAILED`` for something that
 only lacked a key.
 
 The checks that need a live conversation (create, message, events, run a
-command, read/write the workspace, finish) run only when *live* is requested
-and an OpenHands credential is available. Everything else (database, schema,
-queues, leases, worker heartbeat, the account pool) runs against whatever the
-process is already configured with, and a fake Cloud server counts as "real" for
-the connectivity and account checks — it is a real HTTP server the client speaks
-to over a socket, which is what makes those checks meaningful.
+command, read/write the workspace, task completion, finish) run only when
+*live* is requested and an OpenHands credential is available. Everything else
+(database, schema, queues, leases, recovery, worker heartbeat, the account pool)
+runs against whatever the process is already configured with, and a fake Cloud
+server counts as "real" for the connectivity and account checks — it is a real
+HTTP server the client speaks to over a socket, which is what makes those checks
+meaningful.
 """
 from __future__ import annotations
 
@@ -144,6 +145,7 @@ class OpenHandsDiagnostics:
         self.check_pool(report, principal, project_id=project_id)
         self.check_cloud_api(report)
         self.check_queues_and_leases(report, principal)
+        self.check_recovery(report, principal)
         self.check_worker(report)
         self.check_providers(report)
         self.check_provider_probe(report, live=live)
@@ -315,6 +317,83 @@ class OpenHandsDiagnostics:
                        {"task_key": "T1"})
         except Exception as e:  # noqa: BLE001
             report.add("queues_leases", FAILED, f"{type(e).__name__}: {e}")
+        finally:
+            if project_id is not None:
+                try:
+                    with self.store._tx() as cur:
+                        cur.execute("DELETE FROM nexus_projects WHERE id=%s", (project_id,))
+                except Exception:  # noqa: BLE001 - cleanup is best effort
+                    pass
+
+    # -- 5b. recovery ------------------------------------------------------
+    def check_recovery(self, report: Report, principal: str) -> None:
+        """Prove the recovery path: an expired lease is reclaimed and re-claimed.
+
+        A real round trip on a throwaway project, like the queue check. A worker
+        claims a task with a lease that is already expired (``lease_seconds=0``),
+        then dies without binding a conversation; ``reclaim_expired`` takes the
+        task back and a second worker claims it. The second claim must carry a
+        **higher fencing token** than the first, so the dead worker's writes are
+        no-ops - the mechanism that keeps a lost worker from corrupting the work
+        of the one that took over.
+
+        A task whose conversation was already bound is deliberately *not* taken
+        back: that would start a second conversation for the same work, which is
+        the duplication this path exists to prevent. Both halves are asserted.
+
+        The throwaway project is deleted in a ``finally`` (its goals, runs and
+        tasks cascade), so nothing is left behind and no existing row is touched.
+        """
+        import uuid
+
+        from .nexus_projects import ProjectService
+
+        projects = ProjectService(self.store)
+        marker = uuid.uuid4().hex[:8]
+        project_id = None
+        try:
+            project = projects.create(principal, f"diagnostics-recovery-{marker}")
+            project_id = str(project["id"])
+            goal, _ = projects.create_goal(principal, project_id, f"recovery {marker}")
+            run = self.lab.start_run(principal, project_id, str(goal["id"]),
+                                     max_iterations=5,
+                                     plan=[{"id": "T1", "title": "probe",
+                                            "description": "", "acceptance": [],
+                                            "dependencies": []}],
+                                     repository="", branch="")
+            run_id = str(run["id"])
+            # A worker claims with an already-expired lease and dies before
+            # binding a conversation: exactly the case reclaim exists for.
+            first = self.lab.claim_task(run_id, "diagnostics-dead", lease_seconds=0)
+            if first is None:
+                raise RuntimeError("claim_task returned no task")
+            reclaimed = self.lab.reclaim_expired(run_id)
+            if not reclaimed:
+                raise RuntimeError("an expired lease was not reclaimed")
+            second = self.lab.claim_task(run_id, "diagnostics-live", lease_seconds=60)
+            if second is None:
+                raise RuntimeError("a reclaimed task could not be re-claimed")
+            if second["lease_token"] <= first["lease_token"]:
+                raise RuntimeError(
+                    "the fencing token did not advance across recovery")
+            # A task whose conversation is bound is never reclaimed: taking it
+            # back would start a second conversation for work already under way.
+            self.lab.mark_running(second["id"], conversation_id="diag-conv",
+                                  lease_token=second["lease_token"])
+            self.lab.reclaim_expired(run_id)
+            bound = self.lab.get_task_internal(second["id"])
+            if bound is None or bound["state"] != "running" or \
+                    bound["conversation_id"] != "diag-conv":
+                raise RuntimeError("a bound conversation was reclaimed into a second start")
+            self.lab.release_task(second["id"], error="diagnostics", requeue=True,
+                                  lease_token=second["lease_token"])
+            report.add("recovery", VERIFIED,
+                       "expired lease reclaimed and re-claimed with a higher "
+                       "fencing token; a bound conversation was not re-claimed",
+                       {"lease_token_before": first["lease_token"],
+                        "lease_token_after": second["lease_token"]})
+        except Exception as e:  # noqa: BLE001
+            report.add("recovery", FAILED, f"{type(e).__name__}: {e}")
         finally:
             if project_id is not None:
                 try:
@@ -663,16 +742,21 @@ class OpenHandsDiagnostics:
         if not live:
             report.add("live_conversation", UNVERIFIED,
                        "not requested (pass live=true to run the end-to-end probe)")
+            report.add("task_completion", UNVERIFIED,
+                       "not requested (pass live=true to run a conversation to completion)")
             return
         try:
             account = self._pick_account(principal, account_id, project_id)
         except PoolError as e:
             report.add("live_conversation", BLOCKED, str(e))
+            report.add("task_completion", BLOCKED, str(e))
             return
         try:
             client = self._live_client(principal, account)
         except Exception as e:  # noqa: BLE001
             report.add("live_conversation", FAILED, f"{type(e).__name__}: {e}")
+            report.add("task_completion", BLOCKED,
+                       f"no client to run a conversation: {type(e).__name__}")
             return
         self._run_live_probe(report, principal, account, client)
 
@@ -716,6 +800,8 @@ class OpenHandsDiagnostics:
             if not conversation_id:
                 report.add("live_conversation", FAILED,
                            "conversation was created without an id", evidence)
+                report.add("task_completion", FAILED,
+                           "no conversation to run to completion", evidence)
                 return
             report.add("conversation_create", VERIFIED, "conversation created", evidence)
         except (CloudAuthError, CloudUnavailable, CloudError) as e:
@@ -728,9 +814,13 @@ class OpenHandsDiagnostics:
             status = BLOCKED if resource_limited else FAILED
             report.add("live_conversation", status,
                        f"create failed: {type(e).__name__}: {e}", evidence)
+            report.add("task_completion", status,
+                       f"create failed: {type(e).__name__}: {e}", evidence)
             return
         except Exception as e:  # noqa: BLE001
             report.add("live_conversation", FAILED,
+                       f"create failed: {type(e).__name__}: {e}", evidence)
+            report.add("task_completion", FAILED,
                        f"create failed: {type(e).__name__}: {e}", evidence)
             return
 
@@ -747,13 +837,21 @@ class OpenHandsDiagnostics:
                            "the agent echoed the marker" if ran
                            else "conversation finished; marker not seen in the report",
                            {"marker": marker})
+                report.add("task_completion", VERIFIED,
+                           "conversation reached the terminal state 'finished'",
+                           {"state": state})
             else:
                 report.add("message_and_events", FAILED,
                            f"conversation ended in state {state!r}", evidence)
                 report.add("run_command", FAILED, f"state {state!r}", evidence)
+                report.add("task_completion", FAILED,
+                           f"conversation ended in state {state!r}", evidence)
         except Exception as e:  # noqa: BLE001
             report.add("message_and_events", FAILED, f"{type(e).__name__}: {e}", evidence)
             report.add("run_command", BLOCKED, "not reached", evidence)
+            report.add("task_completion", BLOCKED,
+                       f"the conversation could not be polled to completion: "
+                       f"{type(e).__name__}", evidence)
         finally:
             try:
                 client.delete_conversation(conversation_id)

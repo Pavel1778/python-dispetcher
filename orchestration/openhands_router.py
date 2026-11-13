@@ -38,12 +38,47 @@ Which accounts a task may be given at all is decided in two layers:
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .cloud_store import PostgresStore
 from .nexus_executors import ProjectExecutorService
 from .nexus_lab_store import LabStore
 from .openhands_pool import AccountPool, PoolError
+
+
+def _as_dict(value: Any) -> dict | None:
+    """A JSONB object read raw from the database, or ``None``.
+
+    ``jsonb`` comes back as a ``str`` from a raw cursor and as a ``dict`` from
+    ``_task_row``; both are accepted so the same code serves either caller.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+        except ValueError:
+            return None
+        return loaded if isinstance(loaded, dict) else None
+    return None
+
+
+def _as_list(value: Any) -> list:
+    """A JSONB array read raw from the database, or ``[]``."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+        except ValueError:
+            return []
+        return loaded if isinstance(loaded, list) else []
+    return []
 
 
 class NoUsableAccount(RuntimeError):
@@ -208,7 +243,28 @@ class AccountRouter:
         """The durable context to give a new executor for *task*.
 
         Built from the run's rows, so it is reproducible after a crash and never
-        depends on the old conversation being reachable.
+        depends on the old conversation being reachable. The list the task text
+        asks for is carried in full: project, task, goal, plan, completed and
+        remaining steps, repository, branch, last commit, **decisions**,
+        **constraints**, **test results**, **uncommitted work**, last error and
+        acceptance criteria.
+
+        ``decisions`` and ``constraints`` are read from the project memory
+        (``nexus_memory``, the same store the ``decision``/``constraint`` kinds
+        are written to), so a decision a person or an earlier task recorded is
+        handed over rather than rediscovered. ``test_results`` is the run's own
+        durable QA outcome - one entry per settled task with its verdict, reason
+        and commit - which is what the verifier actually recorded, not a claim.
+        ``uncommitted`` states the truth about a fresh sandbox: nothing that was
+        not pushed came with the hand-off, so work the previous executor left
+        uncommitted is gone; it also says whether the branch moved during the
+        last attempt (``changed``), the honest signal of whether anything was
+        committed at all.
+
+        ``previous_report`` is taken from the last attempt's recorded final
+        message when the caller does not pass one, so the executor's own report
+        of what it ran and what failed travels even when the caller only has the
+        task row.
         """
         run_id = str(task["run_id"])
         with self.store._tx() as cur:
@@ -216,23 +272,74 @@ class AccountRouter:
                         "WHERE id=%s", (run_id,))
             run = cur.fetchone() or {}
             cur.execute(
-                "SELECT task_key, title, state, repository, branch FROM nexus_run_tasks "
-                "WHERE run_id=%s ORDER BY created_at, id", (run_id,))
+                "SELECT task_key, title, state, repository, branch, verification, evidence "
+                "FROM nexus_run_tasks WHERE run_id=%s ORDER BY created_at, id", (run_id,))
             siblings = [dict(r) for r in cur.fetchall()]
             cur.execute("SELECT text FROM nexus_goals g JOIN nexus_runs r ON r.goal_id=g.id "
                         "WHERE r.id=%s", (run_id,))
             goal = cur.fetchone()
+            cur.execute(
+                "SELECT kind, content, provenance FROM nexus_memory "
+                "WHERE (project_id=%s OR project_id IS NULL) AND superseded_by IS NULL "
+                "AND kind IN ('decision','constraint') "
+                "ORDER BY created_at DESC, id LIMIT 50",
+                (str(task.get("project_id") or "") or None,))
+            memories = [dict(r) for r in cur.fetchall()]
         plan = [{"task_key": s["task_key"], "title": s["title"], "state": s["state"]}
                 for s in siblings]
         done = [s["task_key"] for s in siblings if s["state"] == "completed_verified"]
         remaining = [s["task_key"] for s in siblings
                      if s["state"] not in ("completed_verified", "failed")]
-        evidence = task.get("evidence") or []
+        decisions = [{"content": m["content"], "provenance": m["provenance"]}
+                     for m in memories if m["kind"] == "decision"]
+        constraints = [{"content": m["content"], "provenance": m["provenance"]}
+                       for m in memories if m["kind"] == "constraint"]
+        evidence = _as_list(task.get("evidence"))
+        last_attempt = next((item for item in reversed(evidence)
+                             if isinstance(item, dict) and item.get("state")), {})
         last_commit = ""
         for item in reversed(evidence):
             if isinstance(item, dict) and item.get("remote_sha"):
                 last_commit = str(item["remote_sha"])
                 break
+        # The QA/test outcome of the run so far: what each settled task was
+        # judged to be, why, and at which commit. The durable record, not a
+        # paraphrase. The reason lives in ``verification`` for a recorded
+        # verdict and in the last evidence entry for an attempt that was not
+        # accepted; read either, and fall back to the task's own state, so a
+        # task that settled without a detail is still reported.
+        settled = {"completed_verified", "completed_unverified", "partial",
+                   "failed", "blocked"}
+        test_results = []
+        for s in siblings:
+            verification = _as_dict(s.get("verification"))
+            records = _as_list(s.get("evidence"))
+            last_record = records[-1] if records and isinstance(records[-1], dict) else {}
+            verdict = ((verification or {}).get("verdict")
+                       or last_record.get("verdict") or "")
+            reason = (verification or {}).get("reason") or last_record.get("reason") or ""
+            if not verdict and s["state"] in settled:
+                verdict = s["state"]
+            if not verdict:
+                continue
+            test_results.append({
+                "task_key": s["task_key"],
+                "verdict": verdict,
+                "reason": str(reason),
+                "commit": last_commit if s["task_key"] == task.get("task_key") else "",
+            })
+        # Nothing uncommitted survives a move to a new sandbox: the hand-off
+        # carries what is on the branch, not the old working tree. ``changed``
+        # is the honest signal of whether the last attempt committed anything.
+        uncommitted = {
+            "carried": False,
+            "base_sha": str(last_attempt.get("base_sha") or "") or None,
+            "changed": bool(last_attempt.get("changed")) if "changed" in last_attempt else None,
+            "note": ("a fresh sandbox does not inherit the previous working tree; only "
+                     "commits pushed to the branch survive the hand-off"),
+        }
+        if not previous_report:
+            previous_report = str(last_attempt.get("final_text") or "")
         return {
             "project_id": str(task.get("project_id") or ""),
             "task_id": str(task.get("id") or ""),
@@ -251,6 +358,10 @@ class AccountRouter:
             "iteration": run.get("iteration"),
             "max_iterations": run.get("max_iterations"),
             "last_commit": last_commit,
+            "decisions": decisions,
+            "constraints": constraints,
+            "test_results": test_results,
+            "uncommitted": uncommitted,
             "previous_report": (previous_report or "")[:4000],
             "last_error": (last_error or "")[:1000],
         }
@@ -268,6 +379,26 @@ class AccountRouter:
         done = ", ".join(context.get("completed_tasks") or []) or "(none)"
         remaining = ", ".join(context.get("remaining_tasks") or []) or "(none)"
         criteria = "\n".join(f"  - {c}" for c in (context.get("acceptance") or [])) or "  - (none)"
+        decisions = "\n".join(
+            f"  - {d['content']}" + (f"  [{d.get('provenance')}]" if d.get("provenance") else "")
+            for d in (context.get("decisions") or [])) or "  - (none recorded)"
+        constraints = "\n".join(
+            f"  - {c['content']}" + (f"  [{c.get('provenance')}]" if c.get("provenance") else "")
+            for c in (context.get("constraints") or [])) or "  - (none recorded)"
+        tests = "\n".join(
+            f"  - {t['task_key']}: {t['verdict']}"
+            + (f" ({t['reason']})" if t.get("reason") else "")
+            + (f" at {t['commit']}" if t.get("commit") else "")
+            for t in (context.get("test_results") or [])) or "  - (no task settled yet)"
+        uncommitted = context.get("uncommitted") or {}
+        unc_line = (
+            "The previous working tree was not carried over: only commits pushed to "
+            "the branch exist in your sandbox."
+            + (f" Base commit when the last attempt began: {uncommitted['base_sha']}."
+               if uncommitted.get("base_sha") else "")
+            + (f" The branch moved during the last attempt: "
+               f"{'yes' if uncommitted.get('changed') else 'no'}."
+               if uncommitted.get("changed") is not None else ""))
         return (
             "You are continuing an interrupted task on a new executor. The previous "
             "OpenHands account is no longer available, so this is a fresh sandbox.\n\n"
@@ -280,6 +411,10 @@ class AccountRouter:
             f"Plan (all tasks in this run):\n{plan_lines or '  (none)'}\n\n"
             f"Already completed and verified (do NOT redo these): {done}\n"
             f"Still to do: {remaining}\n\n"
+            f"Decisions already taken (keep to them):\n{decisions}\n\n"
+            f"Constraints in force:\n{constraints}\n\n"
+            f"Test/QA results so far:\n{tests}\n\n"
+            f"Uncommitted work: {unc_line}\n\n"
             f"This task: {context.get('task_title')}\n{context.get('task_description') or ''}\n\n"
             f"Acceptance criteria:\n{criteria}\n\n"
             f"Previous executor's last report:\n{context.get('previous_report') or '(none)'}\n"
@@ -288,8 +423,10 @@ class AccountRouter:
             "1. The workspace is empty: clone the repository at the branch above first.\n"
             "2. Do not repeat work already completed and verified.\n"
             "3. Continue from the last known commit where possible.\n"
-            "4. Run the relevant tests and report exact commits, files and results.\n"
-            "5. Finish with a short report; do not claim success you did not verify."
+            "4. Keep to the decisions and constraints above; do not undo them.\n"
+            "5. Run the relevant tests, keep to the test/QA results above, and finish "
+            "with a short report of exact commits, files and results; do not claim "
+            "success you did not verify.\n"
         )
 
     def record(self, task: dict, *, account_id: str) -> None:

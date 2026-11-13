@@ -28,6 +28,10 @@ restart is a non-event. It re-reads the active runs and continues.
 Run it beside the web server. More than one worker is fine — claims are leases
 (`SELECT ... FOR UPDATE SKIP LOCKED`), so extra workers only take more work.
 
+The settings that steer the loop (`NEXUS_LAB_INLINE`, `NEXUS_TASK_TIMEOUT_SECONDS`,
+`NEXUS_TASK_STALL_SECONDS`, `NEXUS_LAB_MAX_ACTIVE_TASKS`, the `NEXUS_RETRY_*`
+wait policy) and their defaults are in [ENVIRONMENT.md](ENVIRONMENT.md) §3.6.
+
 **`--once` registers too.** A single pass writes the same worker row and
 heartbeat a long-lived worker does (`register_worker`, kind `worker`; the row is
 marked `stopped` as the pass leaves), so a cron-style deployment is visible to

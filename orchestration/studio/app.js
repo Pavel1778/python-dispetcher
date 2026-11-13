@@ -88,6 +88,7 @@
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
     work: { items: [], data: {}, timer: null, hidden: {} },
     accounts: { github: null, openhands: null },
+    pool: null,
     projectSettings: null
   };
   var routeSeq = 0;
@@ -1121,6 +1122,7 @@
   function runCard(entry, detail) {
     var run = detail.run, tasks = detail.tasks || [], report = detail.report;
     var executions = detail.executions || [], stops = detail.stops || [];
+    var switches = detail.switches || [], events = detail.events || [];
     // "Will be taken in a few seconds" is said only of a run nothing has happened to
     // yet. A task that waits out a refused start says why on its own line.
     var waiting = tasks.length && run.state === 'running' &&
@@ -1134,6 +1136,24 @@
     // A durable run that is between two tries says so, and when it goes on.
     var pause = run.state === 'running' && run.resume_at && run.wait_reason
       ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
+    // The executor at work right now: the newest execution that has not ended,
+    // else the newest one at all. It names the connection, its conversation id
+    // and what it is doing - the "текущий OpenHands / используемый аккаунт /
+    // conversation ID / состояние выполнения" of the run.
+    var current = null;
+    executions.forEach(function (item) {
+      if (!current || !item.ended_at) current = item;
+    });
+    var currentLine = current
+      ? '<div class="work-section"><p class="work-section-title">Текущий исполнитель</p>' +
+        '<dl class="kv">' +
+        '<dt>OpenHands</dt><dd>' + esc(current.executor_label || 'ключ сервера') + '</dd>' +
+        '<dt>Задача</dt><dd class="mono">' + esc(current.task_key || '—') + '</dd>' +
+        '<dt>Разговор</dt><dd class="mono">' + esc(current.conversation_id || '—') + '</dd>' +
+        '<dt>Состояние</dt><dd>' + esc(current.ended_at ? (current.outcome || 'завершён') : 'выполняется') +
+        (current.repository ? ' · ' + esc(current.repository + (current.branch ? ' · ' + current.branch : '')) : '') + '</dd>' +
+        '</dl></div>'
+      : '';
     var steps = tasks.length ? '<ul class="steps">' + tasks.map(function (task) {
       var verdict = task.verification && (task.verification.verdict || task.verification.state);
       var sub = [stateLabel(task.state), 'попытка ' + task.attempt + ' из ' + task.max_attempts];
@@ -1149,12 +1169,43 @@
       var wait = (task.state === 'waiting' || (task.state === 'running' && task.retry_at)) && task.wait_reason
         ? '<div class="step-sub">' + esc(clip(task.wait_reason, 320)) +
           (task.retry_at ? ' · повтор ' + esc(untilText(task.retry_at)) : '') + '</div>' : '';
+      // A manual switch is offered only where the server would accept it: a
+      // task that is actually in flight (dispatched / running / verifying).
+      var inFlight = { dispatched: 1, running: 1, verifying: 1 }[task.state];
+      var switchBtn = inFlight
+        ? '<button class="btn btn-sm" type="button" data-action="switch-executor" data-id="' + esc(task.id) +
+          '" data-run="' + esc(entry.id) + '">' + icon('refresh', 'icon-sm') + 'Сменить исполнителя</button>'
+        : '<span></span>';
       return '<li class="step-row"><span class="dot is-' + stateTone(task.state) + '" title="' + esc(stateLabel(task.state)) + '"></span>' +
         '<div><div class="step-title">' + esc(clip(task.title || task.task_key, 260)) + '</div>' +
         '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' + wait +
         (settled && reason ? '<div class="step-sub">' + esc(clip(reason, 320)) + '</div>' : '') +
-        (!wait && task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div><span></span></li>';
+        (!wait && task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div>' +
+        switchBtn + '</li>';
     }).join('') + '</ul>' : '<p class="step-sub">В плане нет задач.</p>';
+    // Every manual or failover hand-off: who was left, who took over, why.
+    var switchesSection = switches.length
+      ? '<details class="work-section"><summary>Переключения · ' + switches.length + '</summary><ul class="events">' +
+        switches.map(function (s) {
+          var from = s.from_label || 'ключ сервера', to = s.to_label || 'удалённое подключение';
+          return '<li><time>' + esc(clock(s.created_at)) + '</time><span>' +
+            esc((s.task_key ? s.task_key + ': ' : '') + from + ' → ' + to) +
+            (s.reason ? ' · ' + esc(clip(s.reason, 160)) : '') + '</span></li>';
+        }).join('') + '</ul></details>' : '';
+    // The last events of the run: its own milestones and every attempt.
+    var eventsSection = events.length
+      ? '<details class="work-section"><summary>События · ' + events.length + '</summary><ul class="events">' +
+        events.slice(0, 40).map(function (e) {
+          var d = e.detail || {};
+          var extra = [];
+          if (d.task) extra.push(d.task);
+          if (d.account) extra.push(d.account);
+          if (d.conversation_id) extra.push(d.conversation_id);
+          if (d.outcome) extra.push(d.outcome);
+          if (d.reason) extra.push(clip(d.reason, 120));
+          return '<li><time>' + esc(clock(e.at)) + '</time><span>' + esc(e.kind || '') +
+            (extra.length ? ' · ' + esc(extra.join(' · ')) : '') + '</span></li>';
+        }).join('') + '</ul></details>' : '';
     var actions = '';
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
     if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
@@ -1179,11 +1230,12 @@
                : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
       (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
       (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
+      currentLine +
       '<div class="work-section"><p class="work-section-title">План · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач') + '</p>' + steps +
       (waiting ? '<p class="step-sub">' + (inline
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
         : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
-      reportSection +
+      switchesSection + eventsSection + reportSection +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
   }
 
@@ -1735,6 +1787,7 @@
       : Promise.all([
           loadGithubAccounts().catch(function () { S.accounts.github = []; }),
           loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
+          loadOpenhandsPool().catch(function () { S.pool = null; }),
           api('/api/studio').then(function (data) { S.status = data; }, function () {})
         ]);
     return load.then(function (result) {
@@ -1751,6 +1804,13 @@
   function loadOpenhandsAccounts() {
     return api('/api/openhands/accounts').then(function (data) {
       S.accounts.openhands = data.accounts || [];
+    });
+  }
+
+  function loadOpenhandsPool() {
+    return api('/api/openhands/pool').then(function (data) {
+      S.pool = data;
+      return data;
     });
   }
 
@@ -1796,7 +1856,9 @@
     if (account.compatibility === 'compatible') parts.push('совместим');
     else if (account.compatibility === 'incompatible') parts.push('несовместим');
     if (account.is_default) parts.push('по умолчанию');
-    if (account.max_concurrent_tasks) parts.push('не более ' + account.max_concurrent_tasks + ' задач сразу');
+    parts.push('активных разговоров: ' + (account.active_tasks || 0) +
+      (account.max_concurrent_tasks ? ' из ' + account.max_concurrent_tasks : ''));
+    if (account.error_count) parts.push('ошибок: ' + account.error_count);
     return parts.join(' · ');
   }
 
@@ -1808,6 +1870,9 @@
         '<button class="btn btn-sm btn-danger" type="button" data-action="openhands-remove" data-id="' + id + '">Удалить</button>'
       : '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="verify" data-id="' + id + '">Проверить</button>' +
         '<button class="btn btn-sm" type="button" data-action="openhands-edit" data-id="' + id + '">Изменить</button>' +
+        (account.is_default ? '' :
+          '<button class="btn btn-sm" type="button" data-action="openhands-default" data-id="' + id + '">Сделать основным</button>') +
+        '<button class="btn btn-sm" type="button" data-action="openhands-errors" data-id="' + id + '">История ошибок</button>' +
         '<button class="btn btn-sm" type="button" data-action="openhands-op" data-op="' + (on ? 'disable' : 'enable') + '" data-id="' + id + '">' +
         (on ? 'Выключить' : 'Включить') + '</button>' +
         '<button class="btn btn-sm btn-danger" type="button" data-action="openhands-remove" data-id="' + id + '">Удалить</button>';
@@ -1840,6 +1905,83 @@
       '<div class="row"><button class="btn btn-primary btn-sm" type="submit">Подключить</button><p class="form-msg" role="status"></p></div></form>';
   }
 
+  // The selection policy and the fallback order: the two controls that decide
+  // *which* connection runs new work. Both are the server's own settings; the
+  // interface only sends them, it never decides locally.
+  var POOL_MODE_ORDER = ('manual auto failover load_balancing').split(' ');
+  var POOL_MODES = {
+    manual: { label: 'Вручную',
+              note: 'Только выбранное основное подключение. При отказе задачи не переключаются — об этом сообщается.' },
+    auto: { label: 'Автоматически',
+            note: 'Основное подключение, пока оно работает; иначе подключение с наивысшим приоритетом.' },
+    failover: { label: 'С переключением при отказе',
+                note: 'Как «автоматически», но уже отказавшее для задачи подключение больше не выбирается.' },
+    load_balancing: { label: 'Поровну по нагрузке',
+                      note: 'Подключение с наименьшим числом активных задач; приоритет решает при равенстве.' }
+  };
+
+  // Every connection in the effective failover order: the operator's explicit
+  // order first, then by priority and age - the same ranking the pool applies.
+  function openhandsOrder() {
+    var accounts = (S.accounts.openhands || []).slice();
+    var order = ((S.pool && S.pool.config && S.pool.config.fallback_order) || []);
+    var ranked = {};
+    order.forEach(function (id, i) { ranked[String(id)] = i; });
+    accounts.sort(function (a, b) {
+      var ra = ranked[String(a.id)], rb = ranked[String(b.id)];
+      if (ra !== undefined || rb !== undefined) {
+        if (ra === undefined) return 1;
+        if (rb === undefined) return -1;
+        if (ra !== rb) return ra - rb;
+      }
+      var pa = a.priority == null ? 100 : a.priority, pb = b.priority == null ? 100 : b.priority;
+      if (pa !== pb) return pa - pb;
+      return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+    });
+    return accounts;
+  }
+
+  function openhandsPoolHtml() {
+    var accounts = openhandsOrder();
+    var config = (S.pool && S.pool.config) || {};
+    var mode = config.selection_mode || 'auto';
+    var candidates = (S.pool && S.pool.candidates) || [];
+    var loadOf = {};
+    candidates.forEach(function (c) { loadOf[String(c.id)] = c; });
+    var modeNote = (POOL_MODES[mode] || {}).note || '';
+    var rows = accounts.length
+      ? '<ul class="steps">' + accounts.map(function (a, i) {
+          var id = esc(a.id);
+          var live = loadOf[String(a.id)] || {};
+          var on = a.enabled !== false;
+          var parts = [];
+          parts.push(a.is_default ? 'основное' : 'резервное ' + (i + 1));
+          parts.push('приоритет ' + (a.priority == null ? 100 : a.priority));
+          parts.push('активных ' + (live.load != null ? live.load : (a.active_tasks || 0)));
+          if (a.error_count) parts.push('ошибок ' + a.error_count);
+          return '<li class="step-row"><span class="dot is-' + (on ? 'ok' : 'idle') + '"></span>' +
+            '<div><div class="step-title">' + esc(a.label) + '</div>' +
+            '<div class="step-sub">' + esc(parts.join(' · ')) + '</div></div>' +
+            '<div class="row">' +
+            '<button class="btn btn-sm" type="button" data-action="fallback-move" data-dir="up" data-id="' + id + '"' +
+            (i === 0 ? ' disabled' : '') + ' aria-label="Выше">↑</button>' +
+            '<button class="btn btn-sm" type="button" data-action="fallback-move" data-dir="down" data-id="' + id + '"' +
+            (i === accounts.length - 1 ? ' disabled' : '') + ' aria-label="Ниже">↓</button>' +
+            '</div></li>';
+        }).join('') + '</ul>'
+      : '<p class="section-note">Пока не подключено ни одного OpenHands.</p>';
+    return '<div class="section" id="openhands-pool"><h3 class="section-title">' + icon('layers', 'icon-sm') + 'Порядок и режим выбора</h3>' +
+      '<p class="section-note">Как NEXUS выбирает подключение для новых задач. Основное — то, которое выбирается первым; ниже — резервные в порядке переключения.</p>' +
+      '<label class="field"><span class="field-label">Режим выбора</span>' +
+      '<select class="select" id="pool-mode" aria-label="Режим выбора подключения">' +
+      POOL_MODE_ORDER.map(function (key) {
+        return '<option value="' + key + '"' + (key === mode ? ' selected' : '') + '>' +
+          esc(POOL_MODES[key].label) + '</option>';
+      }).join('') + '</select>' +
+      '<span class="field-hint">' + esc(modeNote) + '</span></label>' +
+      rows + '</div>';
+  }
+
   function connectionsHtml() {
     var status = S.status || {};
     var accounts = S.accounts.github || [];
@@ -1858,6 +2000,7 @@
       '<p class="section-note">Подключения OpenHands, на которых выполняются задачи. Ключ хранится зашифрованным и не показывается. Несколько подключений дают переключение при недоступности одного из них.</p>' +
       (ohAccounts.length ? '<div class="cards">' + ohAccounts.map(openhandsCard).join('') + '</div>' : '') +
       '<details class="add"' + (ohAccounts.length ? '' : ' open') + '><summary>' + icon('plus', 'icon-sm') + 'Подключить OpenHands</summary>' + openhandsFormHtml() + '</details></div>' +
+      (ohAccounts.length ? openhandsPoolHtml() : '') +
       '<div class="section"><h3 class="section-title">' + icon('info', 'icon-sm') + 'Сервер</h3>' +
       '<p class="section-note">Задаётся переменными окружения сервера. Здесь видно только, что настроено: сами значения в браузер не передаются.</p>' +
       '<dl class="kv is-status">' +
@@ -2308,6 +2451,59 @@
         }, function (error) { toast(explain(error.message).text, 'bad'); });
       }, true);
     },
+    // Hand an in-flight task to another connection. The target is a real stored
+    // account; the server refuses anything else (409), so the choice is not
+    // filtered here beyond what the server would accept.
+    'switch-executor': function (el) {
+      var taskId = el.getAttribute('data-id'), runId = el.getAttribute('data-run');
+      var open = function () {
+        var accounts = (S.accounts.openhands || []).filter(function (a) {
+          return a.state === 'active' && a.enabled !== false;
+        });
+        if (!accounts.length) {
+          toast('Нет активного подключения OpenHands, на которое можно переключить.', 'bad');
+          return;
+        }
+        var options = accounts.map(function (a) {
+          return '<option value="' + esc(a.id) + '">' + esc(a.label) + '</option>';
+        }).join('');
+        openDialog({
+          title: 'Сменить исполнителя',
+          body: '<p class="lead">Задача будет передана другому подключению OpenHands: текущий разговор остановят (его история сохранится), а новая попытка получит контекст задачи — план, сделанное, ветку и commit.</p>' +
+            '<label class="field"><span class="field-label">Подключение</span>' +
+            '<select class="select" id="switch-account" aria-label="Подключение">' + options + '</select></label>' +
+            '<p class="field-hint">Переключить можно только задачу в работе. Если она уже завершена, сервер ответит отказом.</p>',
+          foot: '<p class="form-msg" id="switch-msg" role="status"></p>' +
+            '<button class="btn btn-ghost" type="button" data-action="close-dialog">Отмена</button>' +
+            '<button class="btn btn-primary" type="button" id="switch-ok">Переключить</button>'
+        });
+        var button = $('#switch-ok');
+        button.addEventListener('click', function () {
+          var accountId = $('#switch-account').value;
+          var message = $('#switch-msg');
+          setBusy(button, true);
+          api(projectUrl('/runs/' + enc(runId) + '/tasks/' + enc(taskId) + '/switch'),
+              { method: 'POST', body: { account_id: accountId } })
+            .then(function (data) {
+              closeDialog();
+              toast(data && data.stopped
+                ? 'Исполнитель сменён, прошлый разговор остановлен.'
+                : 'Исполнитель сменён. Прошлый разговор будет остановлен на следующем проходе.');
+              return refreshWork();
+            }, function (error) {
+              setBusy(button, false);
+              if (!document.contains(message)) return;
+              message.className = 'form-msg is-bad';
+              message.textContent = explain(error.message).text;
+            });
+        });
+      };
+      // The agent tab does not load the connection list; a switch needs it.
+      if (S.accounts.openhands) open();
+      else loadOpenhandsAccounts().then(open, function (error) {
+        toast(explain(error.message).text, 'bad');
+      });
+    },
     'toggle-dir': function (el) {
       var path = el.getAttribute('data-path');
       S.ws.expanded[path] = !S.ws.expanded[path];
@@ -2354,6 +2550,52 @@
         } else toast('OpenHands: ' + (account.last_error || 'недоступно'), 'bad');
         return loadOpenhandsAccounts().then(refreshSettings);
       }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    'openhands-default': function (el) {
+      var id = el.getAttribute('data-id');
+      setBusy(el, true);
+      api('/api/openhands/accounts/' + enc(id) + '/default', { method: 'POST', body: {} })
+        .then(function () {
+          toast('Основное подключение изменено.');
+          return loadOpenhandsAccounts().then(loadOpenhandsPool).then(refreshSettings);
+        }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
+    },
+    'openhands-errors': function (el) {
+      var id = el.getAttribute('data-id');
+      var account = (S.accounts.openhands || []).filter(function (a) { return String(a.id) === id; })[0];
+      var label = account ? account.label : '';
+      api('/api/openhands/accounts/' + enc(id) + '/errors').then(function (data) {
+        var errors = data.errors || [];
+        var body = errors.length
+          ? '<ul class="events">' + errors.map(function (e) {
+              var kind = { auth: 'авторизация', transport: 'сеть', error: 'ошибка', recovered: 'восстановлено' }[e.kind] || e.kind;
+              return '<li><time>' + esc(clock(e.created_at)) + '</time><span>' + esc(kind) +
+                (e.detail ? ' · ' + esc(e.detail) : '') + '</span></li>';
+            }).join('') + '</ul>'
+          : '<p class="section-note">Ошибок не зафиксировано.</p>';
+        openDialog({
+          title: 'История ошибок — ' + esc(label),
+          body: '<p class="lead">Что видел NEXUS, обращаясь к этому подключению. Новые — сверху. Ключ здесь не показывается.</p>' + body,
+          foot: '<button class="btn btn-primary" type="button" data-action="close-dialog">Готово</button>'
+        });
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'fallback-move': function (el) {
+      var id = el.getAttribute('data-id'), dir = el.getAttribute('data-dir');
+      var order = openhandsOrder().map(function (a) { return String(a.id); });
+      var at = order.indexOf(id);
+      if (at < 0) return;
+      var swap = dir === 'up' ? at - 1 : at + 1;
+      if (swap < 0 || swap >= order.length) return;
+      var moved = order[swap];
+      order[swap] = order[at];
+      order[at] = moved;
+      setBusy(el, true);
+      api('/api/openhands/pool', { method: 'POST', body: { fallback_order: order } })
+        .then(function () {
+          toast('Порядок переключения сохранён.');
+          return loadOpenhandsPool().then(refreshSettings);
+        }, function (error) { setBusy(el, false); toast(explain(error.message).text, 'bad'); });
     },
     'openhands-edit': function (el) {
       var id = el.getAttribute('data-id');
@@ -2569,7 +2811,16 @@
         .then(function () { toast('Сохранено.'); return refreshSettings(); },
               function (error) { toast(explain(error.message).text, 'bad'); refreshSettings(); });
     });
-
+    // The OpenHands selection mode is the pool's own setting, not the project's.
+    document.addEventListener('change', function (event) {
+      if (event.target.id !== 'pool-mode') return;
+      var mode = event.target.value;
+      api('/api/openhands/pool', { method: 'POST', body: { selection_mode: mode } })
+        .then(function () {
+          toast('Режим выбора сохранён.');
+          return loadOpenhandsPool().then(refreshSettings);
+        }, function (error) { toast(explain(error.message).text, 'bad'); refreshSettings(); });
+    });
     document.addEventListener('submit', function (event) {
       var form = event.target;
       if (form.id === 'composer') {

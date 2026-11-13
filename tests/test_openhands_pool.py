@@ -216,9 +216,50 @@ def test_diagnostics_verified_paths(store, service, clouds):
     assert by["account_pool"].status == VERIFIED
     assert by["cloud_api"].status == VERIFIED
     assert by["queues_leases"].status == VERIFIED
+    # The recovery round trip runs against the real database.
+    assert by["recovery"].status == VERIFIED
+    assert by["recovery"].evidence["lease_token_after"] > \
+        by["recovery"].evidence["lease_token_before"]
     # The live probe was not requested: it must be UNVERIFIED, never VERIFIED.
     assert by["live_conversation"].status == UNVERIFIED
+    assert by["task_completion"].status == UNVERIFIED
     assert report.ok
+
+
+def test_recovery_check_leaves_nothing_behind(store, service, clouds):
+    """The recovery probe deletes its throwaway project; no rows are left.
+
+    The check is the same real round trip as ``queues_leases`` — a claim with an
+    expired lease, a reclaim, a re-claim — so the only thing to prove separately
+    is that it cleans up after itself and does not disturb existing rows.
+    """
+    _three_accounts(service, clouds)
+    diag = _diagnostics(store, service, clouds)
+    before = _count_projects(store)
+    report = diag.run(PRINCIPAL)
+    assert report.by_name("recovery").status == VERIFIED
+    assert _count_projects(store) == before, "the recovery probe left a project behind"
+
+
+def _count_projects(store) -> int:
+    with store._tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM nexus_projects")
+        return cur.fetchone()["n"]
+
+
+def test_task_completion_is_unverified_without_the_live_probe(store, service, clouds):
+    """Absence of evidence: without ``live`` the completion check is UNVERIFIED.
+
+    It must never be VERIFIED — the run was not requested, so nothing was
+    proved — and it must not be FAILED either, which would claim a broken
+    integration that was never exercised.
+    """
+    _three_accounts(service, clouds)
+    diag = _diagnostics(store, service, clouds)
+    report = diag.run(PRINCIPAL)
+    check = report.by_name("task_completion")
+    assert check.status == UNVERIFIED
+    assert check.status != VERIFIED and check.status != FAILED
 
 
 def test_diagnostics_without_accounts_is_blocked_not_failed(store, service, clouds):
@@ -326,8 +367,53 @@ def test_diagnostics_live_probe_verified(store, service, clouds, monkeypatch):
     assert by["conversation_create"].status == VERIFIED
     assert by["message_and_events"].status == VERIFIED
     assert by["run_command"].status == VERIFIED
+    assert by["task_completion"].status == VERIFIED
     assert by["workspace_rw"].status == BLOCKED  # transport cannot place files
     assert live.deleted == ["conv-0"], "the probe conversation must be deleted"
+
+
+def test_task_completion_fails_when_the_conversation_errors(store, service, clouds):
+    """A conversation that ends in ``error`` is a FAILED completion, not VERIFIED.
+
+    The completion check must follow the conversation's real terminal state; a
+    probe that reported VERIFIED for an errored run would be the false success
+    the whole report exists to prevent.
+    """
+    a, _b, _c = clouds
+    service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=a.base_url,
+                make_default=True)
+
+    class ErroringClient:
+        supports_files = False
+
+        def start_conversation(self, *, initial_message, title=None, tags=None,
+                               selected_repository=None, selected_branch=None, **kw):
+            from orchestration.cloud_client import StartStatus, StartTask
+
+            return StartTask(id="conv-e", status=StartStatus.READY.value,
+                             app_conversation_id="conv-e")
+
+        def get_conversation(self, conversation_id):
+            from orchestration.cloud_client import CloudConversation
+
+            return CloudConversation(id=conversation_id, title=None, sandbox_id="sb",
+                                     execution_status="error", sandbox_status="RUNNING",
+                                     selected_repository=None, selected_branch=None,
+                                     conversation_url=None, raw={})
+
+        def delete_conversation(self, conversation_id):
+            return True
+
+    diag = OpenHandsDiagnostics(
+        store, accounts=service, pool=AccountPool(store, service),
+        cloud_client=CloudClient(base_url=a.base_url, api_key="sk-a", timeout=5.0),
+        client_factory=lambda u, k: CloudClient(base_url=u, api_key=k, timeout=5.0),
+        live_client_factory=lambda account_id: ErroringClient())
+    report = diag.run(PRINCIPAL, live=True)
+    by = {c.name: c for c in report.checks}
+    assert by["task_completion"].status == FAILED
+    assert "error" in by["task_completion"].detail
+    assert not report.ok
 
 
 # ------------------------------------------------- execution client per account

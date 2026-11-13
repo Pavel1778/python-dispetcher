@@ -429,8 +429,8 @@ probe creates and deletes exactly one conversation:
 | Delete | `delete_conversation` | `True`, then `404` (live) |
 | Account capabilities | `account_capabilities()` | LLM key set, 20 MCP servers, profiles (live) |
 | App transport two-phase start | `start_conversation` + poll | reached **`READY`**, then `finished` (live, dated) |
-| **NEXUS diagnostics (structural)** | `OpenHandsDiagnostics.run(live=False)` | database, schema, cloud_api, queues_leases **VERIFIED**; accounts/pool per config |
-| **NEXUS diagnostics (live probe)** | `run(live=True)` with a working `default_model` | **10 VERIFIED / 0 FAILED / 0 BLOCKED**: `conversation_create`, `message_and_events`, `run_command`, `workspace_rw` all VERIFIED |
+| **NEXUS diagnostics (structural)** | `OpenHandsDiagnostics.run(live=False)` | database, schema, cloud_api, queues_leases, recovery **VERIFIED**; accounts/pool per config |
+| **NEXUS diagnostics (live probe)** | `run(live=True)` with a working `default_model` | **11 VERIFIED / 0 FAILED / 0 BLOCKED**: `conversation_create`, `message_and_events`, `run_command`, `workspace_rw`, `task_completion` all VERIFIED |
 | Sandbox file round-trip | upload + download + SHA-256 | match (live) |
 | Sandbox lifecycle (read) | `GET /api/v1/sandboxes/search` | 29 sandboxes, `SandboxInfo` shape as documented (live) |
 
