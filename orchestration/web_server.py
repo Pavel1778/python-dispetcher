@@ -1729,10 +1729,16 @@ class Handler(BaseHTTPRequestHandler):
             # The report is part of the run's record: the same text that was
             # delivered to the chat the run came from, so a person reading the
             # run sees it too. ``None`` until the run has completed. And who
-            # ran what: one line per conversation a task was given.
+            # ran what: one line per conversation a task was given. ``switches``
+            # names every manual/failover hand-off and ``events`` the run's own
+            # timeline, so the interface can show the current executor, the
+            # conversation ids, the switches and the last events without a
+            # second call.
             return (200, {"run": run, "tasks": tasks,
                           "report": self.app.reports.for_run(rest[1]),
                           "executions": self.app.lab.executions(rest[1]),
+                          "switches": self.app.lab.run_handoffs(rest[1]),
+                          "events": self.app.lab.run_events(rest[1]),
                           "stops": self.app.lab.stops(rest[1])}, None)
         # GET /api/v1/projects/{id}/runs/{run_id}/report
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
@@ -3285,19 +3291,24 @@ class Handler(BaseHTTPRequestHandler):
                     project_id=(query.get("project_id") or [None])[0]))
             if path == "/api/openhands/pool":
                 principal = self._project_principal()
+                live = self.app.account_pool.live_load()
+                candidates = []
+                for a in self.app.account_pool.candidates(principal):
+                    observed = int(a.get("active_tasks", 0) or 0) + live.get(str(a["id"]), 0)
+                    candidates.append({
+                        "id": a["id"], "label": a["label"], "priority": a.get("priority"),
+                        "health": a.get("health"), "active_tasks": a.get("active_tasks", 0),
+                        "load": observed,
+                        "enabled": a.get("enabled", True), "is_default": a.get("is_default"),
+                        "max_concurrent_tasks": a.get("max_concurrent_tasks"),
+                        "daily_conversation_limit": a.get("daily_conversation_limit"),
+                        "api_key_hint": a.get("api_key_hint", ""),
+                        "connection_ok": a.get("connection_ok"),
+                        "last_connection_at": a.get("last_connection_at"),
+                        "error_count": a.get("error_count", 0)})
                 return self._json(200, {
                     "config": self.app.account_pool.get_config(principal),
-                    "candidates": [
-                        {"id": a["id"], "label": a["label"], "priority": a.get("priority"),
-                         "health": a.get("health"), "active_tasks": a.get("active_tasks", 0),
-                         "enabled": a.get("enabled", True), "is_default": a.get("is_default"),
-                         "max_concurrent_tasks": a.get("max_concurrent_tasks"),
-                         "daily_conversation_limit": a.get("daily_conversation_limit"),
-                         "api_key_hint": a.get("api_key_hint", ""),
-                         "connection_ok": a.get("connection_ok"),
-                         "last_connection_at": a.get("last_connection_at"),
-                         "error_count": a.get("error_count", 0)}
-                        for a in self.app.account_pool.candidates(principal)],
+                    "candidates": candidates,
                 })
             if path.startswith("/api/github/accounts/"):
                 return self._github_account_get(path)

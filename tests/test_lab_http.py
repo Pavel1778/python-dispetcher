@@ -563,3 +563,73 @@ def test_a_project_links_several_repositories_and_picks_a_primary(harness):
                          session=harness["alice"])
     primaries = [r["full_name"] for r in listing["repositories"] if r["is_primary"]]
     assert primaries == [second]
+
+
+# ------------------- the run detail the "Агент" tab shows while a task works
+def test_run_detail_reports_the_current_executor_and_conversation(harness):
+    """The run detail names the executor, its conversation id and the timeline,
+    so the interface can show "текущий OpenHands / аккаунт / conversation ID /
+    состояние / последние события" without a second call."""
+    pid = _project(harness)
+    _connect(harness, pid)
+    _, goal = request(harness["base"], f"/api/v1/projects/{pid}/goals", "POST",
+                      {"text": "Show the run"}, session=harness["alice"])
+    gid = goal["goal"]["id"]
+    _, payload = request(harness["base"], f"/api/v1/projects/{pid}/goals/{gid}/run",
+                         "POST", {}, session=harness["alice"])
+    run_id = payload["run"]["id"]
+
+    # Nothing has run yet: the detail carries the empty lists, never a fabricated
+    # executor. The keys are present so the interface can rely on them.
+    detail = _detail(harness, pid, run_id)
+    assert detail["executions"] == [] and detail["switches"] == []
+    # The run's own "started" event is real and present from the first moment.
+    assert any(e["kind"] == "run.started" for e in detail["events"])
+
+    # Dispatch the first task through the store, as the worker would: it binds a
+    # conversation and writes an execution row.
+    task = detail["tasks"][0]
+    claimed = harness["app"].lab.claim_task(run_id, "worker-1", lease_seconds=600)
+    assert claimed and str(claimed["id"]) == str(task["id"])
+    harness["app"].lab.mark_running(task["id"], conversation_id="conv-abc",
+                                    account_id=None, kind="start")
+    detail = _detail(harness, pid, run_id)
+    execution = detail["executions"][0]
+    assert execution["conversation_id"] == "conv-abc"
+    assert execution["task_key"] == task["task_key"]
+    # The attempt shows up in the timeline, with the conversation id.
+    attempt = [e for e in detail["events"] if e["kind"] == "attempt.start"]
+    assert attempt and attempt[0]["detail"]["conversation_id"] == "conv-abc"
+    assert detail["tasks"][0]["conversation_id"] == "conv-abc"
+
+
+def test_run_detail_reports_every_executor_switch(harness):
+    """A switch is recorded in the run's ``switches`` with both account labels,
+    and it appears in the run detail the interface reads.
+
+    The row is written by the real writer (``record_handoff``, the same call the
+    scheduler makes when it moves a task); the route joins the account labels.
+    """
+    app = harness["app"]
+    pid = _project(harness)
+    _, goal = request(harness["base"], f"/api/v1/projects/{pid}/goals", "POST",
+                      {"text": "Switch me"}, session=harness["alice"])
+    gid = goal["goal"]["id"]
+    _, payload = request(harness["base"], f"/api/v1/projects/{pid}/goals/{gid}/run",
+                         "POST", {}, session=harness["alice"])
+    run_id = payload["run"]["id"]
+    task_id = payload["tasks"][0]["id"]
+
+    account = _add_openhands_account(app, "user:alice", label="Backup")
+    app.lab.record_handoff(run_id=run_id, task_id=task_id, from_account_id=None,
+                           to_account_id=account["id"], reason="previous account failed",
+                           context={"task_key": "audit", "repository": "owner/repo"})
+
+    detail = _detail(harness, pid, run_id)
+    assert len(detail["switches"]) == 1
+    switch = detail["switches"][0]
+    assert switch["to_account_id"] == account["id"]
+    assert switch["to_label"] == "Backup"
+    assert switch["task_key"] == "audit"
+    # The from side had no account (the server key): it stays null, never faked.
+    assert switch["from_account_id"] is None and switch["from_label"] is None

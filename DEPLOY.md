@@ -109,7 +109,10 @@ Read from the source, not assumed. Names must match exactly.
 | Variable | Required | Read by | Purpose |
 |---|---|---|---|
 | `SUPABASE_DB_URL` (or `DATABASE_URL`) | yes | `cloud_store.py`, `web_server.py` | PostgreSQL/Supabase DSN. Missing → exit code 2. |
+| `AUTO_MIGRATE` | no | `cloud_store.py` | Default true. Apply the idempotent migrations on first connect; `false` manages the schema out of band. |
+| `PSYCOPG_PREPARE` | no | `cloud_store.py` | Server-side prepared statements are off by default. Set to `session` only on a direct (session-mode) connection; never behind a pooler. |
 | `OPENHANDS_API_KEY` | yes (for Cloud) | `cloud_client.py` | Bearer key for Cloud V1. |
+| `NEXUS_SECRET_KEY` | to store accounts | `secrets.py` | Fernet key that encrypts stored GitHub PATs and OpenHands API keys. Without it, adding an account is refused rather than writing plaintext. |
 | `AUTH_USERNAME` | yes | `web_auth.py` | Owner login name. |
 | `AUTH_PASSWORD_HASH` | yes | `web_auth.py` | PBKDF2 hash of the owner password. |
 | `AUTH_SESSION_SECRET` | yes | `web_auth.py` | Separate secret that signs sessions. |
@@ -130,6 +133,12 @@ Read from the source, not assumed. Names must match exactly.
 | `LOCAL_AGENT_SERVER_URL` | dev only | `local_runtime.py` | Base URL of a local agent-server for the local end-to-end scripts. Default `http://127.0.0.1:60000`. |
 | `OHP_LOCAL_LLM_MODEL` | dev only | `local_runtime.py` | Model the local runtime asks the local agent-server to use. |
 | `SESSION_API_KEY` | dev only | `openhands_client.py` | Session key for the local agent-server adapter. Not used by the Cloud transports. |
+
+This table is the deploy-time subset. The complete list — the OpenHands account
+pool, the autonomous-lab and durable-run settings, the provider cascade, the
+evidence keyring and the SSRF allow-list — is in
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md), which names the default and the
+module that reads each one and is kept in step with `.env.example`.
 
 The server **refuses to bind `0.0.0.0`** unless `WEB_AUTH_TOKEN` is set **and**
 the three `AUTH_*` variables are present, so a public deploy can never come up
@@ -288,24 +297,22 @@ To apply them by hand instead, set `AUTO_MIGRATE=false` and run:
 
 ```
 psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
-psql "$SUPABASE_DB_URL" -f migrations/0002_sr_runtime.sql
-psql "$SUPABASE_DB_URL" -f migrations/0003_tool_call_recovery.sql
-psql "$SUPABASE_DB_URL" -f migrations/0004_auth.sql
-psql "$SUPABASE_DB_URL" -f migrations/0005_sr_start_retry.sql
-psql "$SUPABASE_DB_URL" -f migrations/0006_workflow_idempotency.sql
-psql "$SUPABASE_DB_URL" -f migrations/0007_cloud_direct.sql
-psql "$SUPABASE_DB_URL" -f migrations/0008_sr_lifecycle.sql
-psql "$SUPABASE_DB_URL" -f migrations/0009_nexus_projects.sql
-psql "$SUPABASE_DB_URL" -f migrations/0010_nexus_plans.sql
-psql "$SUPABASE_DB_URL" -f migrations/0011_nexus_files.sql
-psql "$SUPABASE_DB_URL" -f migrations/0014_nexus_project_binding.sql
-psql "$SUPABASE_DB_URL" -f migrations/0015_task_workspace_lock.sql
-psql "$SUPABASE_DB_URL" -f migrations/0016_secret_tables_rls.sql
+# ... every file in migrations/, in lexical order, e.g. with a shell loop:
+for f in $(ls migrations/*.sql | sort); do psql "$SUPABASE_DB_URL" -f "$f"; done
 ```
 
-`0012` and `0013` are intentionally unused: they are reserved for the deferred
-File Lab (D-1) workstream. The runner applies every `*.sql` in lexical order and
-does not require a contiguous sequence, so the gap is safe.
+The migrations are `0001`–`0011`, `0014`–`0032`. `0012` and `0013` are
+intentionally unused (reserved for the deferred File Lab, D-1). The runner
+applies every `*.sql` in lexical order and does not require a contiguous
+sequence, so the gap is safe. The set includes the auth tables (`0004`), the
+cloud-direct route table (`0007`), the NEXUS projects/plans/files increments
+(`0009`–`0011`), the D-2 project binding (`0014`), the workspace lock (`0015`),
+the RLS on the sandbox session-key tables (`0016`), the context/memory tables
+(`0017`), the lab runs (`0018`), the GitHub/OpenHands accounts (`0019`, `0020`,
+`0022`, `0026`, `0027`), the specifications (`0021`), the worker heartbeat
+(`0023`), the task hand-off/preferred-account/time-limit columns (`0024`,
+`0025`), the lease fencing and abandoned-conversation columns (`0028`, `0029`),
+and the durable-run/connection/project-repository tables (`0030`–`0032`).
 
 `0014_nexus_project_binding.sql` is additive: it adds the project↔repository
 link table, nullable `project_id` on `tasks`/`workflows`, the canonical
@@ -402,7 +409,9 @@ database is missing tables (apply migrations/): sessions, login_attempts
 ```
 
 This checks the legacy core tables and columns only, not every NEXUS table or
-column. Verify migrations 0009–0011 separately before enabling these features.
+column. The full required set (`REQUIRED_COLUMNS` in `cloud_store.py`) is
+checked by `GET /readyz` and by the diagnostics `schema` check; run those after
+applying migrations to confirm the new NEXUS tables are present too.
 
 ## Render
 
@@ -503,10 +512,17 @@ conversation on that sandbox's agent-server with the sandbox's own
 **`app` (legacy).** `POST /api/v1/app-conversations`, which provisions a sandbox
 *and* creates the conversation for you, as a two-phase start task.
 
-**Caution:** `direct` currently does not honor `selected_repository` and
-`selected_branch` as a verified workspace; do not rely on repository-scoped
-execution with this transport. Global sandbox reuse also lacks project scoping.
-See [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md). The `app` endpoint can fail with
+**Caution:** the `direct` transport has no native `selected_repository` field
+on the agent-server create call, so a repository-scoped task is handled by
+instruction, not by a verified workspace selection. `OPENHANDS_DIRECT_REPO_MODE`
+decides how: `prompt` (default) prepends a deterministic clone step, `refuse`
+dead-letters the task, `allow` ignores the field. Sandbox reuse is now scoped to
+the repository and branch a conversation was started for (`workspace_key`), so a
+task on another repository or branch gets a sandbox of its own and never finds
+someone else's working tree; tasks on one branch share a sandbox but never run
+at the same time (see the workspace lock below). See
+[docs/OPENHANDS_SETUP.md](docs/OPENHANDS_SETUP.md) and [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md).
+The `app` endpoint can fail with
 `HTTP 500` on the live service when it asks a just-provisioned sandbox to create
 a conversation: the start task reaches `STARTING_CONVERSATION` and then errors,
 and a start without an initial message is `READY` but `send-message` returns
@@ -614,13 +630,24 @@ How each behaves, and why:
 
 ### Repository and branch contention check
 
-The dispatcher checks whether an active task names the same repository and
-branch before claiming a queued task. Two conversations editing one checkout
-can overwrite each other's commits, so this check must not be treated as a
-complete isolation guarantee:
+Two conversations editing one checkout can overwrite each other's commits. This
+is prevented by a **real cross-process lock**, not only a read-then-check:
 
-The existing check is per branch and runs in the claiming transaction, but it
-does **not** serialize concurrent claims of different rows for one workspace.
-Do not rely on it as a cross-process lock. The default direct transport also
-does not establish that the requested repository/branch was actually selected.
-See [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md); use caution until fixed and tested.
+* Migration `0015_task_workspace_lock.sql` adds the partial unique index
+  `uq_tasks_workspace_active` on `(selected_repository, COALESCE(selected_branch,''))`
+  over the states `assigned|running|verifying|blocked|recovering`. `queued` is
+  deliberately excluded, so two queued siblings do not block each other before
+  either starts. Repository-less tasks (`selected_repository IS NULL`) never
+  contend, because a NULL key is distinct in a unique index.
+* `claim_task` claims inside a `SAVEPOINT` and treats a `UniqueViolation` as
+  "workspace taken", so two dispatchers can never claim two different queued
+  rows for one workspace in the same instant. The `_workspace_holder` read is
+  only the fast path.
+* On the `direct` transport, sandbox reuse is additionally scoped to the
+  repository and branch a conversation was started for (`workspace_key`).
+
+Two things remain true and are worth knowing: a task can still be started
+against a branch something *outside* NEXUS is pushing to (a person, a bot), and
+the direct transport selects the repository by instruction, not by a native
+field — see [docs/OPENHANDS_SETUP.md](docs/OPENHANDS_SETUP.md) and
+[docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md).

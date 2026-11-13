@@ -26,6 +26,9 @@ python tests/e2e_cloud_dispatcher.py   # real Cloud conversation, then delete it
 python tests/e2e_local_sr_jr.py        # real Sr→Jr on a local agent-server
 ```
 
+The environment variables the tests read (`TEST_SUPABASE_DB_URL` and the
+`E2E_CHROMIUM_*` overrides) are listed in [ENVIRONMENT.md](ENVIRONMENT.md) §3.7.
+
 ## What is real in each layer
 
 | layer | real | faked |
@@ -83,6 +86,27 @@ check per integration point. Each status is earned:
 
 `report.ok` is true when nothing FAILED; BLOCKED and UNVERIFIED do not make it
 false.
+
+The checks map one-to-one onto section 13 of the request:
+
+| check | what it proves | needs `live` |
+| --- | --- | --- |
+| `database`, `schema` | PostgreSQL round-trip; every required table/column | no |
+| `accounts` | each configured account's key is accepted | no |
+| `account_pool` | the selection mode picks a usable account | no |
+| `cloud_api` | the OpenHands endpoint answers | no |
+| `queues_leases` | claim → release → re-claim on a throwaway run | no |
+| `recovery` | an expired lease is reclaimed and re-claimed with a higher fencing token; a bound conversation is not re-claimed | no |
+| `lab_worker` | a fresh worker heartbeat, or FAILED when work is waiting and none is fresh | no |
+| `providers`, `provider_probe` | the LLM orchestrator cascade (configuration; then a real probe) | probe only |
+| `openhands_tools`, `mcp_configuration`, `nexus_tools` | the agent's tool catalog, the account's MCP names, the NEXUS surfaces | catalog only |
+| `conversation_create`, `message_and_events`, `run_command`, `workspace_rw`, `task_completion` | create a conversation, deliver a message, read events, run a shell command, read/write the sandbox, reach the terminal state `finished` | yes |
+
+`recovery` and `queues_leases` are real database round trips on a throwaway
+project the check deletes; they need no Cloud key, so they earn VERIFIED even on
+a keyless deployment. `task_completion` follows the conversation's real terminal
+state: `finished` is VERIFIED, any other terminal state (`error`, `stuck`) is
+FAILED — never a success the probe did not observe.
 
 ## Live verification (recorded)
 
@@ -168,3 +192,44 @@ Do not replace the Cloud client with a mock in an integration test. The value of
 two-phase start, the 422 on a missing body, the `agent_settings` requirement).
 A mock of the client would assert that the client calls itself, and would not
 catch a schema drift.
+
+## The extended acceptance suite (sections A-G)
+
+`tests/test_acceptance_*.py` are a **second, more end-to-end** pass over the same
+sections A-G the request lists ("Создай полноценный набор тестов"). Where
+`test_connectivity.py` and `test_comprehensive_suite.py` (above) exercise the
+services, these drive the whole integration over real sockets, real PostgreSQL,
+real `git` and real `pytest`. They share `tests/acceptance_kit.py` (a
+configurable Cloud HTTP server and a redirect server). Run them with:
+
+```bash
+TEST_SUPABASE_DB_URL="postgresql://user:pw@127.0.0.1:5432/nexus_test" \
+  python -m pytest tests/test_acceptance_*.py -q
+```
+
+| file | section | what it proves |
+| --- | --- | --- |
+| `test_acceptance_connectivity.py` | A | connect, authorize, a rejected key, an unreachable endpoint, a timeout, reconnection; reachability and authorization are separate answers; a redirect never carries the key |
+| `test_acceptance_account_pool.py` | B | one, two, three and many accounts; disable; the primary failing; the move to the backup; a manual switch; automatic (load-balanced) distribution; priority and fallback order; remove-with-active-tasks |
+| `test_acceptance_handoff.py` | C | a real task started on #1 and handed to #2: the task, the context, the Git state, the completed step not redone, the run completed, the switch recorded |
+| `test_acceptance_worker.py` | D | the API and a **separate** `lab_worker` process: submit, close the client, the run continues, the result is readable after reconnecting, and the worker outlives the server process |
+| `test_acceptance_recovery.py` | E | a SIGKILLed worker recovered by a new process; a lost connection requeueing for failover; an expired lease reclaimed; the fencing token stopping a stale worker; no duplicates |
+| `test_acceptance_dev_task.py` | F | a real development task through NEXUS against a **real git repository**: create, test, break, fix, re-test, report, and a real diff |
+| `test_acceptance_e2e_failover.py` | G | the full failover: a real task on #1, #1 fails, the switch to #2, the context handed over, #1 stopped (its real checkout shows no further write), the result verified, nothing duplicated |
+
+Two properties are asserted the way the task text demands:
+
+* **A transport is not mocked.** Section A, B, D and E speak to real HTTP servers
+  over a socket; the store is real PostgreSQL. Sections F and G go further: the
+  "agent" runs real `git` and real `pytest` in real directories, and the Git
+  verifier reads a real branch head from a real repository.
+* **The live OpenHands Cloud is reported BLOCKED, not faked.**
+  `test_acceptance_dev_task.py::test_the_live_openhands_path_is_blocked_without_a_key`
+  asserts that the local agent-server refuses an unauthenticated request — the
+  reason the live path cannot be run here. See
+  `docs/ACCEPTANCE-OPENHANDS.md` for the section-by-section status.
+
+Nothing in these files weakens the invariant that a diagnostic which did not run
+says so: a section that needs a second live account or a live key is marked
+BLOCKED in the report rather than passing on a fake.
+

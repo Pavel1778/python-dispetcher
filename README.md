@@ -36,6 +36,8 @@ Start here:
 - [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md) — the target architecture.
 - [CLOUD-INTEGRATION-MAP.md](CLOUD-INTEGRATION-MAP.md) — the Cloud API surface.
 - [DEPLOY.md](DEPLOY.md) — deployment guide.
+- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable, run
+  command, dependency and required permission in one place.
 
 ## What is ready today
 
@@ -76,11 +78,13 @@ are manual and need a live LLM):
   installable **PWA**, and native client packages: Debian `.deb`, Android
   `.apk`, Windows `.exe`.
 
-Not ready (see `docs/AUTONOMOUS-LAB.md` for the per-item status): there is no
-LLM-driven *replanner* that authors corrective tasks after a failed verification
-(a failed dependency blocks the run for a human), no push notifications, and no
-native iOS app. A legacy `completed` status means the Dispatcher's own rules were
-met — it is **not** verified QA evidence.
+Not ready (see `docs/AUTONOMOUS-LAB.md` for the per-item status): a *bounded*
+run stops on a failed dependency rather than authoring corrective tasks itself
+(a durable run retries the task, but there is no LLM-driven replanner that
+invents new work), there is no out-of-band push notification (a finished run's
+report arrives as a chat message), and there is no native iOS app. A legacy
+`completed` status means the Dispatcher's own rules were met — it is **not**
+verified QA evidence.
 
 ## Quick start (clean environment)
 
@@ -171,12 +175,21 @@ honest reader; the signature is the real integrity boundary.
 
 ## MCP
 
-`python -m orchestration.mcp_server` speaks MCP over stdio and exposes a limited
-tool set (`list_projects`, `get_project`, `list_repositories`, `list_tasks`,
-`get_task`, `create_task`, `dispatch_task`, `get_execution_status`,
-`list_evidence`, `verify_evidence`). There is no arbitrary shell, SQL or eval
-tool. Every tool re-checks project membership through the same services the HTTP
-API uses. Streamable HTTP is not implemented in this MVP.
+NEXUS exposes MCP over **two transports**, both served by the same code
+(`orchestration/mcp_server.py`):
+
+- **stdio** — `python -m orchestration.mcp_server` (JSON-RPC 2.0 over stdin/stdout);
+- **Streamable HTTP** — `POST /mcp` on the web server, reusing the browser
+  session/CSRF or the `WEB_AUTH_TOKEN` bearer.
+
+The tool set is limited (`list_projects`, `get_project`, `list_repositories`,
+`list_tasks`, `get_task`, `create_task`, `dispatch_task`,
+`get_execution_status`, `list_evidence`, `verify_evidence`, `list_runs`,
+`get_run`, `cancel_run`, `list_project_executors`, `assign_project_executor`).
+There is no arbitrary shell, SQL or eval tool. Every tool re-checks project
+membership through the same services the HTTP API uses, and each tool carries a
+scope (`orchestration/nexus_policy.py`, `MCP_TOOL_SCOPES`) that the caller's role
+must hold. A notification returns `202`; a parse error is `400`.
 
 ## Cross-platform web client (PWA)
 
@@ -252,6 +265,12 @@ python -m orchestration.cli openhands switch \
 `python -m orchestration.web_server --host 0.0.0.0 --port $PORT --token $WEB_AUTH_TOKEN`.
 Migrations are idempotent and applied on first connect unless `AUTO_MIGRATE=false`.
 Back up before applying a new migration to a database with real data.
+
+The web server advances autonomous runs on a thread of its own unless
+`NEXUS_LAB_INLINE=0`; a separate worker (`python -m orchestration.lab_worker`)
+can advance them too, and `render.yaml` and `docker-compose.yml` define one. See
+[docs/WORKER_SETUP.md](docs/WORKER_SETUP.md) and
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for the full variable list.
 
 ## NEXUS planning and operations
 

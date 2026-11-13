@@ -1037,8 +1037,14 @@ failure, and prove the integration with one command. The invariants to keep:
   `BLOCKED` (could not run: no credential/resource — a 429 is BLOCKED, not
   FAILED), `UNVERIFIED` (not run — the live probe is opt-in). `report.ok` is
   true unless something FAILED. The `queues_leases` check does a real
-  claim→release→re-claim on a throwaway project it deletes; the live probe
-  creates and deletes exactly one conversation.
+  claim→release→re-claim on a throwaway project it deletes; `recovery` does the
+  same round trip for an **expired** lease (claim with `lease_seconds=0`, die
+  before binding, reclaim, re-claim) and asserts the fencing token advanced and
+  that a *bound* conversation is not re-claimed — a real database check that
+  needs no Cloud key. `task_completion` is the live probe's own check: it is
+  VERIFIED only when the conversation reaches the terminal state `finished`, any
+  other terminal state (`error`/`stuck`) is FAILED, and it is UNVERIFIED without
+  `live`. The live probe creates and deletes exactly one conversation.
 - **Worker heartbeat (migration `0023`).** `LabWorker` registers and heartbeats
   every tick (`register_worker`/`heartbeat`/`stop_worker`); `live_workers` is
   how the diagnostics tell a live worker from a dead one — a lease cannot.
@@ -1800,3 +1806,175 @@ and a case that cannot run here says so rather than simulating.
   is answered `401`) and `delay` (a real slow response for a real timeout test).
   A caller that times out and hangs up no longer prints a broken-pipe traceback
   from the server thread.
+
+## Section 12: the OpenHands settings and the run view in the studio (this session)
+
+The request's section 12 ("Интеграция с интерфейсом NEXUS") asks for two things
+that were only partly present: an OpenHands settings surface with every control
+the account pool supports, and a task view that shows the live executor,
+conversation id, events and switches, with a manual executor switch. What was
+already there (add/edit/remove/test/default-per-account, project executors,
+`account.executions`) is kept; what follows was added.
+
+- **The pool's own settings are now on screen.** `openhandsPoolHtml` renders the
+  selection mode (`#pool-mode`, the four modes of `openhands_pool.MODES`) and
+  the fallback order (the connections in the order the pool would try them, with
+  ↑/↓ buttons). Both are the server's settings: the interface posts to
+  `POST /api/openhands/pool` and re-reads `GET /api/openhands/pool`; it never
+  decides locally. The order the UI shows is the same ranking `candidates()`
+  applies (explicit `fallback_order`, then `priority`, then age).
+- **Default account** is one action per card (`openhands-default` →
+  `POST /api/openhands/accounts/{id}/default`), and **error history** is a dialog
+  (`openhands-errors` → `GET .../errors`). **Active conversations / health** are
+  on the card's standing line, from the account view.
+- **The pool route reports observed load.** `GET /api/openhands/pool` now adds a
+  `load` per candidate: the same in-flight count the selection ranks on
+  (`AccountPool.live_load`, a public wrapper over `_live_load`), not the
+  `active_tasks` counter nothing decrements in production.
+- **The run detail carries the executor timeline.** `GET .../runs/{id}` gained
+  `switches` (`LabStore.run_handoffs`: every hand-off with the from/to account
+  **labels**, joined so the UI names them without the account list) and `events`
+  (`LabStore.run_events`: the run's own project events merged with one entry per
+  attempt start and settle, each with its real timestamp). The `executions` list
+  was already there; the run card now uses all three: a "Текущий исполнитель"
+  block (connection, task, conversation id, state), a switches section, an
+  events section, and a **manual switch** button on every in-flight task
+  (`switch-executor` → the existing
+  `POST .../runs/{run}/tasks/{task}/switch`). The button is shown only for the
+  states the server accepts (`dispatched`/`running`/`verifying`); the server is
+  still the one that refuses anything else (409).
+- **`lab.run_events` sorts in Python, not SQL.** The two sources have different
+  timestamp columns; sorting the merged list by `at` is what keeps a run with no
+  attempts yet honest (it shows only its own `run.started`).
+- Tests: the pool settings/default/fallback-order and the observed-load cases in
+  `tests/test_openhands_pool_http.py`; the run-detail executor/conversation and
+  switch cases in `tests/test_lab_http.py`; and
+  `tests/test_browser_e2e.py::test_the_openhands_selection_mode_and_fallback_order_are_driven_from_the_settings`
+  drives the mode, the order and the default over real Chromium and asserts the
+  server state each time.
+
+## Documentation set (this session)
+
+The operator documentation was brought back in step with the code, and one
+missing document was added. Keep these in step when a variable, command, route
+or status changes.
+
+- **`docs/ENVIRONMENT.md` is the one environment reference** (section 14 of the
+  request names it; it did not exist before). It lists every variable the code
+  reads, its default, and the module that reads it, plus the dependencies, the
+  run commands for `web_server` / `lab_worker` / `mcp_server` / `cli`, the
+  required permissions (GitHub scopes, OpenHands key, database, network) and the
+  recovery procedures. `.env.example` and `DEPLOY.md` point to it; the deploy
+  table in `DEPLOY.md` is the subset a deploy sets by hand.
+- **The MCP section of `README.md` was wrong.** It claimed Streamable HTTP was
+  not implemented; it is (`POST /mcp`, `web_server._mcp_http`), and the tool list
+  was missing `list_runs`/`get_run`/`cancel_run`/`list_project_executors`/
+  `assign_project_executor`. A tool carries a scope from `MCP_TOOL_SCOPES`.
+- **`DEPLOY.md` migration list was stale** (it stopped at `0016`). The set is
+  `0001`–`0011`, `0014`–`0032`; `0012`/`0013` stay reserved for the deferred File
+  Lab. The hand-apply block now uses a shell loop over `migrations/*.sql` so it
+  cannot fall behind again.
+- **`DEPLOY.md`'s "contention check" and the direct-transport caution were
+  out of date.** The workspace lock is the partial unique index
+  `uq_tasks_workspace_active` (migration `0015`) claimed inside a `SAVEPOINT`,
+  not a read-then-check; sandbox reuse is scoped by `workspace_key` to the
+  repository and branch. What remains true (an outside writer can still move a
+  branch head; `direct` selects a repository by instruction) is stated as such.
+- **`docs/FAILOVER.md` said the old conversation is not stopped on a manual
+  switch.** It is (best effort, transcript preserved); `stop_conversation` is
+  transport-honest (`app` returns `False`), and the branch lock — not the stop —
+  is what keeps two executors off one checkout.
+- **`docs/OPENHANDS_ACCOUNTS.md` named the wrong verify endpoint.** An account is
+  verified through `GET /api/v1/settings` (`account_capabilities`), not
+  `/api/settings`.
+- The OpenHands diagnostics check list (`docs/OPENHANDS_SETUP.md`,
+  `docs/TESTING.md`) now names `recovery` and `task_completion` and their earned
+  statuses. `docs/ENVIRONMENT.md` is cross-linked from `WORKER_SETUP`,
+  `TROUBLESHOOTING`, `TESTING` and `OPENHANDS_ACCOUNTS`.
+- `.env.example` gained the variables the docs described but the template
+  omitted: `OPENHANDS_TRANSPORT`, `OPENHANDS_DEFAULT_MODEL`, and the
+  `NEXUS_SPEC_*` settings. No secret value is in any committed file.
+
+Verified: `ruff check .` clean; `pytest tests/` (browser E2E excluded) 1337
+passed, 9 skipped against a disposable PostgreSQL on port 5433.
+
+## Final acceptance testing (this session)
+
+The §15 acceptance pass. Two things to know before touching this area again.
+
+- **The load-sensitive test is `tests/test_acceptance_recovery.py::test_a_sigkilled_worker_is_recovered_by_a_new_process`.**
+  It killed the worker the instant its conversation existed in the Cloud, which
+  is *before* the worker binds the conversation to the task; a `SIGKILL` inside
+  that window is recovered only when the 900 s claim runs out and the
+  conversation is adopted, which is longer than the test's 20 s wait. This is
+  the same race `test_lab_worker_process.py` was fixed for in `5b2efec`; the
+  acceptance copy (`1499e07`) re-introduced it. The fix waits until the task
+  **records** the conversation (`conversation_id == first`) before killing. It
+  fails about one full run in two without that guard, so do not remove it.
+- **`docs/FINAL_ACCEPTANCE_REPORT.md` is now ISSUED** (it was a Phase-0
+  placeholder). It carries the twelve completion conditions with their evidence,
+  the deliverable list, the environment variables, the run commands, the test
+  counts and the remaining BLOCKED/UNVERIFIED items. Keep it in step when a
+  status changes.
+- **A live key *is* available in this environment** (`OPENHANDS_API_KEY`, the
+  live account has a working LLM key and `openhands/deepseek-v4.1-flash` as its
+  default model). The live diagnostics are **17 VERIFIED / 0 FAILED / 0
+  BLOCKED** — `conversation_create`, `message_and_events`, `run_command`,
+  `task_completion`, `workspace_rw` all really ran. The account has **no GitHub
+  provider token** (`provider_tokens_set: {'github': None}`), so a live task
+  that must clone and push ends `completed_unverified` and the run blocks; that
+  is correct, not a defect.
+- **Trap when probing from the shell:** this harness exports a secret into the
+  persistent shell only when a command *mentions the key name*. Once
+  `OPENHANDS_API_KEY` is in the shell, `tests/test_connectivity.py` and
+  `tests/test_acceptance_connectivity.py` (which assert a missing key is refused
+  *before any request*) fail, because `CloudClient(api_key="")` falls back to the
+  environment. Run the suite with `env -u OPENHANDS_API_KEY` or you will chase a
+  failure that is not in the code.
+- The browser E2E skips cleanly when Chromium is absent (29 of the 38 skips are
+  these); `python -m playwright install chromium` makes all 29 pass, leaving 9
+  skips. The other skips are environmental: 4 Android APK (no SDK build-tools),
+  3 Windows `.exe` (no mingw-w64), 1 pooler schema-bootstrap, 1 section F live
+  variant.
+
+## The hand-off context, complete (continuation step)
+
+The traceability matrix of the previous step recorded exactly one open gap: the
+failover hand-off carried only ten of the fourteen context items the request
+names — *history of important decisions*, *uncommitted changes*, *test results*
+and *constraints* were implicit (through the branch and the previous report),
+not named fields. That gap is closed in `AccountRouter.handoff_context` /
+`handoff_message` (`orchestration/openhands_router.py`). Keep these invariants:
+
+- **`decisions` and `constraints` are read from the project memory**, not
+  invented: one query over `nexus_memory` for `kind IN ('decision','constraint')`
+  scoped to the project (plus global rows) and `superseded_by IS NULL`. The
+  provenance label travels with each item, so the new executor can see whether a
+  decision was observed or merely reported. Do not add a second store for these.
+- **`test_results` is the run's durable QA outcome**, one entry per settled task
+  (`task_key`, `verdict`, `reason`, `commit`). The verdict and reason are read
+  from the task's `verification` **or** the last `evidence` entry, and fall back
+  to the task's own state; a task that settled with no detail is still reported,
+  never silently dropped. `commit` is the run's last observed `remote_sha`, set
+  only for the task being handed over (an earlier task's commit is not this
+  task's).
+- **`uncommitted` is honest, never a fabricated patch.** A fresh sandbox does
+  not inherit the previous working tree, so `carried` is always `False` and the
+  `note` says so. `base_sha` is the last attempt's recorded base and `changed`
+  is whether the branch moved during it — `None` when that was never recorded,
+  so "unknown" is not reported as "nothing changed".
+- **`previous_report` falls back to the last attempt's recorded `final_text`**
+  when the caller passes none, so the executor's own report of what it ran
+  travels even when the scheduler holds only the task row.
+- **The message prints all four** (`handoff_message`: "Decisions already
+  taken", "Constraints in force", "Test/QA results so far", "Uncommitted work")
+  and rule 4 tells the new executor to keep to the decisions and constraints.
+  The push rule is still appended by `OpenHandsExecutor._hand_in` (rule 6), so
+  `handoff_message` ends at rule 5 — do not renumber them apart.
+- **`jsonb` is decoded defensively** (`_as_dict`/`_as_list` accept a `dict`/`list`
+  from `_task_row` and a `str` from a raw cursor), so the same helper serves a
+  task read either way.
+- Tests: `tests/test_acceptance_handoff.py` (6 cases — the context shape, the
+  message shape, the recorded-report fallback, and the four load-bearing
+  hand-off cases). The context-shape and message-shape cases fail if any of the
+  four fields is dropped, so they are load-bearing.
