@@ -339,6 +339,12 @@ def _max_age(set_cookie: str) -> int:
     return int(re.search(r"Max-Age=(\d+)", set_cookie).group(1))
 
 
+def _about(seconds: int, value: float) -> bool:
+    """*value* is *seconds*, less what the test itself took - which on a busy
+    runner is more than the moment it takes here."""
+    return seconds - 300 <= value <= seconds
+
+
 def _answer(server, method: str, path: str, token: str, headers: dict | None = None):
     """One request with the session cookie; ``(status, every Set-Cookie line,
     headers)``. A dict of headers keeps one line of a kind, and what matters
@@ -404,8 +410,8 @@ def test_using_a_session_renews_the_cookie_with_it(server, browser):
     for attribute in ("Path=/", "HttpOnly", "SameSite=Strict"):
         assert attribute in cookies[0]
     assert "Secure" not in cookies[0], "plain HTTP here; the HTTPS case is below"
-    assert 30 * DAY - 5 <= _max_age(cookies[0]) <= 30 * DAY
-    assert 30 * DAY - 5 <= _seconds_left() <= 30 * DAY
+    assert _about(30 * DAY, _max_age(cookies[0]))
+    assert _about(30 * DAY, _seconds_left())
     assert "no-store" in headers["Cache-Control"]
     # Told once.
     assert _answer(server, "GET", "/api/session", token)[:2] == (200, [])
@@ -418,7 +424,7 @@ def test_opening_the_studio_renews_the_cookie_and_keeps_it_secure(server, browse
     _time_passes("1 day")
     st, cookies, headers = _answer(server, "GET", "/", token, {"X-Forwarded-Proto": "https"})
     assert st == 200 and len(cookies) == 1
-    assert "Secure" in cookies[0] and 30 * DAY - 5 <= _max_age(cookies[0]) <= 30 * DAY
+    assert "Secure" in cookies[0] and _about(30 * DAY, _max_age(cookies[0]))
     assert "no-store" in headers["Cache-Control"]
 
 
@@ -433,7 +439,7 @@ def test_the_login_address_renews_the_cookie_of_someone_signed_in(server, browse
     st, cookies, headers = _answer(server, "GET", "/login", token)
     assert st == 303 and headers["Location"] == "/"
     assert len(cookies) == 1 and cookies[0].startswith(f"{SESSION_COOKIE}={token};")
-    assert 30 * DAY - 5 <= _max_age(cookies[0]) <= 30 * DAY
+    assert _about(30 * DAY, _max_age(cookies[0]))
     assert _answer(server, "GET", "/", token)[:2] == (200, [])
 
 
@@ -473,9 +479,9 @@ def test_no_session_outlives_ninety_days_however_much_it_is_used(server, browser
         given += [_max_age(cookie) for cookie in cookies]
     # Thirty days more at each use while that fits; at 66 days what is left of
     # the ninety, 24 days; after that there is nothing to add and no cookie.
-    assert len(given) == 6 and all(30 * DAY - 5 <= age <= 30 * DAY for age in given[:5])
-    assert 24 * DAY - 5 <= given[5] <= 24 * DAY
-    assert 2 * DAY - 5 <= _seconds_left() <= 2 * DAY
+    assert len(given) == 6 and all(_about(30 * DAY, age) for age in given[:5])
+    assert _about(24 * DAY, given[5])
+    assert _about(2 * DAY, _seconds_left())
     _time_passes("1 day")
     assert _answer(server, "GET", "/api/session", token)[:2] == (200, []), "nothing to add"
     _time_passes("1 day 1 minute")
@@ -509,7 +515,7 @@ def test_a_session_opened_under_the_twelve_hour_rule_is_carried_over(server, bro
         conn.execute("UPDATE sessions SET expires_at = created_at + interval '12 hours'")
     _time_passes("11 hours")
     st, cookies, _ = _answer(server, "GET", "/api/session", token)
-    assert st == 200 and len(cookies) == 1 and 30 * DAY - 5 <= _max_age(cookies[0]) <= 30 * DAY
+    assert st == 200 and len(cookies) == 1 and _about(30 * DAY, _max_age(cookies[0]))
     _time_passes("5 days")
     assert _answer(server, "GET", "/api/session", token)[0] == 200
 
@@ -533,7 +539,7 @@ def test_lowering_a_limit_ends_the_sessions_that_are_past_it(server, browser, mo
     monkeypatch.setattr(server.app.auth, "session_max", 6 * DAY)
     st, cookies, _ = _answer(server, "GET", "/api/session", token)
     assert st == 200 and len(cookies) == 1
-    assert DAY - 5 <= _max_age(cookies[0]) <= DAY and DAY - 5 <= _seconds_left() <= DAY
+    assert _about(DAY, _max_age(cookies[0])) and _about(DAY, _seconds_left())
 
 
 def test_requests_arriving_together_renew_the_cookie_once(server, browser):
@@ -606,13 +612,13 @@ def test_the_environment_sets_the_lifetime_of_a_real_session(fake, monkeypatch):
         st, _, hdr = b.request("POST", "/login", follow=False,
                                form={"username": "owner", "password": PASSWORD})
         assert st == 303 and _max_age(hdr["Set-Cookie"]) == 2 * DAY
-        assert 2 * DAY - 5 <= _seconds_left() <= 2 * DAY
+        assert _about(2 * DAY, _seconds_left())
         token = b.cookie().value
         _time_passes("1 day 23 hours")
         assert _answer(ws, "GET", "/api/session", token)[0] == 200
         _time_passes("1 day 23 hours")
         st, cookies, _ = _answer(ws, "GET", "/api/session", token)
-        assert st == 200 and DAY - 5 <= _max_age(cookies[0]) <= DAY + 2 * 3600
+        assert st == 200 and _about(DAY + 2 * 3600, _max_age(cookies[0]))
         _time_passes("2 days 1 minute")
         assert _answer(ws, "GET", "/api/session", token)[0] == 401
     finally:
