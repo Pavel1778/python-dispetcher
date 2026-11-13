@@ -439,6 +439,18 @@ def test_the_archive_route_does_not_bypass_membership(studio):
         "/api/v1/projects/00000000-0000-4000-8000-000000000000/runs?archived=1")[0] == 404
 
 
+def test_the_schema_guard_names_the_new_conversation_columns(studio):
+    """A column the store depends on must be in REQUIRED_COLUMNS, and every name
+    there must exist - otherwise the guard reports a healthy database as broken."""
+    from orchestration.cloud_store import PostgresStore
+    required = PostgresStore.REQUIRED_COLUMNS["nexus_conversations"]
+    for column in ("workflow_state", "workflow_goal_id", "workflow_spec_id",
+                   "plan_hash", "workflow_plan", "plan_approved_hash"):
+        assert column in required, f"{column} is not guarded"
+    assert "plan_id" not in required, "a column that no longer exists is guarded"
+    assert studio.app.store.verify_schema() == []
+
+
 # ------------------------------------------------------------- correctness
 def test_two_concurrent_launches_start_exactly_one_run(studio):
     """A double submit of "Запускай" must start one run, not two."""

@@ -476,6 +476,13 @@ class ReportService:
         cur.execute("SELECT g.text, g.spec_id FROM nexus_goals g WHERE g.id=%s", (run["goal_id"],))
         goal = cur.fetchone() or {}
         text = goal.get("text") or ""
+        if goal.get("spec_id"):
+            # A goal with a specification holds only a label; the task itself is
+            # the stored text, exactly as the success report quotes it.
+            cur.execute("SELECT content FROM nexus_specs WHERE id=%s", (goal["spec_id"],))
+            spec = cur.fetchone()
+            if spec is not None:
+                text = spec["content"]
         cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s ORDER BY created_at, id",
                     (run_id,))
         tasks = [_task_view(row) for row in cur.fetchall()]

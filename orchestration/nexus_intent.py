@@ -47,10 +47,6 @@ CONVERSATION_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "
 #: The modes that mean "the person chose this; do not start work".
 _QUIET_MODES = ("ask", "plan", "analysis")
 
-#: The mode that must confirm before running. A work order in it is planned, not
-#: started (``effective_mode`` turns it into ``plan``).
-_MANUAL = "manual"
-
 #: Question marks, in the scripts this project sees.
 _QUESTION_MARK = re.compile(r"[?？]")
 
