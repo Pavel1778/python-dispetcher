@@ -583,6 +583,14 @@ a:hover { text-decoration: underline; }
 .work-foot { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--line); }
 .work-foot .muted { font-size: 12.5px; align-self: center; }
 
+/* The archive: finished runs, kept as records after they leave the active list. */
+.ws-section-head { display: flex; padding: 6px 14px; border-top: 1px solid var(--line); }
+.archive-list { list-style: none; margin: 0; padding: 0 14px 14px; display: grid; gap: 6px; }
+.archive-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.archive-row .dot { flex: none; }
+.archive-title { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-when { flex: none; font-size: 12px; color: var(--text-3); }
+
 .skeleton { margin: 14px; display: grid; gap: 10px; }
 .skeleton i { display: block; height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--surface) 0%, var(--surface-2) 50%, var(--surface) 100%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
 .skeleton i:nth-child(2) { width: 72%; }

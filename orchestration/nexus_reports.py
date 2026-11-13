@@ -461,6 +461,70 @@ class ReportService:
         body, data, outcome = build_report(
             run=run, task_text=text, task_meta=meta, tasks=tasks, executions=executions,
             confirmation=confirmation, stops=stops, handoffs=handoffs)
+        self._insert(cur, run, body, data, outcome)
+
+    def write_terminal(self, cur: Any, run: dict, *, outcome: str, reason: str) -> None:
+        """A report for a run that ended without completing: failed or cancelled.
+
+        The requirement is explicit: a run that failed or was stopped must be
+        reported in its chat at once, and must not be presented as a success.
+        The report is written through the same outbox, so it is delivered once
+        and survives a restart exactly like a success report. It is *not* a
+        claim that anything verified: ``outcome`` is ``failed``/``cancelled``.
+        """
+        run_id = str(run["id"])
+        cur.execute("SELECT g.text, g.spec_id FROM nexus_goals g WHERE g.id=%s", (run["goal_id"],))
+        goal = cur.fetchone() or {}
+        text = goal.get("text") or ""
+        if goal.get("spec_id"):
+            # A goal with a specification holds only a label; the task itself is
+            # the stored text, exactly as the success report quotes it.
+            cur.execute("SELECT content FROM nexus_specs WHERE id=%s", (goal["spec_id"],))
+            spec = cur.fetchone()
+            if spec is not None:
+                text = spec["content"]
+        cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s ORDER BY created_at, id",
+                    (run_id,))
+        tasks = [_task_view(row) for row in cur.fetchall()]
+
+        if outcome == "cancelled":
+            status = ("**Статус:** прогон отменён. Незавершённые задачи выполнены не будут; "
+                      "всё, что успело сделаться, осталось в истории.")
+            headline = "отменено"
+        else:
+            status = ("**Статус:** прогон не выполнен. Задачи не завершены; результат не "
+                      "подтверждён.")
+            headline = "ошибка"
+        if reason:
+            status += f"\n\nПричина: {reason}"
+
+        counts: dict[str, int] = {}
+        for task in tasks:
+            counts[task["state"]] = counts.get(task["state"], 0) + 1
+        done = counts.get("completed_verified", 0) + counts.get("completed_unverified", 0)
+        lines = [
+            "## Отчёт автономного прогона", status,
+            f"Прогон `{run_id[:8]}` · итог: {headline} · задач: {len(tasks)} · "
+            f"завершено: {done}",
+            "### Исходное задание",
+            _quote(_clip(text, TASK_QUOTE_CHARS)) if text.strip() else "_Текст задания не сохранён._",
+            "### Что успело сделаться",
+            "\n".join(
+                f"{i}. **{_clip(t.get('title') or t['task_key'], 160)}** — "
+                f"{t['state']}" for i, t in enumerate(tasks, 1)) or "_Задач не было._",
+            "### Ограничения и блокеры",
+            f"- Итог: {headline}. Прогон не завершён штатно, поэтому результат не подтверждён.",
+        ]
+        body = "\n\n".join(lines)
+        data = {"outcome": outcome, "run_id": run_id, "task_count": len(tasks),
+                "tasks": [{"task_key": t["task_key"], "state": t["state"]} for t in tasks],
+                "reason": reason}
+        self._insert(cur, run, body, data, outcome)
+
+    def _insert(self, cur: Any, run: dict, body: str, data: dict, outcome: str) -> None:
+        """Write one report row for *run*, once. The outbox row is the primary
+        key (``run_id``), so a second attempt on the same run is absorbed."""
+        run_id = str(run["id"])
         cur.execute(
             "INSERT INTO nexus_run_reports(run_id, project_id, conversation_id, state, body, "
             "  summary, outcome) "

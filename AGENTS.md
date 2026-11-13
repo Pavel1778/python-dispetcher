@@ -2065,6 +2065,72 @@ A session is now extended by being used, with a hard end
 Tests: `tests/test_auth.py`, section "session lifetime" - real server, real
 HTTP; time passes by moving the session's own times back in the database.
 
+## Chat-first: Auto runs, Manual confirms, Chat answers (this session)
+
+The requirement: NEXUS must be an intelligent environment, not a system that
+asks permission for everything, and not one that runs a job because a message
+contained a verb. The router already existed (`nexus_intent.py`); this adds the
+*deliberate* mode beside it and the run/report behaviour the request names.
+
+- **`orchestration/nexus_workflow.py`** is the pure new module: the dialogue
+  state machine (`DISCOVERY`…`AWAITING_APPROVAL`→`EXECUTING`…`COMPLETED`) and
+  the launch-command classifier. `EXECUTING` is reachable **only** from
+  `AWAITING_APPROVAL` — a discussion cannot become a run. `classify_launch`
+  separates a command ("Запускай", "Execute", "Run it") from a question about
+  launching ("когда запустишь?"), a prohibition ("Не запускай пока") and a
+  condition ("Запускай только после проверки"); none of the last three is a
+  command. Do not "simplify" that to a keyword check: the prohibition regex has
+  no trailing word boundary on purpose (`не запускай` → `запуска` + `й`).
+- **Auto is untouched and must stay autonomous.** `effective_mode("auto", …)`
+  still returns `autonomous` for a work order; Auto plans and runs without
+  asking. The new mode is **`manual`** (migration 0034 widens the mode CHECK):
+  in it a work order becomes a **plan** (`effective_mode` → `plan`), the plan is
+  proposed and stored, and only an explicit launch command starts the run.
+  Delete the manual gate, not Auto's.
+- **The confirmation is bound to the plan's version.** `nexus_conversations`
+  stores `workflow_plan` (the validated tasks), `plan_hash` (a SHA-256 over
+  them, `nexus_workflow.plan_hash_of`) and `plan_approved_hash`. A *new* plan
+  (a replan) clears any stored approval, so a changed plan must be approved
+  again — this is the "a replan must not silently keep the old confirmation"
+  rule; do not drop the `CASE WHEN plan_hash IS DISTINCT FROM %s` clauses.
+- **The confirmation and the run are one fact.** `web_server._launch_initial`
+  stamps the approval inside `LabStore.start_run(..., also=approve_in)`, on the
+  same cursor that creates the run, guarded by the plan hash: an approval for a
+  version nobody saw leaves the run uncreated. Starting is idempotent per goal
+  (`uq_nexus_runs_active_goal` refuses a second active run), so a double submit
+  of "Запускай" starts one run — the concurrency test asserts it.
+- **Finished runs leave the active list; nothing is deleted.** A run that
+  reaches `completed` sets `hidden_at` by itself (in `_apply_run_state`), like a
+  cancelled run already did. `list_runs` (active) then omits it; the **archive**
+  is `GET /runs?archived=1` (`include_hidden`). A **failed**, **blocked** or
+  **paused** run is deliberately **not** hidden: it needs attention. The old
+  `test_cancel_and_completion_at_the_same_moment_end_one_way` asserted the
+  opposite (`hidden is False`) and was updated on purpose.
+- **Terminal runs report honestly, through the same outbox.** `LabStore` holds
+  an optional `reports` writer (set by the web server and `lab_worker`); on a
+  `cancelled`/`failed` transition `_apply_run_state` calls
+  `ReportService.write_terminal` on the transaction's cursor, so a terminal run
+  is never without a report and the report is `outcome=failed`/`cancelled`, never
+  a success. Delivery is the existing `nexus_run_reports` outbox (one row per
+  run, `run_id` primary key). A **blocked** run appends a chat message
+  (`_tell_chat`) with the reason, at once — it is not terminal, so it is a
+  message, not a report. `test_no_report_for_a_run_that_did_not_complete` was
+  split on purpose into "not ended" (no report) and "ended without completing"
+  (an honest report).
+- Routes/UI: the studio has a **Manual** mode button (the mode menu is driven by
+  `Object.keys(MODES)`), an **Архив прогонов** section on the Agent tab
+  (`loadArchive` → `/runs?archived=1`) and an `open-archived` action that shows a
+  finished run's report; `S.work.keepArchived` keeps exactly that run on screen
+  although the refresh drops hidden runs.
+- Migration `0035_chat_workflow.sql` is additive: the conversation workflow
+  columns, the `manual` mode, the `workflow_plan` jsonb, and one spec state
+  (`awaiting_approval`, reserved for a future hold; today the plan is held on
+  the conversation, not the spec). `REQUIRED_COLUMNS` names every new
+  conversation column.
+- Tests: `tests/test_chat_workflow.py` (42 cases; the classifier, the state
+  machine, the observable Manual turn, Auto unchanged, the archive, the
+  terminal report, concurrency, a stale approval) and the split cases in
+  `tests/test_run_reports.py`. Docs: `docs/CHAT-FIRST.md`, README.
 ## What production showed on 2026-11-13, and what was changed for it
 
 Read from the production database (Supabase, read-only) the morning after the

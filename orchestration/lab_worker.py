@@ -110,6 +110,10 @@ class LabWorker:
         # A completed run's report: written with the completion, delivered to
         # the chat the run was started from.
         self.reports = ReportService(store)
+        # A run that ends without completing (cancelled, failed) is reported by
+        # the store itself, on the transaction that settles it - never as a
+        # success.
+        self.lab.reports = self.reports
         # A branch is read with the GitHub account its project is bound to, as
         # the studio reads it; the server token only where no account is bound.
         self.verifier = GitVerifier(self.github, client_for=project_github(
