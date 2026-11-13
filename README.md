@@ -57,7 +57,29 @@ are manual and need a live LLM):
   run; an explicit command ("исправь …", "реализуй …") starts work; an ambiguous
   message gets one clarifying question; "продолжи" continues the conversation's
   existing run instead of creating a second. The conversation modes are `auto`
-  (default), `ask`, `analysis`, `plan`, `code`, `autonomous`.
+  (default), `ask`, `analysis`, `plan`, `code`, `autonomous` and `manual`.
+- **Three ways to work, one router.** The conversation's *mode* is a default and
+  the message decides the rest (see `docs/CHAT-FIRST.md`):
+  - **Auto** (default) — the router decides per message. Understandable work is
+    planned and run by itself; a question is answered; an unclear message is
+    clarified. Autonomous by design, so it never asks permission it does not
+    need.
+  - **Manual** — NEXUS discusses, proposes a **plan**, and runs only on an
+    explicit launch command ("Запускай", "Execute", "Run it"). A question about
+    launching ("когда запустишь?"), a prohibition ("не запускай пока") and a
+    condition ("запускай только после проверки") are not commands. The
+    confirmation is bound to the plan's *version*: a plan that changed must be
+    approved again. The dialogue state (`DISCOVERY … AWAITING_APPROVAL …
+    EXECUTING …`) is stored, so it survives a restart, and `EXECUTING` is
+    reachable only from `AWAITING_APPROVAL`.
+  - **Chat** (`ask`/`analysis`) — answers, explanations and analysis. No agent
+    is ever started.
+- **Runs in the interface.** A run that completed successfully leaves the active
+  list by itself (its history, tasks and report stay in the **archive**,
+  `GET /runs?archived=1`). A failed, blocked or paused run stays visible: it
+  needs attention. A run that ended without completing (cancelled, failed)
+  writes an honest report to its own chat at once — never as a success. A
+  blocked run tells its chat why, immediately.
 - **Authentication**: browser session (PBKDF2 + server-side sessions + CSRF)
   and a machine bearer token, plus login rate limiting and proxy-aware client
   IP handling.

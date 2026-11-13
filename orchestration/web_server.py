@@ -97,7 +97,6 @@ from .nexus_chat import ChatError
 from .nexus_intent import ANALYSIS, AUTONOMOUS, classify, clarifying_question, effective_mode
 from .nexus_workflow import (
     AWAITING_APPROVAL,
-    EXECUTING,
     classify_launch,
     plan_hash_of,
     render_plan,
@@ -2784,24 +2783,27 @@ class Handler(BaseHTTPRequestHandler):
                                  f"{active['state']}). Второй не запускаю."),
                      "meta": {"mode": "autonomous", "run_id": str(active["id"]),
                               "existing": True}}]
-        # Record the confirmation against the version on offer. A plan that
-        # changed since it was last approved is re-approved here (this launch is
-        # the person's new consent to the current version); the write is guarded
-        # so a concurrent replan cannot approve a version nobody saw.
-        try:
-            self.app.conversations.record_approval(
-                principal, project_id, conversation_id, plan_hash=plan_hash)
-        except ValueError as e:
-            return self._manual_text(f"Не удалось подтвердить план: {e}", error=True)
+        # The confirmation and the run are one fact: the approval is stamped on
+        # the same cursor that creates the run (``also``), guarded by the plan
+        # hash. A replan that slipped in between leaves the approval unstamped
+        # and the run is refused - so a started run always has its approval, and
+        # an approval can never be for a different version.
+        approved = {"ok": False}
+
+        def also(cur: Any, _run: dict) -> None:
+            approved["ok"] = self.app.conversations.approve_in(
+                cur, conversation_id, plan_hash=plan_hash, principal=principal)
+            if not approved["ok"]:
+                raise ValueError("the plan changed; approve the new version")
+
         try:
             run = self.app.lab.start_run(
                 principal, project_id, goal_id, plan=plan, repository=repository,
-                branch=branch, policy="durable", conversation_id=conversation_id)
+                branch=branch, policy="durable", conversation_id=conversation_id,
+                also=also)
         except (ValueError, InvalidTransition) as e:
             return self._manual_text(f"Не удалось запустить прогон: {e}", error=True)
         run_id = str(run["id"])
-        self.app.conversations.set_workflow_state(
-            principal, project_id, conversation_id, EXECUTING)
         tasks = len(plan)
         content = (f"Подтверждено. Автономный прогон запущен: репозиторий "
                    f"`{repository}`, ветка `{branch}`, задач в плане: {tasks}.\n\n"

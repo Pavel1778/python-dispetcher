@@ -20,6 +20,7 @@ from .nexus_projects import _text
 from .nexus_specs import MESSAGE_CHARS
 from .nexus_workflow import (
     AWAITING_APPROVAL,
+    EXECUTING,
     approval_matches,
     check_transition,
     plan_hash_of,
@@ -264,6 +265,27 @@ class ConversationService:
                 f"RETURNING {_CONVERSATION}",
                 (principal, conversation_id, project_id))
             return dict(cur.fetchone())
+
+    @staticmethod
+    def approve_in(cur: Any, conversation_id: str, *, plan_hash: str,
+                   principal: str) -> bool:
+        """Stamp the approval for *plan_hash* on the caller's cursor.
+
+        For a caller that must make the confirmation and the run one fact: it is
+        called inside ``LabStore.start_run``'s ``also`` hook, so the approval and
+        the run commit together. The write is guarded by the stored hash, so a
+        replan that slipped in between the read and this write leaves the
+        approval unstamped (returns ``False``) rather than approving a version
+        nobody saw.
+        """
+        cur.execute(
+            "UPDATE nexus_conversations SET plan_approved_hash=plan_hash, "
+            "  plan_approved_at=now(), plan_approved_by=%s, "
+            "  workflow_state=CASE WHEN workflow_state=%s THEN %s ELSE workflow_state END, "
+            "  updated_at=now() "
+            "WHERE id=%s AND plan_hash=%s",
+            (principal, AWAITING_APPROVAL, EXECUTING, conversation_id, plan_hash))
+        return cur.rowcount == 1
 
     def workflow(self, principal: str, project_id: str, conversation_id: str) -> dict:
         """The dialogue state of a conversation, for the chat surface."""

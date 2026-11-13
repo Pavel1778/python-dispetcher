@@ -370,3 +370,51 @@ def test_the_archive_route_does_not_bypass_membership(studio):
     assert studio.api.get(f"/api/v1/projects/{project}/runs?archived=1")[0] == 200
     assert studio.api.get(
         "/api/v1/projects/00000000-0000-4000-8000-000000000000/runs?archived=1")[0] == 404
+
+
+# ------------------------------------------------------------- correctness
+def test_two_concurrent_launches_start_exactly_one_run(studio):
+    """A double submit of "Запускай" must start one run, not two."""
+    import threading
+
+    project = studio.project()
+    _connect(studio, project)
+    conversation = _conversation(studio, project)
+    studio.answers(json.dumps(PLAN))
+    assert _send(studio, project, conversation, "Реализуй функцию")[0] == 200
+
+    results: list[int] = []
+    lock = threading.Lock()
+
+    def launch():
+        status, _body = _send(studio, project, conversation, "Запускай")
+        with lock:
+            results.append(status)
+
+    threads = [threading.Thread(target=launch) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(status == 200 for status in results), results
+    assert _count_runs(studio, project) == 1, "concurrent launches created extra runs"
+
+
+def test_an_approval_cannot_start_a_plan_it_did_not_see(studio):
+    """The confirmation is bound to a version: an approval for a stale hash is refused."""
+    project = studio.project()
+    _connect(studio, project)
+    conversation = _conversation(studio, project)
+    studio.answers(json.dumps(PLAN), json.dumps(PLAN_2))
+    assert _send(studio, project, conversation, "Реализуй функцию")[0] == 200
+    stale = studio.api.get(
+        f"/api/v1/projects/{project}/conversations/{conversation}")[1]["conversation"]["plan_hash"]
+    # A replan replaces the plan on offer; the old hash is no longer valid.
+    assert _send(studio, project, conversation, "Теперь сделай иначе")[0] == 200
+    with pytest.raises(ValueError):
+        studio.app.conversations.record_approval(
+            "user:owner", project, conversation, plan_hash=stale)
+    # The plan on offer changed, so the stale hash no longer matches.
+    current = studio.api.get(
+        f"/api/v1/projects/{project}/conversations/{conversation}")[1]["conversation"]
+    assert current["plan_hash"] != stale
