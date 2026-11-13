@@ -84,6 +84,27 @@ check per integration point. Each status is earned:
 `report.ok` is true when nothing FAILED; BLOCKED and UNVERIFIED do not make it
 false.
 
+The checks map one-to-one onto section 13 of the request:
+
+| check | what it proves | needs `live` |
+| --- | --- | --- |
+| `database`, `schema` | PostgreSQL round-trip; every required table/column | no |
+| `accounts` | each configured account's key is accepted | no |
+| `account_pool` | the selection mode picks a usable account | no |
+| `cloud_api` | the OpenHands endpoint answers | no |
+| `queues_leases` | claim → release → re-claim on a throwaway run | no |
+| `recovery` | an expired lease is reclaimed and re-claimed with a higher fencing token; a bound conversation is not re-claimed | no |
+| `lab_worker` | a fresh worker heartbeat, or FAILED when work is waiting and none is fresh | no |
+| `providers`, `provider_probe` | the LLM orchestrator cascade (configuration; then a real probe) | probe only |
+| `openhands_tools`, `mcp_configuration`, `nexus_tools` | the agent's tool catalog, the account's MCP names, the NEXUS surfaces | catalog only |
+| `conversation_create`, `message_and_events`, `run_command`, `workspace_rw`, `task_completion` | create a conversation, deliver a message, read events, run a shell command, read/write the sandbox, reach the terminal state `finished` | yes |
+
+`recovery` and `queues_leases` are real database round trips on a throwaway
+project the check deletes; they need no Cloud key, so they earn VERIFIED even on
+a keyless deployment. `task_completion` follows the conversation's real terminal
+state: `finished` is VERIFIED, any other terminal state (`error`, `stuck`) is
+FAILED — never a success the probe did not observe.
+
 ## Live verification (recorded)
 
 Verified against the real Cloud key on 2026-11-11:

@@ -97,7 +97,11 @@ Against the real Cloud service with a valid `OPENHANDS_API_KEY`:
 - `cloud_api`: `VERIFIED` (`GET /api/v1/app-conversations/count` -> 200).
 - `accounts`: `VERIFIED` (key accepted; `llm_api_key_set` true).
 - `queues_leases`: `VERIFIED` (claim → release → re-claim round trip).
-- `live_conversation` / `message_and_events` / `run_command` / `workspace_rw`:
+- `recovery`: `VERIFIED` (an expired lease reclaimed and re-claimed with a
+  higher fencing token; a bound conversation is not re-claimed). A real database
+  round trip on a throwaway project, so it passes without a Cloud key too.
+- `live_conversation` / `message_and_events` / `run_command` / `workspace_rw` /
+  `task_completion`:
   `VERIFIED` with `--live` on the `direct` transport and a stored
   `default_model` of `openhands/deepseek-v4.1-flash`. Without a usable model the
   conversation ends `error` (LLM auth) — which is exactly why the account's own

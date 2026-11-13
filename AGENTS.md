@@ -1037,8 +1037,14 @@ failure, and prove the integration with one command. The invariants to keep:
   `BLOCKED` (could not run: no credential/resource — a 429 is BLOCKED, not
   FAILED), `UNVERIFIED` (not run — the live probe is opt-in). `report.ok` is
   true unless something FAILED. The `queues_leases` check does a real
-  claim→release→re-claim on a throwaway project it deletes; the live probe
-  creates and deletes exactly one conversation.
+  claim→release→re-claim on a throwaway project it deletes; `recovery` does the
+  same round trip for an **expired** lease (claim with `lease_seconds=0`, die
+  before binding, reclaim, re-claim) and asserts the fencing token advanced and
+  that a *bound* conversation is not re-claimed — a real database check that
+  needs no Cloud key. `task_completion` is the live probe's own check: it is
+  VERIFIED only when the conversation reaches the terminal state `finished`, any
+  other terminal state (`error`/`stuck`) is FAILED, and it is UNVERIFIED without
+  `live`. The live probe creates and deletes exactly one conversation.
 - **Worker heartbeat (migration `0023`).** `LabWorker` registers and heartbeats
   every tick (`register_worker`/`heartbeat`/`stop_worker`); `live_workers` is
   how the diagnostics tell a live worker from a dead one — a lease cannot.
