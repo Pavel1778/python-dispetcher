@@ -33,7 +33,7 @@ from orchestration import web_ui  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 STUDIO = ROOT / "orchestration" / "studio"
-SCRIPTS = ("boot.js", "markdown.js", "highlight.js", "app.js")
+SCRIPTS = ("boot.js", "login.js", "markdown.js", "highlight.js", "app.js")
 
 
 def read(name: str) -> str:

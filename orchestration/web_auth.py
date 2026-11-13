@@ -11,9 +11,15 @@ Design choices, and why
 
 * **Sessions are server-side**, in PostgreSQL, not in a signed cookie. A signed
   cookie cannot be revoked before it expires without extra state; a row can be
-  deleted, which makes logout and "revoke all" immediate. Only
-  ``HMAC-SHA256(AUTH_SESSION_SECRET, token)`` is stored, so a database dump does
-  not yield usable cookies.
+  deleted, which makes logout and "revoke all" immediate. Only an HMAC-SHA256
+  of the token is stored, so a database dump does not yield usable cookies.
+
+* **A session belongs to the credentials it was opened with.** The key of that
+  HMAC is ``AUTH_SESSION_SECRET`` bound to the user name and the password hash
+  in force (``AuthService._session_key``). Replacing ``AUTH_PASSWORD_HASH`` -
+  which is how the password is changed - therefore ends every open session at
+  once: no cookie issued before finds its row. So does replacing
+  ``AUTH_USERNAME`` or the secret itself.
 
 * **A session lasts while it is used.** It ends ``AUTH_SESSION_TTL_SECONDS``
   after the last request made with it (30 days by default) and, used or not,
@@ -450,10 +456,27 @@ class AuthService:
         return hmac.compare_digest(provided, session.csrf_token)
 
     # -------------------------------------------------------------- crypto
+    def _session_key(self) -> bytes:
+        """The key session tokens are stored under: the secret, bound to the
+        credentials a session is opened with.
+
+        So a session is good only for the name and the password hash it was
+        opened under. Replace ``AUTH_PASSWORD_HASH`` (or ``AUTH_USERNAME``) and
+        no cookie issued before finds its row: every open session has ended,
+        on every device, which is what changing a password is for. Before
+        this, a session outlived the password it was opened with by up to
+        ninety days.
+
+        The stored hash is taken without whitespace, exactly as
+        :func:`parse_hash` reads it, so pasting the same value again with a
+        stray line break ends nothing.
+        """
+        bound = "\x00".join(("session", self.username or "",
+                              _without_whitespace(self.password_hash or "")))
+        return hmac.new(self.session_secret.encode(), bound.encode(), hashlib.sha256).digest()
+
     def _token_hash(self, token: str) -> str:
-        return hmac.new(
-            self.session_secret.encode(), token.encode(), hashlib.sha256
-        ).hexdigest()
+        return hmac.new(self._session_key(), token.encode(), hashlib.sha256).hexdigest()
 
     def _attempt_key(self, username: str, client_ip: str) -> str:
         return hmac.new(

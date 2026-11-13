@@ -1594,3 +1594,199 @@ def test_the_owner_stays_signed_in_from_one_day_to_the_next(stack, chromium):
         assert watch.problems == []
     finally:
         ctx.close()
+
+
+# --------------------------------------------- a link from another site
+@contextlib.contextmanager
+def _another_site(links: dict):
+    """A page on another site with *links* (``{element id: address}``, read at
+    every request, so a link can be added once its address is known).
+
+    It is served from ``localhost``; the studio is on ``127.0.0.1``. To the
+    browser those are two sites, so a click here is a cross-site navigation -
+    the one a ``SameSite=Strict`` cookie is left out of."""
+    import html
+    from http.server import BaseHTTPRequestHandler
+
+    class Page(BaseHTTPRequestHandler):
+        def do_GET(self):                      # noqa: N802 - the handler's name
+            body = ("<!doctype html><html lang='ru'><meta charset='utf-8'>"
+                    "<title>Другой сайт</title>" + "".join(
+                        f'<p><a id="{html.escape(name)}" href="{html.escape(url, quote=True)}">'
+                        f"{html.escape(name)}</a></p>" for name, url in links.items())
+                    ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):          # the test's output is not a log
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://localhost:{server.server_port}/"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _journey(page, base: str) -> tuple[list, list]:
+    """What the page does from now on: the documents it commits, and how many
+    times it asks whether there is a session. Addresses are given without the
+    studio's origin."""
+    opened: list[str] = []
+    asked: list[str] = []
+    page.on("framenavigated", lambda frame: frame == page.main_frame
+            and opened.append(frame.url.replace(base, "")))
+    page.on("request", lambda request: request.url == base + "/login/state"
+            and asked.append(request.url))
+    return opened, asked
+
+
+def _sessions() -> int:
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        return conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
+
+
+def test_a_link_from_another_site_opens_the_studio_for_someone_signed_in(stack, chromium):
+    """The second reason the owner met the login form while signed in.
+
+    The session cookie is ``SameSite=Strict``, so Chromium leaves it out of a
+    navigation that starts on another site: the server sees nobody and shows
+    the form. The form's page asks, from its own origin, whether there is a
+    session, and goes on to the studio - to the very chat the link named."""
+    links: dict = {}
+    ctx, page, watch = _open(chromium)
+    try:
+        with _another_site(links) as elsewhere:
+            _login(page, stack.base)
+            stack.answers("Ответ в чате по ссылке.")
+            _send(page, "Вопрос, на который ведёт ссылка")
+            expect(page.locator(".msg.assistant .md")).to_have_text("Ответ в чате по ссылке.")
+            chat = page.url
+            assert re.search(r"/#/p/[0-9a-f-]{36}/c/[0-9a-f-]{36}$", chat), chat
+            links.update(studio=stack.base + "/", chat=chat)
+            cookie = _session_cookie(ctx)
+            assert cookie["sameSite"] == "Strict", "the cookie stays strict; the page copes"
+
+            opened, asked = _journey(page, stack.base)
+
+            # A plain link to the studio.
+            page.goto(elsewhere)
+            page.click("#studio")
+            page.wait_for_selector('#app[data-ready="true"]')
+            assert page.url == stack.base + "/"
+            expect(page.locator("#whoami")).to_have_text(USERNAME)
+            # What happened on the way: the browser asked for the studio
+            # without the cookie and was sent to the form; the form asked once
+            # and left for the studio.
+            assert opened == [elsewhere, "/login", "/"], opened
+            assert len(asked) == 1
+
+            # A link to one chat opens that chat.
+            del opened[:], asked[:]
+            page.goto(elsewhere)
+            page.click("#chat")
+            page.wait_for_selector('#app[data-ready="true"]')
+            assert page.url == chat
+            route = chat.replace(stack.base + "/", "")
+            assert opened[:3] == [elsewhere, "/login" + route, "/" + route], opened
+            assert len(asked) == 1
+            expect(page.locator(".msg.user").first).to_contain_text(
+                "Вопрос, на который ведёт ссылка")
+            expect(page.locator(".msg.assistant .md")).to_have_text("Ответ в чате по ссылке.")
+
+            # The form is not left behind in the history: "back" is the other site.
+            page.go_back()
+            page.wait_for_selector("#chat")
+            assert page.url == elsewhere
+
+            # Nobody signed in a second time, and the page still works.
+            assert _sessions() == 1
+            assert _session_cookie(ctx)["value"] == cookie["value"]
+            page.click("#chat")
+            page.wait_for_selector('#app[data-ready="true"]')
+            stack.answers("И дальше работает.")
+            _send(page, "Ещё вопрос")
+            expect(page.locator(".msg.assistant .md").last).to_have_text("И дальше работает.")
+            assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_a_stranger_following_the_same_link_gets_the_form_once(stack, chromium):
+    """Nobody is signed in: the form stays, it asks once, nothing in the page
+    fails, and signing in works as it always did."""
+    links = {"studio": stack.base + "/"}
+    ctx, page, watch = _open(chromium)
+    try:
+        with _another_site(links) as elsewhere:
+            opened, asked = _journey(page, stack.base)
+            page.goto(elsewhere)
+            page.click("#studio")
+            page.wait_for_selector("#loginbtn")
+            page.wait_for_timeout(700)
+            assert page.url == stack.base + "/login"
+            assert opened == [elsewhere, "/login"] and len(asked) == 1, (opened, asked)
+            assert _sessions() == 0
+
+            page.fill("#username", USERNAME)
+            page.fill("#password", PASSWORD)
+            page.click("#loginbtn")
+            page.wait_for_selector('#app[data-ready="true"]')
+            assert page.url == stack.base + "/" and _sessions() == 1
+            assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_the_form_does_not_send_the_visitor_round_in_circles(stack, chromium):
+    """The one way this could go wrong: the form is told there is a session,
+    and the navigation it then starts arrives without one - a browser that
+    leaves the cookie out of it, or a sign-out in another tab at that moment.
+    The server sends the visitor back to the form, and a form that tried again
+    would never stop. It tries once: the second time it stays, and can be used.
+    """
+    links = {"studio": stack.base + "/"}
+    ctx, page, watch = _open(chromium)
+    try:
+        with _another_site(links) as elsewhere:
+            _login(page, stack.base)
+
+            def the_cookie_goes_missing(route):
+                # The form's question is answered by the server, truthfully -
+                # and the cookie is gone from the browser before the form can
+                # act on the answer.
+                answer = route.fetch()
+                assert answer.json() == {"signed_in": True}
+                ctx.clear_cookies()
+                route.fulfill(response=answer)
+
+            page.route(stack.base + "/login/state", the_cookie_goes_missing)
+            opened, asked = _journey(page, stack.base)
+            page.goto(elsewhere)
+            page.click("#studio")
+            page.wait_for_selector("#loginbtn")
+            page.wait_for_timeout(1500)
+            assert page.url == stack.base + "/login"
+            # To the form, away once, back to the form - and there it stays.
+            assert opened == [elsewhere, "/login", "/login"], opened
+            assert len(asked) == 1, "the form asked again"
+
+            # The form that stayed is a working form.
+            page.unroute(stack.base + "/login/state")
+            page.fill("#username", USERNAME)
+            page.fill("#password", PASSWORD)
+            page.click("#loginbtn")
+            page.wait_for_selector('#app[data-ready="true"]')
+            assert page.url == stack.base + "/"
+            assert watch.problems == []
+    finally:
+        ctx.close()

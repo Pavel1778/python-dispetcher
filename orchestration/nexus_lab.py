@@ -142,6 +142,15 @@ class Executor(Protocol):
     def poll(self, task: dict, conversation_id: str) -> TaskReport: ...
 
 
+class StartLeft(Exception):
+    """The worker is stopping while a start it asked for is still on its way.
+
+    Not a failure, and deliberately not a ``CloudError``: the service accepted
+    the start and it is recorded on the task (``LabStore.record_start``), so
+    the worker that runs next finishes it. The claim is left exactly as it is.
+    """
+
+
 class DispatchError(CloudError):
     """A dispatch failed, and the account that failed is known.
 
@@ -222,6 +231,15 @@ class OpenHandsExecutor:
         #: it, the process-wide ``client`` is used, exactly as before.
         self.router = router
         self._client_factory = client_factory
+        #: Called with the task and a record of the start as soon as the
+        #: service has accepted it and before its conversation exists. The
+        #: scheduler keeps the record on the task (``LabStore.record_start``),
+        #: so the start can be finished by another process (``follow_start``).
+        self.on_start: Callable[[dict, dict], Any] | None = None
+        #: Says that the worker is being stopped. A start that is recorded is
+        #: then left to the next worker (``StartLeft``) instead of being waited
+        #: for: the process has seconds, the start may need a minute.
+        self.stopping: Callable[[], bool] | None = None
 
     @staticmethod
     def instructions(task: dict, original: str = "") -> str:
@@ -504,6 +522,14 @@ class OpenHandsExecutor:
         if conv_id:
             return Dispatched(conv_id, proof, account_id, kind)
         if hasattr(client, "get_start_task") and getattr(start, "id", None):
+            # The service has the start; the conversation comes when the
+            # sandbox is ready. From here on the start is on the task, not only
+            # in this process: a worker that is replaced now does not take it
+            # along (the claim would stand until its lease ran out).
+            recorded = self._start_accepted(task, {
+                "start_task_id": str(start.id),
+                "account_id": str(account_id) if account_id else None,
+                "kind": kind, "delivery": proof})
             current = start
             for _ in range(self.start_poll_attempts):
                 conv_id = getattr(current, "app_conversation_id", None)
@@ -511,6 +537,8 @@ class OpenHandsExecutor:
                     return Dispatched(conv_id, proof, account_id, kind)
                 if getattr(current, "failed", False):
                     raise CloudError(f"start task failed: {getattr(current, 'detail', '')}")
+                if recorded and self.stopping is not None and self.stopping():
+                    raise StartLeft(f"start task {start.id} is left to the next worker")
                 time.sleep(self.poll_interval)
                 nxt = client.get_start_task(current.id)
                 if nxt is None:
@@ -518,6 +546,56 @@ class OpenHandsExecutor:
                 current = nxt
             raise CloudError("start task not READY within the poll budget")
         return Dispatched(getattr(start, "id", ""), proof, account_id, kind)
+
+    def _start_accepted(self, task: dict, start: dict) -> bool:
+        """Hand the accepted start to whoever keeps it. Returns whether it was
+        kept: a start nobody recorded has to be waited for here, as before."""
+        if self.on_start is None:
+            return False
+        try:
+            return bool(self.on_start(task, start))
+        except Exception:  # noqa: BLE001 - a record that failed is no reason to drop the start
+            log.warning("task %s: the accepted start could not be recorded",
+                        task.get("task_key"), exc_info=True)
+            return False
+
+    def follow_start(self, task: dict) -> Dispatched | None:
+        """How the start recorded on *task* (``pending_start``) stands now.
+
+        The conversation, once the service has made it - with the delivery
+        record, the account and the kind the start was asked with, so binding
+        it is what the worker that asked would have done. ``None`` while the
+        sandbox is still coming up, and when the service could not be asked
+        just now: not being able to look is not the start having failed, and
+        the claim's lease bounds how long the looking goes on. A start the
+        service reports as failed, or no longer knows, raises as a dispatch
+        does.
+
+        One question, no waiting: the scheduler asks again on its next pass.
+        """
+        start = task.get("pending_start") or {}
+        account_id = start.get("account_id") or None
+        try:
+            # The start task is known to the account that accepted it and to
+            # no other.
+            client = self._client_for_task({**task, "openhands_account_id": account_id})
+            current = client.get_start_task(str(start["start_task_id"]))
+        except CloudError as e:
+            log.warning("task %s: the start left by another worker could not be asked: %s",
+                        task.get("task_key"), type(e).__name__)
+            return None
+        if current is None or getattr(current, "failed", False):
+            reason = ("start task disappeared" if current is None
+                      else f"start task failed: {getattr(current, 'detail', '')}")
+            if account_id is None:
+                raise CloudError(reason)
+            raise DispatchError(f"CloudError: {reason}", account_id=account_id,
+                                unavailable=False)
+        conversation_id = getattr(current, "app_conversation_id", None)
+        if not conversation_id:
+            return None
+        return Dispatched(str(conversation_id), start.get("delivery") or None, account_id,
+                          str(start.get("kind") or "start"))
 
     @staticmethod
     def _tags(task: dict) -> dict[str, str]:
@@ -1093,6 +1171,8 @@ class TickResult:
     waiting: bool = False
     #: A task that did not verify was sent back to be tried again.
     retried: str | None = None
+    #: Starts another worker had asked for and left, bound in this tick.
+    followed: int = 0
     note: str = ""
 
 
@@ -1127,13 +1207,25 @@ class LabScheduler:
                  start_wait: Callable[..., float] | None = None,
                  reports: Any | None = None,
                  cycle_wait: Callable[..., float] | None = None,
-                 evidence: Any | None = None, acceptance: Any | None = None):
+                 evidence: Any | None = None, acceptance: Any | None = None,
+                 stopping: Callable[[], bool] | None = None):
         self.store = store
         self.executor = executor
         self.verifier = verifier
         self.principal = principal
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        # A start the service has accepted is kept on the task, and one that is
+        # kept is not waited for by a worker that is stopping (see
+        # ``_follow_starts``). An executor that knows neither is left alone.
+        if hasattr(executor, "on_start"):
+            executor.on_start = self._record_start
+        if stopping is not None and hasattr(executor, "stopping"):
+            executor.stopping = stopping
+        #: Says that the worker is being stopped: nothing new is claimed then.
+        self._stopping = stopping
+        #: Tasks whose start this scheduler recorded and has not settled yet.
+        self._recorded: set[str] = set()
         #: How long a task waits after the service refused to start it.
         self.start_wait = start_wait or refused_start_wait
         #: How long a task waits between two work cycles: ``(cycle, seed=...)``.
@@ -1284,6 +1376,9 @@ class LabScheduler:
             return result
         durable = run.get("policy") == "durable"
         result.reclaimed = len(self.store.reclaim_expired(run_id))
+        # A start that was accepted before the worker that asked for it was
+        # replaced: its conversation is bound here, by whoever runs now.
+        self._follow_starts(run_id, durable, result)
 
         # 0. Stop every conversation a switch or failover left behind, so a task
         #    cannot have two writers on its branch at once. The branch stays held
@@ -1303,6 +1398,12 @@ class LabScheduler:
         #    conversation the poll above just abandoned is stopped first, so a
         #    failover in this same tick is not held back by the branch lock.
         self._stop_abandoned(run_id)
+        if self._stopping is not None and self._stopping():
+            # The worker is being stopped. What is at work has been looked at;
+            # a task claimed now would be a start this process cannot see
+            # through. The next process claims it.
+            result.note = "stopping: nothing new is started"
+            return result
         task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds)
         if task is not None:
             result.claimed = task["task_key"]
@@ -1602,54 +1703,93 @@ class LabScheduler:
             result.finished = applied is not None
             result.note = "blocked: no usable account"
             return True
+        except StartLeft as left:
+            # The worker is being stopped. The service has the start and the
+            # task has its record: the worker that runs next binds the
+            # conversation. Nothing is released, nothing is started twice.
+            self._recorded.discard(str(task["id"]))
+            result.note = f"stopping: {left}"
+            return True
         except (CloudError, GitHubError) as e:
-            refused = e if isinstance(e, CloudRateLimited) else getattr(e, "refused", None)
-            if refused is not None:
-                self._start_refused(task, e, refused)
-                result.note = "start refused: rate limited"
-                return True
-            # A dispatch failure is a provider/transport problem: record the
-            # account that failed (so a failover excludes it), release the
-            # task so another attempt - or another account - can try, and
-            # keep the lease short so recovery is fast. A failure that
-            # another attempt would only repeat ends the task now, with its
-            # reason - in a bounded run. A durable one waits and tries again.
-            failed_account = self._failed_account(e, task)
-            unavailable = getattr(e, "unavailable", isinstance(e, CloudAuthError))
-            permanent = bool(getattr(e, "permanent", False))
-            again = task["attempt"] < task["max_attempts"] and not permanent
-            error = f"{type(e).__name__}: {e}"
-            if durable and not again:
-                cycle = int(task.get("cycle") or 0) + 1
-                ceiling = nexus_retry.max_cycles()
-                if ceiling and cycle >= ceiling:
-                    self.store.release_task(task["id"], error=error, requeue=False,
-                                            failed_account_id=failed_account,
-                                            lease_token=task["lease_token"])
-                else:
-                    wait = self.cycle_wait(cycle, seed=str(task["id"]))
-                    self.store.wait_task(
-                        task["id"], seconds=wait, new_cycle=True,
-                        failed_account_id=failed_account,
-                        reason=f"{error} Следующая попытка через {_span(wait)}.",
-                        lease_token=task["lease_token"])
-            else:
-                self.store.release_task(task["id"], error=error, requeue=again,
+            if str(task["id"]) in self._recorded:
+                # The start was on the row, so another worker may have seen
+                # the same failure. One of the two deals with it.
+                self._recorded.discard(str(task["id"]))
+                if not self.store.take_start(task["id"], lease_token=task["lease_token"]):
+                    result.note = "start failed: dealt with by the worker that followed it"
+                    return True
+            self._dispatch_failed(task, e, durable, result)
+            return True
+        self._recorded.discard(str(task["id"]))
+        self._bind(run_id, task, conversation_id, base_sha)
+        result.dispatched = True
+        return False
+
+    def _dispatch_failed(self, task: dict, e: Exception, durable: bool,
+                         result: TickResult) -> None:
+        """A start that did not happen: the task is released, set aside or
+        ended, by the kind of the failure. The same for a start this worker
+        asked for and for one it found recorded and followed."""
+        refused = e if isinstance(e, CloudRateLimited) else getattr(e, "refused", None)
+        if refused is not None:
+            self._start_refused(task, e, refused)
+            result.note = "start refused: rate limited"
+            return
+        # A dispatch failure is a provider/transport problem: record the
+        # account that failed (so a failover excludes it), release the
+        # task so another attempt - or another account - can try, and
+        # keep the lease short so recovery is fast. A failure that
+        # another attempt would only repeat ends the task now, with its
+        # reason - in a bounded run. A durable one waits and tries again.
+        failed_account = self._failed_account(e, task)
+        unavailable = getattr(e, "unavailable", isinstance(e, CloudAuthError))
+        permanent = bool(getattr(e, "permanent", False))
+        again = task["attempt"] < task["max_attempts"] and not permanent
+        error = f"{type(e).__name__}: {e}"
+        if durable and not again:
+            cycle = int(task.get("cycle") or 0) + 1
+            ceiling = nexus_retry.max_cycles()
+            if ceiling and cycle >= ceiling:
+                self.store.release_task(task["id"], error=error, requeue=False,
                                         failed_account_id=failed_account,
                                         lease_token=task["lease_token"])
-            if failed_account and self.router is not None:
-                self.router.note_failure(
-                    task, account_id=failed_account, error=error, unavailable=unavailable)
-            result.note = f"dispatch failed: {type(e).__name__}"
-            return True
+            else:
+                wait = self.cycle_wait(cycle, seed=str(task["id"]))
+                self.store.wait_task(
+                    task["id"], seconds=wait, new_cycle=True,
+                    failed_account_id=failed_account,
+                    reason=f"{error} Следующая попытка через {_span(wait)}.",
+                    lease_token=task["lease_token"])
+        else:
+            self.store.release_task(task["id"], error=error, requeue=again,
+                                    failed_account_id=failed_account,
+                                    lease_token=task["lease_token"])
+        if failed_account and self.router is not None:
+            self.router.note_failure(
+                task, account_id=failed_account, error=error, unavailable=unavailable)
+        result.note = f"dispatch failed: {type(e).__name__}"
+
+    def _bind(self, run_id: str, task: dict, conversation_id: str,
+              base_sha: str | None, *, start: dict | None = None) -> None:
+        """Bind the conversation a start produced to its task.
+
+        One place for the worker that asked for the start and for a worker that
+        found the start recorded and followed it (``_follow_starts``; *start*
+        is then that record, and says which account the task had before).
+        """
+        if self.store.conversation_of(task["id"]) == str(conversation_id):
+            # Another worker followed the same start and was first.
+            return
         account_id = getattr(conversation_id, "account_id", None)
         if account_id is None and task.get("openhands_account_id"):
             account_id = str(task["openhands_account_id"])
         # A switch between accounts is recorded as a hand-off, with the
         # context that was passed, so the history of an executor change is
         # durable and auditable. The "from" account is whatever this task
-        # was previously bound to or had tried.
-        previous = _last_account(task)
+        # was previously bound to or had tried - as the worker that asked for
+        # the start saw it: choosing an account may already be on the row.
+        previous = (start.get("previous_account") or None) if start is not None \
+            else _last_account(task)
         kind = getattr(conversation_id, "kind", "start")
         if (account_id and previous and previous != str(account_id)
                 and self.router is not None):
@@ -1665,8 +1805,57 @@ class LabScheduler:
                                 delivery=getattr(conversation_id, "delivery", None),
                                 account_id=account_id, base_sha=base_sha, kind=kind,
                                 lease_token=task["lease_token"])
-        result.dispatched = True
-        return False
+
+    def _record_start(self, task: dict, start: dict) -> bool:
+        """Keep an accepted start on its task (the executor's ``on_start``)."""
+        if task.get("lease_token") is None:
+            return False
+        recorded = self.store.record_start(
+            task["id"], start={**start, "base_sha": task.get("base_sha"),
+                               "previous_account": _last_account(task)},
+            lease_token=task["lease_token"])
+        if recorded:
+            self._recorded.add(str(task["id"]))
+        return recorded
+
+    def _follow_starts(self, run_id: str, durable: bool, result: TickResult) -> None:
+        """Finish the starts that were accepted and not bound.
+
+        A conversation is started in two steps, and for about a minute the
+        claim has only a start task to show. The worker that asked waits for
+        it; if that worker is gone - a deployment replaced it, it crashed - the
+        start used to be found again only when the lease ran out, a quarter of
+        an hour later, as an orphan and a second attempt. The start task is on
+        the row now, so any worker asks it how it stands: a conversation is
+        bound, a failure is handled as the failed dispatch it is, and a start
+        still on its way is asked again on the next pass.
+
+        The worker that asked may well be alive and asking too. Both read; the
+        first to see the conversation binds it and the other's write changes
+        nothing (``mark_running``).
+        """
+        follow = getattr(self.executor, "follow_start", None)
+        if follow is None:
+            return
+        for task in self.store.pending_starts(run_id):
+            try:
+                conversation_id = follow(task)
+            except (CloudError, GitHubError) as e:
+                # The worker that asked may be alive and see the same failure:
+                # whoever takes the start off the row deals with it.
+                if self.store.take_start(task["id"], lease_token=task["lease_token"]):
+                    log.info("task %s: the start left by another worker failed: %s",
+                             task["task_key"], type(e).__name__)
+                    self._dispatch_failed(task, e, durable, result)
+                continue
+            if conversation_id is None:
+                continue
+            log.info("task %s: bound conversation %s from a start left by another worker",
+                     task["task_key"], conversation_id)
+            start = task.get("pending_start") or {}
+            self._bind(run_id, task, conversation_id, start.get("base_sha") or None,
+                       start=start)
+            result.followed += 1
 
     def _set_aside(self, task: dict, reason: str, result: TickResult, *,
                    forget_tried: bool = False) -> None:

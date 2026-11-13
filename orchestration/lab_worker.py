@@ -28,7 +28,7 @@ import os
 import signal
 import sys
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
@@ -81,7 +81,8 @@ class LabWorker:
                  github: GitHubClient | None = None,
                  github_accounts: GitHubAccountService | None = None,
                  heartbeat_seconds: int = 60, account_router: Any | None = None,
-                 evidence: Any | None = None, discover_router: bool = True):
+                 evidence: Any | None = None, discover_router: bool = True,
+                 stopping: Callable[[], bool] | None = None):
         self.store = store
         self.lab = LabStore(store)
         self.client = client if client is not None else build_cloud_client(store)
@@ -124,6 +125,10 @@ class LabWorker:
         #: diagnostics; it is written on register and every tick.
         self.heartbeat_seconds = heartbeat_seconds
         self._stop = threading.Event()
+        #: The owner of the loop is stopping (the web server runs this worker
+        #: inside its own process and has its own stop). Asked together with
+        #: ``_stop`` by a start that is on its way: see ``LabScheduler``.
+        self._stopping = stopping
 
     def _client_for_account(self, account_id: str, task: dict | None = None) -> Any:
         """A client for one OpenHands account, built from its stored config.
@@ -144,7 +149,11 @@ class LabWorker:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
                             router=self.account_router, reports=self.reports,
-                            evidence=self.evidence)
+                            evidence=self.evidence, stopping=self.stopping)
+
+    def stopping(self) -> bool:
+        """Whether this worker has been told to stop."""
+        return self._stop.is_set() or bool(self._stopping is not None and self._stopping())
 
     def _find_router(self) -> None:
         """Start using stored connections once the deployment has any.
@@ -177,10 +186,15 @@ class LabWorker:
         sched = self.scheduler()
         summary: dict[str, Any] = {"runs": 0, "advanced": 0, "errors": []}
         for run_id in active_run_ids(self.store):
+            if self.stopping():
+                # Told to stop: the run in hand was finished, the rest are the
+                # next process's. Nothing about them is in this one.
+                summary["stopping"] = True
+                break
             summary["runs"] += 1
             try:
                 result = sched.tick(run_id)
-                if result.claimed or result.verified or result.finished:
+                if result.claimed or result.verified or result.finished or result.followed:
                     summary["advanced"] += 1
             except Exception as e:  # noqa: BLE001 - one bad run must not stop the loop
                 log.exception("run %s tick failed", run_id)
@@ -192,6 +206,9 @@ class LabWorker:
         for name, step in (("stops", sched.deliver_stops),
                            ("reports", self.reports.deliver_due),
                            ("executors", self._reprobe)):
+            if self.stopping():
+                summary["stopping"] = True
+                break                    # rows, all of it: owed by the next process too
             try:
                 done = step()
                 if done and any(done.values() if isinstance(done, dict) else [done]):

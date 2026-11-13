@@ -3082,6 +3082,9 @@
 
   /* ------------------------------------------------------------------ boot */
   function boot() {
+    // The login page sends a signed-in visitor here once and remembers that it
+    // did (studio/login.js). The studio opened, so the mark has done its work.
+    try { window.sessionStorage.removeItem('nexus.login.bounce'); } catch (e) { /* no storage */ }
     bindEvents();
     applyLayoutDefaults();
     renderComposer();

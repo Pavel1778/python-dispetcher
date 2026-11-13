@@ -2058,10 +2058,9 @@ A session is now extended by being used, with a hard end
   it - that address is what a browser remembers after months of signing in.
 - **What the handler says about the cookie itself stands**: the login answer and
   the logout answer carry exactly one `Set-Cookie`, never the renewal as well.
-- **A password change does not end an open session**; changing
-  `AUTH_SESSION_SECRET` ends all of them. This is documented (DEPLOY.md,
-  docs/SECURITY.md), not solved. Binding the session to the password hash would
-  solve it and sign everyone out once when deployed.
+- **A session belongs to the credentials it was opened with** (since
+  2026-11-13, next section): replacing `AUTH_PASSWORD_HASH`, `AUTH_USERNAME` or
+  `AUTH_SESSION_SECRET` ends every open session.
 
 Tests: `tests/test_auth.py`, section "session lifetime" - real server, real
 HTTP; time passes by moving the session's own times back in the database.
@@ -2123,7 +2122,7 @@ contained a verb. The router already existed (`nexus_intent.py`); this adds the
   (`loadArchive` → `/runs?archived=1`) and an `open-archived` action that shows a
   finished run's report; `S.work.keepArchived` keeps exactly that run on screen
   although the refresh drops hidden runs.
-- Migration `0034_chat_workflow.sql` is additive: the conversation workflow
+- Migration `0035_chat_workflow.sql` is additive: the conversation workflow
   columns, the `manual` mode, the `workflow_plan` jsonb, and one spec state
   (`awaiting_approval`, reserved for a future hold; today the plan is held on
   the conversation, not the spec). `REQUIRED_COLUMNS` names every new
@@ -2132,3 +2131,92 @@ contained a verb. The router already existed (`nexus_intent.py`); this adds the
   machine, the observable Manual turn, Auto unchanged, the archive, the
   terminal report, concurrency, a stale approval) and the split cases in
   `tests/test_run_reports.py`. Docs: `docs/CHAT-FIRST.md`, README.
+## What production showed on 2026-11-13, and what was changed for it
+
+Read from the production database (Supabase, read-only) the morning after the
+durable runs went live. Each item is a defect that was visible there, its
+cause, and the rule that now holds.
+
+### A start is not lost with the process that asked for it
+
+Five of the seven executions of the night were `adopted` at attempt 2, each
+exactly 900 s after its claim. Cause: `render.yaml` has `autoDeploy: true` and
+the agents push to the deployed branch, so every task that ends with a push
+replaces the server ~50 s later - while it waits for the next task's
+conversation to come up (a start takes about a minute). The start task was in
+the worker's memory only; `web_server.main` had no `SIGTERM` handler.
+
+- The accepted start is on the row: `nexus_run_tasks.pending_start` (migration
+  0034), written by `LabStore.record_start` through the executor's `on_start`
+  hook, fenced by the claim's token.
+- Every pass follows recorded starts (`LabScheduler._follow_starts` →
+  `OpenHandsExecutor.follow_start`): one question per pass, no waiting. A
+  conversation is bound through `_bind` - the same code as the normal path;
+  keep it one place. A transient error while asking is "not known yet"
+  (`None`), never a failed start.
+- `LabStore.mark_running` is a no-op for the conversation the task already
+  has. Do not "simplify" this away: two workers legitimately bind one start
+  (the one that asked is often still alive), and a second pass through
+  `mark_running` used to mean a second execution row and a stop signal for the
+  conversation at work.
+- A failed start is dealt with by whoever takes the record
+  (`LabStore.take_start`) - both the follower and the worker that asked go
+  through it, or the failure is counted against the connection twice.
+- Stopping: `SIGTERM` sets the stop flag in both entry points. A stopping
+  worker claims nothing (`LabScheduler.tick`), begins no further run
+  (`LabWorker.tick_once`) and raises `StartLeft` instead of waiting for a
+  recorded start. `StartLeft` is deliberately not a `CloudError`: nothing is
+  released. `App.stop` waits `LAB_STOP_GRACE` (20 s) for the lab loop before
+  closing the store.
+- Not covered, by design: a kill before the service answered the start
+  request. The lease (900 s) and the adopt path still handle it.
+- Tests: `tests/test_start_handover.py` (real `web_server` and `lab_worker`
+  processes, `SIGTERM` and `SIGKILL`), two-worker cases in
+  `tests/test_openhands_failover.py`. `docs/DURABLE-RUNS.md`, "A start outlives
+  the worker that asked for it".
+
+### A signed-in owner who follows a link from another site gets the studio
+
+The cookie is `SameSite=Strict`, so a navigation from another site arrives
+without it and was answered with the login form - to an owner whose session
+was fine. `GET /login/state` (public, one bit, `no-store`, never an error) is
+asked by `/static/login.js` from the login page, which then does
+`location.replace('/' + location.hash)`. A `sessionStorage` mark (10 s) stops
+a loop when the next navigation is refused all the same; `boot()` in `app.js`
+clears it. The cookie stays `Strict` - do not relax it to make this simpler.
+Tests: `tests/test_auth.py` ("signed in already, at the form") and three
+Chromium journeys across two sites in `tests/test_browser_e2e.py`.
+
+### A session belongs to its credentials
+
+`AuthService._session_key` binds the HMAC key of the stored token hash to
+`AUTH_USERNAME` and the (whitespace-free) `AUTH_PASSWORD_HASH`. Replacing
+either ends every open session; a deployment that changes neither ends none.
+There is no migration and no fallback to the old key on purpose: a fallback
+would keep honouring sessions opened before a password change. Deploying this
+ended the sessions open at that moment, once (production had none alive).
+Tests: `tests/test_auth.py`, "a session and its credentials" - a second server
+on the same database, as a deployment starts one.
+
+### Housekeeping that never ran, and a trail nobody wanted
+
+- `App._maybe_sweep` goes by the clock (at start, then every
+  `_sweep_interval` = 300 s) and runs after a pass whatever became of the
+  pass. It counted passes (every 60th, from the start of the process); a pass
+  takes ~2 minutes in production and the server is replaced several times an
+  hour, so an expired session was still in the table 100 minutes later.
+- `PostgresStore.set_workflow_state` leaves a workflow that is already in the
+  state alone: no `workflow_state` event, `updated_at` unchanged. The verifier
+  names the state of every open workflow on every pass; four idle workflows
+  wrote 2 891 events in a day.
+- `LabStore.register_worker` restarts `started_at` on re-registration, as its
+  docstring always said.
+
+### What production had not exercised by then
+
+Stated so that nobody reads "deployed" as "seen working": the stop signal on
+cancel (0 rows in `nexus_executor_stops`), failover between connections,
+several repositories in one project, project executors, the intent router and
+the new session rules had not run live by 2026-11-13 09:40 UTC. They are
+covered by tests against the fake Cloud only.
+

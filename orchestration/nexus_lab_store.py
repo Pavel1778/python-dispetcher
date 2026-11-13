@@ -718,6 +718,7 @@ class LabStore:
         out["verification"] = _loads(out.get("verification"))
         out["spec_ref"] = _loads(out.get("spec_ref"))
         out["tried_accounts"] = _loads(out.get("tried_accounts")) or []
+        out["pending_start"] = _loads(out.get("pending_start"))
         if out.get("openhands_account_id") is not None:
             out["openhands_account_id"] = str(out["openhands_account_id"])
         if out.get("preferred_account_id") is not None:
@@ -821,12 +822,82 @@ class LabStore:
                         "WHERE id=%s", (run_id,))
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='dispatched', attempt=attempt+1, "
-                "conversation_id=NULL, retry_at=NULL, wait_reason=NULL, "
+                "conversation_id=NULL, retry_at=NULL, wait_reason=NULL, pending_start=NULL, "
                 "lease_owner=%s, lease_token=lease_token+1, "
                 "lease_expires=now() + (%s || ' seconds')::interval, updated_at=now() "
                 "WHERE id=%s RETURNING *",
                 (worker_id, lease_seconds, task["id"]))
             return self._task_row(cur.fetchone())
+
+    def conversation_of(self, task_id: str) -> str | None:
+        """The conversation bound to the task now, if any."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT conversation_id FROM nexus_run_tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            return str(row["conversation_id"]) if row and row["conversation_id"] else None
+
+    def record_start(self, task_id: str, *, start: dict, lease_token: int) -> bool:
+        """Keep the start the executor's service has accepted for this claim.
+
+        Starting a conversation has two phases: the service takes the start and
+        names a start task, and the conversation exists when the sandbox is
+        ready - about a minute later. Until then the claim has nothing to show
+        but the lease, and a worker replaced inside that minute used to take
+        the start with it (see migration 0034). With the start task on the row,
+        whoever runs next finishes the start instead of waiting out the lease.
+
+        *start* names the ``start_task_id`` and what binding the conversation
+        will need: the ``account_id`` that accepted it, the ``kind`` of the
+        attempt, the ``base_sha`` it began from and the ``delivery`` record.
+        The claim's token is stored with it; the record counts only while the
+        task still carries that token. Returns whether it was written - it is
+        not when the claim was taken away meanwhile.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_run_tasks SET pending_start=%s::jsonb, updated_at=now() "
+                "WHERE id=%s AND lease_token=%s AND state='dispatched' "
+                "AND conversation_id IS NULL",
+                (_jsonb({**start, "lease_token": int(lease_token)}), task_id,
+                 int(lease_token)))
+            return cur.rowcount == 1
+
+    def take_start(self, task_id: str, *, lease_token: int) -> bool:
+        """Take the recorded start off the task, to deal with its failure.
+
+        A start that failed may be seen by two workers - the one that asked,
+        still waiting for it, and one that followed it. The failure is dealt
+        with once: by the worker this returns True to. (Binding needs no such
+        gate: binding the same conversation twice changes nothing.)
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_run_tasks SET pending_start=NULL, updated_at=now() "
+                "WHERE id=%s AND lease_token=%s AND state='dispatched' "
+                "AND conversation_id IS NULL AND pending_start IS NOT NULL",
+                (task_id, int(lease_token)))
+            return cur.rowcount == 1
+
+    def pending_starts(self, run_id: str) -> list[dict]:
+        """Claimed tasks whose start was accepted and whose conversation is not
+        bound yet - by this worker or by any other.
+
+        Following a start is reading: the start task is asked how it stands,
+        and the conversation it produced is bound once, by the first to see it
+        (``mark_running`` makes the second a no-op). So a start is not lost
+        with the process that asked for it, the same way a conversation is not
+        (``reclaim_expired``). The lease still bounds it: a start that has
+        produced nothing when the claim runs out is taken back as before.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT * FROM nexus_run_tasks WHERE run_id=%s AND state='dispatched' "
+                "AND conversation_id IS NULL AND pending_start IS NOT NULL "
+                "AND pending_start->>'start_task_id' <> '' "
+                "AND (pending_start->>'lease_token')::bigint = lease_token "
+                "AND lease_expires IS NOT NULL AND lease_expires > now() "
+                "ORDER BY updated_at, id", (run_id,))
+            return [self._task_row(row) for row in cur.fetchall()]
 
     def mark_running(self, task_id: str, *, conversation_id: str | None = None,
                      delivery: dict | None = None,
@@ -857,16 +928,26 @@ class LabStore:
         ``continue`` in the conversation it already had, a ``handoff`` to
         another executor, an ``adopted`` orphan). Both go into the task's
         execution history together with the executor's name as it is now.
+
+        Binding the conversation the task already has changes nothing. A start
+        that two processes followed (``pending_starts``) is bound by whichever
+        saw it first; the other's call is this no-op - not a second entry in
+        the history, and not a stop signal for the conversation at work.
         """
         proof = _jsonb(delivery) if delivery else None
         fence = "AND lease_token=%s" if lease_token is not None else ""
         params: list[Any] = [conversation_id, account_id, account_id, proof, proof,
                              conversation_id, conversation_id, conversation_id,
                              conversation_id, conversation_id, conversation_id,
-                             conversation_id, base_sha, task_id]
+                             conversation_id, conversation_id, base_sha, task_id]
         if lease_token is not None:
             params.append(lease_token)
         with self.store._tx() as cur:
+            if conversation_id:
+                cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s FOR UPDATE", (task_id,))
+                held = cur.fetchone()
+                if held is not None and str(held["conversation_id"] or "") == str(conversation_id):
+                    return self._task_row(held)
             cur.execute("UPDATE nexus_run_tasks SET "
                         "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
                         "conversation_id=COALESCE(%s, conversation_id), "
@@ -886,6 +967,8 @@ class LabStore:
                         "resume_conversation_id = CASE WHEN %s::text IS NULL THEN "
                         "  resume_conversation_id ELSE NULL END, "
                         "resume_note = CASE WHEN %s::text IS NULL THEN resume_note ELSE NULL END, "
+                        "pending_start = CASE WHEN %s::text IS NULL THEN pending_start "
+                        "  ELSE NULL END, "
                         "base_sha = COALESCE(%s, base_sha), "
                         "updated_at=now() "
                         f"WHERE id=%s {fence} RETURNING *",
@@ -1895,7 +1978,14 @@ class LabStore:
 
     # -------------------------------------------------------- worker heartbeat
     def register_worker(self, worker_id: str, *, kind: str = "worker") -> None:
-        """Record that a worker is running (upsert; also restarts the clock)."""
+        """Record that a worker is running (upsert; also restarts the clock).
+
+        A process registers once, when it starts, so ``started_at`` is when the
+        process that is running now started - under a name another process had
+        before it, too. (It used to keep the time of the very first process of
+        that name: the diagnostics showed a server replaced an hour ago as
+        running since last week.)
+        """
         if kind not in ("worker", "inline"):
             raise ValueError("kind must be 'worker' or 'inline'")
         with self.store._tx() as cur:
@@ -1903,7 +1993,7 @@ class LabStore:
                 "INSERT INTO nexus_lab_workers(worker_id, kind, state, started_at, "
                 "  heartbeat_at) VALUES (%s,%s,'running',now(),now()) "
                 "ON CONFLICT (worker_id) DO UPDATE SET kind=EXCLUDED.kind, state='running', "
-                "  heartbeat_at=now()", (worker_id, kind))
+                "  started_at=now(), heartbeat_at=now()", (worker_id, kind))
 
     def heartbeat(self, worker_id: str, *, error: str | None = None) -> None:
         with self.store._tx() as cur:

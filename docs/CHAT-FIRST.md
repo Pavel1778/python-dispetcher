@@ -112,7 +112,7 @@ and, just as important, the three shapes that only *look* like one:
   offer and the approval bound to its version.
 - `orchestration/web_server.py` — the Manual turn (`_manual_turn`), the launch
   (`_launch_initial`), the run/archive routes.
-- `migrations/0034_chat_workflow.sql` — the conversation workflow columns and
+- `migrations/0035_chat_workflow.sql` — the conversation workflow columns and
   the `manual` mode.
 
 ## Tests
