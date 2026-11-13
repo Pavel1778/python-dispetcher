@@ -1766,12 +1766,25 @@ Tests: `tests/test_durable_runs.py`, `test_run_reports.py`,
 `test_openhands_connections.py` (connections and project executors), the HTTP cases in
 `test_lab_inline.py`, and the studio journeys in `test_browser_e2e.py`.
 
-Not verified against the live services: nothing here was run against a real
-OpenHands Cloud account or a real GitHub repository - this was written without
-credentials for either. The Cloud's sandbox pause, `/interrupt` on an
-agent-server and the events query used for the stall check are taken from the
-OpenHands source and its OpenAPI description, and exercised only against the
-stand-in servers in `tests/`.
+Not verified against the live services before the merge: this was written
+without credentials for OpenHands; GitHub was exercised read-only. The Cloud's
+sandbox pause and `/interrupt` on an agent-server are taken from the OpenHands
+source and its OpenAPI description, and exercised only against the stand-in
+servers in `tests/`. Seen working on the live service after the deploy
+(2026-11-12): the events query of the stall check, a run completing with its
+report written and delivered to its chat once.
+
+**A report says "done" only of what NEXUS saw** (`nexus_reports.build_report`,
+`outcome`). The first report the live service produced said "выполнено" for a
+run whose agent had written "the push was refused (403)": the agent named the
+unchanged head, which is all `GitVerifier` asks for. The headline is now
+`no_changes` ("изменений в репозитории нет - результат не подтверждён") when no
+branch moved, and `unconfirmed` when the starting commit is not known. The run
+itself still completes in that case - the rule of acceptance is `main`'s and
+was not changed. Do not add a success wording to the report that does not
+depend on `moved`; and if acceptance is ever tightened ("the branch must have
+moved"), a task that legitimately changes nothing needs a way to say so, or a
+durable run will start it for ever.
 
 ## The acceptance suite, sections A-G (this session)
 
@@ -2016,3 +2029,39 @@ agents. Now the mode is a **default** and the message decides.
 - Tests: `tests/test_intent_router.py` (the acceptance table, the shape rules,
   the safe defaults, and the observable HTTP behaviour) and the conversational
   journeys in `tests/test_browser_e2e.py`.
+## How long a login lasts: sliding sessions (2026-11-12)
+
+The owner reported being signed out "about once every 24 hours". The cause was
+not a fault: `web_auth.SESSION_TTL_SECONDS` was `12 * 3600`, the session row
+expired exactly twelve hours after the login whether it was used or not
+(`get_session` wrote only `last_seen`), the cookie had the same `Max-Age`, and
+there was no setting for either. Opening the studio once a day meant signing in
+every day. Sessions are in PostgreSQL and `AUTH_SESSION_SECRET` is stable, so a
+deploy or a restart never signed anyone out - do not look there first.
+
+A session is now extended by being used, with a hard end
+(`AUTH_SESSION_TTL_SECONDS`, 30 days from the last request;
+`AUTH_SESSION_MAX_SECONDS`, 90 days from the login). Rules that keep it right:
+
+- **One statement decides** (`PostgresStore.get_session`): it locks the row,
+  judges it by the limits passed *now* (not only by the stored `expires_at`),
+  and rewrites the expiry when that differs from the stored one by at least the
+  step (`AuthService.renew_step`, an hour for limits measured in days). The step
+  applies in both directions. Without it downwards, a request that began just
+  before the one that renewed computes an expiry a moment earlier and answers
+  with a second cookie (`test_requests_arriving_together_renew_the_cookie_once`).
+- **The cookie is renewed with the session**, or the browser drops it while the
+  server would still honour it. `Handler._session` notes the renewal and
+  `_json`, `_html` and `_redirect` send it. Never put it on an answer a cache
+  may keep: `_static` does not carry it, and a new response helper may take it
+  only if it says `no-store`. `/login` redirecting a signed-in owner must carry
+  it - that address is what a browser remembers after months of signing in.
+- **What the handler says about the cookie itself stands**: the login answer and
+  the logout answer carry exactly one `Set-Cookie`, never the renewal as well.
+- **A password change does not end an open session**; changing
+  `AUTH_SESSION_SECRET` ends all of them. This is documented (DEPLOY.md,
+  docs/SECURITY.md), not solved. Binding the session to the password hash would
+  solve it and sign everyone out once when deployed.
+
+Tests: `tests/test_auth.py`, section "session lifetime" - real server, real
+HTTP; time passes by moving the session's own times back in the database.

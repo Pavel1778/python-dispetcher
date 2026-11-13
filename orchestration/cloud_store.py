@@ -1828,21 +1828,71 @@ class PostgresStore:
                 (token_hash, username, csrf_token, ttl_seconds),
             )
 
-    def get_session(self, token_hash: str) -> dict[str, Any] | None:
-        """Return the live session row, or ``None``. Expired rows are ignored."""
+    def get_session(self, token_hash: str, *, ttl_seconds: int | None = None,
+                    max_seconds: int | None = None,
+                    renew_step_seconds: int = 1) -> dict[str, Any] | None:
+        """Return the live session row, or ``None``. Expired rows are ignored.
+
+        Reading a session is using it, and with *ttl_seconds* the session is
+        sliding:
+
+        * it is live only while it was used within the last *ttl_seconds* and
+          was opened within the last *max_seconds* - by the limits passed now,
+          whatever its stored expiry says, so lowering a limit takes effect at
+          once;
+        * its expiry moves to ``now + ttl_seconds``, never past ``created_at +
+          max_seconds``. It is rewritten only when that differs from the stored
+          one by at least *renew_step_seconds*: later (a page that polls every
+          few seconds does not rewrite it every few seconds) or earlier (a
+          limit was lowered).
+
+        The result carries ``renewed`` - the expiry was rewritten, so the
+        browser's cookie has to be renewed too - and ``seconds_left``.
+
+        One statement: the row is locked, judged and written together, so of
+        several requests arriving at once exactly one reports the renewal. The
+        step is what makes that hold in both directions: a request that began
+        a moment *before* the one that renewed, and got the row after it,
+        computes an expiry a moment earlier than the stored one - which is not
+        a lowered limit, and must not be answered with a second cookie.
+        Without *ttl_seconds* nothing but ``last_seen`` is written.
+        """
         with self._tx() as cur:
             cur.execute(
-                "SELECT username, csrf_token, expires_at FROM sessions "
-                "WHERE token_hash=%s AND expires_at > now()",
-                (token_hash,),
-            )
-            row = cur.fetchone()
-            if row is not None:
-                cur.execute(
-                    "UPDATE sessions SET last_seen=now() WHERE token_hash=%s",
-                    (token_hash,),
+                """
+                WITH live AS (
+                    SELECT token_hash, expires_at AS was,
+                           CASE WHEN %(ttl)s::float8 IS NULL THEN expires_at
+                                ELSE LEAST(
+                                    now() + make_interval(secs => %(ttl)s::float8),
+                                    COALESCE(created_at
+                                             + make_interval(secs => %(max)s::float8),
+                                             'infinity'))
+                           END AS want
+                    FROM sessions
+                    WHERE token_hash = %(hash)s AND expires_at > now()
+                      AND (%(ttl)s::float8 IS NULL
+                           OR last_seen + make_interval(secs => %(ttl)s::float8) > now())
+                      AND (%(max)s::float8 IS NULL
+                           OR created_at + make_interval(secs => %(max)s::float8) > now())
+                    FOR UPDATE
                 )
-        return row
+                UPDATE sessions s
+                SET last_seen = now(),
+                    expires_at = CASE
+                        WHEN live.want >= live.was + make_interval(secs => %(step)s::float8)
+                             OR live.want <= live.was - make_interval(secs => %(step)s::float8)
+                        THEN live.want ELSE s.expires_at END
+                FROM live
+                WHERE s.token_hash = live.token_hash
+                RETURNING s.username, s.csrf_token, s.expires_at,
+                          (s.expires_at <> live.was) AS renewed,
+                          EXTRACT(EPOCH FROM (s.expires_at - now()))::float8 AS seconds_left
+                """,
+                {"hash": token_hash, "ttl": ttl_seconds, "max": max_seconds,
+                 "step": max(1, int(renew_step_seconds))},
+            )
+            return cur.fetchone()
 
     def delete_session(self, token_hash: str) -> None:
         with self._tx() as cur:

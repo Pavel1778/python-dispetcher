@@ -70,8 +70,14 @@ services:
       - key: AUTH_PASSWORD_HASH
         sync: false
       # Required. Separate secret that signs sessions. Not the API key.
+      # Changing it signs every device out.
       - key: AUTH_SESSION_SECRET
         sync: false
+      # Optional, not listed as keys so that the defaults apply: how long a
+      # login lasts, in seconds. AUTH_SESSION_TTL_SECONDS (default 2592000, 30
+      # days) is counted from the last request, AUTH_SESSION_MAX_SECONDS
+      # (default 7776000, 90 days) from the login. See DEPLOY.md, "How long a
+      # login lasts".
       # Required. Bearer token that guards the machine API and the public bind.
       # Distinct from the login; a machine client sends it instead of a session.
       - key: WEB_AUTH_TOKEN
