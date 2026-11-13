@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -631,3 +633,129 @@ def test_a_first_start_is_not_probed_for_authorization(store, service, clouds):
     sched.tick(str(run["id"]))
     assert client_a.auth_probes == 0, "a first start must not be probed"
     assert len(client_a.started) == 1, "the first start must go through"
+
+
+# -- a start that two workers are looking at ------------------------------------
+#
+# A start is accepted first and has its conversation later, and since the start
+# task is kept on the task's row (migration 0034) a second worker may be asking
+# it beside the one that asked for the start.
+class TwoStepClient(AccountClient):
+    """An account that starts a conversation as the live service does: the
+    start is accepted, and how it ends is known later - when the test says."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.outcome: str | None = None          # None: the sandbox is coming up
+        self.asked = 0
+        self.conversation: str | None = None
+
+    def start_conversation(self, **kw):
+        ready = super().start_conversation(**kw)
+        self.conversation = ready.app_conversation_id
+        return StartTask(id=f"{self.name}-start-{len(self.started)}",
+                         status=StartStatus.WORKING.value)
+
+    def get_start_task(self, start_id):
+        self.asked += 1
+        if self.outcome == "failed":
+            return StartTask(id=start_id, status=StartStatus.ERROR.value,
+                             detail="the sandbox did not come up")
+        if self.outcome == "ready":
+            return StartTask(id=start_id, status=StartStatus.READY.value,
+                             app_conversation_id=self.conversation)
+        return StartTask(id=start_id, status=StartStatus.WORKING.value)
+
+
+def _wait(read, what: str, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = read()
+        if value:
+            return value
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def _account(service, account_id) -> dict:
+    return next(a for a in service.list_accounts(PRINCIPAL) if str(a["id"]) == str(account_id))
+
+
+def _asked_and_followed(store, service, clouds):
+    """One account, one task, and two workers on it: the first has asked for
+    the start and is waiting for it (in a thread of its own, as a process
+    would be); the second finds the start on the row."""
+    va = service.add(PRINCIPAL, label="A", api_key="sk-a", base_url=clouds[0].base_url)
+    client = TwoStepClient("A")
+    pool = AccountPool(store, service)
+    pool.set_config(PRINCIPAL, selection_mode="failover")
+    lab = LabStore(store)
+    router = AccountRouter(store, pool=pool, lab=lab, principal=PRINCIPAL)
+
+    def worker(name: str, poll: float) -> LabScheduler:
+        executor = OpenHandsExecutor(None, router=router, poll_interval=poll,
+                                     client_factory=lambda account_id, task=None: client)
+        return LabScheduler(lab, executor, StubVerifier(), worker_id=name, router=router)
+
+    project, run, _ = _make_run(store)
+    run_id = str(run["id"])
+    asked, followed = worker("asked", 1.0), worker("followed", 0.05)
+    waiting = threading.Thread(target=asked.tick, args=(run_id,), daemon=True)
+    waiting.start()
+    _wait(lambda: lab.pending_starts(run_id), "the accepted start to be on the row")
+    # The second worker looks: the sandbox is not there yet, nothing changes.
+    assert followed.tick(run_id).followed == 0
+    assert _task(lab, project, run)["state"] == "dispatched"
+    # From just after the first worker looked: the second is the next to look.
+    seen = client.asked
+    _wait(lambda: client.asked > seen, "the worker that asked to look again")
+    return va, client, lab, project, run, followed, waiting
+
+
+def test_a_failed_start_that_two_workers_saw_is_one_failure(store, service, clouds):
+    """Both see the start fail. The task is released once in any case (the
+    release is fenced); what was not fenced is the account's record - the
+    failure would stand in its error list twice."""
+    va, client, lab, project, run, followed, waiting = _asked_and_followed(
+        store, service, clouds)
+    client.outcome = "failed"
+    followed.tick(str(run["id"]))
+    task = _task(lab, project, run)
+    assert task["state"] != "dispatched"
+    assert "start task failed: the sandbox did not come up" in (task["last_error"] or "")
+    assert task["tried_accounts"] == [str(va["id"])]
+    assert _account(service, va["id"])["error_count"] == 1
+
+    # The worker that asked sees the same failure at its next look, and has
+    # nothing left to do about it.
+    waiting.join(timeout=10)
+    assert not waiting.is_alive()
+    assert _account(service, va["id"])["error_count"] == 1, "one failure, counted once"
+    assert _task(lab, project, run)["tried_accounts"] == [str(va["id"])]
+    assert len(client.started) == 1
+
+
+def test_a_start_that_two_workers_saw_come_up_is_bound_once(store, service, clouds):
+    """The other outcome, through the same two workers: the conversation is
+    there, both come to bind it, and the task has one conversation, one entry
+    in its history and no stop signal."""
+    va, client, lab, project, run, followed, waiting = _asked_and_followed(
+        store, service, clouds)
+    client.status = "running"
+    client._conversations[client.conversation]["status"] = "running"
+    client.outcome = "ready"
+    assert followed.tick(str(run["id"])).followed == 1
+    task = _task(lab, project, run)
+    assert task["state"] == "running" and task["conversation_id"] == client.conversation
+    assert task["attempt"] == 1 and str(task["openhands_account_id"]) == str(va["id"])
+    waiting.join(timeout=10)
+    assert not waiting.is_alive()
+    with store._tx() as cur:
+        cur.execute("SELECT kind, attempt, conversation_id, outcome FROM nexus_task_executions")
+        history = [tuple(row.values()) for row in cur.fetchall()]
+        cur.execute("SELECT count(*) AS n FROM nexus_executor_stops")
+        stops = cur.fetchone()["n"]
+    assert history == [("start", 1, client.conversation, None)]
+    assert stops == 0
+    assert len(client.started) == 1 and _account(service, va["id"])["error_count"] == 0
+

@@ -62,6 +62,7 @@ import logging
 import os
 import re
 import socket
+import signal
 import threading
 import time
 import urllib.parse
@@ -166,6 +167,10 @@ UUID_RE = re.compile(
 #: allowed, markup that slipped through an escaping bug still cannot run code or
 #: send data anywhere. ``style-src 'self'`` is why the UI never emits a ``style``
 #: attribute and sets dynamic sizes through the CSSOM instead.
+#: How long a stopping server waits for the pass that advances runs. A
+#: platform gives a process about thirty seconds between SIGTERM and SIGKILL.
+LAB_STOP_GRACE = 20.0
+
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "
     "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; "
@@ -540,7 +545,13 @@ class App:
         self.spec_planner.wake()
         for loop in (self._loop, self._lab_loop, self._plan_loop):
             if loop:
-                loop.join(timeout=5)
+                # The pass that advances runs is given the time to finish what
+                # it has in hand: closing the store under it would lose what it
+                # was about to write (a start it has just been given, a
+                # verdict). It does not wait for a conversation to come up -
+                # that is left to the next process (``LabScheduler``) - so this
+                # is seconds, inside what a platform allows a stopping process.
+                loop.join(timeout=LAB_STOP_GRACE if loop is self._lab_loop else 5)
         self.store.close()
 
     def _run_planning(self) -> None:
@@ -598,7 +609,11 @@ class App:
                                       client=self.client, github=self.github,
                                       github_accounts=self.github_accounts,
                                       account_router=build_account_router(self.store),
-                                      evidence=self.evidence)
+                                      evidence=self.evidence,
+                                      # A start that is on its way when the
+                                      # server is stopped is left, recorded, to
+                                      # the process that replaces this one.
+                                      stopping=self._stop.is_set)
                     # Known to the diagnostics as a live worker (migration 0023):
                     # a server that advances runs is one. Its heartbeat is
                     # written by every pass.
@@ -3994,13 +4009,23 @@ def main() -> int:
                 "at an empty database.")
         return 2
     server = WebServer(app, args.host, args.port)
+
+    def _terminate(signum, frame):
+        # How a platform stops a process - every deployment sends this to the
+        # one it replaces. Without a handler Python dies on the spot, in the
+        # middle of whatever the loops were writing. It is the same request as
+        # Ctrl-C: finish what is in hand, then leave.
+        raise KeyboardInterrupt
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate)
     server.start()
-    print(f"listening on http://{args.host}:{server.port}")
+    print(f"listening on http://{args.host}:{server.port}", flush=True)
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        pass
+        print("stopping: finishing the pass in hand", flush=True)
     finally:
         server.stop()
     return 0
