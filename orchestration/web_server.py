@@ -545,15 +545,18 @@ class App:
     def stop(self) -> None:
         self._stop.set()
         self.spec_planner.wake()
-        for loop in (self._loop, self._lab_loop, self._plan_loop):
+        # The pass that advances runs is given the time to finish what it has
+        # in hand: closing the store under it would lose what it was about to
+        # write (a start it has just been given, a verdict). It does not wait
+        # for a conversation to come up - that is left to the next process
+        # (``LabScheduler``) - so this is seconds. It is waited for first, and
+        # the whole stop stays inside ``LAB_STOP_GRACE``: a platform gives a
+        # stopping process about half a minute before it kills it.
+        deadline = time.monotonic() + LAB_STOP_GRACE
+        for loop in (self._lab_loop, self._loop, self._plan_loop):
             if loop:
-                # The pass that advances runs is given the time to finish what
-                # it has in hand: closing the store under it would lose what it
-                # was about to write (a start it has just been given, a
-                # verdict). It does not wait for a conversation to come up -
-                # that is left to the next process (``LabScheduler``) - so this
-                # is seconds, inside what a platform allows a stopping process.
-                loop.join(timeout=LAB_STOP_GRACE if loop is self._lab_loop else 5)
+                left = max(0.2, deadline - time.monotonic())
+                loop.join(timeout=left if loop is self._lab_loop else min(5.0, left))
         self.store.close()
 
     def _run_planning(self) -> None:

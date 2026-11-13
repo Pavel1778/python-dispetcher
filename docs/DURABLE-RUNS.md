@@ -110,9 +110,17 @@ Now:
   back and the old path applies (a new attempt that first looks for a
   conversation with the task's tags).
 
-What it does not cover: a process killed *before* the service answered the
-start request has nothing to record. If the service did create the start, that
-is found the old way, when the lease runs out.
+What it does not cover:
+
+- A process killed *before* the service answered the start request has
+  nothing to record. If the service did create the start, that is found the
+  old way, when the lease runs out.
+- A run cancelled while a start is on its way: the worker that asked binds the
+  conversation when it comes up and records its stop signal, as before. If
+  that worker is gone in the same minute, nobody follows the start of a
+  cancelled run (only starts of claimed tasks are followed), and the
+  conversation is not told to stop. Two things at once in one minute; not
+  seen, and not closed.
 
 `tests/test_start_handover.py` replaces real processes at that moment - the
 web server by `SIGTERM`, the worker by `SIGKILL` and `SIGTERM`, and two workers
