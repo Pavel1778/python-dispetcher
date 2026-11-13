@@ -39,6 +39,7 @@ from typing import Any
 from .cloud_store import NotFound, PostgresStore
 from .nexus_conversations import ConversationService
 from .nexus_projects import ProjectService
+from .nexus_specs import split_context
 
 log = logging.getLogger("nexus_reports")
 
@@ -107,6 +108,20 @@ def _accepted(task: dict) -> dict:
         if isinstance(item, dict) and item.get("remote_sha"):
             return item
     return {}
+
+
+def _quote_message(message: str, conversation: str) -> str:
+    """The task of a run that a short chat message started, as a report quotes
+    it: the message, and a line saying that the conversation went with it.
+
+    The conversation itself is not quoted. It is right above the report in the
+    chat, and a report that carried it would put it there twice - and into the
+    next task that takes this report along.
+    """
+    return _quote(message[:TASK_QUOTE_CHARS].rstrip() or "…") + (
+        "\n\n_Сообщение короткое, поэтому в задание вошла и предшествующая переписка "
+        f"этого чата ({len(conversation)} символов): планировщик и агенты получили её "
+        "вместе с сообщением._")
 
 
 def build_report(*, run: dict, task_text: str, task_meta: dict | None,
@@ -351,7 +366,14 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
     # -------------------------------------------------------------- the task
     text = task_text or ""
     meta = task_meta or {}
-    if len(text) > TASK_QUOTE_CHARS:
+    # A short chat message took its conversation with it into the task
+    # (``nexus_chat.task_with_context``). The report quotes the message: the
+    # conversation is right above it in the chat, and quoting it here would
+    # put it there twice - and into the next task that takes this report along.
+    message, conversation = split_context(text)
+    if conversation is not None:
+        quoted = _quote_message(message, conversation)
+    elif len(text) > TASK_QUOTE_CHARS:
         size = meta.get("chars") or len(text)
         digest = str(meta.get("sha256") or "")[:12]
         quoted = _quote(text[:TASK_QUOTE_CHARS].rstrip()) + (
@@ -498,6 +520,17 @@ class ReportService:
         if reason:
             status += f"\n\nПричина: {reason}"
 
+        # A short chat message took its conversation with it into the task
+        # (``nexus_chat.task_with_context``): the message is what is quoted,
+        # exactly as in the report of a run that completed.
+        message, conversation = split_context(text)
+        if conversation is not None:
+            quoted = _quote_message(message, conversation)
+        elif text.strip():
+            quoted = _quote(_clip(text, TASK_QUOTE_CHARS))
+        else:
+            quoted = "_Текст задания не сохранён._"
+
         counts: dict[str, int] = {}
         for task in tasks:
             counts[task["state"]] = counts.get(task["state"], 0) + 1
@@ -507,7 +540,7 @@ class ReportService:
             f"Прогон `{run_id[:8]}` · итог: {headline} · задач: {len(tasks)} · "
             f"завершено: {done}",
             "### Исходное задание",
-            _quote(_clip(text, TASK_QUOTE_CHARS)) if text.strip() else "_Текст задания не сохранён._",
+            quoted,
             "### Что успело сделаться",
             "\n".join(
                 f"{i}. **{_clip(t.get('title') or t['task_key'], 160)}** — "

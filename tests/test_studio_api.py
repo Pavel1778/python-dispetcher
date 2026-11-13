@@ -223,8 +223,9 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     assert body["openhands"] == {"server_key": True, "transport": "direct"}
     assert body["github"] == {"server_token": True}
     assert body["accounts"] == {"encryption_key": True}
-    # This server does not advance autonomous runs unless it is told to.
-    assert body["lab"] == {"inline": False}
+    # This server does not advance autonomous runs unless it is told to. The
+    # OpenHands conversations of a finished run are deleted a day later.
+    assert body["lab"] == {"inline": False, "cleanup_hours": 24.0}
     assert isinstance(body["version"], str) and body["version"]
     # The page asks on every load, so the answer must not depend on OpenHands
     # being reachable: no request reaches the Cloud API.

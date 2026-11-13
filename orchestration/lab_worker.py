@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from typing import Any, Callable
 
 from .cloud_direct import build_cloud_client
@@ -41,6 +42,12 @@ from .nexus_reports import ReportService
 from .nexus_specs import SpecService
 
 log = logging.getLogger("lab_worker")
+
+#: How often the worker deletes OpenHands conversations of ended runs that
+#: are owed a deletion, and how often it looks through the runs for
+#: conversations that have become owed one. Seconds.
+CLEANUP_INTERVAL_SECONDS = 30.0
+CLEANUP_SWEEP_SECONDS = 600.0
 
 
 def build_evidence_service(store: PostgresStore) -> Any | None:
@@ -107,6 +114,9 @@ class LabWorker:
         self.executor = OpenHandsExecutor(
             self.client, specs=SpecService(store), router=account_router,
             client_factory=self._client_for_account if account_router else None)
+        # A conversation is deleted with the key it was started with, whether
+        # or not that connection is still given work (``OpenHandsExecutor.remove``).
+        self.executor.account_client = self._client_for_account
         # A completed run's report: written with the completion, delivered to
         # the chat the run was started from.
         self.reports = ReportService(store)
@@ -129,6 +139,12 @@ class LabWorker:
         #: inside its own process and has its own stop). Asked together with
         #: ``_stop`` by a start that is on its way: see ``LabScheduler``.
         self._stopping = stopping
+        #: When the conversations of ended runs are next deleted, and when the
+        #: runs are next looked through for conversations that have become
+        #: owed a deletion (``_cleanup``). On the monotonic clock; both are due
+        #: on the first pass, so a restart does not put the work off.
+        self._cleanup_at = 0.0
+        self._cleanup_sweep_at = 0.0
 
     def _client_for_account(self, account_id: str, task: dict | None = None) -> Any:
         """A client for one OpenHands account, built from its stored config.
@@ -205,7 +221,8 @@ class LabWorker:
         # not yet in their chat, and a look at executors that were written off.
         for name, step in (("stops", sched.deliver_stops),
                            ("reports", self.reports.deliver_due),
-                           ("executors", self._reprobe)):
+                           ("executors", self._reprobe),
+                           ("cleanup", lambda: self._cleanup(sched))):
             if self.stopping():
                 summary["stopping"] = True
                 break                    # rows, all of it: owed by the next process too
@@ -221,6 +238,28 @@ class LabWorker:
         last_error = summary["errors"][-1] if summary["errors"] else None
         self.lab.heartbeat(self.worker_id, error=last_error)
         return summary
+
+    def _cleanup(self, sched: LabScheduler) -> dict[str, int] | None:
+        """Delete the OpenHands conversations of runs that are over, a few
+        at a time (``LabScheduler.remove_conversations``).
+
+        Not on every pass: a pass comes every few seconds and this is not
+        urgent. Deletions that are owed are made every
+        ``CLEANUP_INTERVAL_SECONDS``; the runs are looked through for
+        conversations that have become owed every ``CLEANUP_SWEEP_SECONDS``.
+        """
+        now = time.monotonic()
+        if now < self._cleanup_at:
+            return None
+        self._cleanup_at = now + CLEANUP_INTERVAL_SECONDS
+        sweep = now >= self._cleanup_sweep_at
+        if sweep:
+            self._cleanup_sweep_at = now + CLEANUP_SWEEP_SECONDS
+        done = sched.remove_conversations(sweep=sweep)
+        if any(done.values()):
+            log.info("OpenHands conversations of ended runs: %s", done)
+        # What is still owed is not news on every pass; what was done is.
+        return {key: value for key, value in done.items() if key != "pending"}
 
     def _reprobe(self) -> int:
         """Ask connections marked unavailable whether they answer again."""

@@ -967,6 +967,9 @@ def test_the_report_arrives_in_the_open_chat_by_itself_and_can_be_copied(lab_sta
         page.wait_for_selector(".work [data-action='copy-report']")
         expect(page.locator(".work .pill").first).to_have_text("готово")
         assert "отправлен в чат" in page.inner_text(".work")
+        # The run is over: the card says when its OpenHands conversations go.
+        expect(page.locator(".work .work-note", has_text="Разговоры OpenHands")).to_contain_text(
+            "Разговоры OpenHands этого прогона будут удалены")
         assert "исполнитель: ключ сервера" in page.inner_text(".work .steps")
         page.click(".work [data-action='copy-report']")
         expect(page.locator(".toast").last).to_contain_text("Отчёт скопирован")
@@ -996,6 +999,60 @@ def _first_project(app):
         return str(cur.fetchone()["id"])
 
 
+# ------------------------------------------- the chat reads the repository
+def test_an_answer_about_the_repository_says_which_files_it_was_written_from(stack, chromium):
+    """«Ты вообще видишь репозиторий?» was answered "no": the model had been
+    given the repository's name and nothing else. Now it is shown the files,
+    may open one, and the line under the answer says what it read."""
+    stack.answers("READ: src/cart.py",
+                  "Да, вижу. В `src/cart.py` функция **add** складывает два числа.")
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        _send(page, "Ты вообще видишь репозиторий? Что делает корзина?")
+        expect(page.locator(".msg.assistant .md strong")).to_have_text("add")
+        # The model asked for a file and was given it: two calls, the second
+        # with the file's text. Its request for the file is not shown as an answer.
+        assert len(stack.llm.calls) == 2
+        first, second = (call["body"]["messages"][-1]["content"] for call in stack.llm.calls)
+        assert "src/cart.py" in first and "def add(a: int, b: int)" not in first
+        assert "def add(a: int, b: int) -> int:" in second
+        assert page.locator(".msg.assistant").count() == 1
+        assert "READ:" not in page.inner_text(".msg.assistant")
+
+        sources = page.locator(".msg.assistant .msg-sources")
+        expect(sources.locator("summary")).to_have_text(
+            f"Репозиторий {REPO} · ветка main · коммит abc123 · файлов в списке: 4 · открыто: 2")
+        sources.locator("summary").click()
+        expect(sources.locator("li code")).to_have_text(["README.md", "src/cart.py"])
+
+        # It is stored with the answer: a reload shows the same line.
+        page.reload()
+        page.wait_for_selector('#app[data-ready="true"]')
+        expect(page.locator(".msg.assistant .msg-sources summary")).to_contain_text("открыто: 2")
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_a_repository_that_cannot_be_read_is_said_so_under_the_answer(stack, chromium):
+    stack.answers("Репозиторий сейчас прочитать не удалось, поэтому отвечаю без него.")
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _connect_repository(page)
+        stack.github.force_status = 401
+        _send(page, "Что в репозитории?")
+        expect(page.locator(".msg.assistant .md")).to_contain_text("отвечаю без него")
+        expect(page.locator(".msg.assistant .msg-sources.is-warn")).to_contain_text(
+            f"Репозиторий {REPO} не прочитан")
+        # The turn itself succeeded: nothing in the page failed.
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
 # ------------------------------------------------- cancel hides the run (phone)
 def test_a_cancelled_run_leaves_the_agent_tab_and_stays_gone(lab_stack, chromium):
     stack = lab_stack
@@ -1015,6 +1072,9 @@ def test_a_cancelled_run_leaves_the_agent_tab_and_stays_gone(lab_stack, chromium
         # «Отменить»: the card leaves the tab at once.
         page.tap('.work [data-op="cancel"]')
         expect(page.locator(".dialog .lead")).to_contain_text("останутся в базе")
+        # What will not stay is said before the person confirms.
+        expect(page.locator(".dialog .lead")).to_contain_text(
+            "Разговоры агентов в OpenHands будут удалены через 24 часа.")
         page.tap(".dialog-foot .btn-danger")
         page.wait_for_selector(".work", state="detached")
         expect(page.locator("#ws-body .empty h3")).to_have_text("Агент ещё не запускался")
@@ -1063,6 +1123,8 @@ def test_a_stopped_task_leaves_the_agent_tab_too(stack, chromium):
         page.locator(".work-chip").click()
         page.wait_for_selector(".work [data-action='cancel-workflow']")
         page.click(".work [data-action='cancel-workflow']")
+        expect(page.locator(".dialog .lead")).to_contain_text(
+            "История задачи сохранится. Разговоры агентов в OpenHands будут удалены через 24 часа.")
         page.click(".dialog-foot .btn-danger")
         page.wait_for_selector(".work", state="detached")
         expect(page.locator("#ws-body .empty h3")).to_have_text("Агент ещё не запускался")

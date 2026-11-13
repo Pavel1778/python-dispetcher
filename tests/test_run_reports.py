@@ -328,6 +328,48 @@ def test_a_long_task_is_quoted_by_its_beginning_and_named_by_its_size(env):
     assert len(text) < 60_000
 
 
+@pytest.mark.parametrize("ending", ["completed", "cancelled", "failed"])
+def test_a_short_order_is_quoted_without_the_conversation_it_took_along(env, ending):
+    """«Делай» goes into the task with the conversation before it
+    (``nexus_chat.task_with_context``). Whatever way the run ends, its report
+    quotes the message and says that the conversation went with it: the
+    conversation is right above the report in the chat, and a report that
+    repeated it would carry it into the next short order too."""
+    from orchestration.nexus_chat import task_with_context
+    from orchestration.nexus_specs import CONTEXT_MARKER, SpecService
+
+    wish = "Нужно, чтобы сервис отвечал на /health, а сайт показывал его статус."
+    task, attached = task_with_context("Делай", [
+        {"role": "user", "content": wish},
+        {"role": "assistant", "content": "Это две задачи: сервис и сайт.",
+         "meta": {"mode": "ask"}}])
+    assert attached == 2 and wish in task
+    goal, _spec, _ = SpecService(env["store"]).create_with_goal(
+        ALICE, env["project"], task, source="chat", conversation_id=env["chat"])
+    env["goal"] = str(goal["id"])
+    run_id = start(env, TWO, policy="bounded" if ending == "failed" else "durable")
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    if ending == "completed":
+        complete(env, sched, executor, run_id)
+    else:
+        do_task(env, sched, executor, run_id, "api", APP, sha(0xA1))
+        sched.tick(run_id)
+        if ending == "cancelled":
+            env["lab"].set_run_state(ALICE, env["project"], run_id, "cancelled")
+        else:
+            env["lab"].set_run_state_internal(run_id, "failed", last_error="deadline passed")
+        sched.run_until_done(run_id)
+    env["reports"].deliver_due()
+    assert env["lab"].run_row(run_id)["state"] == ending
+    chat = reports_in_chat(env)
+    assert len(chat) == 1
+    body = chat[0]["content"]
+    assert "### Исходное задание\n\n> Делай\n" in body
+    assert "в задание вошла и предшествующая переписка этого чата" in body
+    assert wish not in body and CONTEXT_MARKER not in body
+
+
 # ------------------------------------------------------------ only when earned
 @pytest.mark.parametrize("ending", ["blocked", "paused"])
 def test_no_report_for_a_run_that_did_not_end(env, ending):

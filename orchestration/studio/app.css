@@ -402,6 +402,13 @@ a:hover { text-decoration: underline; }
 .msg-meta .icon-btn { opacity: 0; }
 .msg:hover .msg-meta .icon-btn, .msg-meta .icon-btn:focus-visible { opacity: 1; }
 .msg-model { display: inline-flex; align-items: center; gap: 6px; }
+/* What an answer was read from: the repository, the commit, the files opened. */
+.msg-sources { margin: 8px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--text-3); overflow-wrap: anywhere; }
+.msg-sources code { font-family: var(--mono); font-size: 12px; color: var(--text-2); }
+.msg-sources summary { cursor: pointer; }
+.msg-sources ul { margin: 6px 0 0; padding-left: 18px; }
+.msg-sources.is-warn { display: flex; gap: 6px; align-items: flex-start; color: var(--warn, var(--text-2)); }
+.msg-sources .is-warn { color: var(--warn, var(--text-2)); }
 .msg-model::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
 
 .msg.step { align-items: center; gap: 8px; padding-left: 40px; color: var(--text-3); font-size: 12.5px; }
@@ -564,6 +571,7 @@ a:hover { text-decoration: underline; }
 .work-id { font-family: var(--mono); font-size: 12px; color: var(--text-3); }
 .work-goal { margin: 0; padding: 0 14px 12px; color: var(--text-2); font-size: 13.5px; line-height: 1.5; overflow-wrap: anywhere; }
 .work-reason { margin: 0 14px 12px; padding: 8px 10px; border-radius: 9px; background: var(--bad-soft); color: var(--text-2); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.work-note { margin: 0 14px 12px; font-size: 12.5px; color: var(--text-3); line-height: 1.45; overflow-wrap: anywhere; }
 .work-section { border-top: 1px solid var(--line); padding: 10px 14px 12px; }
 .work-section > summary, .work-section-title { font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-3); margin: 0 0 8px; }
 .work-section > summary { cursor: pointer; margin: 0; list-style: none; display: flex; align-items: center; gap: 6px; }

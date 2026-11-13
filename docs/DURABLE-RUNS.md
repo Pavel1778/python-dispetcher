@@ -183,10 +183,11 @@ ran which attempt, in which conversation) and `stops`.
 and hidden (`hidden_at`), its unfinished tasks are `blocked`, their leases are
 released, and a stop signal is recorded for every conversation that was at work.
 
-- **Nothing is deleted.** Tasks, evidence, executions, messages, events and the
-  cancellation itself (`cancelled_at`, `cancelled_by`) stay. `GET …/runs`
+- **Nothing is deleted here.** Tasks, evidence, executions, messages, events and
+  the cancellation itself (`cancelled_at`, `cancelled_by`) stay. `GET …/runs`
   leaves hidden runs out; `GET …/runs/<run>` still answers for one by its id.
-  `POST …/runs/<run>/hide` hides any other run that is over.
+  `POST …/runs/<run>/hide` hides any other run that is over. What does go, a
+  day later, is the run's conversations in OpenHands (below).
 - **The executor is really told to stop**, and the signal is owed until it is
   seen to have worked (below).
 - **It is idempotent and wins races.** Cancelling twice changes nothing. A
@@ -229,6 +230,78 @@ Two records say what is still owed, for two situations:
 
 While either record holds a conversation, its repository and branch are given
 to no other task.
+
+## The conversations of work that is over are deleted
+
+Every attempt of every task starts a conversation in the OpenHands account it
+runs on. Until migration `0036` nothing removed one: a month of runs left a
+month of conversations in the account, and a sandbox for most of them.
+
+**What is deleted, and when.** Every conversation a run started - whatever
+became of the attempt - once the run has been `completed`, `failed`,
+`cancelled` or `blocked` for the retention period
+(`NEXUS_OPENHANDS_CLEANUP_HOURS`, 24 unless set; `0` = at once, `off` = never).
+A run that ended before this existed is treated the same, so the first passes
+after the deployment clear the backlog. Nothing is recorded at the start of a
+conversation: what a run started is read from what the run kept - the
+execution history, the stop signals, a task's `abandoned` list, the task and
+its evidence, in that order of trust for "which connection was it".
+
+The older Sr/Jr workflows (the chat's "Код" mode) are covered too: the Sr
+conversation of a workflow and the conversation of each of its tasks, once the
+workflow has been `completed` or `cancelled` for the same period. Those are the
+two states nothing reopens. A `blocked` or `failed` workflow can be resumed and
+resumes in the Sr conversation it has, so its conversations are kept until a
+person stops it ("Остановить" on its card).
+
+**What is never taken:**
+
+- a conversation of a task that is at work, or that the task's next attempt
+  will continue (`resume_conversation_id`), in a run that is not over;
+- anything of a blocked run a person has resumed since - the retention starts
+  again when the run is over again;
+- a conversation whose sandbox was handed to another conversation in the last
+  15 minutes (`SANDBOX_QUIET_SECONDS`): the direct transport shares sandboxes.
+
+**How.** `nexus_conversation_cleanups` holds one row per conversation:
+`requested` → `deleted` | `missing` | `abandoned`. The worker loop looks for
+conversations that have become owed every 10 minutes and delivers what is owed
+every 30 seconds, five at a time (`LabWorker._cleanup` →
+`LabScheduler.remove_conversations` → `OpenHandsExecutor.remove`), with the key
+the conversation was started with: the stored connection, or the server's own.
+
+A deletion is closed only by the service's own word:
+
+| Transport | What is done | What counts as gone |
+|---|---|---|
+| `app` | `DELETE /api/v1/app-conversations/<id>` | the account, asked again by id, no longer reports it |
+| `direct` | the same in the account (which also removes a sandbox that holds nothing else), then `DELETE /api/conversations/<id>` on the sandbox's agent-server, then the route row here (it holds the sandbox's session key) | as above; a sandbox that no longer answers is not an error |
+| `local` | `DELETE /api/conversations/<id>` | the server no longer has it |
+
+- `deleted` - the service deleted it and no longer reports it.
+- `missing` - it had none by that id. That is also what a *different* key is
+  answered, so a conversation whose key has been replaced since reads as
+  `missing` while it still exists in the old account. Nothing here can tell
+  the two apart.
+- A failure - no answer, a rejected key, a rate limit, a conversation that is
+  still reported - leaves the row `requested` with `last_error`. It is tried
+  again after 60 s, doubling to at most a day (or after the `Retry-After` the
+  service gave), and is never given up.
+- `abandoned` - only when the conversation ran on a stored connection that has
+  since been removed: no key is left that could reach it.
+
+**Where it shows.** `GET …/runs/<run>` and `GET …/workflows/<id>` carry
+`cleanup` (`enabled`, `due_at`, counts by state, `last_error`); `GET
+/api/studio` carries `lab.cleanup_hours`. The run and workflow cards say when
+the conversations will be deleted, how many have been, and why one that is
+owed is still there; the cancel dialogs say it before a person confirms.
+
+**What this does not do.** It does not delete a sandbox by itself (the service
+removes one when its last conversation goes), and it does not touch
+conversations this application did not start. The link "Открыть в OpenHands"
+of a workflow disappears once its conversations are gone; the transcript is
+not copied anywhere first - what the agent reported is in the task's result
+and the run's report, the step-by-step log is not.
 
 ## OpenHands connections
 
@@ -325,6 +398,7 @@ of any repository is unverified.
 | `NEXUS_TASK_TIMEOUT_SECONDS` | 7200 | time limit of one conversation |
 | `NEXUS_TASK_STALL_SECONDS` | 1800 | no activity for this long = hung (0 = off) |
 | `NEXUS_LAB_MAX_ACTIVE_TASKS` | 8 | tasks at work at once (0 = no limit) |
+| `NEXUS_OPENHANDS_CLEANUP_HOURS` | 24 | conversations of work that is over are deleted after this long (0 = at once, `off` = never) |
 | `NEXUS_OPENHANDS_ALLOWED_HOSTS` | - | hosts that may be private |
 | `NEXUS_ALLOW_PRIVATE_TARGETS` | off | any private address may be used (the SSRF policy's own switch) |
 
@@ -345,6 +419,11 @@ database that already holds runs, projects and links.
 `0034_pending_start.sql` adds one nullable column, `nexus_run_tasks.pending_start`
 (the start a claimed task is waiting for; see "A start outlives the worker that
 asked for it"). No existing row changes.
+
+`0036_conversation_cleanup.sql` adds one table, `nexus_conversation_cleanups`
+(see "The conversations of work that is over are deleted"). No existing row
+changes; the rows for work that is already over are written by the worker's
+first passes, not by the migration.
 
 ## What this does not do
 

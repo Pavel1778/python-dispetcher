@@ -162,6 +162,7 @@ Without a key pair the lab records no evidence (never a fabricated one).
 | `NEXUS_LAB_MAX_ACTIVE_TASKS` | `8` | `nexus_lab_store.py` | Tasks at work at once over all runs (`0` = no limit). |
 | `NEXUS_TASK_TIMEOUT_SECONDS` | `7200` | `nexus_lab_store.py` | How long one task's conversation may run before the task is given up (bounded to 60 s … 24 h). |
 | `NEXUS_TASK_STALL_SECONDS` | `1800` | `nexus_lab.py` | A conversation with no sign of life this long is told to stop and the task restarted. `0` switches the check off. |
+| `NEXUS_OPENHANDS_CLEANUP_HOURS` | `24` | `nexus_lab.py` | How long after a run (or an Sr/Jr workflow) is over its OpenHands conversations are deleted from the account they ran on. `0` deletes at once; `off`/`never`/`no`/`false`/`disabled` keeps them for ever; a value that is not a number counts as `24`. See `docs/DURABLE-RUNS.md`, "The conversations of work that is over are deleted". |
 | `NEXUS_RETRY_BASE_SECONDS` | `60` | `nexus_retry.py` | Wait after the first exhausted work cycle. |
 | `NEXUS_RETRY_MAX_SECONDS` | `3600` | `nexus_retry.py` | Longest wait between cycles. |
 | `NEXUS_RETRY_MAX_CYCLES` | `0` | `nexus_retry.py` | Operator ceiling on cycles per task (`0` = none; then the run waits for a person). |

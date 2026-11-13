@@ -29,6 +29,10 @@ right what is missing, in a new one otherwise; a bounded number of times in a
 row, then after a pause that grows (``nexus_retry``). It ends when every task
 verified and the repositories were looked at once more, or when a person
 cancels it - and a cancelled run's conversations are told to stop.
+
+A run's conversations are not left in the OpenHands account for ever: once the
+run has been over for the retention period, every conversation it started is
+deleted there (``LabScheduler.remove_conversations``).
 """
 from __future__ import annotations
 
@@ -240,6 +244,11 @@ class OpenHandsExecutor:
         #: then left to the next worker (``StartLeft``) instead of being waited
         #: for: the process has seconds, the start may need a minute.
         self.stopping: Callable[[], bool] | None = None
+        #: Builds the client of one stored connection from its id alone,
+        #: whether or not the connection is given work now. Deleting a
+        #: conversation needs it: the run is over, and the connection it ran on
+        #: may since have been switched off - its conversations are still there.
+        self.account_client: Callable[[str], Any] | None = None
 
     @staticmethod
     def instructions(task: dict, original: str = "") -> str:
@@ -432,6 +441,34 @@ class OpenHandsExecutor:
             return self._client_for_account(
                 str(account_id), {"project_id": project_id} if project_id else None)
         return self.client
+
+    def remove(self, account_id: str | None, conversation_id: str,
+               project_id: str | None = None) -> str:
+        """Delete a conversation in the account it ran on, and say what became
+        of it: ``deleted`` - the service deleted it and no longer reports it -
+        or ``missing`` - it was not there any more.
+
+        Anything else is an error and is raised: the service could not be
+        asked, refused, or still reports the conversation. The deletion is then
+        still owed. Nothing is ever reported as deleted on the strength of a
+        call that merely did not fail.
+
+        The conversation is deleted with the key it was started with:
+        *account_id* names the stored connection, ``None`` is the server's own
+        key. Another key would be answered "no such conversation" for a
+        conversation that is still there.
+        """
+        if account_id and self.account_client is not None:
+            client = self.account_client(str(account_id))
+        else:
+            client = self._stop_client(account_id, project_id)
+        remove = getattr(client, "remove_conversation", None)
+        if not callable(remove):
+            raise CloudError("this transport cannot delete a conversation")
+        outcome = remove(str(conversation_id))
+        if outcome not in ("deleted", "missing"):
+            raise CloudError(f"the transport answered {outcome!r} to a deletion")
+        return outcome
 
     def dispatch(self, task: dict) -> str:
         """Give *task* to an agent and return the conversation that has it.
@@ -1150,6 +1187,57 @@ def stall_seconds() -> int:
     except ValueError:
         value = DEFAULT_STALL_SECONDS
     return max(0, value)
+
+
+#: How long the OpenHands conversations of a run that is over are kept before
+#: they are deleted, in hours. ``NEXUS_OPENHANDS_CLEANUP_HOURS`` changes it.
+DEFAULT_CLEANUP_HOURS = 24.0
+#: How many conversations one pass deletes at most. Deleting is not urgent,
+#: and each deletion makes the service archive a workspace and remove a
+#: sandbox: a few at a time.
+CLEANUP_BATCH = 5
+#: A deletion that failed is tried again after this long, doubling with every
+#: failure in a row up to ``CLEANUP_WAIT_CEILING``. It is not given up: there
+#: is nothing to gain by leaving a conversation behind, and a key that was
+#: rejected for a day may be put right the day after.
+CLEANUP_RETRY_SECONDS = 60.0
+CLEANUP_WAIT_CEILING = 24 * 3600.0
+
+
+def cleanup_retention_seconds() -> float | None:
+    """How long after a run is over its OpenHands conversations are deleted,
+    in seconds; ``None`` when they are never deleted.
+
+    ``NEXUS_OPENHANDS_CLEANUP_HOURS``: a number of hours (``0`` deletes as
+    soon as the run is over), or ``off`` to keep every conversation. Unset, or
+    anything that is not a number of hours, is ``DEFAULT_CLEANUP_HOURS`` - a
+    mistyped value must not turn into "delete at once".
+    """
+    import os
+
+    raw = os.environ.get("NEXUS_OPENHANDS_CLEANUP_HOURS", "").strip().lower()
+    if raw in ("off", "never", "no", "false", "disabled"):
+        return None
+    try:
+        hours = float(raw) if raw else DEFAULT_CLEANUP_HOURS
+    except ValueError:
+        hours = DEFAULT_CLEANUP_HOURS
+    if not 0 <= hours < float("inf"):       # negative, inf, nan
+        hours = DEFAULT_CLEANUP_HOURS
+    return hours * 3600.0
+
+
+def cleanup_retry_wait(attempts: int, error: Exception | None = None) -> float:
+    """Seconds until a deletion that failed *attempts* times is tried again.
+
+    What the service asked for when it refused with a rate limit; otherwise a
+    minute, doubling, up to a day.
+    """
+    asked = getattr(error, "retry_after", None)
+    if isinstance(asked, (int, float)) and asked > 0:
+        return float(min(CLEANUP_WAIT_CEILING, max(CLEANUP_RETRY_SECONDS, asked)))
+    return float(min(CLEANUP_WAIT_CEILING,
+                     CLEANUP_RETRY_SECONDS * 2 ** min(max(0, int(attempts) - 1), 16)))
 
 
 @dataclass
@@ -2107,6 +2195,69 @@ class LabScheduler:
                 self._stop_abandoned(run_id)
             except Exception:  # noqa: BLE001 - one run must not stop the others
                 log.exception("could not stop what run %s left behind", run_id)
+        return summary
+
+    # ------------------------------------------------- conversation cleanup
+    def remove_conversations(self, *, limit: int = CLEANUP_BATCH,
+                             sweep: bool = True) -> dict[str, int]:
+        """Delete the OpenHands conversations of runs that are over.
+
+        Two steps. With *sweep*, every conversation of a run that has been
+        over for the retention period is written down as owed a deletion
+        (``LabStore.queue_cleanups``). Then up to *limit* of those that are
+        owed are deleted, one at a time, each in the account it ran on
+        (``OpenHandsExecutor.remove``).
+
+        A deletion is closed only by the service's own word: **deleted** when
+        it deleted the conversation and no longer reports it, **missing** when
+        it had none by that id (a person removed it first). A failure leaves
+        the deletion owed and says why; it is tried again later, less and less
+        often, and never given up - except where it cannot be made at all: the
+        conversation ran on a stored connection that has since been removed,
+        and no key is left that could reach it. That one is **abandoned**.
+
+        A service that cannot be reached ends the pass: the next deletions
+        would only wait out the same timeout.
+
+        Deleting is switched off by ``NEXUS_OPENHANDS_CLEANUP_HOURS=off``; an
+        executor that cannot delete (a test double) leaves everything as it is.
+        """
+        summary = {"queued": 0, "deleted": 0, "missing": 0, "pending": 0, "abandoned": 0}
+        retention = cleanup_retention_seconds()
+        remove = getattr(self.executor, "remove", None)
+        if retention is None or not callable(remove):
+            return summary
+        if sweep:
+            summary["queued"] = self.store.queue_cleanups(retention_seconds=retention)
+        for _ in range(max(0, int(limit))):
+            if self._stopping is not None and self._stopping():
+                break                        # a row: owed by the next process too
+            item = self.store.claim_cleanup(self.worker_id, retention_seconds=retention)
+            if item is None:
+                break
+            conversation_id = str(item["conversation_id"])
+            if item.get("executor_label") and not item.get("openhands_account_id"):
+                self.store.cleanup_result(
+                    item["id"], abandon=True,
+                    error=f"the connection it ran on ({item['executor_label']}) has been "
+                          "removed; no key is left that can reach its conversations")
+                summary["abandoned"] += 1
+                continue
+            try:
+                outcome = remove(item.get("openhands_account_id"), conversation_id,
+                                 item.get("project_id"))
+            except Exception as e:  # noqa: BLE001 - recorded; the deletion is still owed
+                self.store.cleanup_result(
+                    item["id"], error=f"{type(e).__name__}: {e}",
+                    retry_seconds=cleanup_retry_wait(int(item.get("attempts") or 1), e))
+                summary["pending"] += 1
+                log.info("conversation %s could not be deleted yet: %s: %s",
+                         conversation_id, type(e).__name__, e)
+                if isinstance(e, CloudUnavailable):
+                    break
+                continue
+            self.store.cleanup_result(item["id"], outcome=outcome)
+            summary[outcome] += 1
         return summary
 
     def run_until_done(self, run_id: str, *, max_ticks: int = 500,

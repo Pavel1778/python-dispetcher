@@ -605,6 +605,30 @@ class CloudClient:
         )
         return status == 200 and bool((payload or {}).get("success", True))
 
+    def remove_conversation(self, conversation_id: str) -> str:
+        """Delete a conversation from the account and say what became of it:
+        ``deleted`` or ``missing`` (the account had none by that id).
+
+        ``DELETE /api/v1/app-conversations/{id}`` removes the account's record
+        of the conversation and its copy on the sandbox, and then the sandbox
+        itself once no conversation of the account is left on it. The answer
+        to the DELETE is not taken as the outcome: the service answers 404
+        both for a conversation it does not have and for a deletion it could
+        not make. So the account is asked for the conversation afterwards, and
+        only "there is none" closes the matter. A conversation it still
+        reports raises :class:`CloudError`: nothing was deleted, try later.
+        """
+        try:
+            asked = self.delete_conversation(conversation_id)
+        except CloudNotFound:
+            asked = False
+        try:
+            self.get_conversation(conversation_id)
+        except CloudNotFound:
+            return "deleted" if asked else "missing"
+        raise CloudError(
+            f"the account still reports conversation {conversation_id} after its deletion")
+
     def update_conversation(self, conversation_id: str, *,
                             title: str | None = None) -> bool:
         """``PATCH /api/v1/app-conversations/{id}`` (title only, here).

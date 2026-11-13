@@ -62,6 +62,24 @@ become a run. In Manual:
 3. an **explicit launch command** starts exactly one run and moves the state to
    `EXECUTING`.
 
+A short order is not a task by itself: «Делай» says to act, and what to do was
+said before it. Such a message (600 characters or fewer) takes the conversation
+with it into the plan request and into the stored task of the run
+(`nexus_chat.task_with_context`), exactly as it does when Auto starts a run; the
+plan message says that it did.
+
+A go-ahead that is not one of the launch commands below («Делай», «Сделай»,
+«Ладно, запускай») while a plan is waiting for its confirmation is neither a
+launch nor a new order: the plan stays as it is, no model is asked, and the
+reply names the command. A message that names work («Сделай иначе: …») is a
+change of requirements and gets a new plan.
+
+When the last thing said was the router's clarifying question ("explain it in
+the chat, or do the work and start a run?"), the next message answers that
+question, and is read as its answer before anything else - also when it is
+«Запускай». Choosing the work gives the message that was asked about its plan;
+it does not start the plan that was on offer before the question.
+
 The confirmation is bound to the plan's **version**. The plan's hash is stored
 with it (`plan_hash`); a launch records the approved version
 (`plan_approved_hash`). If the plan changes (a requirement change produces a new
@@ -73,6 +91,13 @@ approved on its own — a replan can never silently keep an old confirmation.
 `ask` and `analysis` only answer. No run and no OpenHands conversation is ever
 started. `analysis` reads the project's real runs, tasks and reports from the
 database (`App._run_facts`) so answers are grounded, not guessed.
+
+Every answer - in these modes, and to a question in Auto or Manual - is written
+with the project's repository in view (`App.repository_access`,
+`orchestration/nexus_repo_reader.py`) and is told how work starts in the mode
+the conversation is in (`nexus_chat.WORK_STARTS`): with an order in Auto, with a
+plan and «Запускай» in Manual, and by switching the mode in a mode that only
+answers.
 
 ## Launch commands
 

@@ -250,6 +250,20 @@ class LocalCloudClient(OpenHandsClient):
         status, _ = self._request("DELETE", f"/api/conversations/{conversation_id}")
         return status in (200, 204)
 
+    def remove_conversation(self, conversation_id: str) -> str:
+        """Delete a conversation and say what became of it: ``deleted`` or
+        ``missing``. As on the Cloud transports, the server is asked for the
+        conversation afterwards; one it still has raises :class:`CloudError`."""
+        try:
+            asked = self.delete_conversation(conversation_id)
+            status, _ = self._request("GET", f"/api/conversations/{conversation_id}")
+        except ApiUnavailable as e:
+            raise CloudUnavailable(str(e)) from e
+        if status == 404:
+            return "deleted" if asked else "missing"
+        raise CloudError(
+            f"the server still reports conversation {conversation_id} after its deletion")
+
     #: The local agent-server exposes the same conversation-scoped pause as the
     #: direct transport, so a stop here is real.
     supports_conversation_stop = True
