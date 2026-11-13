@@ -15,6 +15,19 @@ Design choices, and why
   ``HMAC-SHA256(AUTH_SESSION_SECRET, token)`` is stored, so a database dump does
   not yield usable cookies.
 
+* **A session lasts while it is used.** It ends ``AUTH_SESSION_TTL_SECONDS``
+  after the last request made with it (30 days by default) and, used or not,
+  ``AUTH_SESSION_MAX_SECONDS`` after the login (90 days). Each use moves the
+  expiry forward, and the browser's cookie is sent again with the new lifetime
+  - a session the server still honours is of no use once the browser has
+  dropped its cookie. The limits in force *now* decide: lowering one ends the
+  sessions that are past it at their next request, not weeks later.
+
+  Until 2026-11-12 a session lasted a fixed twelve hours from the login,
+  whether it was used or not, and the limit could not be set: an owner who
+  opened the studio once a day signed in every day, and one who worked for
+  thirteen hours was signed out in the middle of it.
+
 * **CSRF** is double-submit: a random token is stored with the session and must
   be echoed in the ``X-CSRF-Token`` header on state-changing requests. An
   attacker's page cannot read the token (it is not exposed to script from
@@ -56,8 +69,22 @@ PBKDF2_ITERATIONS = 600_000
 PBKDF2_ALGO = "pbkdf2_sha256"
 _SALT_BYTES = 16
 
-#: Default session lifetime and the lockout policy.
-SESSION_TTL_SECONDS = 12 * 3600
+#: Session lifetime: how long a login lasts without being used, and how long
+#: it lasts at all. The operator sets them with ``AUTH_SESSION_TTL_SECONDS`` and
+#: ``AUTH_SESSION_MAX_SECONDS``; see the module docstring.
+SESSION_TTL_SECONDS = 30 * 24 * 3600
+SESSION_MAX_SECONDS = 90 * 24 * 3600
+#: What the operator may set them to: five minutes to 400 days (no browser
+#: keeps a cookie for longer than that).
+SESSION_SECONDS_FLOOR = 300
+SESSION_SECONDS_CEILING = 400 * 24 * 3600
+#: A use rewrites the expiry only when that moves it by at least this much (a
+#: tenth of the lifetime, when that is less; ``AuthService.renew_step``). A
+#: session measured in days gains nothing from being rewritten, cookie and
+#: all, on every request of a page that polls.
+SESSION_RENEW_STEP_SECONDS = 3600
+
+#: The lockout policy.
 MAX_LOGIN_FAILURES = 5
 LOCKOUT_SECONDS = 900
 
@@ -231,11 +258,40 @@ def _burn_time(password: str) -> None:
     verify_password(password, _DUMMY_HASH)
 
 
+def session_seconds(name: str, default: int) -> int:
+    """A session limit from the environment variable *name*, or *default*.
+
+    A value that is not a number is reported and the default is used; one
+    outside ``SESSION_SECONDS_FLOOR`` .. ``SESSION_SECONDS_CEILING`` is brought
+    into that range. Neither a typo nor a zero may leave the owner unable to
+    stay signed in for a minute, or signed in for ever. The value itself is not
+    logged when it cannot be read: what was pasted there may be something else.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s is not a whole number of seconds; using the default, %s",
+                    name, default)
+        return default
+    limited = min(SESSION_SECONDS_CEILING, max(SESSION_SECONDS_FLOOR, value))
+    if limited != value:
+        log.warning("%s=%s is outside %s..%s seconds; using %s", name, value,
+                    SESSION_SECONDS_FLOOR, SESSION_SECONDS_CEILING, limited)
+    return limited
+
+
 @dataclass(frozen=True)
 class Session:
     token: str
     csrf_token: str
     username: str
+    #: Set when resolving the session has just moved its expiry: the lifetime,
+    #: in seconds, the browser's cookie is to be given again. ``None`` when
+    #: there is nothing to tell the browser.
+    cookie_ttl: int | None = None
 
 
 class AuthService:
@@ -248,7 +304,8 @@ class AuthService:
         username: str | None = None,
         password_hash: str | None = None,
         session_secret: str | None = None,
-        session_ttl: int = SESSION_TTL_SECONDS,
+        session_ttl: int | None = None,
+        session_max: int | None = None,
         max_failures: int = MAX_LOGIN_FAILURES,
         lockout_seconds: int = LOCKOUT_SECONDS,
     ):
@@ -268,7 +325,14 @@ class AuthService:
             else os.environ.get("AUTH_SESSION_SECRET")
         )
         self.session_secret = secret_env.strip() if isinstance(secret_env, str) else secret_env
-        self.session_ttl = session_ttl
+        #: The longest a session lasts, used or not, from the login.
+        self.session_max = (int(session_max) if session_max is not None
+                            else session_seconds("AUTH_SESSION_MAX_SECONDS", SESSION_MAX_SECONDS))
+        ttl = (int(session_ttl) if session_ttl is not None
+               else session_seconds("AUTH_SESSION_TTL_SECONDS", SESSION_TTL_SECONDS))
+        #: How long a session lasts without being used. It cannot stay unused
+        #: for longer than it may live at all.
+        self.session_ttl = min(ttl, self.session_max)
         self.max_failures = max_failures
         self.lockout_seconds = lockout_seconds
 
@@ -348,14 +412,31 @@ class AuthService:
         return Session(token=token, csrf_token=csrf, username=username)
 
     # ------------------------------------------------------------- session
+    @property
+    def renew_step(self) -> int:
+        """How much lifetime a use has to add before the session is extended."""
+        return max(1, min(SESSION_RENEW_STEP_SECONDS, self.session_ttl // 10))
+
     def resolve(self, token: str | None) -> Session | None:
-        """Return the live session for *token*, or ``None`` if absent/expired."""
+        """Return the live session for *token*, or ``None`` if absent/expired.
+
+        Resolving a session is using it: its expiry moves forward (see the
+        module docstring). When it has moved, ``cookie_ttl`` of the result is
+        the lifetime the browser's cookie has to be given again; the caller
+        that answers the request sends it.
+        """
         if not token or not self.session_secret:
             return None
-        row = self.store.get_session(self._token_hash(token))
+        row = self.store.get_session(
+            self._token_hash(token), ttl_seconds=self.session_ttl,
+            max_seconds=self.session_max, renew_step_seconds=self.renew_step)
         if row is None:
             return None
-        return Session(token=token, csrf_token=row["csrf_token"], username=row["username"])
+        cookie_ttl = None
+        if row.get("renewed"):
+            cookie_ttl = max(1, int(row.get("seconds_left") or 0))
+        return Session(token=token, csrf_token=row["csrf_token"], username=row["username"],
+                       cookie_ttl=cookie_ttl)
 
     def logout(self, token: str | None) -> None:
         """Revoke a session. Idempotent; safe to call with a stale token."""

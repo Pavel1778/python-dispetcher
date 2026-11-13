@@ -1350,8 +1350,29 @@ class Handler(BaseHTTPRequestHandler):
     def app(self) -> App:
         return self.server.app  # type: ignore[attr-defined]
 
+    #: ``Set-Cookie`` for a session that this request has just extended, until
+    #: a response takes it (``_session``, ``_take_renewed_cookie``).
+    _renewed_cookie: str | None = None
+
     # ------------------------------------------------------------- helpers
+    def _take_renewed_cookie(self) -> str | None:
+        """The renewed session cookie this request owes the browser, once.
+
+        ``_json``, ``_html`` and ``_redirect`` send it: the answers a cache
+        does not keep (the first two say ``no-store``; a 303 is not stored
+        unless it says it may be). A session cookie must never ride on an
+        answer that a cache may hand to somebody else, so ``_static`` does not
+        carry it - and it serves only what needs no session. A renewal that
+        meets no such answer (a file download) is not lost for long: the next
+        one is due ``AuthService.renew_step`` later.
+        """
+        cookie, self._renewed_cookie = self._renewed_cookie, None
+        return cookie
+
     def _json(self, code: int, payload: Any, *, cookie: str | None = None) -> None:
+        # What the handler says about the cookie itself (login, logout) stands.
+        renewed = self._take_renewed_cookie()
+        cookie = cookie or renewed
         body = json.dumps(payload, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -1364,6 +1385,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _html(self, code: int, text: str, *, cookie: str | None = None) -> None:
+        renewed = self._take_renewed_cookie()
+        cookie = cookie or renewed
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1392,6 +1415,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _redirect(self, to: str, *, cookie: str | None = None) -> None:
+        # ``/login`` sends a signed-in owner on to the studio: an address a
+        # browser remembers, so this may well be the first request of the day.
+        renewed = self._take_renewed_cookie()
+        cookie = cookie or renewed
         self.send_response(303)
         self.send_header("Location", to)
         if cookie:
@@ -1526,7 +1553,15 @@ class Handler(BaseHTTPRequestHandler):
     # --------------------------------------------------------------- session
     def _session(self):
         token = parse_cookie(self.headers.get("Cookie"), SESSION_COOKIE)
-        return self.app.auth.resolve(token)
+        session = self.app.auth.resolve(token)
+        ttl = getattr(session, "cookie_ttl", None)
+        if ttl:
+            # Using the session has just extended it. The browser's copy of the
+            # cookie has to live as long, or the browser drops it while the
+            # server would still honour it - and the owner signs in again.
+            self._renewed_cookie = session_cookie_header(
+                session.token, ttl=ttl, secure=self._cookie_secure())
+        return session
 
     def _bearer_ok(self) -> bool:
         """Machine authentication for the API, unchanged from before.

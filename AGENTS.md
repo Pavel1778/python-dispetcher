@@ -1813,3 +1813,40 @@ and a case that cannot run here says so rather than simulating.
   is answered `401`) and `delay` (a real slow response for a real timeout test).
   A caller that times out and hangs up no longer prints a broken-pipe traceback
   from the server thread.
+
+## How long a login lasts: sliding sessions (2026-11-12)
+
+The owner reported being signed out "about once every 24 hours". The cause was
+not a fault: `web_auth.SESSION_TTL_SECONDS` was `12 * 3600`, the session row
+expired exactly twelve hours after the login whether it was used or not
+(`get_session` wrote only `last_seen`), the cookie had the same `Max-Age`, and
+there was no setting for either. Opening the studio once a day meant signing in
+every day. Sessions are in PostgreSQL and `AUTH_SESSION_SECRET` is stable, so a
+deploy or a restart never signed anyone out - do not look there first.
+
+A session is now extended by being used, with a hard end
+(`AUTH_SESSION_TTL_SECONDS`, 30 days from the last request;
+`AUTH_SESSION_MAX_SECONDS`, 90 days from the login). Rules that keep it right:
+
+- **One statement decides** (`PostgresStore.get_session`): it locks the row,
+  judges it by the limits passed *now* (not only by the stored `expires_at`),
+  and rewrites the expiry when that differs from the stored one by at least the
+  step (`AuthService.renew_step`, an hour for limits measured in days). The step
+  applies in both directions. Without it downwards, a request that began just
+  before the one that renewed computes an expiry a moment earlier and answers
+  with a second cookie (`test_requests_arriving_together_renew_the_cookie_once`).
+- **The cookie is renewed with the session**, or the browser drops it while the
+  server would still honour it. `Handler._session` notes the renewal and
+  `_json`, `_html` and `_redirect` send it. Never put it on an answer a cache
+  may keep: `_static` does not carry it, and a new response helper may take it
+  only if it says `no-store`. `/login` redirecting a signed-in owner must carry
+  it - that address is what a browser remembers after months of signing in.
+- **What the handler says about the cookie itself stands**: the login answer and
+  the logout answer carry exactly one `Set-Cookie`, never the renewal as well.
+- **A password change does not end an open session**; changing
+  `AUTH_SESSION_SECRET` ends all of them. This is documented (DEPLOY.md,
+  docs/SECURITY.md), not solved. Binding the session to the password hash would
+  solve it and sign everyone out once when deployed.
+
+Tests: `tests/test_auth.py`, section "session lifetime" - real server, real
+HTTP; time passes by moving the session's own times back in the database.

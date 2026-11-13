@@ -37,6 +37,10 @@ There are two independent authentication paths, and neither weakens the other:
 * Sessions live server-side in the `sessions` table. Only
   `HMAC-SHA256(AUTH_SESSION_SECRET, token)` is stored, so a database dump does
   not yield usable cookies. Logout deletes the row, which is immediate.
+* A session lasts while it is used: it ends 30 days after the last request
+  made with it and, used or not, 90 days after the login
+  (`AUTH_SESSION_TTL_SECONDS`, `AUTH_SESSION_MAX_SECONDS`). See
+  "How long a login lasts" below.
 * State-changing requests from a browser need the `X-CSRF-Token` header (the
   token is returned by `GET /api/session`). A Bearer client is exempt, because
   it does not rely on a cookie and so cannot be tricked by a cross-site form.
@@ -113,6 +117,8 @@ Read from the source, not assumed. Names must match exactly.
 | `AUTH_USERNAME` | yes | `web_auth.py` | Owner login name. |
 | `AUTH_PASSWORD_HASH` | yes | `web_auth.py` | PBKDF2 hash of the owner password. |
 | `AUTH_SESSION_SECRET` | yes | `web_auth.py` | Separate secret that signs sessions. |
+| `AUTH_SESSION_TTL_SECONDS` | no | `web_auth.py` | How long a login lasts without being used. Default `2592000` (30 days). |
+| `AUTH_SESSION_MAX_SECONDS` | no | `web_auth.py` | How long a login lasts at all, however much it is used. Default `7776000` (90 days). |
 | `WEB_AUTH_TOKEN` | yes | `web_server.py` | Bearer token for the machine API. |
 | `GITHUB_TOKEN` | no | `github_client.py` | Server-side GitHub token for repository discovery; if write access is separately enabled, its GitHub permissions also bound confirmed writes. Never returned by the API or UI. |
 | `GITHUB_ENABLE_WRITES` | no | `web_server.py` | Default false. Enables the session-only, CSRF-protected, two-step GitHub repository actions; see [docs/DEVELOPMENT-LAB.md](docs/DEVELOPMENT-LAB.md). |
@@ -227,6 +233,37 @@ Work through this in order:
    spaces are trimmed on both sides, but the comparison is case-sensitive.
 5. `AUTH_SESSION_SECRET` only signs the session. A wrong value breaks the
    *existing* session, not the login itself.
+
+### How long a login lasts
+
+A session is extended by being used. Each request made with it moves its
+expiry to 30 days from then (`AUTH_SESSION_TTL_SECONDS`), but never past 90
+days from the login (`AUTH_SESSION_MAX_SECONDS`); the browser's cookie is sent
+again with the same lifetime. So the owner signs in again
+
+* after 30 days without opening the studio, or
+* 90 days after the last sign-in, whichever comes first.
+
+Both values are whole seconds, from `300` (five minutes) to `34560000` (400
+days; no browser keeps a cookie longer). A value outside that range is brought
+into it, one that is not a number is reported in the log and the default is
+used, and the idle limit is never longer than the overall one. A changed limit
+applies to the sessions that are already open, at their next request: lowering
+one ends the sessions that are past it.
+
+Until 2026-11-12 the lifetime was a fixed 12 hours from the login, not extended
+by use and not configurable, which is why the studio asked for the password
+about once a day. To have that back, set both variables to `43200`.
+
+What ends a session before its time:
+
+* **"Выйти"** ends that one session, at once.
+* **Changing `AUTH_SESSION_SECRET`** ends every session on every device: the
+  stored hashes no longer match any cookie. This is the way to sign everything
+  out after a lost phone.
+* **Changing the password (`AUTH_PASSWORD_HASH`) does not.** A session that is
+  already open stays open. After a password that may have leaked, change
+  `AUTH_SESSION_SECRET` as well.
 
 ### Regenerating AUTH_PASSWORD_HASH on Render
 
