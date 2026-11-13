@@ -64,6 +64,15 @@ def test_a_sigkilled_worker_is_recovered_by_a_new_process(monkeypatch):
         first_worker = Worker(studio, worker_id="acc-kill-1")
         first = _until(lambda: _task_conversation(studio, "audit"),
                        what="the first worker to dispatch")
+        # "Already started" means recorded as well: the conversation exists in
+        # the Cloud an instant before the worker has bound it to the task, and a
+        # kill inside that instant is another case - the task is then taken back
+        # when its claim runs out and the conversation is adopted
+        # (tests/test_durable_runs.py), which takes longer than this test waits.
+        _until(lambda: next((t for t in _detail(studio, project, run)["tasks"]
+                             if t["task_key"] == "audit"
+                             and t["conversation_id"] == first), None),
+               what="the first worker to record the conversation it started")
         first_worker.stop(sig=signal.SIGKILL)          # a crash, not a shutdown
 
         second_worker = Worker(studio, worker_id="acc-kill-2")

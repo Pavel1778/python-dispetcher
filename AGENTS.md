@@ -1897,3 +1897,42 @@ or status changes.
 
 Verified: `ruff check .` clean; `pytest tests/` (browser E2E excluded) 1337
 passed, 9 skipped against a disposable PostgreSQL on port 5433.
+
+## Final acceptance testing (this session)
+
+The §15 acceptance pass. Two things to know before touching this area again.
+
+- **The load-sensitive test is `tests/test_acceptance_recovery.py::test_a_sigkilled_worker_is_recovered_by_a_new_process`.**
+  It killed the worker the instant its conversation existed in the Cloud, which
+  is *before* the worker binds the conversation to the task; a `SIGKILL` inside
+  that window is recovered only when the 900 s claim runs out and the
+  conversation is adopted, which is longer than the test's 20 s wait. This is
+  the same race `test_lab_worker_process.py` was fixed for in `5b2efec`; the
+  acceptance copy (`1499e07`) re-introduced it. The fix waits until the task
+  **records** the conversation (`conversation_id == first`) before killing. It
+  fails about one full run in two without that guard, so do not remove it.
+- **`docs/FINAL_ACCEPTANCE_REPORT.md` is now ISSUED** (it was a Phase-0
+  placeholder). It carries the twelve completion conditions with their evidence,
+  the deliverable list, the environment variables, the run commands, the test
+  counts and the remaining BLOCKED/UNVERIFIED items. Keep it in step when a
+  status changes.
+- **A live key *is* available in this environment** (`OPENHANDS_API_KEY`, the
+  live account has a working LLM key and `openhands/deepseek-v4.1-flash` as its
+  default model). The live diagnostics are **17 VERIFIED / 0 FAILED / 0
+  BLOCKED** — `conversation_create`, `message_and_events`, `run_command`,
+  `task_completion`, `workspace_rw` all really ran. The account has **no GitHub
+  provider token** (`provider_tokens_set: {'github': None}`), so a live task
+  that must clone and push ends `completed_unverified` and the run blocks; that
+  is correct, not a defect.
+- **Trap when probing from the shell:** this harness exports a secret into the
+  persistent shell only when a command *mentions the key name*. Once
+  `OPENHANDS_API_KEY` is in the shell, `tests/test_connectivity.py` and
+  `tests/test_acceptance_connectivity.py` (which assert a missing key is refused
+  *before any request*) fail, because `CloudClient(api_key="")` falls back to the
+  environment. Run the suite with `env -u OPENHANDS_API_KEY` or you will chase a
+  failure that is not in the code.
+- The browser E2E skips cleanly when Chromium is absent (29 of the 38 skips are
+  these); `python -m playwright install chromium` makes all 29 pass, leaving 9
+  skips. The other skips are environmental: 4 Android APK (no SDK build-tools),
+  3 Windows `.exe` (no mingw-w64), 1 pooler schema-bootstrap, 1 section F live
+  variant.
