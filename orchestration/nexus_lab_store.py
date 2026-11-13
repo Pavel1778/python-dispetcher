@@ -44,6 +44,13 @@ writes run/task state, so the invariants live in one spot:
   run - one whose caller named explicit budgets - keeps the older rule: when
   the attempts or the budgets are spent, it stops.
 * **A cancelled run leaves the lists, not the database** (``hidden_at``).
+* **What a run created in OpenHands is deleted when the run is over.** Once a
+  run has been over for the retention period, every conversation it started
+  is owed a deletion (``nexus_conversation_cleanups``): written down by
+  ``queue_cleanups``, taken one at a time by ``claim_cleanup`` and closed by
+  ``cleanup_result`` when the service no longer reports the conversation. A
+  conversation that a task is still at work in, or will be continued in, is
+  never taken.
 
 Membership is checked in the same query that touches a row.
 """
@@ -71,6 +78,38 @@ ACTIVE_RUN_STATES = frozenset({"running", "paused", "waiting_for_approval", "blo
 
 #: Run states with no way forward. A terminal run is never serviced again.
 TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+
+#: Run states in which a run's OpenHands conversations are no longer needed,
+#: and are deleted once the run has been in one for the retention period. A
+#: ``blocked`` run is among them: it has stopped and waits for a person, and
+#: what a person's "resume" starts is a conversation of its own
+#: (``_requeue_retryable`` clears the old one). A ``paused`` run and one that
+#: waits for an approval go on in the conversations they have.
+CLEANUP_RUN_STATES = ("completed", "failed", "cancelled", "blocked")
+
+#: The same for an Sr/Jr workflow (the chat's "Код" mode): only the two states
+#: nothing reopens (``PostgresStore.resume_workflow`` refuses both). A blocked
+#: or failed workflow is resumed in the Sr conversation it already has, so its
+#: conversations are kept until a person cancels it.
+CLEANUP_WORKFLOW_STATES = ("completed", "cancelled")
+
+#: "Some task still needs conversation ``{conversation}``": it is at work in
+#: it, or its next attempt will be made in it (``resume_conversation_id``).
+#: Only tasks of a run that is not over count: a terminal run polls nothing
+#: and continues nothing.
+_CONVERSATION_NEEDED = (
+    "EXISTS (SELECT 1 FROM nexus_run_tasks n JOIN nexus_runs nr ON nr.id = n.run_id "
+    "  WHERE nr.state NOT IN ('completed','failed','cancelled') "
+    "    AND ((n.conversation_id = {conversation} "
+    "          AND n.state IN ('dispatched','running','verifying')) "
+    "         OR n.resume_conversation_id = {conversation})) ")
+
+#: A sandbox that was handed to a conversation this recently keeps every
+#: conversation it holds. The service removes a sandbox when the last
+#: conversation it knows of on it is deleted, and it learns of a conversation
+#: started on a sandbox a moment after the start: deleting the old ones in
+#: that moment would take the sandbox from under the new one.
+SANDBOX_QUIET_SECONDS = 900
 
 #: The run state machine: for each state, the states it may be entered from.
 #: Asking for the state a run is already in is a no-op, not an error.
@@ -1870,6 +1909,255 @@ class LabStore:
     def _stop_row(row: Any) -> dict:
         out = dict(row)
         for key in ("id", "run_id", "task_id", "project_id", "openhands_account_id"):
+            if out.get(key) is not None:
+                out[key] = str(out[key])
+        return out
+
+    # --------------------------------------------------- conversation cleanup
+    def queue_cleanups(self, *, retention_seconds: float, limit: int = 500) -> int:
+        """Write down the conversations that are now owed a deletion.
+
+        Every conversation of a run that has been over (``CLEANUP_RUN_STATES``)
+        for *retention_seconds* gets one row in ``nexus_conversation_cleanups``,
+        unless it has one already. Returns how many rows were added.
+
+        Nothing is recorded when a conversation is started; what a run started
+        is read here from what the run kept, so a run that ended before this
+        table existed is cleaned up like any other. A conversation is named in
+        up to five places, and each also says - or does not say - which
+        connection it ran on, so they are read in that order of trust:
+
+        1. the execution history (one row per conversation, with the
+           connection and its name as it was);
+        2. a stop signal (a conversation that never reached a task: it was
+           started by a worker that had lost the task meanwhile);
+        3. a task's ``abandoned`` list (left behind by a switch, not yet stopped);
+        4. the task itself (its current conversation and connection);
+        5. the task's evidence (earlier attempts; the connection is taken to be
+           the task's, which is exact for every run that never changed it).
+
+        A conversation some task still needs (``_CONVERSATION_NEEDED``) is left
+        out: it is written down on a later pass, when nothing needs it.
+
+        The older Sr/Jr workflows (the chat's "Код" mode) keep their
+        conversations elsewhere - ``workflows.sr_conversation_id`` and the
+        ``conversations`` table - and are read here too. A workflow counts as
+        over when it is ``completed`` or ``cancelled``
+        (``CLEANUP_WORKFLOW_STATES``): the two states nothing can reopen. A
+        ``blocked`` or ``failed`` workflow can be resumed, and resumes in the
+        Sr conversation it has, so its conversations are kept until a person
+        cancels it. They all ran on the server's own key.
+        """
+        needed = _CONVERSATION_NEEDED.format(conversation="k.conversation_id")
+        retention = max(0.0, float(retention_seconds))
+        with self.store._tx() as cur:
+            cur.execute(
+                "WITH ended AS ("
+                "  SELECT id, project_id FROM nexus_runs WHERE state = ANY(%s) "
+                "  AND updated_at <= now() - %s * interval '1 second'), "
+                "known AS ("
+                "  SELECT x.conversation_id, x.run_id, x.task_id, "
+                "         x.openhands_account_id AS account_id, x.executor_label AS label, 1 AS rank "
+                "    FROM nexus_task_executions x JOIN ended e ON e.id = x.run_id "
+                "   WHERE x.conversation_id IS NOT NULL "
+                "  UNION ALL "
+                "  SELECT s.conversation_id, s.run_id, s.task_id, s.openhands_account_id, NULL, 2 "
+                "    FROM nexus_executor_stops s JOIN ended e ON e.id = s.run_id "
+                "  UNION ALL "
+                "  SELECT a.item->>'conversation_id', t.run_id, t.id, "
+                "         (SELECT o.id FROM nexus_openhands_accounts o "
+                "           WHERE o.id::text = a.item->>'account_id'), NULL, 3 "
+                "    FROM nexus_run_tasks t JOIN ended e ON e.id = t.run_id "
+                "    CROSS JOIN LATERAL jsonb_array_elements(CASE "
+                "      WHEN jsonb_typeof(t.abandoned) = 'array' THEN t.abandoned "
+                "      ELSE '[]'::jsonb END) AS a(item) "
+                "  UNION ALL "
+                "  SELECT t.conversation_id, t.run_id, t.id, t.openhands_account_id, NULL, 4 "
+                "    FROM nexus_run_tasks t JOIN ended e ON e.id = t.run_id "
+                "   WHERE t.conversation_id IS NOT NULL "
+                "  UNION ALL "
+                "  SELECT v.item->>'conversation_id', t.run_id, t.id, t.openhands_account_id, "
+                "         NULL, 5 "
+                "    FROM nexus_run_tasks t JOIN ended e ON e.id = t.run_id "
+                "    CROSS JOIN LATERAL jsonb_array_elements(CASE "
+                "      WHEN jsonb_typeof(t.evidence) = 'array' THEN t.evidence "
+                "      ELSE '[]'::jsonb END) AS v(item)), "
+                "chosen AS ("
+                "  SELECT DISTINCT ON (k.conversation_id) k.conversation_id, k.run_id, k.task_id, "
+                "         k.account_id, k.label "
+                "    FROM known k "
+                "   WHERE COALESCE(k.conversation_id, '') <> '' "
+                "     AND NOT EXISTS (SELECT 1 FROM nexus_conversation_cleanups c "
+                "                      WHERE c.conversation_id = k.conversation_id) "
+                f"     AND NOT {needed}"
+                "   ORDER BY k.conversation_id, k.rank) "
+                "INSERT INTO nexus_conversation_cleanups(conversation_id, run_id, task_id, "
+                "  project_id, openhands_account_id, executor_label) "
+                "SELECT c.conversation_id, c.run_id, c.task_id, e.project_id, o.id, "
+                "       COALESCE(NULLIF(c.label, ''), o.label, '') "
+                "  FROM chosen c JOIN ended e ON e.id = c.run_id "
+                "  LEFT JOIN nexus_openhands_accounts o ON o.id = c.account_id "
+                " ORDER BY c.conversation_id LIMIT %s "
+                "ON CONFLICT (conversation_id) DO NOTHING",
+                (list(CLEANUP_RUN_STATES), retention, int(limit)))
+            added = cur.rowcount
+            cur.execute(
+                "WITH ended AS ("
+                "  SELECT id, project_id, sr_conversation_id FROM workflows "
+                "   WHERE state = ANY(%s) AND updated_at <= now() - %s * interval '1 second'), "
+                "known AS ("
+                "  SELECT e.sr_conversation_id AS conversation_id, e.id AS workflow_id, "
+                "         e.project_id FROM ended e "
+                "  UNION "
+                "  SELECT c.external_conversation_id, e.id, e.project_id "
+                "    FROM conversations c JOIN tasks t ON t.id = c.task_id "
+                "    JOIN ended e ON e.id = t.workflow_id) "
+                "INSERT INTO nexus_conversation_cleanups(conversation_id, workflow_id, "
+                "  project_id) "
+                "SELECT DISTINCT ON (k.conversation_id) k.conversation_id, k.workflow_id, p.id "
+                "  FROM known k LEFT JOIN nexus_projects p ON p.id = k.project_id "
+                " WHERE COALESCE(k.conversation_id, '') <> '' "
+                "   AND NOT EXISTS (SELECT 1 FROM nexus_conversation_cleanups c "
+                "                    WHERE c.conversation_id = k.conversation_id) "
+                f"   AND NOT {needed}"
+                " ORDER BY k.conversation_id, k.workflow_id LIMIT %s "
+                "ON CONFLICT (conversation_id) DO NOTHING",
+                (list(CLEANUP_WORKFLOW_STATES), retention, int(limit)))
+            return added + cur.rowcount
+
+    def claim_cleanup(self, worker_id: str, *, retention_seconds: float,
+                      lease_seconds: int = 300) -> dict | None:
+        """Take one deletion that is due, for *lease_seconds*, or ``None``.
+
+        One at a time, by one worker at a time: a worker that dies with a
+        deletion in hand gives it up when the lease runs out. A row is due
+        only while what it was written for still holds, and that is looked at
+        here, not remembered from when the row was written:
+
+        * its run is still over, and has been for *retention_seconds* - a
+          blocked run a person has resumed keeps its conversations until it is
+          over again (a row whose run no longer exists is due at once). A
+          workflow's row is due while the workflow is still completed or
+          cancelled, which nothing in this application changes;
+        * no task needs the conversation (``_CONVERSATION_NEEDED``);
+        * the sandbox it is on was not handed to a conversation in the last
+          ``SANDBOX_QUIET_SECONDS``.
+        """
+        needed = _CONVERSATION_NEEDED.format(conversation="c.conversation_id")
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT c.id FROM nexus_conversation_cleanups c "
+                "LEFT JOIN nexus_runs r ON r.id = c.run_id "
+                "WHERE c.state = 'requested' AND c.next_attempt_at <= now() "
+                "AND (c.lease_expires IS NULL OR c.lease_expires < now()) "
+                "AND (c.run_id IS NULL OR (r.state = ANY(%s) "
+                "     AND r.updated_at <= now() - %s * interval '1 second')) "
+                "AND (c.workflow_id IS NULL OR EXISTS ("
+                "  SELECT 1 FROM workflows w WHERE w.id = c.workflow_id "
+                "     AND w.state = ANY(%s))) "
+                f"AND NOT {needed}"
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM conversation_routes cr "
+                "  JOIN cloud_sandboxes sb ON sb.sandbox_id = cr.sandbox_id "
+                "  WHERE cr.external_conversation_id = c.conversation_id "
+                "    AND sb.updated_at > now() - %s * interval '1 second') "
+                "ORDER BY c.next_attempt_at, c.id LIMIT 1 FOR UPDATE OF c SKIP LOCKED",
+                (list(CLEANUP_RUN_STATES), max(0.0, float(retention_seconds)),
+                 list(CLEANUP_WORKFLOW_STATES), SANDBOX_QUIET_SECONDS))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cur.execute(
+                "UPDATE nexus_conversation_cleanups SET attempts = attempts + 1, "
+                "lease_expires = now() + (%s || ' seconds')::interval "
+                "WHERE id=%s RETURNING *", (lease_seconds, row["id"]))
+            return self._cleanup_row(cur.fetchone())
+
+    def cleanup_result(self, cleanup_id: str, *, outcome: str | None = None,
+                       error: str | None = None, retry_seconds: float = 0.0,
+                       abandon: bool = False) -> dict:
+        """Write what came of one try at deleting a conversation.
+
+        *outcome* is ``deleted`` (the service deleted it and no longer reports
+        it) or ``missing`` (it was not there any more): either closes the row.
+        Without one the deletion is still owed and is tried again after
+        *retry_seconds*, with *error* saying why it has not happened yet - or,
+        with *abandon*, is given up for the reason in *error*.
+        """
+        if outcome not in (None, "deleted", "missing"):
+            raise ValueError("invalid cleanup outcome")
+        state = outcome or ("abandoned" if abandon else "requested")
+        with self.store._tx() as cur:
+            cur.execute(
+                "UPDATE nexus_conversation_cleanups SET state=%s, last_error=%s, "
+                "lease_expires=NULL, "
+                "next_attempt_at = now() + %s * interval '1 second', "
+                "finished_at = CASE WHEN %s THEN now() ELSE finished_at END "
+                "WHERE id=%s AND state='requested' RETURNING *",
+                (state, (error or None) and error[:1000], max(0.0, float(retry_seconds)),
+                 state != "requested", cleanup_id))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT * FROM nexus_conversation_cleanups WHERE id=%s",
+                            (cleanup_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise NotFound("cleanup not found")
+            return self._cleanup_row(row)
+
+    def cleanups(self, run_id: str) -> list[dict]:
+        """Every deletion of a run's conversations, oldest first."""
+        with self.store._tx() as cur:
+            cur.execute("SELECT * FROM nexus_conversation_cleanups WHERE run_id=%s "
+                        "ORDER BY created_at, id", (run_id,))
+            return [self._cleanup_row(row) for row in cur.fetchall()]
+
+    def cleanup_summary(self, run_id: str | None = None, *,
+                        retention_seconds: float | None,
+                        workflow_id: str | None = None) -> dict:
+        """What has become of a run's OpenHands conversations, in numbers -
+        or, with *workflow_id*, of an Sr/Jr workflow's.
+
+        ``due_at`` is when they become owed a deletion: set while the run is
+        over and deleting is switched on, ``None`` for a run that is at work
+        (its conversations are kept) and when deleting is off. ``last_error``
+        is why a deletion that is still owed has not happened yet.
+        """
+        out: dict[str, Any] = {"enabled": retention_seconds is not None, "due_at": None,
+                               "requested": 0, "deleted": 0, "missing": 0, "abandoned": 0,
+                               "last_error": None}
+        if workflow_id is not None:
+            table, column, owner, states = ("workflows", "workflow_id", workflow_id,
+                                            CLEANUP_WORKFLOW_STATES)
+        else:
+            table, column, owner, states = "nexus_runs", "run_id", run_id, CLEANUP_RUN_STATES
+        with self.store._tx() as cur:
+            if retention_seconds is not None:
+                cur.execute(
+                    f"SELECT updated_at + %s * interval '1 second' AS due_at FROM {table} "
+                    "WHERE id=%s AND state = ANY(%s)",
+                    (max(0.0, float(retention_seconds)), owner, list(states)))
+                row = cur.fetchone()
+                out["due_at"] = row["due_at"] if row else None
+            cur.execute(
+                "SELECT state, count(*) AS n FROM nexus_conversation_cleanups "
+                f"WHERE {column}=%s GROUP BY state", (owner,))
+            for row in cur.fetchall():
+                out[row["state"]] = int(row["n"])
+            cur.execute(
+                "SELECT last_error FROM nexus_conversation_cleanups "
+                f"WHERE {column}=%s AND state IN ('requested','abandoned') "
+                "AND last_error IS NOT NULL ORDER BY next_attempt_at DESC, id LIMIT 1",
+                (owner,))
+            row = cur.fetchone()
+            out["last_error"] = row["last_error"] if row else None
+        return out
+
+    @staticmethod
+    def _cleanup_row(row: Any) -> dict:
+        out = dict(row)
+        for key in ("id", "run_id", "task_id", "workflow_id", "project_id",
+                    "openhands_account_id"):
             if out.get(key) is not None:
                 out[key] = str(out[key])
         return out

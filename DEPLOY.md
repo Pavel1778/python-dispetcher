@@ -355,7 +355,7 @@ psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 for f in $(ls migrations/*.sql | sort); do psql "$SUPABASE_DB_URL" -f "$f"; done
 ```
 
-The migrations are `0001`–`0011`, `0014`–`0034`. `0012` and `0013` are
+The migrations are `0001`–`0011`, `0014`–`0035`. `0012` and `0013` are
 intentionally unused (reserved for the deferred File Lab, D-1). The runner
 applies every `*.sql` in lexical order and does not require a contiguous
 sequence, so the gap is safe. The set includes the auth tables (`0004`), the
@@ -367,7 +367,8 @@ the RLS on the sandbox session-key tables (`0016`), the context/memory tables
 (`0023`), the task hand-off/preferred-account/time-limit columns (`0024`,
 `0025`), the lease fencing and abandoned-conversation columns (`0028`, `0029`),
 the durable-run/connection/project-repository tables (`0030`–`0032`), the
-chat's intent record (`0033`) and the start a task is waiting for (`0034`).
+chat's intent record (`0033`), the start a task is waiting for (`0034`) and
+the list of OpenHands conversations that are owed a deletion (`0035`).
 
 `0014_nexus_project_binding.sql` is additive: it adds the project↔repository
 link table, nullable `project_id` on `tasks`/`workflows`, the canonical

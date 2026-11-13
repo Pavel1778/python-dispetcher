@@ -94,8 +94,19 @@ from .github_confirmations import Confirmations
 from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
 from .nexus_binding import AuthorizationError, ProjectBindingError, authorize_run_task
-from .nexus_chat import ChatError
-from .nexus_intent import classify, clarifying_question, effective_mode
+from .nexus_chat import ChatError, task_with_context
+from .nexus_intent import (
+    ANALYSIS,
+    AUTONOMOUS,
+    CHAT,
+    Intent,
+    clarification_choice,
+    clarifying_question,
+    classify,
+    effective_mode,
+    names_no_work,
+)
+from .nexus_repo_reader import RepositoryAccess, RepositoryUnavailable, RepositoryView
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
@@ -111,6 +122,7 @@ from .nexus_specs import (
     inline_chars,
     max_spec_chars,
     preview,
+    split_context,
 )
 from .providers import ProviderCascade
 from .sr_runtime import SrRuntime
@@ -138,6 +150,39 @@ def _version() -> str:
         return version("python-dispetcher")
     except Exception:  # noqa: BLE001 - diagnostics must not fail
         return "dev"
+
+
+def _names_work(history: list[dict]) -> bool:
+    """Whether something a person said earlier in the conversation gives a
+    bare go-ahead ("делай") a meaning: a message that is not itself a
+    greeting or a go-ahead."""
+    return any(m.get("role") == "user" and not names_no_work(m.get("content") or "")
+               for m in history)
+
+
+def _asked_about(history: list[dict]) -> str | None:
+    """The message the router's clarifying question was about, when that
+    question is the last thing said in the conversation; else ``None``."""
+    spoken = [m for m in history if m.get("role") in ("user", "assistant")]
+    if len(spoken) < 2:
+        return None
+    last, before = spoken[-1], spoken[-2]
+    meta = last.get("meta") if isinstance(last.get("meta"), dict) else {}
+    if last.get("role") != "assistant" or not meta.get("clarify"):
+        return None
+    if before.get("role") != "user" or not (before.get("content") or "").strip():
+        return None
+    return before["content"]
+
+
+def _cleanup_hours() -> float | None:
+    """After how many hours an ended run's OpenHands conversations are
+    deleted (``NEXUS_OPENHANDS_CLEANUP_HOURS``); ``None`` when never."""
+    from .nexus_lab import cleanup_retention_seconds
+
+    seconds = cleanup_retention_seconds()
+    return None if seconds is None else round(seconds / 3600.0, 2)
+
 
 #: Minimal liveness page. Reveals nothing about configuration.
 HEALTHZ = {"status": "ok"}
@@ -841,7 +886,9 @@ class App:
             # Whether this process advances autonomous runs itself. When it
             # does not, a run waits for ``python -m orchestration.lab_worker``,
             # and the page says so instead of showing a run that never moves.
-            "lab": {"inline": self.lab_inline},
+            # ``cleanup_hours``: how long after a run is over its OpenHands
+            # conversations are deleted; ``None`` when they are kept for ever.
+            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours()},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {
@@ -972,6 +1019,42 @@ class App:
         if account_id is None:
             return self.github
         return self.github_accounts.client_for_account(owner, account_id)
+
+    def repository_access(self, project_id: str, conversation: dict) -> RepositoryAccess:
+        """What a chat turn of *conversation* may read of the project's
+        repository, asked of GitHub now.
+
+        The repository is the conversation's own, else the project's main one;
+        the branch is the one the conversation works on, else the repository's
+        default. It is read with the identity the project reads that
+        repository with (:meth:`repository_client`), so the chat sees exactly
+        what the project was given access to. Never raises: a repository that
+        cannot be read is an answer too, and the turn states the reason.
+        """
+        from .nexus_github_accounts import SecretsError
+
+        full_name = ((conversation.get("repository") or "").strip()
+                     or self.project_repos.primary_repository(project_id) or "")
+        if not full_name:
+            return RepositoryAccess()
+        branch = (conversation.get("selected_branch") or "").strip()
+        try:
+            client = self.repository_client(project_id, full_name)
+        except (NotFound, ValueError, SecretsError) as e:
+            return RepositoryAccess(
+                full_name=full_name, branch=branch,
+                error=f"the GitHub account this project reads the repository with cannot "
+                      f"be used: {e}")
+        if not client.configured:
+            return RepositoryAccess(
+                full_name=full_name, branch=branch,
+                error="no GitHub account is connected for this repository and the server "
+                      "has no GitHub token (GITHUB_TOKEN)")
+        try:
+            view = RepositoryView.open(client, full_name, branch or None)
+        except RepositoryUnavailable as e:
+            return RepositoryAccess(full_name=full_name, branch=branch, error=str(e))
+        return RepositoryAccess(full_name=full_name, branch=view.branch, view=view)
 
     def check_project_repository(self, principal: str, project_id: str,
                                  full_name: str) -> dict[str, Any]:
@@ -1208,10 +1291,19 @@ class App:
             if t.state.value in ("failed", "blocked", "dead_letter") and t.evidence:
                 reason = t.evidence[0].get("reason") if isinstance(t.evidence[0], dict) else str(t.evidence[0])
                 break
+        from .nexus_lab import cleanup_retention_seconds
+
         return {
+            # What has become of the OpenHands conversations of this workflow
+            # - its Sr and its tasks' - once it is completed or cancelled.
+            "cleanup": self.lab.cleanup_summary(
+                workflow_id=workflow_id, retention_seconds=cleanup_retention_seconds()),
             "workflow": {
                 "id": workflow_id,
-                "goal": wf["goal"],
+                # What was asked, without the conversation a short message
+                # took with it (that part is for the agent; see
+                # ``nexus_chat.task_with_context``).
+                "goal": split_context(wf["goal"] or "")[0],
                 "state": workflows.get(workflow_id, {}).get("state"),
                 "project_id": workflows.get(workflow_id, {}).get("project_id"),
                 "sr_conversation_id": wf.get("sr_conversation_id"),
@@ -1798,13 +1890,19 @@ class Handler(BaseHTTPRequestHandler):
             # names every manual/failover hand-off and ``events`` the run's own
             # timeline, so the interface can show the current executor, the
             # conversation ids, the switches and the last events without a
-            # second call.
+            # second call. ``cleanup`` says what has become of the run's
+            # OpenHands conversations: when they are deleted, how many have
+            # been, and why one that is owed a deletion still exists.
+            from .nexus_lab import cleanup_retention_seconds
             return (200, {"run": run, "tasks": tasks,
                           "report": self.app.reports.for_run(rest[1]),
                           "executions": self.app.lab.executions(rest[1]),
                           "switches": self.app.lab.run_handoffs(rest[1]),
                           "events": self.app.lab.run_events(rest[1]),
-                          "stops": self.app.lab.stops(rest[1])}, None)
+                          "stops": self.app.lab.stops(rest[1]),
+                          "cleanup": self.app.lab.cleanup_summary(
+                              rest[1], retention_seconds=cleanup_retention_seconds())},
+                    None)
         # GET /api/v1/projects/{id}/runs/{run_id}/report
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
                 and rest[2] == "report"):
@@ -2712,7 +2810,29 @@ class Handler(BaseHTTPRequestHandler):
         # ask/plan/analysis/code mode is the person's own choice.
         active_run = self.app.conversations.linked_run(principal, project_id, conversation_id)
         chosen = mode or conversation["mode"]
-        intent = classify(text, mode=chosen, has_active_run=active_run is not None)
+        # What was said before this turn. The turn's own text is the request
+        # and is not part of it.
+        history = self.app.conversations.list_messages(principal, project_id, conversation_id)
+        intent = classify(text, mode=chosen, has_active_run=active_run is not None,
+                          has_context=_names_work(history))
+        # The request a model is asked to answer; the message itself, except
+        # when the message only says how an earlier one is to be handled.
+        request = text
+        asked_about = _asked_about(history)
+        if asked_about is not None and not intent.continue_run:
+            # The last thing said here was the router's own question: explain
+            # in the chat, or do the work as a run? This message is the answer
+            # to it. "Сразу работу и прогон" starts the work - and it used to
+            # be read as a remark and answered with "I cannot start a run".
+            choice = clarification_choice(text)
+            if choice == "work":
+                intent = Intent(AUTONOMOUS, reason="chose work when asked")
+            elif choice == "chat":
+                # The message that was asked about is what gets answered.
+                earlier = classify(asked_about, mode=chosen)
+                intent = Intent(ANALYSIS if earlier.intent == ANALYSIS else CHAT,
+                                question=True, reason="chose the chat when asked")
+                request = asked_about
         turn_mode = effective_mode(chosen, intent)
         if (turn_mode == "autonomous" and chosen != "autonomous"
                 and not (conversation.get("repository")
@@ -2737,18 +2857,30 @@ class Handler(BaseHTTPRequestHandler):
             # the user chose is never replaced.
             self.app.conversations.rename(
                 principal, project_id, conversation_id, title_from_message(text))
-        # An autonomous turn's text is the task. It is stored first, exactly as
-        # it was sent - not trimmed, any size the server accepts - with its
-        # SHA-256, as a specification; planning and the agents work from that
-        # copy. The same text in the same conversation is the same row, which is
-        # what lets a repeated send be recognised.
+        # A turn that starts work has a task, and a short message is not one by
+        # itself: "делай" says to act, and what to do was said before it. Such
+        # a message takes the conversation with it (``task_with_context``), so
+        # the planner and the agents are given what the person meant, not one
+        # word. A long message is a document and is the task as it stands.
+        task, attached = sent, 0
+        if turn_mode in ("autonomous", "code") and not (intent.continue_run and active_run):
+            task, attached = task_with_context(sent, history)
+        # An autonomous turn's task is stored first, exactly as it is - not
+        # trimmed, any size the server accepts - with its SHA-256, as a
+        # specification; planning and the agents work from that copy. The same
+        # text in the same conversation is the same row, which is what lets a
+        # repeated send be recognised.
         spec = None
         shown, user_meta = text, None
         if turn_mode == "autonomous":
             spec, _new = self.app.specs.create(
-                principal, project_id, sent, source="chat", conversation_id=conversation_id)
+                principal, project_id, task, source="chat", conversation_id=conversation_id)
             user_meta = {"spec": SpecService.summary(spec)}
-            if spec["char_count"] > inline_chars():
+            if attached:
+                # The transcript shows the message as it was written; that the
+                # conversation went into the task is recorded with it.
+                user_meta["spec"]["context_messages"] = attached
+            elif spec["char_count"] > inline_chars():
                 # The transcript shows the beginning; the message says so and
                 # points at the whole text. Nothing downstream reads this copy.
                 shown = preview(sent)
@@ -2757,10 +2889,6 @@ class Handler(BaseHTTPRequestHandler):
         user_msg = self.app.conversations.add_message(
             principal, project_id, conversation_id, role="user", content=shown,
             meta=user_meta)
-        # What was said before this turn. The turn's own text is the request
-        # and is not repeated as history.
-        history = [m for m in self.app.conversations.list_messages(
-            principal, project_id, conversation_id) if str(m["id"]) != str(user_msg["id"])]
         appended: list[dict] = [user_msg]
         # "Продолжи" continues the run this conversation already started; it
         # never creates a second one. A run that is paused or blocked is
@@ -2793,9 +2921,15 @@ class Handler(BaseHTTPRequestHandler):
         # What the project's runs really did, for an analysis turn. Read here so
         # a question about progress is answered from the database, not guessed.
         run_facts = self._run_facts(principal, project_id) if turn_mode == "analysis" else None
+        # What this turn may read of the repository. Asked of GitHub now, for
+        # the turns that answer in words: they read files instead of guessing.
+        access = (self.app.repository_access(project_id, conversation)
+                  if turn_mode in ("ask", "analysis", "plan") else None)
         try:
             produced = self.app.chat.respond(
-                mode=turn_mode, goal=text, context=context, memory=memory,
+                mode=turn_mode,
+                goal=task.strip() if turn_mode == "code" and attached else request,
+                context=context, memory=memory,
                 repository=conversation.get("repository") or "",
                 branch=conversation.get("selected_branch") or "",
                 history=history,
@@ -2804,7 +2938,7 @@ class Handler(BaseHTTPRequestHandler):
                 project_id=project_id, principal=principal,
                 conversation_id=conversation_id,
                 spec_id=spec["id"] if spec else None,
-                run_facts=run_facts)
+                run_facts=run_facts, access=access, attached=attached)
         except ChatError as e:
             self.app.conversations.set_state(principal, project_id, conversation_id, "error")
             err = self.app.conversations.add_message(
@@ -3457,7 +3591,8 @@ class Handler(BaseHTTPRequestHandler):
                 for w in self.app.store.list_workflows():
                     tasks = self.app.store.list_tasks(workflow_id=w["id"])
                     out.append({
-                        "id": w["id"], "goal": w["goal"], "state": w["state"],
+                        "id": w["id"], "goal": split_context(w["goal"] or "")[0],
+                        "state": w["state"],
                         "sr_status": w.get("sr_status"),
                         "sr_conversation_id": w.get("sr_conversation_id"),
                         "task_count": len(tasks),

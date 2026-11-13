@@ -1088,14 +1088,18 @@ def test_one_long_message_does_not_make_later_questions_too_large(lab):
     long_text = specification(150_000, seed=9)
     status, reply = lab.send(long_text, mode="ask", conversation=conversation)
     assert status == 200, reply
-    # The request is in its prompt once - not a second time as "history".
+    # The request is in its prompt once - not a second time as "history" - and
+    # whole. After it comes one line and nothing else: what the model may open
+    # of the repository in this round.
     assert asked[0].count(long_text[:200]) == 1
-    assert asked[0].endswith("Request:\n" + long_text.strip())
+    request, _, after = asked[0].partition("Request:\n" + long_text.strip())
+    assert _ and not request.count("Request:\n")
+    assert after.strip().startswith("To open files") and len(after) < 300, after
     assert "Recent conversation" not in asked[0]
 
     status, reply = lab.send("А что с пунктом 7?", mode="ask", conversation=conversation)
     assert status == 200, reply
-    assert asked[1].endswith("Request:\nА что с пунктом 7?")
+    assert "\n\nRequest:\nА что с пунктом 7?\n\nTo open files" in asked[1]
     assert "assistant: Ответ." in asked[1]
     assert "more characters not shown]" in asked[1]
     assert len(asked[1]) < 26_000, "the whole earlier message was sent again"

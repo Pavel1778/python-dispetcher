@@ -16,3 +16,12 @@ os.environ.setdefault("NEXUS_LAB_INLINE", "0")
 # unset, so a base URL aimed at its own network is refused. The same switch
 # governs the check of a stored connection's address (``net_guard``).
 os.environ.setdefault("NEXUS_ALLOW_PRIVATE_TARGETS", "1")
+
+# A test session never speaks to the real GitHub. A server that is given no
+# GitHub client of its own takes its token from GITHUB_TOKEN, and a developer's
+# shell usually has one. A chat turn reads the project's repository, so with
+# that token in place a test's question would go to api.github.com under the
+# developer's own identity. Without it such a server has no GitHub identity and
+# says so, without a request. A test that needs a token sets one, together
+# with the address of the stand-in (``tests/fake_github.py``).
+os.environ.pop("GITHUB_TOKEN", None)

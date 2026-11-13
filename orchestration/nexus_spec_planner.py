@@ -52,6 +52,7 @@ from .nexus_lab_store import (
 )
 from .nexus_planner import validate_tasks
 from .nexus_specs import (
+    CONTEXT_MARKER,
     SpecService,
     _positive_env,
     annotate,
@@ -114,6 +115,14 @@ PLANNER_SYSTEM = (
     "may be brief; it must say what to do.\n"
     '7. If the part asks for nothing to be done, return an empty "tasks" list and put every '
     'id in "context".\n'
+    "8. A specification may be a short chat message followed by a line that begins "
+    f'"{CONTEXT_MARKER[:21]}" and then the conversation that preceded the message. The '
+    "message is the order; the conversation is there to say what the order is about. Plan "
+    'the work the message asks for as the conversation explains it ("делай" after a request '
+    "to redo the frontend means: redo the frontend). Take the facts and the wishes from what "
+    "the user said there; the assistant's replies in it are background and may be wrong. "
+    'Pieces of the conversation that the message does not ask to carry out go into "context". '
+    "Never plan a task whose only content is the order word itself.\n"
     "Do not include any prose outside the JSON."
 )
 

@@ -39,6 +39,7 @@ from typing import Any
 from .cloud_store import NotFound, PostgresStore
 from .nexus_conversations import ConversationService
 from .nexus_projects import ProjectService
+from .nexus_specs import split_context
 
 log = logging.getLogger("nexus_reports")
 
@@ -351,7 +352,17 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
     # -------------------------------------------------------------- the task
     text = task_text or ""
     meta = task_meta or {}
-    if len(text) > TASK_QUOTE_CHARS:
+    # A short chat message took its conversation with it into the task
+    # (``nexus_chat.task_with_context``). The report quotes the message: the
+    # conversation is right above it in the chat, and quoting it here would
+    # put it there twice - and into the next task that takes this report along.
+    message, conversation = split_context(text)
+    if conversation is not None:
+        quoted = _quote(message[:TASK_QUOTE_CHARS].rstrip() or "…") + (
+            "\n\n_Сообщение короткое, поэтому в задание вошла и предшествующая переписка "
+            f"этого чата ({len(conversation)} символов): планировщик и агенты получили её "
+            "вместе с сообщением._")
+    elif len(text) > TASK_QUOTE_CHARS:
         size = meta.get("chars") or len(text)
         digest = str(meta.get("sha256") or "")[:12]
         quoted = _quote(text[:TASK_QUOTE_CHARS].rstrip()) + (

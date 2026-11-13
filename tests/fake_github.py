@@ -91,7 +91,8 @@ class FakeGitHub:
         #: from "everything": ``{(token, full_name): {"push": False, ...}}``.
         self.token_permissions: dict[tuple[str, str], dict] = {}
         #: File contents, keyed by path, returned base64 from /contents/{path}.
-        self.contents: dict[str, str] = {
+        #: A value may be ``bytes``, for a file that is not text.
+        self.contents: dict[str, str | bytes] = {
             "README.md": "# Demo project\n\nA tiny service used by tests.\n",
             "requirements.txt": "pytest\n",
             "src/app.py": "def add(a, b):\n    return a + b\n",
@@ -248,9 +249,11 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json(404, {"message": "Not Found"})
                     return
                 import base64
+                # A test that needs a file that is not text gives its bytes.
+                raw = content if isinstance(content, bytes) else content.encode()
                 self._json(200, {
                     "path": rel, "encoding": "base64",
-                    "content": base64.b64encode(content.encode()).decode(),
+                    "content": base64.b64encode(raw).decode(),
                 })
                 return
         self._json(404, {"message": "Not Found"})

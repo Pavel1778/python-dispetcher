@@ -634,6 +634,37 @@
     return '';
   }
 
+  // What an answer rests on: the repository the turn read, at which commit,
+  // and which files it opened - or that it could not be read, and why. The
+  // assistant says "I looked at the code"; this line is what it looked at.
+  function sourcesHtml(meta) {
+    var repo = meta && meta.repository;
+    if (!repo || typeof repo !== 'object' || !repo.full_name) return '';
+    if (repo.error) {
+      return '<p class="msg-sources is-warn">' + icon('alert', 'icon-sm') +
+        '<span>Репозиторий <code>' + esc(repo.full_name) + '</code> не прочитан: ' +
+        esc(clip(String(repo.error), 300)) + '</span></p>';
+    }
+    var read = Array.isArray(repo.read) ? repo.read : [];
+    var names = [];
+    read.forEach(function (item) {
+      if (item && item.path && names.indexOf(String(item.path)) < 0) names.push(String(item.path));
+    });
+    var missed = Array.isArray(repo.not_read) ? repo.not_read : [];
+    var head = 'Репозиторий <code>' + esc(repo.full_name) + '</code>' +
+      (repo.branch ? ' · ветка <code>' + esc(repo.branch) + '</code>' : '') +
+      (repo.revision ? ' · коммит <code>' + esc(String(repo.revision).slice(0, 7)) + '</code>' : '') +
+      ' · файлов в списке: ' + esc(String(repo.files || 0)) +
+      ' · открыто: ' + names.length;
+    if (!names.length && !missed.length) return '<p class="msg-sources">' + head + '</p>';
+    return '<details class="msg-sources"><summary>' + head + '</summary><ul>' +
+      names.map(function (name) { return '<li><code>' + esc(name) + '</code></li>'; }).join('') +
+      missed.map(function (item) {
+        return '<li class="is-warn"><code>' + esc(String(item.path || '')) + '</code> — не открыт: ' +
+          esc(clip(String(item.reason || ''), 200)) + '</li>';
+      }).join('') + '</ul></details>';
+  }
+
   function workChip(entry) {
     var record = S.work.data[entry.key];
     var state = record && record.state;
@@ -686,7 +717,7 @@
     return '<article class="msg assistant" data-id="' + id + '">' +
       '<svg class="msg-avatar" aria-hidden="true"><use href="#i-logo"/></svg>' +
       '<div class="msg-body"><div class="md">' + MD.render(message.content) + '</div>' +
-      (entry ? workChip(entry) : '') +
+      (entry ? workChip(entry) : '') + sourcesHtml(meta) +
       '<div class="msg-meta">' + (label ? '<span class="msg-model">' + esc(label) + '</span>' : '') +
       '<span title="' + esc(fullTime(message.created_at)) + '">' + esc(clock(message.created_at)) + '</span>' +
       copyButton(id, meta.report ? 'Скопировать отчёт' : 'Скопировать ответ') +
@@ -1097,17 +1128,34 @@
     if ({ blocked: 1, failed: 1 }[wf.state]) {
       actions += '<button class="btn btn-sm" type="button" data-action="resume-workflow" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Возобновить</button>';
     }
+    // Once the workflow is over its conversations are deleted from OpenHands,
+    // and a link to one that is gone would open an error page.
+    var cleanup = detail.cleanup || null;
+    var cleanupLine = cleanupText(cleanup, !!wf.sr_conversation_id, 'этой задачи');
+    if (cleanup && ((cleanup.deleted || 0) + (cleanup.missing || 0)) && !(cleanup.requested || 0) && !(cleanup.abandoned || 0)) link = '';
     return '<section class="work"><div class="work-head">' + pill(wf.state) +
       '<span class="work-kind">Задача OpenHands</span><span class="work-id">' + esc(shortId(entry.id)) + '</span>' +
       '<span class="topbar-spacer"></span>' + link + '</div>' +
       '<p class="work-goal">' + esc(clip(wf.goal, 400)) + '</p>' +
       (wf.reason ? '<p class="work-reason">' + esc(clip(resultText(wf.reason), 400)) + '</p>' : '') +
+      (cleanupLine ? '<p class="work-note">' + esc(cleanupLine) + '</p>' : '') +
       '<div class="work-section"><p class="work-section-title">Задачи' + (tasks.length ? ' · ' + tasks.length : '') + '</p>' + steps + '</div>' +
       log +
       '<div class="work-foot">' + actions + '<span class="muted">Старший агент: ' + esc(wf.sr_status ? stateLabel(wf.sr_status) : 'не запущен') + '</span></div></section>';
   }
 
   // When something that is waiting will be looked at again, in a few words.
+  // When the OpenHands conversations of a run that is over are deleted, as a
+  // sentence for a dialog; empty when the server keeps them for ever.
+  function cleanupNotice() {
+    var hours = S.status && S.status.lab ? S.status.lab.cleanup_hours : null;
+    if (hours === null || hours === undefined) return '';
+    if (!hours) return ' Разговоры агентов в OpenHands будут удалены.';
+    var whole = Math.round(hours);
+    return ' Разговоры агентов в OpenHands будут удалены через ' +
+      (Math.abs(hours - whole) < 0.01 ? whole + ' ' + plural(whole, 'час', 'часа', 'часов') : hours + ' ч') + '.';
+  }
+
   function untilText(value) {
     if (!value) return '';
     var left = new Date(value).getTime() - Date.now();
@@ -1129,6 +1177,36 @@
     });
     if (!last) return null;
     return { label: last.executor_label || 'ключ сервера', starts: count, kind: last.kind };
+  }
+
+  // What has become of a run's OpenHands conversations, in one sentence: when
+  // they are deleted, how many have been, and why one that is owed a deletion
+  // is still there. Nothing is said of a run that started no conversation, or
+  // while the run is at work (its conversations are kept).
+  function cleanupText(cleanup, hasConversations, whose) {
+    if (!cleanup) return '';
+    whose = whose || 'этого прогона';
+    var gone = (cleanup.deleted || 0) + (cleanup.missing || 0);
+    var owed = cleanup.requested || 0, stuck = cleanup.abandoned || 0;
+    var total = gone + owed + stuck;
+    var why = cleanup.last_error ? ' Причина: ' + clip(cleanup.last_error, 200) : '';
+    if (!total) {
+      if (!cleanup.enabled || !cleanup.due_at || !hasConversations) return '';
+      var due = parseTime(cleanup.due_at);
+      return due && due.getTime() > Date.now()
+        ? 'Разговоры OpenHands ' + whose + ' будут удалены ' + fullTime(cleanup.due_at) + '.'
+        : 'Разговоры OpenHands ' + whose + ' удаляются.';
+    }
+    if (owed) {
+      return 'Разговоры OpenHands ' + whose + ' удаляются: удалено ' + gone + ' из ' + total + '.' +
+        (why ? why + ' Попытка будет повторена.' : '');
+    }
+    if (stuck) {
+      return 'Разговоры OpenHands ' + whose + ': удалено ' + gone + ' из ' + total + ', ' +
+        stuck + ' удалить нельзя.' + why;
+    }
+    return 'Разговоры OpenHands ' + whose + ' удалены: ' + gone + '.' +
+      (cleanup.missing ? ' Из них ' + cleanup.missing + ' в OpenHands уже не было.' : '');
   }
 
   function runCard(entry, detail) {
@@ -1235,6 +1313,8 @@
           : 'ожидает отправки в чат') + '</span></div></div>'
       : '';
     var owed = stops.filter(function (stop) { return stop.state === 'requested'; }).length;
+    var cleanupLine = cleanupText(detail.cleanup, executions.length > 0 ||
+      tasks.some(function (task) { return !!task.conversation_id; }));
     return '<section class="work" data-run="' + esc(entry.id) + '"><div class="work-head">' + pill(run.state) +
       '<span class="work-kind">Автономный прогон</span><span class="work-id">' + esc(shortId(entry.id)) + '</span>' +
       '<span class="topbar-spacer"></span><span class="work-id" title="' +
@@ -1242,6 +1322,7 @@
                : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
       (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
       (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
+      (cleanupLine ? '<p class="work-note">' + esc(cleanupLine) + '</p>' : '') +
       currentLine +
       '<div class="work-section"><p class="work-section-title">План · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач') + '</p>' + steps +
       (waiting ? '<p class="step-sub">' + (inline
@@ -2431,7 +2512,7 @@
     'refresh-work': function () { refreshWork(); },
     'cancel-workflow': function (el) {
       var id = el.getAttribute('data-id');
-      confirmDialog('Остановить задачу?', 'Диспетчер перестанет её вести, и она уйдёт из списка. Сессия OpenHands и история задачи сохранятся.', 'Остановить', function () {
+      confirmDialog('Остановить задачу?', 'Диспетчер перестанет её вести, и она уйдёт из списка. История задачи сохранится.' + (cleanupNotice() || ' Сессия OpenHands сохранится.'), 'Остановить', function () {
         api('/api/workflows/' + enc(id) + '/cancel', { method: 'POST', body: {} }).then(function () {
           dropWork('workflow:' + id);
           toast('Задача остановлена.');
@@ -2453,7 +2534,7 @@
         workAction(el, api(projectUrl('/runs/' + enc(id) + '/' + op), { method: 'POST', body: {} }), done);
         return;
       }
-      confirmDialog('Отменить прогон?', 'Незавершённые задачи больше не будут выполняться, агентам будет отправлен сигнал остановки, а прогон уйдёт из списка. Его история, логи и результаты останутся в базе.', 'Отменить прогон', function () {
+      confirmDialog('Отменить прогон?', 'Незавершённые задачи больше не будут выполняться, агентам будет отправлен сигнал остановки, а прогон уйдёт из списка. Его история, логи и результаты останутся в базе.' + cleanupNotice(), 'Отменить прогон', function () {
         api(projectUrl('/runs/' + enc(id) + '/cancel'), { method: 'POST', body: {} }).then(function () {
           // The server has settled the run and taken it out of the lists; the
           // card leaves with it, now, and a reload will not bring it back.
@@ -2481,7 +2562,7 @@
         }).join('');
         openDialog({
           title: 'Сменить исполнителя',
-          body: '<p class="lead">Задача будет передана другому подключению OpenHands: текущий разговор остановят (его история сохранится), а новая попытка получит контекст задачи — план, сделанное, ветку и commit.</p>' +
+          body: '<p class="lead">Задача будет передана другому подключению OpenHands: текущий разговор остановят (он остаётся в OpenHands, пока прогон не закончится), а новая попытка получит контекст задачи — план, сделанное, ветку и commit.</p>' +
             '<label class="field"><span class="field-label">Подключение</span>' +
             '<select class="select" id="switch-account" aria-label="Подключение">' + options + '</select></label>' +
             '<p class="field-hint">Переключить можно только задачу в работе. Если она уже завершена, сервер ответит отказом.</p>',
@@ -2661,7 +2742,7 @@
         if ((deps.projects || []).length) lines.push('оно исполнитель проектов: ' + deps.projects.map(function (p) { return p.name; }).join(', '));
         if (deps.pending_stops) lines.push('ему ещё нужно остановить разговоров: ' + deps.pending_stops);
         if (!lines.length) {
-          confirmDialog('Удалить подключение?', 'Ключ будет удалён. История того, какие задачи оно выполняло, сохранится.', 'Удалить', function () {
+          confirmDialog('Удалить подключение?', 'Ключ будет удалён. История того, какие задачи оно выполняло, сохранится. Разговоры, которые оно оставило в OpenHands и которые ещё не удалены, останутся там: без ключа удалить их нельзя.', 'Удалить', function () {
             remove(false).catch(function (error) { toast(explain(error.message).text, 'bad'); });
           }, true);
         } else {

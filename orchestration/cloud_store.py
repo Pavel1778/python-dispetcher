@@ -387,6 +387,9 @@ class PostgresStore:
                                  "state", "attempts", "next_attempt_at"),
         "nexus_task_executions": ("id", "run_id", "task_id", "kind",
                                   "executor_label", "conversation_id"),
+        "nexus_conversation_cleanups": ("id", "conversation_id", "run_id",
+                                        "openhands_account_id", "executor_label",
+                                        "state", "attempts", "next_attempt_at"),
         "nexus_project_executors": ("project_id", "account_id", "position", "enabled"),
         "nexus_project_repositories": ("project_id", "repository_id",
                                        "github_account_id", "is_primary"),
@@ -1099,6 +1102,17 @@ class PostgresStore:
                 (conversation_id,),
             )
             return cur.fetchone()
+
+    def delete_conversation_route(self, conversation_id: str) -> bool:
+        """Forget where a conversation lived, and the session key that went
+        with it. For a conversation that has been deleted. ``True`` when there
+        was a route."""
+        with self._tx() as cur:
+            cur.execute(
+                "DELETE FROM conversation_routes WHERE external_conversation_id=%s",
+                (conversation_id,),
+            )
+            return cur.rowcount > 0
 
     def save_sandbox(
         self,

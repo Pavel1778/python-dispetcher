@@ -244,6 +244,11 @@ class CloudDirectClient:
             # Each pass either returns or takes one sandbox off the list.
             while (row := self.store.running_sandbox(self.scope, workspace)) is not None:
                 if self._still_running(row["sandbox_id"]):
+                    # Written down as handed out now: until the service has
+                    # learnt of the conversation about to be started on it,
+                    # the conversations it already holds are not deleted
+                    # (``nexus_lab_store.SANDBOX_QUIET_SECONDS``).
+                    self.store.mark_sandbox_status(row["sandbox_id"], "RUNNING")
                     return SandboxRoute(
                         sandbox_id=row["sandbox_id"],
                         agent_server_url=row["agent_server_url"],
@@ -660,9 +665,52 @@ class CloudDirectClient:
         return status in (200, 201)
 
     def delete_conversation(self, conversation_id: str) -> bool:
-        route = self._route_for(conversation_id)
-        status, _ = self._send(route, "DELETE", f"/api/conversations/{conversation_id}")
-        return status in (200, 204)
+        """Delete a conversation everywhere it is kept; ``True`` when there
+        was one to delete. See :meth:`remove_conversation`."""
+        return self.remove_conversation(conversation_id) == "deleted"
+
+    def remove_conversation(self, conversation_id: str) -> str:
+        """Delete a conversation and say what became of it: ``deleted`` or
+        ``missing`` (it was nowhere to be found).
+
+        A conversation of this transport is kept in three places, and each is
+        dealt with here:
+
+        * **the account.** The service records every conversation that is
+          started on one of its sandboxes, and that record is what a person
+          sees in their OpenHands account. Deleting the conversation on its
+          sandbox alone does not remove it (the sandbox reports the deletion
+          and the service does nothing with the report), so the account API
+          is asked first - with the same question and the same proof as on the
+          ``app`` transport (:meth:`CloudClient.remove_conversation`). Deleting
+          there also removes the sandbox once it holds no conversation of the
+          account. A failure here is raised: nothing else is touched, and the
+          whole deletion is tried again.
+        * **the sandbox.** While other conversations share the sandbox the
+          service leaves this one's copy on it, so it is deleted directly, by
+          its own id. It concerns nothing else on the sandbox. A sandbox that
+          does not answer - paused, or already removed along with everything
+          on it - is not an error: there is nothing to ask of it.
+        * **this application.** The route to the conversation holds the
+          sandbox's session key. Once the conversation is gone the route is
+          dropped, and the key with it.
+        """
+        outcome = self.cloud.remove_conversation(conversation_id)
+        row = self.store.conversation_route(conversation_id)
+        if row is not None:
+            route = SandboxRoute(sandbox_id=row["sandbox_id"],
+                                 agent_server_url=row["agent_server_url"],
+                                 session_api_key=row["session_api_key"])
+            try:
+                status, _ = self._send(route, "DELETE",
+                                       f"/api/conversations/{conversation_id}")
+            except CloudError:
+                status = 0
+            if status in (200, 204):
+                outcome = "deleted"
+            self.store.delete_conversation_route(conversation_id)
+        self._cache.pop(conversation_id, None)
+        return outcome
 
     def pause(self, conversation_id: str) -> None:
         route = self._route_for(conversation_id)

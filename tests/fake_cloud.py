@@ -91,6 +91,13 @@ class FakeCloud:
         self.sandboxes: dict[str, dict] = {}
         self.agent_server_url: str | None = None
         self.sandbox_session_key = "test-key"
+        # Deletions: the conversations deleted, in order; the sandboxes removed
+        # because their last conversation was; and a status to answer a DELETE
+        # with instead of deleting (404 is what the live service answers for a
+        # deletion it could not make, as well as for a conversation it has not).
+        self.deleted: list[str] = []
+        self.removed_sandboxes: list[str] = []
+        self.delete_status = 0
 
     def make_conversation(self, *, title, repo=None, branch=None,
                           execution_status="running", tags=None) -> str:
@@ -110,6 +117,27 @@ class FakeCloud:
         self.events[cid] = []
         self.messages[cid] = []
         return cid
+
+    def register(self, cid: str, sandbox_id: str, *, title: str | None = None,
+                 tags: dict | None = None) -> None:
+        """The service learns of a conversation that was started on one of its
+        sandboxes directly (the ``direct`` transport). On the live service the
+        sandbox reports it; from then on the account lists it, with the title
+        the service gives a conversation it did not start itself."""
+        self.conversations[cid] = {
+            "id": cid,
+            "title": title or f"Conversation {cid.replace('-', '')}",
+            "sandbox_id": sandbox_id,
+            "execution_status": "running",
+            "sandbox_status": "RUNNING",
+            "selected_repository": None,
+            "selected_branch": None,
+            "conversation_url": f"https://cloud.example/api/conversations/{cid}",
+            "sub_conversation_ids": [],
+            "tags": dict(tags or {}),
+        }
+        self.events.setdefault(cid, [])
+        self.messages.setdefault(cid, [])
 
     def add_assistant_message(self, cid: str, text: str) -> None:
         self.events[cid].append(
@@ -428,10 +456,22 @@ class _Handler(BaseHTTPRequestHandler):
         if (path.startswith("/api/v1/app-conversations/")
                 and path.count("/") == 4):
             cid = path.split("/")[4]
+            if self.cloud.delete_status:
+                return self._json(self.cloud.delete_status,
+                                  {"detail": "Failed to delete conversation"})
             if cid not in self.cloud.conversations:
                 return self._json(404, {"detail": "not found"})
+            sandbox_id = self.cloud.conversations[cid].get("sandbox_id")
             del self.cloud.conversations[cid]
             self.cloud.events.pop(cid, None)
+            self.cloud.deleted.append(cid)
+            # As on the live service: a sandbox goes with the last conversation
+            # the account has on it, and stays while another one is there.
+            if sandbox_id in self.cloud.sandboxes and not any(
+                    c.get("sandbox_id") == sandbox_id
+                    for c in self.cloud.conversations.values()):
+                del self.cloud.sandboxes[sandbox_id]
+                self.cloud.removed_sandboxes.append(sandbox_id)
             return self._json(200, {"success": True})
         return self._json(404, {"detail": "not found"})
 

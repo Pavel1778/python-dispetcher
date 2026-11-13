@@ -130,6 +130,8 @@ class FakeRuntime:
          "usable": True},
     ]})
     tool_catalog_status: int = 0
+    #: The conversations deleted with ``DELETE /api/conversations/{id}``, in order.
+    deleted: list[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def finish(self, conversation_id: str, response: str | None) -> None:
@@ -418,6 +420,24 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, json.loads(json.dumps(rt.settings)))
             return
 
+        self._json(404, {"detail": "Not Found"})
+
+    def do_DELETE(self) -> None:
+        path = self.path.split("?")[0]
+        if not self._guard():
+            return
+        parts = [p for p in path.split("/") if p]
+        # DELETE /api/conversations/{id}: the conversation and its events go;
+        # the sandbox, its files and every other conversation stay.
+        if len(parts) == 3 and parts[:2] == ["api", "conversations"]:
+            rt = self.runtime
+            with rt.lock:
+                if rt.conversations.pop(parts[2], None) is None:
+                    self._json(404, {"detail": "Not Found"})
+                    return
+                rt.deleted.append(parts[2])
+            self._json(200, {"success": True})
+            return
         self._json(404, {"detail": "Not Found"})
 
     def _query_path(self) -> str | None:

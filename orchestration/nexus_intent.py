@@ -125,6 +125,52 @@ _GREETING = re.compile(
     r"хай|ку|спасибо|благодарю|ок|окей|ok|okay|hello|hi|hey|thanks|thank\s+you)"
     r"[\s!.,:)-]*$", re.IGNORECASE)
 
+#: The message says in so many words that the work is to be done as a run:
+#: "делать это в режиме прогона", "сделай это прогоном", "запускаем прогон".
+#: Such a message is an order whatever read-only verbs it also contains - the
+#: person named the way of working. A question about a run is still a question
+#: (it is decided before this is looked at), and a refusal is not a request:
+#: see :func:`_asks_for_a_run`.
+_RUN_REQUEST = re.compile(
+    r"(?:"
+    r"в\s+режиме\s+(?:автономного\s+|авто)?прогона|режимом\s+прогона|"
+    r"(?:автономным\s+)?прогоном|через\s+(?:автономный\s+)?прогон|"
+    r"(?:запус(?:ти|тите|кай|кайте|каем|тим|тить)|начн(?:и|ите|ём|ем)|начина(?:й|йте|ем)|"
+    r"стартуй|стартуем|сделай|сделаем|делай|делаем)\s+(?:сразу\s+|уже\s+|этот\s+|новый\s+)?"
+    r"(?:автономный\s+|авто)?прогон|"
+    r"as\s+an?\s+(?:autonomous\s+)?run|in\s+run\s+mode|"
+    r"(?:start|launch|begin|do)\s+(?:an?|the)\s+(?:autonomous\s+)?run"
+    r")(?![\w-])", re.IGNORECASE)
+
+#: Words that turn a request around when they stand just before it.
+_NEGATION = re.compile(
+    r"(?:\bне|\bбез|\bникаких|\bnot|\bno|\bnever|\bwithout|n['’]t)\s+(?:\w+\s+){0,2}$",
+    re.IGNORECASE)
+
+#: A go-ahead: the whole message is "do it". It names no work - the work is
+#: what the conversation before it was about - so it is an order only when
+#: there is such a conversation (:func:`classify`, *has_context*). "Да" and
+#: "давай" are deliberately absent: they agree with whatever was said last,
+#: and that is as often an offer to explain as an offer to act.
+_GO_AHEAD = re.compile(
+    r"^\s*(?:(?:ну|да|ок|окей|хорошо|ладно|давай|тогда|ok|okay|yes|then|so)[\s,.!]+){0,3}"
+    r"(?:делай|делайте|сделай|сделайте|действуй|действуйте|приступай|приступайте|"
+    r"начинай|начинайте|выполняй|выполняйте|запускай|запускайте|запусти|запустите|"
+    r"поехали|погнали|вперёд|вперед|в\s+работу|"
+    r"go(?:\s+ahead)?|do\s+it|proceed|start|let['’]?s\s+go)"
+    r"(?:\s+(?:это|так|всё|все|уже|сейчас|сразу|пожалуйста|прогон|работу|"
+    r"it|now|please))*[\s.!]*$", re.IGNORECASE)
+
+#: What an answer to :func:`clarifying_question` chooses. The question offers
+#: two things by name - explain in the chat, or do the work as a run - so the
+#: answer is read for those names.
+_CHOOSES_WORK = re.compile(
+    r"(?:прогон|запус|выполн|работ|дела[йе]|сдела|исполн|приступ|начина|начн|втор|"
+    r"\brun\b|\bstart|\bexecute|\bdo\s+it|\bthe\s+work|\bsecond|\bgo\b)", re.IGNORECASE)
+_CHOOSES_CHAT = re.compile(
+    r"(?:\bчат|обсуд|объясн|поясн|расскаж|поговор|перв|\bchat|\bdiscuss|\bexplain|\bfirst|"
+    r"\btalk)", re.IGNORECASE)
+
 #: A request for a plan, answered in the chat (the "plan" reply), never a run.
 _PLAN = re.compile(
     r"\b(?:предложи\s+план|составь\s+план|спланируй|составить\s+план|"
@@ -181,6 +227,18 @@ class Intent:
         return self.intent == AUTONOMOUS and not self.ambiguous
 
 
+#: The reason of a go-ahead that has nothing to go ahead with.
+_NO_CONTEXT = "go-ahead with nothing before it"
+
+
+def names_no_work(text: str) -> bool:
+    """Whether *text* is a greeting, a courtesy or a bare go-ahead: a message
+    that by itself says nothing about what is to be done. A conversation made
+    only of such messages gives a go-ahead nothing to refer to."""
+    raw = (text or "").strip()
+    return not raw or bool(_GREETING.match(raw) or _GO_AHEAD.match(raw))
+
+
 #: A message longer than this is a document (a specification, a brief), not a
 #: remark to be asked about: a long text that mixes verbs is read, not
 #: intercepted with a clarifying question.
@@ -207,6 +265,36 @@ def _has_explicit_order(text: str) -> bool:
     return bool(_EXPLICIT_ORDER.match(text))
 
 
+def _asks_for_a_run(text: str) -> bool:
+    """Whether *text* says the work is to be done as a run, and does not say
+    the opposite ("только не в режиме прогона", "без запуска прогона")."""
+    for match in _RUN_REQUEST.finditer(text):
+        if not _NEGATION.search(text[:match.start()]):
+            return True
+    return False
+
+
+def clarification_choice(text: str) -> str | None:
+    """What a reply to :func:`clarifying_question` chooses: ``"work"``,
+    ``"chat"``, or ``None`` when it names neither or both.
+
+    The question was "explain and discuss it in the chat, or do the work and
+    start an autonomous run?". "Сразу работу и прогон" picks the second, "в
+    чате" the first. A reply that is itself a question, or longer than a
+    remark, is not an answer to it and is routed like any other message.
+    """
+    raw = (text or "").strip()
+    if not raw or not _short(raw) or _QUESTION_MARK.search(raw):
+        return None
+    work = bool(_CHOOSES_WORK.search(raw)) and not _NEGATION.search(
+        raw[:_CHOOSES_WORK.search(raw).start()])
+    chat = bool(_CHOOSES_CHAT.search(raw)) and not _NEGATION.search(
+        raw[:_CHOOSES_CHAT.search(raw).start()])
+    if work == chat:
+        return None
+    return "work" if work else "chat"
+
+
 def _residual_after_continue(text: str) -> str:
     """*text* with the continuation cue and polite filler removed.
 
@@ -220,7 +308,8 @@ def _residual_after_continue(text: str) -> str:
     return " ".join(stripped.split())
 
 
-def classify(text: str, *, mode: str | None = None, has_active_run: bool = False) -> Intent:
+def classify(text: str, *, mode: str | None = None, has_active_run: bool = False,
+             has_context: bool = False) -> Intent:
     """Classify one chat message.
 
     *mode* is the conversation's chosen mode, used only as a *hint* for the
@@ -228,6 +317,10 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     an autonomous run, whatever the words say, because the person chose that
     mode. ``auto`` (and ``autonomous``) leave the decision to the message.
     *has_active_run* lets "продолжи" be recognised as continuing real work.
+    *has_context* says that something was said in the conversation before this
+    message: only then is a bare go-ahead ("делай", "приступай") an order -
+    the order to do what was discussed. With nothing before it, it names no
+    work and is answered.
 
     The rules are ordered; the first that matches decides. Read them as: a
     question is never an order; an order is only an order when it names work.
@@ -282,6 +375,18 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
         return Intent(CHAT, ambiguous=not question, question=question,
                       reason="continue with no known run")
 
+    # 4a. A bare go-ahead ("делай", "приступай", "go ahead") after a
+    #     conversation is the order to do what the conversation was about. The
+    #     caller puts that conversation into the task
+    #     (``nexus_chat.task_with_context``). With nothing before it there is
+    #     nothing to go ahead with, and it is answered. It stands before the
+    #     question rule because "do it" opens with a word that rule reads as
+    #     an interrogative; a go-ahead never ends with a question mark.
+    if _GO_AHEAD.match(raw):
+        if has_context:
+            return Intent(AUTONOMOUS, reason="go-ahead for what was discussed")
+        return Intent(CHAT, reason=_NO_CONTEXT)
+
     # 5. A question is answered, never executed - even when it contains an
     #    order verb ("почему прогон ломается?", "почему ты не исправил это?").
     #    A question that asks *why* about real state, or uses an analysis verb,
@@ -294,6 +399,13 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
         if order and not discuss and _short(raw):
             return Intent(CHAT, ambiguous=True, question=True, reason="question with a buried order")
         return Intent(CHAT, question=True, reason="question")
+
+    # 5a. The message says to do it as a run ("делать это в режиме прогона").
+    #     That is an order even when it also asks to look into something first:
+    #     looking into it is then part of the work. It comes after the question
+    #     rule, so "можно ли сделать это прогоном?" is still answered.
+    if _asks_for_a_run(raw):
+        return Intent(AUTONOMOUS, reason="asks for a run")
 
     # 6. A request for a plan is answered in the chat.
     if _PLAN.search(raw) and not explicit_order:
@@ -350,7 +462,9 @@ def effective_mode(mode: str | None, intent: Intent) -> str:
         # goal runs rather than being turned into a chat reply.
         if intent.question:
             return "analysis" if intent.intent == ANALYSIS else "ask"
-        if intent.intent == CHAT and intent.reason == "discussion":
+        if intent.intent == CHAT and intent.reason in ("discussion", "greeting", _NO_CONTEXT):
+            # "Привет" is not a goal, and "делай" with nothing said before it
+            # names none: a run planned from either is planned from nothing.
             return "ask"
         return "autonomous"
     # auto: the message alone decides.

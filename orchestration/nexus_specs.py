@@ -169,6 +169,42 @@ def preview(text: str, limit: int = PREVIEW_CHARS) -> str:
     return head[:limit].rstrip() + "…"
 
 
+#: The line that begins the conversation attached to a short chat message.
+#:
+#: "Делай" is an order, and what to do was said in the messages before it. A
+#: task made of such a message carries those messages with it
+#: (``nexus_chat.task_with_context``): the message, this line, a note on how
+#: to read what follows, then the conversation. Everything from this line on
+#: is background - it says what the message refers to, it does not ask for
+#: anything by itself. :func:`build_index` therefore never counts a piece of
+#: it as an obligation, so a plan is not held to sentences of a discussion.
+CONTEXT_MARKER = "=== КОНТЕКСТ ЗАДАНИЯ: предшествующая переписка этого чата ==="
+
+
+def split_context(text: str) -> tuple[str, str | None]:
+    """``(the message, the conversation attached to it)`` of a task text.
+
+    The second is ``None`` for a text with no attached conversation - which is
+    every text that was written as a task in the first place.
+    """
+    at = _context_start(text)
+    if at is None:
+        return text, None
+    return text[:at].rstrip(), text[at:]
+
+
+def _context_start(text: str) -> int | None:
+    """Where the marker line begins in *text*, or ``None``. Only a whole line
+    counts: the same words inside a sentence are a sentence."""
+    at = text.find(CONTEXT_MARKER)
+    while at != -1:
+        end = at + len(CONTEXT_MARKER)
+        if (at == 0 or text[at - 1] == "\n") and (end == len(text) or text[end] in "\r\n"):
+            return at
+        at = text.find(CONTEXT_MARKER, end)
+    return None
+
+
 #: ``nexus_goals.text`` holds at most this many characters (migration 0009).
 GOAL_TEXT_CHARS = 20_000
 
@@ -178,9 +214,11 @@ def goal_label(text: str) -> str:
 
     A text that fits the goal column is the label itself, as it always was. A
     longer one is represented by its beginning; the text is in ``nexus_specs``.
+    A short message that took its conversation with it is labelled by the
+    message: the conversation is in the specification, not in the list of goals.
     """
-    head = text.strip()
-    return head if len(head) <= GOAL_TEXT_CHARS else preview(text)
+    head = split_context(text)[0].strip() or text.strip()
+    return head if len(head) <= GOAL_TEXT_CHARS else preview(head)
 
 
 def requirement_key(ordinal: int, count: int) -> str:
@@ -539,14 +577,19 @@ def build_index(text: str) -> SpecIndex:
                 pieces.append((section.ordinal, i, j, "paragraph"))
             i = j
     width = max(4, len(str(len(pieces))))
+    # A conversation attached to a short message is background from its marker
+    # line on: a list in somebody's answer is not a list of demands.
+    background = _context_start(text)
     requirements: list[Requirement] = []
     for ordinal, (section_ordinal, first, last, kind) in enumerate(pieces):
         body = text[starts[first]:starts[last]]
         # A heading is judged by its title, without the "##" and the number.
         said = headings[first][2] if kind == "heading" else body
-        normative = kind in ("item", "row") or (
-            kind in ("paragraph", "heading")
-            and bool(_NORMATIVE.search(said) or _IMPERATIVE.match(said) or _ORDER.match(said)))
+        normative = (background is None or starts[first] < background) and (
+            kind in ("item", "row") or (
+                kind in ("paragraph", "heading")
+                and bool(_NORMATIVE.search(said) or _IMPERATIVE.match(said)
+                         or _ORDER.match(said))))
         requirements.append(Requirement(
             ordinal=ordinal, key=f"R-{ordinal + 1:0{width}d}", section=section_ordinal,
             kind=kind, normative=normative, start=starts[first], end=starts[last],

@@ -282,6 +282,17 @@ event stream (§1.2), and on the `direct` transport also from
   cancelling a NEXUS run, its deadline, or a task's time limit.
 - **Finish.** The agent ends by calling the `finish` tool (its `message` is the
   report) or by writing a final message. NEXUS reads both.
+- **Delete.** Cloud: `DELETE /api/v1/app-conversations/{id}` removes the
+  conversation from the account, and its sandbox once it holds no other
+  conversation of the account. Agent-server: `DELETE /api/conversations/{id}`
+  removes the copy on that sandbox only - the account keeps listing the
+  conversation, so the `direct` transport asks the account first and the
+  sandbox second (`CloudDirectClient.remove_conversation`). NEXUS deletes the
+  conversations of work that is over after a retention period; see
+  `docs/DURABLE-RUNS.md`, "The conversations of work that is over are deleted".
+  Verified against the stand-in services only (`tests/test_conversation_cleanup.py`);
+  the account-side deletion of a `direct` conversation rests on the upstream
+  source, not on a live call from this repository.
 - **Runtime.** Agent-server: `GET /api/conversations/{id}/runtime`,
   `POST …/runtime/reprovision`; runtime kinds are reported by `/server_info`
   (`conversation_runtime: "local"`, plus a capabilities list). Cloud exposes

@@ -97,7 +97,7 @@ def _head_reads(studio):
 
 def test_the_server_alone_takes_a_run_from_the_chat_to_completed(monkeypatch):
     with studio_stack(monkeypatch, lab_inline=True) as studio:
-        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": True}
+        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": True, "cleanup_hours": 24.0}
         project, run = _start_run(studio, account=True)
 
         # The first task is started on the Cloud, for the connected repository
@@ -326,7 +326,7 @@ def test_left_alone_the_server_advances_runs_itself(monkeypatch):
     monkeypatch.delenv("NEXUS_LAB_INLINE", raising=False)
     with studio_stack(monkeypatch) as studio:
         assert studio.app.lab_inline is True
-        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": True}
+        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": True, "cleanup_hours": 24.0}
         project, run = _start_run(studio)
         first = _until(lambda: _task_conversation(studio, "audit"),
                        what="the first task to start with nothing configured")
@@ -402,7 +402,7 @@ def test_the_switch_is_read_from_the_environment(monkeypatch, value, expected):
     monkeypatch.setenv("NEXUS_LAB_INLINE", value)
     with studio_stack(monkeypatch) as studio:
         assert studio.app.lab_inline is expected
-        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": expected}
+        assert studio.api.get("/api/studio")[1]["lab"] == {"inline": expected, "cleanup_hours": 24.0}
 
 
 def test_an_answer_given_through_the_finish_tool_is_the_report(monkeypatch):
