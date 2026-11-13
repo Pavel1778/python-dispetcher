@@ -315,6 +315,26 @@ def test_a_question_in_auto_mode_starts_nothing(studio):
     assert _count_runs(studio, project) == 0
 
 
+def test_switching_a_conversation_to_manual_changes_the_behaviour(studio):
+    """The same order is a run in Auto and a plan in Manual."""
+    project = studio.project()
+    _connect(studio, project)
+    conversation = _conversation(studio, project, mode="auto")
+
+    # Switch the conversation to Manual.
+    status, body = studio.api.patch(
+        f"/api/v1/projects/{project}/conversations/{conversation}",
+        {"mode": "manual"})
+    assert status == 200 and body["conversation"]["mode"] == "manual"
+
+    # Now an order proposes a plan and starts nothing.
+    studio.answers(json.dumps(PLAN))
+    status, body = _send(studio, project, conversation, "Исправь найденные ошибки")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"].get("awaiting_approval") is True
+    assert _count_runs(studio, project) == 0
+
+
 # ------------------------------------------------------ run lifecycle / archive
 def _runs(stack, project, *, archived=False):
     path = f"/api/v1/projects/{project}/runs" + ("?archived=1" if archived else "")
