@@ -92,7 +92,9 @@ shell, and double every `$` (`$$`) inside a Docker Compose `env_file`.
 | `WEB_AUTH_TOKEN` | — | `web_server.py` | Bearer token for the machine API. Required to bind a public interface. |
 | `AUTH_USERNAME` | — | `web_auth.py` | Owner login name. Required for a public bind. |
 | `AUTH_PASSWORD_HASH` | — | `web_auth.py` | PBKDF2-SHA256 hash of the owner password (`pbkdf2_sha256$<iters>$<salt>$<digest>`). Never the password. |
-| `AUTH_SESSION_SECRET` | — | `web_auth.py` | Separate secret that signs sessions. Must not be the Cloud key. |
+| `AUTH_SESSION_SECRET` | — | `web_auth.py` | Separate secret that signs sessions. Must not be the Cloud key. Changing it ends every open session. |
+| `AUTH_SESSION_TTL_SECONDS` | `2592000` (30 days) | `web_auth.py` | How long a login lasts without being used; each request made with the session starts the count again. `300` .. `34560000`; a value that is not a number falls back to the default. |
+| `AUTH_SESSION_MAX_SECONDS` | `7776000` (90 days) | `web_auth.py` | How long a login lasts at all, however much it is used. Same range. The idle limit is never longer than this one. See DEPLOY.md, "How long a login lasts". |
 | `WEB_COOKIE_SECURE` | auto | `web_server.py` | Force the `Secure` cookie flag. Default: on when `X-Forwarded-Proto: https`. |
 | `TRUSTED_PROXY_HOPS` | `1` | `web_server.py` | Number of trusted proxies; the client IP is the rightmost trusted hop of `X-Forwarded-For`. `0` ignores the header. A junk value falls back to `1`; a negative value clamps to `0`. |
 | `LOGIN_MAX_ATTEMPTS_PER_IP` | `30` | `web_server.py` | In-memory per-IP login ceiling per minute. |

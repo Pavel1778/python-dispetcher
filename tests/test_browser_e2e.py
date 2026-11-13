@@ -1505,3 +1505,86 @@ def test_a_project_gets_a_second_repository_from_another_github_account(stack, c
         assert watch.problems == []
     finally:
         ctx.close()
+
+
+# ------------------------------------------------------- staying signed in
+DAY = 24 * 3600
+
+
+def _time_passes(interval: str) -> None:
+    """*interval* passes for the open sessions: their own times move back by
+    it in the database, which is where the server reads them from. The
+    browser's clock stays where it is, so a cookie's expiry is counted from
+    the real moment it was set."""
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE sessions SET created_at = created_at - %(i)s::interval, "
+            "last_seen = last_seen - %(i)s::interval, "
+            "expires_at = expires_at - %(i)s::interval", {"i": interval})
+
+
+def _session_cookie(ctx) -> dict:
+    return next(c for c in ctx.cookies() if c["name"] == "dispatcher_session")
+
+
+def test_the_owner_stays_signed_in_from_one_day_to_the_next(stack, chromium):
+    """What the owner reported: the studio asked for the password about once a
+    day. A login lasted twelve hours whether the studio was used or not.
+
+    One sign-in in a real browser, then: thirteen hours later, and every eleven
+    days after that, the studio opens - not the login form. The browser's own
+    copy of the cookie follows the session: it is replaced when the session is
+    extended, and it is given only what is left when the ninety days are nearly
+    over. After ninety days the login form is back, once."""
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        first = _session_cookie(ctx)
+        assert first["httpOnly"] and first["sameSite"] == "Strict"
+        assert 30 * DAY - 60 < first["expires"] - time.time() <= 30 * DAY
+
+        def visit() -> None:
+            page.goto(stack.base + "/")
+            page.wait_for_selector('#app[data-ready="true"]')
+            assert page.url == stack.base + "/"
+            expect(page.locator("#whoami")).to_have_text(USERNAME)
+
+        # Thirteen hours on: the old rule had ended the session an hour ago.
+        page.wait_for_timeout(1200)
+        _time_passes("13 hours")
+        visit()
+        renewed = _session_cookie(ctx)
+        assert renewed["value"] == first["value"], "the same session, not a new login"
+        assert renewed["expires"] > first["expires"] + 1, "the browser's cookie was not renewed"
+
+        # The page that is open goes on working: its CSRF token is the session's.
+        stack.answers("Всё ещё здесь.")
+        _send(page, "Проверка через тринадцать часов")
+        expect(page.locator(".msg.assistant .md")).to_have_text("Всё ещё здесь.")
+
+        # Used every eleven days, up to the 88th.
+        for _ in range(8):
+            _time_passes("11 days")
+            visit()
+        # The last time there was anything to add was the 66th day, and the
+        # cookie was given what was then left of the ninety: 23 days and a half.
+        left = _session_cookie(ctx)["expires"] - time.time()
+        assert 23 * DAY < left < 24 * DAY, left / DAY
+        assert _session_cookie(ctx)["value"] == first["value"]
+        assert watch.problems == []
+
+        # Past the ninety days the session is over, used or not.
+        watch.allow(r"HTTP 401 ")      # the open page may ask once more before it leaves
+        _time_passes("2 days")
+        page.goto(stack.base + "/")
+        page.wait_for_selector("#loginbtn")
+        assert page.url == stack.base + "/login"
+        _login(page, stack.base)
+        again = _session_cookie(ctx)
+        assert again["value"] != first["value"]
+        assert 30 * DAY - 60 < again["expires"] - time.time() <= 30 * DAY
+        assert watch.problems == []
+    finally:
+        ctx.close()

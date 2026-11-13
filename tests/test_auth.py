@@ -7,9 +7,11 @@ lookup, CSRF check, logout) is exercised. Only the Cloud API is a local fake.
 
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -23,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from orchestration.cloud_client import CloudClient  # noqa: E402
 from orchestration.web_auth import (  # noqa: E402
     SESSION_COOKIE,
+    SESSION_MAX_SECONDS,
+    SESSION_TTL_SECONDS,
     AuthService,
     hash_password,
     parse_hash,
@@ -306,6 +310,319 @@ def test_logout_clears_cookie(browser):
     browser.login()
     st, body, hdr = browser.json("POST", "/logout")
     assert "Max-Age=0" in hdr.get("Set-Cookie", "")
+
+
+# -------------------------------------------------------- session lifetime
+# A session lasts while it is used: 30 days from the last request, 90 days from
+# the login at most. Time passes here by moving a session's own times back in
+# the database, which is what the server reads them from.
+DAY = 24 * 3600
+
+
+def _time_passes(interval: str) -> None:
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE sessions SET created_at = created_at - %(i)s::interval, "
+            "last_seen = last_seen - %(i)s::interval, "
+            "expires_at = expires_at - %(i)s::interval", {"i": interval})
+
+
+def _seconds_left() -> float:
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        return float(conn.execute(
+            "SELECT EXTRACT(EPOCH FROM (expires_at - now())) FROM sessions").fetchone()[0])
+
+
+def _max_age(set_cookie: str) -> int:
+    return int(re.search(r"Max-Age=(\d+)", set_cookie).group(1))
+
+
+def _about(seconds: int, value: float) -> bool:
+    """*value* is *seconds*, less what the test itself took - which on a busy
+    runner is more than the moment it takes here."""
+    return seconds - 300 <= value <= seconds
+
+
+def _answer(server, method: str, path: str, token: str, headers: dict | None = None):
+    """One request with the session cookie; ``(status, every Set-Cookie line,
+    headers)``. A dict of headers keeps one line of a kind, and what matters
+    in places is that there is exactly one."""
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+    try:
+        conn.request(method, path,
+                     headers={"Cookie": f"{SESSION_COOKIE}={token}", **(headers or {})})
+        response = conn.getresponse()
+        response.read()
+        return response.status, response.headers.get_all("Set-Cookie") or [], response.headers
+    finally:
+        conn.close()
+
+
+def test_the_default_limits_are_thirty_days_unused_and_ninety_at_most(server):
+    assert (SESSION_TTL_SECONDS, SESSION_MAX_SECONDS) == (30 * DAY, 90 * DAY)
+    assert (server.app.auth.session_ttl, server.app.auth.session_max) == (30 * DAY, 90 * DAY)
+
+
+def test_a_session_that_is_used_is_not_ended_after_twelve_hours(browser):
+    """What the owner reported: signed out about once a day. A session lasted
+    twelve hours from the login whether it was used or not, so opening the
+    studio once a day meant signing in every day - and a long working day
+    ended with the login page in the middle of it."""
+    browser.login()
+    csrf = browser.json("GET", "/api/session")[1]["csrf_token"]
+    _time_passes("11 hours 59 minutes")
+    assert browser.json("GET", "/api/session")[0] == 200
+    _time_passes("2 minutes")                       # twelve hours and a minute
+    st, body, _ = browser.json("GET", "/api/session")
+    assert st == 200 and body["username"] == "owner"
+    for _ in range(5):                              # and one visit a day after that
+        _time_passes("24 hours")
+        assert browser.json("GET", "/api/dashboard")[0] == 200
+    # The studio itself opens, not the login form...
+    st, raw, _ = browser.request("GET", "/", follow=False)
+    assert st == 200 and "Войти" not in raw
+    # ...and it is the same session: what the page holds still writes.
+    st, body, _ = browser.json("GET", "/api/session")
+    assert st == 200 and body["csrf_token"] == csrf
+    st, body, _ = browser.json("POST", "/api/workflows", data={"goal": "five days in"},
+                               headers={"X-CSRF-Token": csrf})
+    assert st == 200 and body["workflow_id"]
+
+
+def test_using_a_session_renews_the_cookie_with_it(server, browser):
+    """A session the server still honours is of no use once the browser has
+    dropped its cookie: the cookie is sent again with the session's new
+    lifetime - and not on every answer of a page that polls."""
+    st, _, hdr = browser.request("POST", "/login", follow=False,
+                                 form={"username": "owner", "password": PASSWORD})
+    assert st == 303 and _max_age(hdr["Set-Cookie"]) == 30 * DAY
+    token = browser.cookie().value
+    # Used at once, and half an hour later: nothing to tell the browser.
+    assert _answer(server, "GET", "/api/session", token)[:2] == (200, [])
+    _time_passes("30 minutes")
+    assert _answer(server, "GET", "/api/session", token)[:2] == (200, [])
+    _time_passes("31 minutes")                      # an hour since the login
+    st, cookies, headers = _answer(server, "GET", "/api/session", token)
+    assert st == 200 and len(cookies) == 1
+    assert cookies[0].startswith(f"{SESSION_COOKIE}={token};"), "the same session, not a new one"
+    for attribute in ("Path=/", "HttpOnly", "SameSite=Strict"):
+        assert attribute in cookies[0]
+    assert "Secure" not in cookies[0], "plain HTTP here; the HTTPS case is below"
+    assert _about(30 * DAY, _max_age(cookies[0]))
+    assert _about(30 * DAY, _seconds_left())
+    assert "no-store" in headers["Cache-Control"]
+    # Told once.
+    assert _answer(server, "GET", "/api/session", token)[:2] == (200, [])
+    assert _answer(server, "GET", "/api/dashboard", token)[:2] == (200, [])
+
+
+def test_opening_the_studio_renews_the_cookie_and_keeps_it_secure(server, browser):
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("1 day")
+    st, cookies, headers = _answer(server, "GET", "/", token, {"X-Forwarded-Proto": "https"})
+    assert st == 200 and len(cookies) == 1
+    assert "Secure" in cookies[0] and _about(30 * DAY, _max_age(cookies[0]))
+    assert "no-store" in headers["Cache-Control"]
+
+
+def test_the_login_address_renews_the_cookie_of_someone_signed_in(server, browser):
+    """``/login`` is the address a browser remembers from all the days of
+    signing in again. It sends a signed-in owner on to the studio; if that
+    answer did not carry the renewal, the request after it would find nothing
+    to renew and the browser would keep the old lifetime."""
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("1 day")
+    st, cookies, headers = _answer(server, "GET", "/login", token)
+    assert st == 303 and headers["Location"] == "/"
+    assert len(cookies) == 1 and cookies[0].startswith(f"{SESSION_COOKIE}={token};")
+    assert _about(30 * DAY, _max_age(cookies[0]))
+    assert _answer(server, "GET", "/", token)[:2] == (200, [])
+
+
+def test_a_renewed_cookie_is_never_put_on_an_answer_a_cache_may_keep(server, browser):
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("1 day")
+    for path in ("/static/app.js", "/static/pwa/icon-192.png", "/manifest.webmanifest"):
+        st, cookies, headers = _answer(server, "GET", path, token)
+        assert st == 200 and cookies == [], path
+        assert "no-store" not in headers["Cache-Control"], path
+    # The renewal is still owed, and the first answer that is not kept carries it.
+    st, cookies, headers = _answer(server, "GET", "/api/session", token)
+    assert st == 200 and len(cookies) == 1 and "no-store" in headers["Cache-Control"]
+
+
+def test_a_session_that_is_not_used_ends_after_thirty_days(server, browser):
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("29 days 23 hours")
+    assert _answer(server, "GET", "/api/session", token)[0] == 200    # ...and it is renewed
+    _time_passes("30 days 1 minute")
+    st, cookies, _ = _answer(server, "GET", "/api/session", token)
+    assert st == 401 and cookies == []
+    st, cookies, headers = _answer(server, "GET", "/", token)
+    assert st == 303 and headers["Location"] == "/login" and cookies == []
+
+
+def test_no_session_outlives_ninety_days_however_much_it_is_used(server, browser):
+    browser.login()
+    token = browser.cookie().value
+    given: list[int] = []
+    for _ in range(8):                              # used every 11 days: 88 days
+        _time_passes("11 days")
+        st, cookies, _ = _answer(server, "GET", "/api/session", token)
+        assert st == 200 and len(cookies) <= 1
+        given += [_max_age(cookie) for cookie in cookies]
+    # Thirty days more at each use while that fits; at 66 days what is left of
+    # the ninety, 24 days; after that there is nothing to add and no cookie.
+    assert len(given) == 6 and all(_about(30 * DAY, age) for age in given[:5])
+    assert _about(24 * DAY, given[5])
+    assert _about(2 * DAY, _seconds_left())
+    _time_passes("1 day")
+    assert _answer(server, "GET", "/api/session", token)[:2] == (200, []), "nothing to add"
+    _time_passes("1 day 1 minute")
+    assert _answer(server, "GET", "/api/session", token)[0] == 401
+    # Signing in again is a new session with the whole lifetime.
+    browser.login()
+    assert browser.cookie().value != token
+    assert browser.json("GET", "/api/session")[0] == 200
+
+
+def test_logging_out_answers_with_the_clearing_cookie_only(server, browser):
+    """A renewal is due at the request that logs out. The answer must end the
+    cookie, not renew it - with both lines in it, the browser keeps the last."""
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("1 day")
+    st, cookies, _ = _answer(server, "POST", "/logout", token)
+    assert st == 200 and len(cookies) == 1
+    assert cookies[0].startswith(f"{SESSION_COOKIE}=;") and "Max-Age=0" in cookies[0]
+    assert _answer(server, "GET", "/api/session", token)[0] == 401
+
+
+def test_a_session_opened_under_the_twelve_hour_rule_is_carried_over(server, browser):
+    """The sessions open at the moment this is deployed: nobody is signed out
+    by the deployment, and the first request gives the session and its cookie
+    the new lifetime."""
+    browser.login()
+    token = browser.cookie().value
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute("UPDATE sessions SET expires_at = created_at + interval '12 hours'")
+    _time_passes("11 hours")
+    st, cookies, _ = _answer(server, "GET", "/api/session", token)
+    assert st == 200 and len(cookies) == 1 and _about(30 * DAY, _max_age(cookies[0]))
+    _time_passes("5 days")
+    assert _answer(server, "GET", "/api/session", token)[0] == 200
+
+
+def test_lowering_a_limit_ends_the_sessions_that_are_past_it(server, browser, monkeypatch):
+    """The limits in force now decide, not the expiry a session was given when
+    the limits were longer: an operator who shortens them after an incident is
+    not left waiting a month for it to take effect."""
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("3 days")
+    assert _answer(server, "GET", "/api/session", token)[0] == 200    # good for 30 days more
+    _time_passes("2 days")
+    monkeypatch.setattr(server.app.auth, "session_ttl", DAY)
+    assert _answer(server, "GET", "/api/session", token)[0] == 401, "unused for two days"
+    monkeypatch.setattr(server.app.auth, "session_ttl", 30 * DAY)
+    assert _answer(server, "GET", "/api/session", token)[0] == 200
+    monkeypatch.setattr(server.app.auth, "session_max", 4 * DAY)
+    assert _answer(server, "GET", "/api/session", token)[0] == 401, "opened five days ago"
+    # A session within the lowered limits is shortened to them, cookie and all.
+    monkeypatch.setattr(server.app.auth, "session_max", 6 * DAY)
+    st, cookies, _ = _answer(server, "GET", "/api/session", token)
+    assert st == 200 and len(cookies) == 1
+    assert _about(DAY, _max_age(cookies[0])) and _about(DAY, _seconds_left())
+
+
+def test_requests_arriving_together_renew_the_cookie_once(server, browser):
+    """A page fires several requests when it opens. One of them renews."""
+    import threading
+    browser.login()
+    token = browser.cookie().value
+    _time_passes("1 day")
+    answers: list = []
+    start = threading.Barrier(6)
+
+    def ask():
+        start.wait()
+        answers.append(_answer(server, "GET", "/api/session", token)[:2])
+
+    threads = [threading.Thread(target=ask) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert [status for status, _ in answers] == [200] * 6
+    assert sum(len(cookies) for _, cookies in answers) == 1
+
+
+@pytest.mark.parametrize("ttl,longest,expected", [
+    (None, None, (30 * DAY, 90 * DAY)),             # nothing set: the defaults
+    ("86400", "604800", (DAY, 7 * DAY)),
+    (" 3600 ", None, (3600, 90 * DAY)),             # a pasted value with spaces
+    ("0", "1", (300, 300)),                         # never less than five minutes
+    ("999999999", "999999999", (400 * DAY, 400 * DAY)),    # nor more than 400 days
+    ("7776000", "86400", (DAY, DAY)),               # unused cannot exceed the longest
+    ("thirty days", "", (30 * DAY, 90 * DAY)),      # not a number: the default
+    ("12.5", None, (30 * DAY, 90 * DAY)),
+    (None, "-5", (300, 300)),
+])
+def test_the_session_limits_are_read_from_the_environment(monkeypatch, ttl, longest, expected):
+    for name, value in (("AUTH_SESSION_TTL_SECONDS", ttl), ("AUTH_SESSION_MAX_SECONDS", longest)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    auth = AuthService(None)
+    assert (auth.session_ttl, auth.session_max) == expected
+    assert 1 <= auth.renew_step <= 3600 and auth.renew_step <= auth.session_ttl
+
+
+def test_an_unreadable_limit_is_reported_without_its_value(monkeypatch, caplog):
+    monkeypatch.setenv("AUTH_SESSION_TTL_SECONDS", "sk-pasted-into-the-wrong-field")
+    with caplog.at_level("WARNING", logger="web_auth"):
+        assert AuthService(None).session_ttl == 30 * DAY
+    assert "AUTH_SESSION_TTL_SECONDS" in caplog.text
+    assert "sk-pasted" not in caplog.text
+
+
+def test_the_environment_sets_the_lifetime_of_a_real_session(fake, monkeypatch):
+    """The whole path: the variable, the session row and the cookie agree."""
+    monkeypatch.setenv("OPENHANDS_API_KEY", "test-key")
+    monkeypatch.setenv("AUTH_USERNAME", "owner")
+    monkeypatch.setenv("AUTH_SESSION_SECRET", "unit-test-session-secret")
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", hash_password(PASSWORD, iterations=1000))
+    monkeypatch.setenv("AUTH_SESSION_TTL_SECONDS", str(2 * DAY))
+    monkeypatch.setenv("AUTH_SESSION_MAX_SECONDS", str(5 * DAY))
+    app = App(DSN, poll_interval=3600, token="machine-token")
+    app.client = CloudClient(fake.base_url, api_key="test-key", timeout=5.0)
+    app.dispatcher.client = app.runtime.client = app.client
+    ws = WebServer(app, "127.0.0.1", 0)
+    ws.start()
+    try:
+        b = Browser(f"http://127.0.0.1:{ws.port}")
+        st, _, hdr = b.request("POST", "/login", follow=False,
+                               form={"username": "owner", "password": PASSWORD})
+        assert st == 303 and _max_age(hdr["Set-Cookie"]) == 2 * DAY
+        assert _about(2 * DAY, _seconds_left())
+        token = b.cookie().value
+        _time_passes("1 day 23 hours")
+        assert _answer(ws, "GET", "/api/session", token)[0] == 200
+        _time_passes("1 day 23 hours")
+        st, cookies, _ = _answer(ws, "GET", "/api/session", token)
+        assert st == 200 and _about(DAY + 2 * 3600, _max_age(cookies[0]))
+        _time_passes("2 days 1 minute")
+        assert _answer(ws, "GET", "/api/session", token)[0] == 401
+    finally:
+        ws.stop()
 
 
 # ------------------------------------------------------------ rate limiting

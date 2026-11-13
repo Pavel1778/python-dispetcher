@@ -194,6 +194,43 @@ def test_an_analysis_turn_reads_the_real_state_and_changes_nothing(studio):
     assert "Autonomous runs of this project" in prompt
 
 
+def test_an_analysis_turn_in_a_project_that_has_runs_is_answered_from_them(studio):
+    """The case above has no run, so the loop that gathers the facts never ran.
+    With a run in the project it asked ``LabStore`` for a method no class has,
+    and the turn ended in a 500. Here: a run, and a finished one's report."""
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers(json.dumps(PLAN))
+    status, body = _send(studio, project, conversation, "Исправь найденные ошибки")
+    assert status == 200, body
+    run_id = next(m["meta"]["run_id"] for m in body["messages"] if m["meta"].get("run_id"))
+
+    studio.answers("Прогон идёт: одна задача в работе.")
+    status, body = _send(studio, project, conversation, "Проанализируй, почему тесты падают")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["mode"] == "analysis"
+    assert body["messages"][-1]["content"] == "Прогон идёт: одна задача в работе."
+    prompt = studio.llm.calls[-1]["body"]["messages"][-1]["content"]
+    assert "Autonomous runs of this project" in prompt and run_id in prompt
+    assert '"policy": "durable"' in prompt
+    assert _count_runs(studio, project) == 1, "the question started another run"
+
+    # A run that has a report: its text is among the facts.
+    with studio.app.store._tx() as cur:
+        cur.execute(
+            "INSERT INTO nexus_run_reports(run_id, project_id, conversation_id, body, outcome) "
+            "VALUES (%s, %s, %s, %s, 'no_changes')",
+            (run_id, project, conversation,
+             "## Отчёт автономного прогона\n\n**Статус:** изменений в репозитории нет."))
+    studio.answers("В репозитории ничего не изменилось.")
+    status, body = _send(studio, project, conversation, "Проанализируй отчёт последнего прогона")
+    assert status == 200, body
+    prompt = studio.llm.calls[-1]["body"]["messages"][-1]["content"]
+    assert "изменений в репозитории нет" in prompt and '"report_outcome": "no_changes"' in prompt
+
+
 def test_an_ambiguous_message_asks_one_question_and_starts_nothing(studio):
     project = studio.project()
     assert studio.api.post(f"/api/v1/projects/{project}/repository",

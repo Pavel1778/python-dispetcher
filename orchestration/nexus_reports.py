@@ -21,7 +21,10 @@ Three properties are enforced here, each by construction rather than by care:
   NEXUS checked itself (the commits are in the branches on GitHub; what GitHub
   lists as changed; what the repository's own checks say) from what the agents
   reported (their summaries, the tests they say they ran), and says which is
-  which.
+  which. Its headline says "done" only when NEXUS saw new commits: a run whose
+  tasks were all accepted while no branch moved - an agent that could not push
+  names the head it found, and that is accepted - is reported as "no changes
+  in the repository; the result is not confirmed" (``build_report``).
 
 The text is Markdown, in Russian like the rest of the chat. ``summary`` holds
 the same facts as data.
@@ -114,10 +117,22 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
 
     Pure: everything it says comes from its arguments, which are the run's own
     rows and what GitHub answered at the final confirmation. *outcome* is
-    ``success`` or ``success_with_notes`` - the second when something a reader
-    must know stands beside the success (a repository's own checks failed or
-    have not finished, a task was accepted without the branch moving, a stop
-    signal could not be confirmed).
+
+    * ``success`` - NEXUS saw new commits in the repositories and nothing
+      stands beside that;
+    * ``success_with_notes`` - the same, with something a reader must know (a
+      repository's own checks failed or have not finished, a task was accepted
+      without the branch moving, a stop signal could not be confirmed);
+    * ``no_changes`` - the run completed and **no repository has a new
+      commit**: the head of each branch is the commit the work started from.
+      Every task was accepted, because the rule of acceptance - the agent named
+      the head of the branch - holds for an agent that pushed nothing and named
+      the head it found. That is not a result NEXUS can vouch for, so the
+      report does not call it done: an agent whose push was refused ends
+      exactly like this;
+    * ``unconfirmed`` - the same doubt for another reason: the commit the work
+      started from is not known (the run was started before it was recorded, or
+      GitHub did not answer then), so whether anything changed cannot be said.
     """
     repositories = list((confirmation or {}).get("repositories") or [])
     by_task: dict[str, list[dict]] = {}
@@ -178,6 +193,21 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
             "verification": (task.get("verification") or {}).get("reason")})
 
     # ------------------------------------------------------ the repositories
+    # What NEXUS itself saw change. ``moved``: new commits between the start
+    # and now; ``still``: the head is the commit the work started from;
+    # ``unknown``: the start is not known. Tasks accepted for different commits
+    # of one branch show that it moved even when the start is not known.
+    moved: list[str] = []
+    still: list[str] = []
+    unknown: list[str] = []
+    #: Notes about whether anything changed. They stand beside a success; a
+    #: report that says "no changes" in its headline does not repeat them.
+    change_notes: list[str] = []
+    accepted_in: dict[tuple[str, str], set[str]] = {}
+    for item in task_data:
+        if item["repository"] and item["commit"]:
+            accepted_in.setdefault((item["repository"], item["branch"]), set()).add(
+                item["commit"])
     repo_sections: list[str] = []
     for repo in repositories:
         base, head = repo.get("base_sha"), repo.get("head_sha")
@@ -195,13 +225,25 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
                 f"{_plural(total, 'коммит', 'коммита', 'коммитов')}, {listed} "
                 f"{_plural(listed, 'файл', 'файла', 'файлов')} (+{added} −{removed}) — "
                 "по данным GitHub.")
+            moved.append(repo["repository"])
         elif base and head:
             lines.append(f"- Вершина ветки не изменилась: `{_short(head)}`. Новых коммитов "
                          "за время прогона нет.")
-            notes.append(f"в {repo['repository']} нет изменений")
+            change_notes.append(f"в {repo['repository']} нет изменений")
+            still.append(repo["repository"])
         else:
             lines.append(f"- Вершина ветки сейчас: `{_short(head)}`. С какого коммита прогон "
                          "начал, установить не удалось, поэтому список изменений не построен.")
+            commits_accepted = len(accepted_in.get(
+                (repo["repository"], repo.get("branch") or ""), ()))
+            if commits_accepted > 1:
+                lines.append("- Ветка менялась за время прогона: задачи приняты по разным "
+                             f"коммитам ({commits_accepted}).")
+                notes.append(f"список изменений в {repo['repository']} не построен")
+                moved.append(repo["repository"])
+            else:
+                change_notes.append(f"изменения в {repo['repository']} не подтверждены")
+                unknown.append(repo["repository"])
         if repo.get("comparison_error"):
             lines.append("- Список коммитов и файлов GitHub не отдал: "
                          f"{_clip(repo['comparison_error'], 200)}.")
@@ -222,9 +264,11 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
         lines.append(f"- Задачи: {', '.join(repo.get('tasks') or []) or '—'}. Коммиты, по "
                      "которым они приняты, содержатся в ветке — проверено при итоговой сверке.")
         if repo.get("unchanged"):
-            lines.append("- Приняты без изменения ветки (агент сообщил, что менять нечего): "
-                         + ", ".join(repo["unchanged"]) + ".")
-            notes.append("часть задач принята без изменений")
+            # Said as what was seen. Why nothing was pushed - nothing needed
+            # changing, or the push was refused - is in the agent's own words.
+            lines.append("- Приняты без изменения ветки (за время их работы новых коммитов "
+                         "не появилось): " + ", ".join(repo["unchanged"]) + ".")
+            change_notes.append("часть задач принята без изменений")
         checks = repo.get("checks")
         if isinstance(checks, dict) and checks.get("total"):
             if checks.get("failed"):
@@ -258,15 +302,42 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
                       "к сверке): список коммитов и файлов не построен.")
 
     # --------------------------------------------------------------- headline
-    outcome = "success_with_notes" if notes else "success"
-    seen: list[str] = []
-    for note in notes:
-        if note not in seen:
-            seen.append(note)
-    status = ("**Статус:** выполнено, все задачи проверены и подтверждены в репозиториях."
-              if outcome == "success" else
-              "**Статус:** выполнено и подтверждено в репозиториях, с замечаниями: "
-              + "; ".join(seen) + ".")
+    # "Done" is said only of what was seen: a run in which no repository has a
+    # new commit is not reported as done, whatever its tasks were accepted for.
+    beside = list(dict.fromkeys(notes))
+    seen = list(dict.fromkeys(notes + change_notes))
+    if repositories and not moved:
+        outcome = "unconfirmed" if unknown else "no_changes"
+        if outcome == "no_changes":
+            status = (
+                "**Статус:** изменений в репозитории нет — результат не подтверждён.\n\n"
+                "Задачи приняты по отчётам агентов, но ни одного нового коммита за время "
+                "прогона NEXUS не увидел: вершина ветки та же, что до начала работы. Если "
+                "работа должна была изменить код, она не доставлена. Что произошло, сказано "
+                "в отчёте агента ниже.")
+            limits.insert(0, (
+                "Новых коммитов в репозитории нет. Задачи приняты, потому что вершина ветки "
+                "названа в отчёте агента, — это правило выполняется и тогда, когда агент "
+                "ничего не отправил и назвал прежнюю вершину. Прогон из-за этого задачи не "
+                "перезапускал."))
+        else:
+            status = (
+                "**Статус:** завершено, но изменения в репозитории не подтверждены.\n\n"
+                "NEXUS не знает, с какого коммита начиналась работа, и не может сказать, "
+                "появились ли в ветке новые коммиты. Что произошло, сказано в отчёте агента "
+                "ниже.")
+            limits.insert(0, (
+                "Начальный коммит неизвестен (прогон начат до того, как NEXUS стал его "
+                "записывать, или GitHub тогда не ответил): появились ли новые коммиты, "
+                "не установлено."))
+        if beside:
+            status += "\n\nЗамечания: " + "; ".join(beside) + "."
+    else:
+        outcome = "success_with_notes" if seen else "success"
+        status = ("**Статус:** выполнено, все задачи проверены и подтверждены в репозиториях."
+                  if outcome == "success" else
+                  "**Статус:** выполнено и подтверждено в репозиториях, с замечаниями: "
+                  + "; ".join(seen) + ".")
     created, updated = run.get("created_at"), run.get("updated_at")
     took = ""
     if created is not None and updated is not None:
@@ -298,6 +369,8 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
         + ("- Итоговая сверка после последней задачи: коммиты, по которым приняты задачи, "
            "по-прежнему содержатся в ветках. Список коммитов и файлов — из GitHub.\n"
            if repositories else "")
+        + ("- Новых коммитов нет: подтверждать в репозитории нечего.\n"
+           if outcome == "no_changes" else "")
         + "- Содержание изменений и результаты тестов NEXUS сам не проверял: они приведены "
           "со слов агентов (блоки с цитатами в разделе «Что сделано»).")
 
@@ -332,6 +405,9 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
             "files": (r.get("files") or [])[:LISTED_FILES],
             "tasks": r.get("tasks") or [], "unchanged": r.get("unchanged") or [],
             "checks": r.get("checks")} for r in repositories],
+        # Which repositories NEXUS saw new commits in, which it saw none in,
+        # and which it cannot say for: what ``outcome`` was decided from.
+        "changes": {"changed": moved, "unchanged": still, "unknown": unknown},
         "limits": limits,
     }
     return body, data, outcome

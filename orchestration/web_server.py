@@ -1355,8 +1355,29 @@ class Handler(BaseHTTPRequestHandler):
     def app(self) -> App:
         return self.server.app  # type: ignore[attr-defined]
 
+    #: ``Set-Cookie`` for a session that this request has just extended, until
+    #: a response takes it (``_session``, ``_take_renewed_cookie``).
+    _renewed_cookie: str | None = None
+
     # ------------------------------------------------------------- helpers
+    def _take_renewed_cookie(self) -> str | None:
+        """The renewed session cookie this request owes the browser, once.
+
+        ``_json``, ``_html`` and ``_redirect`` send it: the answers a cache
+        does not keep (the first two say ``no-store``; a 303 is not stored
+        unless it says it may be). A session cookie must never ride on an
+        answer that a cache may hand to somebody else, so ``_static`` does not
+        carry it - and it serves only what needs no session. A renewal that
+        meets no such answer (a file download) is not lost for long: the next
+        one is due ``AuthService.renew_step`` later.
+        """
+        cookie, self._renewed_cookie = self._renewed_cookie, None
+        return cookie
+
     def _json(self, code: int, payload: Any, *, cookie: str | None = None) -> None:
+        # What the handler says about the cookie itself (login, logout) stands.
+        renewed = self._take_renewed_cookie()
+        cookie = cookie or renewed
         body = json.dumps(payload, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -1369,6 +1390,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _html(self, code: int, text: str, *, cookie: str | None = None) -> None:
+        renewed = self._take_renewed_cookie()
+        cookie = cookie or renewed
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1397,6 +1420,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _redirect(self, to: str, *, cookie: str | None = None) -> None:
+        # ``/login`` sends a signed-in owner on to the studio: an address a
+        # browser remembers, so this may well be the first request of the day.
+        renewed = self._take_renewed_cookie()
+        cookie = cookie or renewed
         self.send_response(303)
         self.send_header("Location", to)
         if cookie:
@@ -1531,7 +1558,15 @@ class Handler(BaseHTTPRequestHandler):
     # --------------------------------------------------------------- session
     def _session(self):
         token = parse_cookie(self.headers.get("Cookie"), SESSION_COOKIE)
-        return self.app.auth.resolve(token)
+        session = self.app.auth.resolve(token)
+        ttl = getattr(session, "cookie_ttl", None)
+        if ttl:
+            # Using the session has just extended it. The browser's copy of the
+            # cookie has to live as long, or the browser drops it while the
+            # server would still honour it - and the owner signs in again.
+            self._renewed_cookie = session_cookie_header(
+                session.token, ttl=ttl, secure=self._cookie_secure())
+        return session
 
     def _bearer_ok(self) -> bool:
         """Machine authentication for the API, unchanged from before.
@@ -2552,18 +2587,29 @@ class Handler(BaseHTTPRequestHandler):
                 counts = self.app.lab.count_tasks(str(run["id"]))
             except Exception:  # noqa: BLE001 - a facts gather must not fail a turn
                 counts = {}
-            report = self.app.lab.report_for_run(str(run["id"])) or {}
+            # The run's final report, where it has one. It lives with
+            # ``ReportService`` (``nexus_run_reports``; its text is ``body``).
+            # This read used to be ``self.app.lab.report_for_run`` - a method of
+            # an earlier draft that no class has - so an analysis turn in any
+            # project that had a run ended in a 500.
+            try:
+                report = self.app.reports.for_run(str(run["id"])) or {}
+            except Exception:  # noqa: BLE001 - a facts gather must not fail a turn
+                report = {}
             out.append({
                 "id": str(run["id"]),
                 "state": run["state"],
                 "goal_id": str(run.get("goal_id") or ""),
+                "policy": run.get("policy"),
                 "iteration": run.get("iteration"),
                 "max_iterations": run.get("max_iterations"),
-                "retry_attempt": run.get("retry_attempt"),
-                "max_retry_cycles": run.get("max_retry_cycles"),
+                # Where a durable run stands in its retries, and what it waits for.
+                "cycle": run.get("cycle"),
+                "wait_reason": (run.get("wait_reason") or "")[:500],
                 "last_error": (run.get("last_error") or "")[:500],
                 "tasks": counts,
-                "report": (report.get("content") or "")[:3000] if report else "",
+                "report_outcome": report.get("outcome") or "",
+                "report": (report.get("body") or "")[:3000],
             })
         return {"runs": out}
 

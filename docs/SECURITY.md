@@ -57,6 +57,17 @@ Two independent paths, neither a substitute for the other:
   server-side session row (only `HMAC(AUTH_SESSION_SECRET, token)` is stored, so
   logout is immediate and a database leak yields no usable cookie), and a
   double-submit CSRF token required on every write.
+
+  A session is sliding with a hard end: 30 days from the last request, 90 days
+  from the login (`AUTH_SESSION_TTL_SECONDS`, `AUTH_SESSION_MAX_SECONDS`;
+  DEPLOY.md, "How long a login lasts"). What that costs, compared with the
+  fixed 12 hours it replaced: a cookie taken from a device stays good for as
+  long as it is used, up to 90 days, instead of at most 12 hours. What bounds
+  it: the cookie is `HttpOnly`, `Secure` and `SameSite=Strict`; the renewed
+  cookie is only ever sent on an answer marked `no-store` or on a redirect,
+  never on one a cache may keep; logout ends the session at once; changing
+  `AUTH_SESSION_SECRET` ends all of them. **Changing the password does not end
+  an open session** - rotate the secret too.
 - **Machine bearer** (`WEB_AUTH_TOKEN`): `Authorization: Bearer ...`, for the
   CLI and scripts.
 
