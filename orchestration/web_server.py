@@ -1770,8 +1770,7 @@ class Handler(BaseHTTPRequestHandler):
         #   the active list (completed successfully, or cancelled), with its
         #   history and report.
         if rest == ["runs"]:
-            from urllib.parse import parse_qs, urlparse
-            params = parse_qs(urlparse(self.path).query)
+            params = urllib.parse.parse_qs(urlparse(self.path).query)
             archived = (params.get("archived") or ["0"])[0] not in ("", "0", "false")
             return (200, {"runs": self.app.lab.list_runs(
                 principal, project_id, include_hidden=archived)}, None)

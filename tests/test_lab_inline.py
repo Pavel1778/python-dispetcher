@@ -277,7 +277,10 @@ def test_cancel_tells_openhands_to_stop_and_the_run_leaves_the_list(monkeypatch)
         # Still there to be read: the run, its plan, who ran what.
         assert stopped["run"]["state"] == "cancelled" and len(stopped["tasks"]) == 2
         assert [e["outcome"] for e in stopped["executions"]] == ["cancelled"]
-        assert stopped["report"] is None
+        # A cancelled run reports honestly in its chat: never a success.
+        report = stopped["report"]
+        assert report is not None and report["outcome"] == "cancelled"
+        assert "отменён" in report["body"]
 
         # The agent's late answer changes nothing, and nothing new is started.
         _finish(studio, first, f"Коммит {HEAD}")
