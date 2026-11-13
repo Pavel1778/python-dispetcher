@@ -312,6 +312,64 @@ def test_logout_clears_cookie(browser):
     assert "Max-Age=0" in hdr.get("Set-Cookie", "")
 
 
+# ------------------------------------------- signed in already, at the form
+def test_the_login_page_can_ask_whether_the_visitor_is_signed_in(server, browser):
+    """The cookie is ``SameSite=Strict``: a link on another site reaches the
+    studio without it, and the owner - signed in - is shown the login form. The
+    form's own script asks this, same-site, and leaves for the studio.
+
+    The answer is public and is never an error for a stranger: an anonymous
+    visitor to the login page must not get a failed request for being one."""
+    st, body, headers = browser.json("GET", "/login/state")
+    assert (st, body) == (200, {"signed_in": False})
+    assert headers.get("Cache-Control") == "no-store"
+    assert "Set-Cookie" not in headers, "asking is not a login"
+
+    st, page, _ = browser.request("GET", "/login")
+    assert st == 200 and re.search(r'<script defer src="/static/login\.js\?v=\w+">', page)
+    st, script, headers = browser.request("GET", "/static/login.js")
+    assert st == 200 and "/login/state" in script
+    assert headers["Content-Type"].startswith("application/javascript")
+
+    browser.login()
+    assert browser.json("GET", "/login/state")[1] == {"signed_in": True}
+    # What a navigation that began on another site looks like to the server:
+    # the same person, no cookie. The form is the right answer to *that*.
+    arriving = Browser(browser.base)
+    st, page, _ = arriving.request("GET", "/", follow=False)
+    assert st in (302, 303)
+    assert arriving.json("GET", "/login/state")[1] == {"signed_in": False}
+
+    browser.json("POST", "/logout")
+    assert browser.json("GET", "/login/state")[1] == {"signed_in": False}
+
+
+def test_only_a_live_browser_session_counts_as_signed_in(server, browser):
+    base = browser.base
+    forged = Browser(base).json(
+        "GET", "/login/state", headers={"Cookie": f"{SESSION_COOKIE}=not-a-session"})
+    assert forged[:2] == (200, {"signed_in": False})
+    # The machine token opens the API. It is not somebody at a login form.
+    machine = Browser(base).json(
+        "GET", "/login/state", headers={"Authorization": "Bearer machine-token"})
+    assert machine[:2] == (200, {"signed_in": False})
+
+    browser.login()
+    assert browser.json("GET", "/login/state")[1] == {"signed_in": True}
+    _time_passes("31 days")                      # unused for longer than a session lasts
+    assert browser.json("GET", "/login/state")[:2] == (200, {"signed_in": False})
+    assert browser.json("GET", "/api/session")[0] == 401
+
+
+def test_the_login_state_has_one_answer_and_takes_no_writes(server, browser):
+    browser.login()
+    for path in ("/login/state/", "/login/state/owner", "/login/states"):
+        assert browser.json("GET", path)[0] in (401, 404), path
+    csrf = browser.json("GET", "/api/session")[1]["csrf_token"]
+    st, _, _ = browser.json("POST", "/login/state", data={}, headers={"X-CSRF-Token": csrf})
+    assert st in (404, 405)
+
+
 # -------------------------------------------------------- session lifetime
 # A session lasts while it is used: 30 days from the last request, 90 days from
 # the login at most. Time passes here by moving a session's own times back in

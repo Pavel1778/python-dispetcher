@@ -3187,6 +3187,13 @@ class Handler(BaseHTTPRequestHandler):
                 if self._session() is not None:
                     return self._redirect("/")
                 return self._html(200, web_ui.login_page(""))
+            if path == "/login/state":
+                # Asked by the login page itself (studio/login.js). The cookie is
+                # SameSite=Strict, so a link from another site reaches /login
+                # without it and a signed-in owner is shown the form; the page's
+                # own request does carry it. Public, and never an error for a
+                # stranger: it says one thing, about the caller's own cookie.
+                return self._json(200, {"signed_in": self._session() is not None})
             if path == "/healthz":
                 return self._json(200, HEALTHZ)
             if path == "/readyz":
