@@ -335,6 +335,53 @@ def test_switching_a_conversation_to_manual_changes_the_behaviour(studio):
     assert _count_runs(studio, project) == 0
 
 
+def test_a_spent_plan_does_not_start_a_second_run(studio):
+    """After a run finishes, "Запускай" must not start it again; a new task needs
+    a new message (the conversation's workflow state is mirrored terminal)."""
+    project = studio.project()
+    _connect(studio, project)
+    conversation = _conversation(studio, project)
+    studio.answers(json.dumps(PLAN))
+    assert _send(studio, project, conversation, "Реализуй функцию")[0] == 200
+    assert _send(studio, project, conversation, "Запускай")[0] == 200
+    run_id = _runs(studio, project)[0]["id"]
+
+    with studio.app.store._tx() as cur:
+        cur.execute("UPDATE nexus_run_tasks SET state='completed_verified' "
+                    "WHERE run_id=%s", (run_id,))
+    assert studio.app.lab.set_run_state_internal(run_id, "completed") is not None
+    # The conversation is no longer EXECUTING.
+    wf = studio.api.get(
+        f"/api/v1/projects/{project}/conversations/{conversation}")[1]["conversation"]
+    assert wf["workflow_state"] == "COMPLETED"
+
+    status, body = _send(studio, project, conversation, "Запускай")
+    assert status == 200, body
+    assert _count_runs(studio, project) == 0, "a spent plan started a second run"
+    assert "выполнен" in body["messages"][-1]["content"]
+
+
+def test_a_new_message_after_a_finished_run_proposes_a_new_plan(studio):
+    project = studio.project()
+    _connect(studio, project)
+    conversation = _conversation(studio, project)
+    studio.answers(json.dumps(PLAN), json.dumps(PLAN_2))
+    assert _send(studio, project, conversation, "Реализуй функцию")[0] == 200
+    assert _send(studio, project, conversation, "Запускай")[0] == 200
+    run_id = _runs(studio, project)[0]["id"]
+    with studio.app.store._tx() as cur:
+        cur.execute("UPDATE nexus_run_tasks SET state='completed_verified' WHERE run_id=%s",
+                    (run_id,))
+    studio.app.lab.set_run_state_internal(run_id, "completed")
+
+    status, body = _send(studio, project, conversation, "Теперь сделай иначе")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"].get("awaiting_approval") is True
+    wf = studio.api.get(
+        f"/api/v1/projects/{project}/conversations/{conversation}")[1]["conversation"]
+    assert wf["workflow_state"] == AWAITING_APPROVAL
+
+
 # ------------------------------------------------------ run lifecycle / archive
 def _runs(stack, project, *, archived=False):
     path = f"/api/v1/projects/{project}/runs" + ("?archived=1" if archived else "")

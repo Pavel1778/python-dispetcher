@@ -97,6 +97,7 @@ from .nexus_chat import ChatError
 from .nexus_intent import ANALYSIS, AUTONOMOUS, classify, clarifying_question, effective_mode
 from .nexus_workflow import (
     AWAITING_APPROVAL,
+    EXECUTING,
     classify_launch,
     plan_hash_of,
     render_plan,
@@ -2770,6 +2771,14 @@ class Handler(BaseHTTPRequestHandler):
         if not goal_id:
             return self._manual_text(
                 "Не удалось связать план с задачей проекта. Опишите задачу заново.")
+        # The plan on offer must still be waiting for approval. A conversation
+        # whose run already ended (the state was mirrored to COMPLETED/CANCELLED/
+        # FAILED) must not start a second run of a spent plan: a new task needs a
+        # new message.
+        if workflow.get("workflow_state") not in (AWAITING_APPROVAL, EXECUTING):
+            return self._manual_text(
+                "Этот план уже выполнен или отменён. Опишите новую задачу — я предложу "
+                "новый план.")
         conversation = self.app.conversations.get(principal, project_id, conversation_id)
         repository = (conversation.get("repository")
                       or self.app.project_repos.primary_repository(project_id) or "")

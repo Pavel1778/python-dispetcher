@@ -556,6 +556,16 @@ class LabStore:
             cur.execute("UPDATE nexus_goals SET state=%s, updated_at=now() WHERE id=%s",
                         (state, run["goal_id"]))
             self._notify(cur, project_id, f"goal_{state}", f"Цель: {state}", run_id)
+            # And onto the conversation the run was started from, so its chat
+            # workflow is not left "EXECUTING" for ever: a later "Запускай"
+            # would otherwise start a second run of a plan that is already
+            # spent. The dialogue moves to its terminal state; a new task needs
+            # a new message.
+            if run.get("conversation_id"):
+                cur.execute(
+                    "UPDATE nexus_conversations SET workflow_state=%s, updated_at=now() "
+                    "WHERE id=%s AND workflow_state IN ('EXECUTING','REPORTING')",
+                    (state.upper(), run["conversation_id"]))
         return run
 
     @staticmethod
