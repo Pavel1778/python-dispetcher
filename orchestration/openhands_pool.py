@@ -211,6 +211,15 @@ class AccountPool:
     def _load_of(account: dict, live: dict[str, int]) -> int:
         return int(account.get("active_tasks", 0) or 0) + live.get(str(account["id"]), 0)
 
+    def live_load(self) -> dict[str, int]:
+        """Observed in-flight tasks per account id, for the operator's view.
+
+        Public wrapper over :meth:`_live_load` so the interface can show the
+        same load the selection policy ranks on, instead of the counter nothing
+        decrements.
+        """
+        return self._live_load()
+
     @staticmethod
     def _at_limit(account: dict, live: dict[str, int]) -> bool:
         """True when an account is already running as much as it is allowed to.

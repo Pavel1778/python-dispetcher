@@ -1800,3 +1800,49 @@ and a case that cannot run here says so rather than simulating.
   is answered `401`) and `delay` (a real slow response for a real timeout test).
   A caller that times out and hangs up no longer prints a broken-pipe traceback
   from the server thread.
+
+## Section 12: the OpenHands settings and the run view in the studio (this session)
+
+The request's section 12 ("Интеграция с интерфейсом NEXUS") asks for two things
+that were only partly present: an OpenHands settings surface with every control
+the account pool supports, and a task view that shows the live executor,
+conversation id, events and switches, with a manual executor switch. What was
+already there (add/edit/remove/test/default-per-account, project executors,
+`account.executions`) is kept; what follows was added.
+
+- **The pool's own settings are now on screen.** `openhandsPoolHtml` renders the
+  selection mode (`#pool-mode`, the four modes of `openhands_pool.MODES`) and
+  the fallback order (the connections in the order the pool would try them, with
+  ↑/↓ buttons). Both are the server's settings: the interface posts to
+  `POST /api/openhands/pool` and re-reads `GET /api/openhands/pool`; it never
+  decides locally. The order the UI shows is the same ranking `candidates()`
+  applies (explicit `fallback_order`, then `priority`, then age).
+- **Default account** is one action per card (`openhands-default` →
+  `POST /api/openhands/accounts/{id}/default`), and **error history** is a dialog
+  (`openhands-errors` → `GET .../errors`). **Active conversations / health** are
+  on the card's standing line, from the account view.
+- **The pool route reports observed load.** `GET /api/openhands/pool` now adds a
+  `load` per candidate: the same in-flight count the selection ranks on
+  (`AccountPool.live_load`, a public wrapper over `_live_load`), not the
+  `active_tasks` counter nothing decrements in production.
+- **The run detail carries the executor timeline.** `GET .../runs/{id}` gained
+  `switches` (`LabStore.run_handoffs`: every hand-off with the from/to account
+  **labels**, joined so the UI names them without the account list) and `events`
+  (`LabStore.run_events`: the run's own project events merged with one entry per
+  attempt start and settle, each with its real timestamp). The `executions` list
+  was already there; the run card now uses all three: a "Текущий исполнитель"
+  block (connection, task, conversation id, state), a switches section, an
+  events section, and a **manual switch** button on every in-flight task
+  (`switch-executor` → the existing
+  `POST .../runs/{run}/tasks/{task}/switch`). The button is shown only for the
+  states the server accepts (`dispatched`/`running`/`verifying`); the server is
+  still the one that refuses anything else (409).
+- **`lab.run_events` sorts in Python, not SQL.** The two sources have different
+  timestamp columns; sorting the merged list by `at` is what keeps a run with no
+  attempts yet honest (it shows only its own `run.started`).
+- Tests: the pool settings/default/fallback-order and the observed-load cases in
+  `tests/test_openhands_pool_http.py`; the run-detail executor/conversation and
+  switch cases in `tests/test_lab_http.py`; and
+  `tests/test_browser_e2e.py::test_the_openhands_selection_mode_and_fallback_order_are_driven_from_the_settings`
+  drives the mode, the order and the default over real Chromium and asserts the
+  server state each time.
