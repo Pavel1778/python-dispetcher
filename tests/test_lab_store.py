@@ -294,6 +294,33 @@ def test_registering_the_same_worker_twice_is_an_upsert(lab):
     assert len(live) == 1 and live[0]["kind"] == "inline"
 
 
+def test_a_worker_that_registers_again_has_started_again(lab):
+    """``started_at`` is when the process running now started. The upsert kept
+    the time of the first process that ever used the name: in production the
+    server, replaced at every deployment, read as running since the day before."""
+    def started_ago() -> float:
+        with lab["store"]._tx() as cur:
+            cur.execute("SELECT EXTRACT(EPOCH FROM (now() - started_at)) AS ago "
+                        "FROM nexus_lab_workers WHERE worker_id='w1'")
+            return float(cur.fetchone()["ago"])
+
+    lab["lab"].register_worker("w1", kind="inline")
+    with lab["store"]._tx() as cur:
+        cur.execute("UPDATE nexus_lab_workers SET started_at = now() - interval '26 hours', "
+                    "heartbeat_at = now() - interval '2 minutes' WHERE worker_id='w1'")
+    # Passes of the same process do not move it ...
+    lab["lab"].heartbeat("w1")
+    assert started_ago() > 26 * 3600 - 5
+    # ... a stop does not ...
+    lab["lab"].stop_worker("w1")
+    assert started_ago() > 26 * 3600 - 5
+    # ... the next process under the name does.
+    lab["lab"].register_worker("w1", kind="inline")
+    assert started_ago() < 60
+    [live] = lab["lab"].live_workers(max_age_seconds=60)
+    assert live["worker_id"] == "w1" and live["state"] == "running"
+
+
 def test_register_worker_rejects_an_unknown_kind(lab):
     with pytest.raises(ValueError):
         lab["lab"].register_worker("w1", kind="bogus")

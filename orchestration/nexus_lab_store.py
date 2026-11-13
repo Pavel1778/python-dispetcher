@@ -1909,7 +1909,14 @@ class LabStore:
 
     # -------------------------------------------------------- worker heartbeat
     def register_worker(self, worker_id: str, *, kind: str = "worker") -> None:
-        """Record that a worker is running (upsert; also restarts the clock)."""
+        """Record that a worker is running (upsert; also restarts the clock).
+
+        A process registers once, when it starts, so ``started_at`` is when the
+        process that is running now started - under a name another process had
+        before it, too. (It used to keep the time of the very first process of
+        that name: the diagnostics showed a server replaced an hour ago as
+        running since last week.)
+        """
         if kind not in ("worker", "inline"):
             raise ValueError("kind must be 'worker' or 'inline'")
         with self.store._tx() as cur:
@@ -1917,7 +1924,7 @@ class LabStore:
                 "INSERT INTO nexus_lab_workers(worker_id, kind, state, started_at, "
                 "  heartbeat_at) VALUES (%s,%s,'running',now(),now()) "
                 "ON CONFLICT (worker_id) DO UPDATE SET kind=EXCLUDED.kind, state='running', "
-                "  heartbeat_at=now()", (worker_id, kind))
+                "  started_at=now(), heartbeat_at=now()", (worker_id, kind))
 
     def heartbeat(self, worker_id: str, *, error: str | None = None) -> None:
         with self.store._tx() as cur:

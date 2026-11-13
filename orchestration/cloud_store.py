@@ -1696,14 +1696,26 @@ class PostgresStore:
         }
 
     def set_workflow_state(self, workflow_id: str, state: str) -> None:
-        """Move a workflow to *state*. Only the verifier calls this."""
+        """Move a workflow to *state*. Only the verifier calls this.
+
+        A workflow that is in *state* already is left alone: no event, and
+        ``updated_at`` keeps saying when it last changed. The verifier looks at
+        every workflow that is not completed or cancelled on every pass and
+        says what it sees; for a workflow that stays ``blocked``, ``failed`` or
+        ``running`` that was one ``workflow_state`` event per pass, for ever -
+        in production four idle workflows wrote 2 891 of them in a day.
+        """
         with self._tx() as cur:
             cur.execute(
-                "UPDATE workflows SET state=%s, updated_at=now() WHERE id=%s",
-                (state, workflow_id),
+                "UPDATE workflows SET state=%s, updated_at=now() "
+                "WHERE id=%s AND state IS DISTINCT FROM %s",
+                (state, workflow_id, state),
             )
             if cur.rowcount == 0:
-                raise NotFound(f"workflow {workflow_id}")
+                cur.execute("SELECT 1 FROM workflows WHERE id=%s", (workflow_id,))
+                if cur.fetchone() is None:
+                    raise NotFound(f"workflow {workflow_id}")
+                return
             self._event(cur, "workflow_state", workflow_id=workflow_id,
                         detail={"state": state})
 

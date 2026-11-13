@@ -527,8 +527,10 @@ class App:
         self.last_plan_tick: dict[str, Any] = {}
         # Sweep expired sessions and stale rate-limit rows occasionally, not
         # every tick: they are housekeeping, not dispatch work.
-        self._sweep_every = 60
-        self._sweeps_done = 0
+        #: Seconds between two sweeps of expired sessions and stale rate-limit
+        #: rows, by the clock (see ``_maybe_sweep``).
+        self._sweep_interval = 300.0
+        self._swept_at: float | None = None
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
@@ -641,12 +643,14 @@ class App:
                 jr = self.dispatcher.tick().as_dict()
                 vf = self.verifier.tick().as_dict()
                 self.last_tick = {"at": time.time(), "sr": sr, "jr": jr, "verify": vf}
-                self._maybe_sweep()
             except CloudError as e:
                 self.last_tick = {"at": time.time(), "cloud_error": str(e)}
             except Exception as e:  # noqa: BLE001 - the loop must survive
                 log.exception("tick failed")
                 self.last_tick = {"at": time.time(), "error": f"{type(e).__name__}: {e}"}
+            # After the pass whatever became of it: housekeeping of this
+            # server's own tables does not depend on the agent service.
+            self._maybe_sweep()
             self._stop.wait(self.poll_interval)
 
     def _maybe_sweep(self) -> None:
@@ -656,10 +660,18 @@ class App:
         bound: nothing else deletes an expired session row or a rate-limit row
         whose window has passed. A failure here must never stop the dispatch
         loop, so it is swallowed and logged.
+
+        It goes by the clock: once when the server starts, then every
+        ``_sweep_interval`` seconds. It used to go by passes of the loop -
+        every sixtieth, counted from the start of the process - which was five
+        minutes only on paper: a pass takes about two minutes in production,
+        so the sweep was due two hours after a start, and a server that is
+        redeployed more often than that never reached it.
         """
-        self._sweeps_done += 1
-        if self._sweeps_done % self._sweep_every:
+        now = time.monotonic()
+        if self._swept_at is not None and now - self._swept_at < self._sweep_interval:
             return
+        self._swept_at = now
         try:
             sessions = self.store.purge_expired_sessions()
             attempts = self.store.purge_stale_login_attempts()
