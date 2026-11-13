@@ -949,7 +949,7 @@ def test_the_report_arrives_in_the_open_chat_by_itself_and_can_be_copied(lab_sta
 
         # What is copied is the report as it is stored, whole.
         principal, project = _owner_principal(stack.app), _first_project(stack.app)
-        run = stack.app.lab.list_runs(principal, project)[0]
+        run = stack.app.lab.list_runs(principal, project, include_hidden=True)[0]
         stored = stack.app.reports.get(principal, project, str(run["id"]))
         assert stored["state"] == "delivered"
         report.locator("[data-action='copy-message']").click()

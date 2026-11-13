@@ -453,6 +453,10 @@ class App:
         # the chat the run was started from (``nexus_reports``).
         from .nexus_reports import ReportService
         self.reports = ReportService(self.store)
+        # Give the store the writer so a run that ends *without* completing
+        # (cancelled, failed) is reported in its chat at once - never as a
+        # success. A completed run's report comes from the scheduler.
+        self.lab.reports = self.reports
         # The account pool: which account runs work, and in what order, under a
         # selection mode. The policy lives in the service, not the UI.
         from .openhands_pool import AccountPool
@@ -1761,9 +1765,17 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/v1/projects/{id}/actions/{action_id}
         if len(rest) == 2 and rest[0] == "actions" and UUID_RE.fullmatch(rest[1]):
             return (200, {"action": self.app.actions.get(principal, rest[1])}, None)
-        # GET /api/v1/projects/{id}/runs            (the autonomous lab)
+        # GET /api/v1/projects/{id}/runs[?archived=1]   (the autonomous lab)
+        #   By default the *active* runs: everything that is work in progress or
+        #   needs attention. ``?archived=1`` is the archive: every run that left
+        #   the active list (completed successfully, or cancelled), with its
+        #   history and report.
         if rest == ["runs"]:
-            return (200, {"runs": self.app.lab.list_runs(principal, project_id)}, None)
+            from urllib.parse import parse_qs, urlparse
+            params = parse_qs(urlparse(self.path).query)
+            archived = (params.get("archived") or ["0"])[0] not in ("", "0", "false")
+            return (200, {"runs": self.app.lab.list_runs(
+                principal, project_id, include_hidden=archived)}, None)
         # GET /api/v1/projects/{id}/runs/{run_id}
         if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
             run = self.app.lab.get_run(principal, project_id, rest[1])
@@ -2723,9 +2735,9 @@ class Handler(BaseHTTPRequestHandler):
         except ChatError as e:
             return self._manual_text(f"Не удалось составить план: {e}", error=True)
         # The goal binds the plan to the request (used when the run is started).
-        goal = None
+        goal_id = None
         try:
-            goal, _created = self.app.specs.create_with_goal(
+            goal, _spec, _created = self.app.specs.create_with_goal(
                 principal, project_id, text, source="chat",
                 conversation_id=conversation_id)
             goal_id = str(goal["id"])

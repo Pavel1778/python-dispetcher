@@ -68,9 +68,11 @@ def env():
             gh.gh.push(name, BASE, "initial")
         github = GitHubClient(gh.base_url, token="server-token", timeout=5.0)
         lab = LabStore(store)
+        reports = ReportService(store)
+        lab.reports = reports
         yield {"store": store, "projects": projects, "project": project, "goal": goal,
                "chat": chat, "conversations": conversations, "lab": lab, "gh": gh.gh,
-               "github": github, "reports": ReportService(store)}
+               "github": github, "reports": reports}
     store.close()
 
 
@@ -327,20 +329,17 @@ def test_a_long_task_is_quoted_by_its_beginning_and_named_by_its_size(env):
 
 
 # ------------------------------------------------------------ only when earned
-@pytest.mark.parametrize("ending", ["cancelled", "blocked", "failed", "paused"])
-def test_no_report_for_a_run_that_did_not_complete(env, ending):
-    policy = "bounded" if ending in ("blocked", "failed") else "durable"
+@pytest.mark.parametrize("ending", ["blocked", "paused"])
+def test_no_report_for_a_run_that_did_not_end(env, ending):
+    """A run that is merely paused or blocked is not over: no report yet."""
+    policy = "bounded" if ending == "blocked" else "durable"
     run_id = start(env, TWO, policy=policy)
     executor = Conversations()
     sched = scheduler(env, executor)
     do_task(env, sched, executor, run_id, "api", APP, sha(0xA1))
     sched.tick(run_id)
-    if ending == "cancelled":
-        env["lab"].set_run_state(ALICE, env["project"], run_id, "cancelled")
-    elif ending == "paused":
+    if ending == "paused":
         env["lab"].set_run_state(ALICE, env["project"], run_id, "paused")
-    elif ending == "failed":
-        env["lab"].set_run_state_internal(run_id, "failed", last_error="deadline passed")
     else:
         sched.tick(run_id)
         executor.states[executor.of("site")[-1]] = "error"
@@ -354,9 +353,60 @@ def test_no_report_for_a_run_that_did_not_complete(env, ending):
     sched.run_until_done(run_id)
     env["reports"].deliver_due()
     assert env["lab"].run_row(run_id)["state"] == ending
-    assert reports_in_chat(env) == []
     with pytest.raises(NotFound):
         env["reports"].get(ALICE, env["project"], run_id)
+
+
+@pytest.mark.parametrize("ending", ["cancelled", "failed"])
+def test_a_run_that_ended_without_completing_still_reports_honestly(env, ending):
+    """The requirement: a cancelled or failed run tells its chat at once, and
+    never presents itself as a success. The report is delivered like any other."""
+    policy = "bounded" if ending == "failed" else "durable"
+    run_id = start(env, TWO, policy=policy)
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    do_task(env, sched, executor, run_id, "api", APP, sha(0xA1))
+    sched.tick(run_id)
+    if ending == "cancelled":
+        env["lab"].set_run_state(ALICE, env["project"], run_id, "cancelled")
+    else:
+        env["lab"].set_run_state_internal(run_id, "failed", last_error="deadline passed")
+    sched.run_until_done(run_id)
+    env["reports"].deliver_due()
+    assert env["lab"].run_row(run_id)["state"] == ending
+    chat = reports_in_chat(env)
+    assert len(chat) == 1, "a run that ended without completing reports once"
+    body = chat[0]["content"]
+    assert body.startswith("## Отчёт автономного прогона")
+    assert "выполнено" not in body.splitlines()[1], "an unfinished run is not called done"
+    if ending == "cancelled":
+        assert "отменён" in body
+    else:
+        assert "не выполнен" in body and "deadline passed" in body
+    report = env["reports"].get(ALICE, env["project"], run_id)
+    assert report["outcome"] == ending
+    assert report["state"] == "delivered"
+
+
+def test_a_blocked_run_tells_its_chat_at_once(env):
+    """A blocked run needs a person; the chat hears the reason immediately."""
+    run_id = start(env, TWO, policy="bounded")
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    do_task(env, sched, executor, run_id, "api", APP, sha(0xA1))
+    sched.tick(run_id)
+    executor.states[executor.of("site")[-1]] = "error"
+    for _ in range(8):
+        sched.tick(run_id)
+        if env["lab"].run_row(run_id)["state"] == "blocked":
+            break
+        executor.states[executor.of("site")[-1]] = "error"
+        env["lab"].set_run_state(ALICE, env["project"], run_id, "running") \
+            if env["lab"].run_row(run_id)["state"] == "blocked" else None
+    assert env["lab"].run_row(run_id)["state"] == "blocked"
+    notes = [m for m in messages(env) if (m.get("meta") or {}).get("blocked")]
+    assert notes, "the chat was not told the run is blocked"
+    assert "заблокирован" in notes[-1]["content"].lower()
 
 
 def test_a_commit_that_left_the_branch_is_done_again_before_any_report(env):

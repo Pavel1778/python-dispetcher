@@ -104,7 +104,7 @@
     mode: 'auto', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
-    work: { items: [], data: {}, timer: null, hidden: {} },
+    work: { items: [], data: {}, timer: null, hidden: {}, keepArchived: {} },
     accounts: { github: null, openhands: null },
     pool: null,
     projectSettings: null
@@ -933,6 +933,12 @@
       // history stays on the server; only the view drops it.
       var run = entry.kind === 'run' && record.detail && record.detail.run;
       if (record.state === 'cancelled' || (run && run.hidden)) {
+        if (S.work.keepArchived[entry.key]) {
+          // Opened by hand from the archive: keep exactly this one on screen,
+          // even though it left the active list. Data are still loaded.
+          S.work.data[entry.key] = record;
+          return null;
+        }
         dropWork(entry.key);
         return null;
       }
@@ -1268,8 +1274,52 @@
   // phone the last runs could not be reached while a run was at work.
   var agentScroll = { touching: false, at: 0, timer: null };
 
+  // The archive: runs that left the active list (completed cleanly, or
+  // cancelled). Loaded on demand; its rows are read-only records - the work is
+  // over - but each keeps its full report, tasks and history.
+  var archive = { open: false, items: [], loading: false, error: null };
+
+  function loadArchive() {
+    archive.loading = true;
+    archive.error = null;
+    renderAgent();
+    return api(projectUrl('/runs') + '?archived=1')
+      .then(function (data) {
+        archive.items = (data.runs || []);
+        archive.loading = false;
+        renderAgent();
+      }, function (error) {
+        archive.loading = false;
+        archive.error = error.message;
+        renderAgent();
+      });
+  }
+
   function agentListBusy() {
     return agentScroll.touching || Date.now() - agentScroll.at < 400;
+  }
+
+  function archiveRow(run) {
+    var cancelled = run.state === 'cancelled';
+    return '<li class="archive-row" data-id="' + esc(run.id) + '">' +
+      '<span class="dot is-' + stateTone(run.state) + '"></span>' +
+      '<span class="archive-title">' + esc(shortId(run.id)) + ' · ' + esc(stateLabel(run.state)) +
+      (run.workflow_goal_id ? '' : '') + '</span>' +
+      '<span class="archive-when">' + esc(fullTime(run.updated_at || run.created_at)) + '</span>' +
+      '<button class="btn btn-sm" type="button" data-action="open-archived" data-id="' + esc(run.id) + '">' +
+      (cancelled ? 'Подробности' : 'Отчёт') + '</button></li>';
+  }
+
+  function archiveHtml() {
+    var head = '<div class="ws-section-head"><button class="btn btn-sm" type="button" data-action="toggle-archive">' +
+      icon('archive', 'icon-sm') + (archive.open ? 'Скрыть архив' : 'Архив прогонов') + '</button></div>';
+    if (!archive.open) return head;
+    var inner;
+    if (archive.loading) inner = '<p class="step-sub">Загружаю…</p>';
+    else if (archive.error) inner = '<p class="step-sub">' + esc(archive.error) + '</p>';
+    else if (!archive.items.length) inner = '<p class="step-sub">Завершённых прогонов нет.</p>';
+    else inner = '<ul class="archive-list">' + archive.items.map(archiveRow).join('') + '</ul>';
+    return head + inner;
   }
 
   function renderAgent() {
@@ -1277,7 +1327,8 @@
     clearTimeout(agentScroll.timer);
     if (!S.work.items.length) {
       body.innerHTML = emptyHtml('bot', 'Агент ещё не запускался',
-        'Отправьте задачу в режиме «Код» или «Автономно» — здесь появятся шаги, статусы и ссылка на сессию OpenHands.');
+        'Отправьте задачу в режиме «Код», «Автономно» или «Вручную» — здесь появятся ' +
+        'шаги, статусы и ссылка на сессию OpenHands.') + archiveHtml();
       return;
     }
     var html = S.work.items.map(function (entry) {
@@ -1291,7 +1342,7 @@
           '<div class="work-foot"><button class="btn btn-sm" type="button" data-action="refresh-work">Обновить</button></div></section>';
       }
       return entry.kind === 'workflow' ? workflowCard(entry, record.detail) : runCard(entry, record.detail);
-    }).join('');
+    }).join('') + archiveHtml();
     var list = $('.work-list', body);
     if (list && list.__html === html) return;
     if (list && agentListBusy()) {
@@ -2434,6 +2485,25 @@
       }, function () { toast('Не удалось скопировать.', 'bad'); });
     },
     'open-work': function () { setWorkspace(true, 'agent'); refreshWork(); },
+    'toggle-archive': function () {
+      archive.open = !archive.open;
+      if (archive.open && !archive.items.length && !archive.loading) loadArchive();
+      else renderAgent();
+    },
+    // An archived run is opened the same way a live one is: the card shows its
+    // tasks, its report and its history. It is not a second interface. It is
+    // remembered as opened-by-hand so the refresh that drops hidden runs keeps
+    // exactly this one on screen.
+    'open-archived': function (el) {
+      var id = el.getAttribute('data-id');
+      var key = 'run:' + id;
+      S.work.keepArchived[key] = true;
+      delete S.work.hidden[key];
+      if (!S.work.items.some(function (item) { return item.key === key; })) {
+        S.work.items.unshift({ kind: 'run', id: id, key: key });
+      }
+      refreshWork();
+    },
     'refresh-work': function () { refreshWork(); },
     'cancel-workflow': function (el) {
       var id = el.getAttribute('data-id');
