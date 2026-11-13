@@ -284,3 +284,122 @@ def test_a_question_during_a_running_run_does_not_stop_or_restart_it(studio):
     after = studio.api.get(f"/api/v1/projects/{project}/runs/{run_id}")[1]["run"]
     assert after["state"] == before["state"], "the question changed the run's state"
     assert _count_runs(studio, project) == 1
+
+
+# --------------------------------------------------------------------------
+# Regressions for the P0 incident: a report/history request started a new
+# autonomous run instead of reading history, and an explicit prohibition on
+# launching work was itself read as an order to launch. Both were found live
+# in production (conversation 2547fea6): "Дай отчёт последнего успешно
+# завершившегося прогона" and, a few messages later in the same incident,
+# "Не запускай ничего, просто ответь" each started a run.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    # The exact production message: "успешно завершившегося" is a participle
+    # ("...that has finished"), not the imperative "заверши" ("finish!").
+    "Дай отчёт последнего успешно завершившегося прогона",
+    "Покажи последний успешный прогон",
+    # The exact second production message of the same incident: "выполненной"
+    # is the participle of "выполни" ("do it!"), not an order.
+    "Отлично, полностью отчитайся о выполненной работе",
+])
+def test_a_report_or_history_request_is_never_read_as_an_order(text):
+    for mode in ("auto", "autonomous"):
+        intent = classify(text, mode=mode)
+        assert not intent.starts_work, (text, mode, intent)
+        assert effective_mode(mode, intent) != "autonomous", (text, mode, intent)
+
+
+@pytest.mark.parametrize("text", [
+    "Не запускай ничего, просто ответь",
+    "Не запускай ничего",
+    "Никаких новых прогонов",
+    "Без запуска, просто объясни",
+])
+def test_an_explicit_prohibition_never_starts_work(text):
+    """Section 4: these must never launch, in *any* conversation mode -
+    including a conversation already set to \"Автономно\", which otherwise
+    runs an unclear statement as the work the person chose that mode for."""
+    for mode in ("auto", "autonomous", "manual"):
+        intent = classify(text, mode=mode)
+        assert intent.forbids_run, (text, mode, intent)
+        assert not intent.starts_work, (text, mode, intent)
+        assert effective_mode(mode, intent) not in ("autonomous", "plan", "code"), (text, mode, intent)
+
+
+def test_a_participle_does_not_mask_a_real_order_of_the_same_verb():
+    """The participle guards must not blunt the imperative they share a root
+    with: "Заверши задачу" is still a real order to finish the task."""
+    for text in ("Заверши задачу", "Закончи работу", "Выполни этот план",
+                 "Исправь ошибку", "Создай модуль", "Собери проект"):
+        intent = classify(text, mode="auto")
+        assert intent.starts_work, (text, intent)
+
+
+def test_report_request_with_a_completed_run_reads_history_not_a_new_run(studio):
+    """End-to-end version of the production incident: asking for the last
+    successful run's report, in a conversation already past its first
+    exchange, must read the stored run - never start another one."""
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers(json.dumps(PLAN))
+    status, body = _send(studio, project, conversation, "Реализуй функцию")
+    assert status == 200, body
+    run_id = next(m["meta"]["run_id"] for m in body["messages"] if m["meta"].get("run_id"))
+    assert studio.api.post(f"/api/v1/projects/{project}/runs/{run_id}/pause", {})[0] == 200
+
+    with studio.app.store._tx() as cur:
+        cur.execute("UPDATE nexus_runs SET state = 'completed' WHERE id = %s", (run_id,))
+        cur.execute(
+            "INSERT INTO nexus_run_reports(run_id, project_id, conversation_id, body, outcome) "
+            "VALUES (%s, %s, %s, %s, 'changes_made')",
+            (run_id, project, conversation,
+             "## Отчёт автономного прогона\n\n**Статус:** задача выполнена."))
+
+    studio.answers("Последний прогон завершился успешно: задача выполнена.")
+    status, body = _send(studio, project, conversation,
+                         "Дай отчёт последнего успешно завершившегося прогона")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["mode"] == "analysis"
+    prompt = studio.llm.calls[-1]["body"]["messages"][-1]["content"]
+    assert run_id in prompt and '"report_outcome": "changes_made"' in prompt
+    assert _count_runs(studio, project) == 1, "the report request started another run"
+
+
+def test_an_explicit_prohibition_is_honoured_end_to_end_even_in_autonomous_mode(studio):
+    """The production incident's exact refusal, driven through the real HTTP
+    server: a conversation already set to \"Автономно\" must still not launch
+    when the person explicitly says not to."""
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="autonomous")
+    studio.answers("Хорошо, ничего не запускаю. Чем могу помочь?")
+
+    status, body = _send(studio, project, conversation, "Не запускай ничего, просто ответь")
+    assert status == 200, body
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+    assert _count_runs(studio, project) == 0
+    assert studio.api.get(f"/api/v1/projects/{project}/goals")[1]["goals"] == []
+    assert studio.cloud.cloud.conversations == {}
+
+
+@pytest.mark.parametrize("text", [
+    # Section 4's own list of messages that must never launch - checked in
+    # every conversation mode, including a conversation already set to
+    # "Автономно", where an unclear *statement* would otherwise default to
+    # work (see test_a_report_or_history_request_is_never_read_as_an_order
+    # and test_an_explicit_prohibition_never_starts_work for the two that
+    # need their own tests because they also assert something more specific).
+    "Что готово?", "Отчитайся", "Проверь историю", "Покажи результаты",
+    "Почему ошибка?", "Что ты предлагаешь?", "Составь план", "Объясни",
+    "Продолжим обсуждение", "Как исправить?",
+])
+def test_the_section_4_non_launch_list_never_starts_work(text):
+    for mode in ("auto", "autonomous"):
+        intent = classify(text, mode=mode)
+        assert not intent.starts_work, (text, mode, intent)
+        assert effective_mode(mode, intent) not in ("autonomous", "plan", "code"), (text, mode, intent)
