@@ -374,6 +374,29 @@ class ProjectRepositoryService:
                      "label": link["label"]}
                     for link in self._links(cur, project_id) if link["usable"]]
 
+    def primary_repository(self, project_id: str) -> str | None:
+        """The project's primary repository (``owner/name``), or ``None``.
+
+        The one a task that names no repository runs against. When the operator
+        has not chosen one but the project has exactly one linked repository,
+        that one is the primary in effect: a project with a single repository
+        needs no ceremony to use it.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT r.full_name FROM nexus_project_repositories pr "
+                "JOIN repositories r ON r.id = pr.repository_id "
+                "WHERE pr.project_id=%s AND pr.is_primary LIMIT 1", (project_id,))
+            row = cur.fetchone()
+            if row is not None:
+                return row["full_name"]
+            cur.execute(
+                "SELECT r.full_name FROM nexus_project_repositories pr "
+                "JOIN repositories r ON r.id = pr.repository_id "
+                "WHERE pr.project_id=%s ORDER BY r.full_name LIMIT 2", (project_id,))
+            rows = cur.fetchall()
+            return rows[0]["full_name"] if len(rows) == 1 else None
+
     def account_for_repository(self, project_id: str, repository_full_name: str
                                ) -> tuple[str | None, str | None]:
         """The ``(principal, account_id)`` that reads a repository of a project,

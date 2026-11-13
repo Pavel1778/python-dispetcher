@@ -19,7 +19,10 @@ from .cloud_store import NotFound, PostgresStore
 from .nexus_projects import _text
 from .nexus_specs import MESSAGE_CHARS
 
-_MODES = ("ask", "code", "plan", "autonomous")
+#: The modes a conversation may be set to. ``auto`` is the default: the Intent
+#: Router decides per message (see ``orchestration/nexus_intent.py``), so a
+#: question in an ``auto`` conversation is answered instead of starting a run.
+_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto")
 
 
 class ConversationService:
@@ -30,7 +33,7 @@ class ConversationService:
 
     # ------------------------------------------------------------- lifecycle
     def create(self, principal: str, project_id: str, *,
-               title: str = "", mode: str = "ask") -> dict:
+               title: str = "", mode: str = "auto") -> dict:
         mode = self._mode(mode)
         title = _text(title, "title", maximum=200, required=False)
         with self.store._tx() as cur:
@@ -125,6 +128,22 @@ class ConversationService:
             if row is None:
                 raise NotFound("conversation not found")
             return dict(row)
+
+    def linked_run(self, principal: str, project_id: str, conversation_id: str) -> dict | None:
+        """The run this conversation started, if any, or ``None``.
+
+        Used by the Intent Router: "продолжи" is an order only when there is
+        real work to continue. Membership is checked, so a non-member gets
+        "not found" (a raised ``NotFound``) rather than a window into the chat.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "SELECT r.id, r.state FROM nexus_conversations c "
+                "JOIN nexus_runs r ON r.id = c.run_id "
+                "WHERE c.id=%s AND c.project_id=%s", (conversation_id, project_id))
+            row = cur.fetchone()
+        return {"id": str(row["id"]), "state": row["state"]} if row else None
 
     def link_run(self, principal: str, project_id: str, conversation_id: str,
                  run_id: str | None) -> dict:
