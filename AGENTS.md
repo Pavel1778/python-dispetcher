@@ -1978,3 +1978,41 @@ not named fields. That gap is closed in `AccountRouter.handoff_context` /
   message shape, the recorded-report fallback, and the four load-bearing
   hand-off cases). The context-shape and message-shape cases fail if any of the
   four fields is dropped, so they are load-bearing.
+
+## Chat-first intent routing (PR #29, consolidated)
+
+Before this, the conversation's `mode` was the *decision*: any message in an
+`autonomous` conversation started a run, so "почему прогон ломается?" launched
+agents. Now the mode is a **default** and the message decides.
+
+- **`orchestration/nexus_intent.py` is the one router.** `classify(text, mode=,
+  has_active_run=)` returns a `chat`/`analysis`/`autonomous` intent from the
+  *shape* of the message — a question is never an order, an order is only an
+  order when it names work — never from a single keyword ("проверь", "проект",
+  "код" appear in both questions and orders). `effective_mode(mode, intent)`
+  turns that into the mode the turn runs in. The router classifies only; the
+  chat turn acts.
+- **Invariants.** A question is answered in every mode and starts no run and no
+  OpenHands conversation. `analysis` reads the project's real run state
+  (`_run_facts`) and never starts a run. An ambiguous *short* message is
+  answered with one clarifying question and does not call the model; a *long*
+  message is a specification and is read, not intercepted. "продолжи" resumes
+  the run this conversation started (`_continue_run`) and never creates a
+  second. A question asked during a run does not change the run's state.
+- **Modes.** Migration `0033_chat_intent.sql` widens the conversation-mode CHECK
+  to `ask, analysis, plan, code, autonomous, auto` and makes `auto` the default.
+  `analysis` and `auto` are new; an existing row keeps its mode. The studio has
+  an "Авто" (default) and a "Разбор" mode.
+- **Planner fallback.** `SpecPlanner._fallback_plan` recovers an empty plan from
+  the specification's own index — one task per section with a normative piece,
+  in document order — and never fabricates work: a text with no obligation still
+  fails honestly. `coverage["fallback"]` marks it.
+- **This branch did not re-implement durable runs.** `main` (PR #31) already
+  carries the newer durable-runs implementation (`nexus_executors`,
+  `nexus_retry`, migrations `0030`–`0032`, `docs/DURABLE-RUNS.md`); PR #29 was
+  reconciled onto it and its obsolete files (`0026_durable_autonomy.sql`,
+  `0028_report_delivery_claim.sql`) removed. The chat-intent migration is
+  `0033_chat_intent.sql`, after main's `0032`.
+- Tests: `tests/test_intent_router.py` (the acceptance table, the shape rules,
+  the safe defaults, and the observable HTTP behaviour) and the conversational
+  journeys in `tests/test_browser_e2e.py`.

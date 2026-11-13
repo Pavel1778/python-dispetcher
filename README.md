@@ -50,6 +50,14 @@ are manual and need a live LLM):
   actions (cancel / resume / retry / rename) with a web UI.
 - The **Sr→Jr bridge**: Sr runs on Cloud with `client_tools` and delegates to
   Jr tasks, which the dispatcher runs and feeds back.
+- **Chat-first routing**: a message is not a task. `orchestration/nexus_intent.py`
+  classifies each chat turn as `chat` (answer), `analysis` (read the real state,
+  change nothing) or `autonomous` (start a run), from the shape of the message,
+  never from a single keyword. A question is answered in any mode and starts no
+  run; an explicit command ("исправь …", "реализуй …") starts work; an ambiguous
+  message gets one clarifying question; "продолжи" continues the conversation's
+  existing run instead of creating a second. The conversation modes are `auto`
+  (default), `ask`, `analysis`, `plan`, `code`, `autonomous`.
 - **Authentication**: browser session (PBKDF2 + server-side sessions + CSRF)
   and a machine bearer token, plus login rate limiting and proxy-aware client
   IP handling.
