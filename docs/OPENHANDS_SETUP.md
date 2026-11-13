@@ -36,6 +36,12 @@ endpoint's sandbox provisioning works.
 | `OPENHANDS_DIRECT_REPO_MODE` | no | `prompt` (default), `refuse` or `allow`. See below. |
 | `OPENHANDS_AGENT_PROFILE_ID` | no | Select an account agent profile by id. Unset = inherit the account's active profile and its MCP servers/skills. |
 | `NEXUS_SECRET_KEY` | to store accounts | Fernet key that encrypts a stored API key. Without it, adding an account is refused rather than writing plaintext. |
+| `NEXUS_OPENHANDS_ALLOWED_HOSTS` | no | Comma-separated hosts permitted as a private self-hosted endpoint (narrower than `NEXUS_ALLOW_PRIVATE_TARGETS`). |
+
+Every operator-supplied base URL is checked by the SSRF guard (`net_guard`): a
+non-`http(s)` scheme, embedded credentials, a loopback/private/link-local or
+cloud-metadata target is refused before any socket is opened. See
+`docs/ENVIRONMENT.md` §3.3.
 
 ### `OPENHANDS_DEFAULT_MODEL` is not optional in practice
 
@@ -89,6 +95,39 @@ the process-wide `OPENHANDS_*` variables. So a probe that says `VERIFIED` is
 evidence about *that account*; a probe that could pass on a working process
 default while the named account is misconfigured would be worse than no probe.
 When no account is configured the check is `BLOCKED`, not `FAILED`.
+
+### The checks the report runs
+
+| check | proves | needs `live` |
+| --- | --- | --- |
+| `database`, `schema` | a PostgreSQL round-trip; every required table/column present | no |
+| `accounts` | each configured account's key is accepted | no |
+| `account_pool` | the selection mode picks a usable account | no |
+| `cloud_api` | the OpenHands endpoint answers | no |
+| `queues_leases` | claim → release → re-claim on a throwaway run | no |
+| `recovery` | an expired lease is reclaimed and re-claimed with a higher fencing token; a bound conversation is not re-claimed | no |
+| `lab_worker` | a fresh worker heartbeat (FAILED when work is waiting and none is fresh) | no |
+| `providers`, `provider_probe` | the LLM orchestrator cascade (configuration; then a real read-only probe) | probe only |
+| `openhands_tools`, `mcp_configuration`, `nexus_tools` | the agent's tool catalog, the account's MCP names, the NEXUS surfaces | catalog only |
+| `conversation_create`, `message_and_events`, `run_command`, `workspace_rw`, `task_completion` | create a conversation, deliver a message, read events, run a shell command, read/write the sandbox, reach the terminal state `finished` | yes |
+
+`task_completion` follows the conversation's real terminal state: `finished` is
+`VERIFIED`; any other terminal state (`error`, `stuck`) is `FAILED`; without
+`live` it is `UNVERIFIED`.
+
+To see the tool surface — which tools NEXUS exposes and which the OpenHands
+agent has:
+
+```bash
+NEXUS_URL=... NEXUS_TOKEN=... \
+  python -m orchestration.cli openhands tools --live
+```
+
+`nexus_tools` (the MCP and `sr_` client tools) and `mcp_configuration` (the
+account's configured MCP server names) run without `--live`; the agent catalog
+is `UNVERIFIED` without it, because reading it on the direct transport may
+provision a sandbox. A listed tool is not proof it ran — only an observed
+`ActionEvent` is.
 
 ## Verified live (2026-11-12)
 

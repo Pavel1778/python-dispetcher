@@ -26,6 +26,9 @@ python tests/e2e_cloud_dispatcher.py   # real Cloud conversation, then delete it
 python tests/e2e_local_sr_jr.py        # real Sr→Jr on a local agent-server
 ```
 
+The environment variables the tests read (`TEST_SUPABASE_DB_URL` and the
+`E2E_CHROMIUM_*` overrides) are listed in [ENVIRONMENT.md](ENVIRONMENT.md) §3.7.
+
 ## What is real in each layer
 
 | layer | real | faked |

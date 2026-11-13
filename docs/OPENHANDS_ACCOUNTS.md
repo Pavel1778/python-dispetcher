@@ -15,8 +15,9 @@ and an **encrypted** API key. The pool decides which account runs each task.
   and last four characters, e.g. `sk-o…onse` — so the interface and the logs can
   show *which* key is stored without holding it. A key shorter than 12
   characters is masked whole.
-- An account is verified against Cloud (`GET /api/settings`) before it is
-  trusted. A rejected key marks the account `invalid`, not silently kept.
+- An account is verified against Cloud (`GET /api/v1/settings` via
+  `account_capabilities`) before it is trusted. A rejected key marks the account
+  `invalid`, not silently kept.
 - Accounts are scoped to a principal. A project may bind exactly one; the
   worker resolves the project's owner as the principal whose pool applies.
 
@@ -191,3 +192,9 @@ A project may be given its own ordered list of connections — a primary and
 backups — with `failover` or `distribute` as the strategy
 (`/api/v1/projects/<id>/executors`). It then runs on those connections only.
 A project without a list keeps the pool rules above. See `DURABLE-RUNS.md`.
+
+## Configuration reference
+
+The account and pool environment variables (`NEXUS_SECRET_KEY`,
+`NEXUS_OPENHANDS_ALLOWED_HOSTS`, `NEXUS_ALLOW_PRIVATE_TARGETS`) and their
+defaults are listed in [ENVIRONMENT.md](ENVIRONMENT.md) §3.3.

@@ -124,10 +124,19 @@ has no executor to switch from and a terminal one is done, so both are a `409`.
 The target must be the principal's active, enabled account. The switch records
 the current account as tried and stores the target as the task's preference; the
 lab worker performs the move on its next tick, starting a **new** conversation on
-the target with the hand-off context. The old conversation is not stopped (its
-transcript is the record) and is simply never polled again. The preference
-applies to exactly one hand-off and is cleared once the task is dispatched, so a
-switch never pins a task to an account for good.
+the target with the hand-off context. The old conversation is **stopped** (best
+effort, transcript preserved) and recorded in the task's evidence; until the
+stop is confirmed the task's branch stays held (`_BRANCH_FREE`), so no second
+writer starts on the same checkout. The preference applies to exactly one
+hand-off and is cleared once the task is dispatched, so a switch never pins a
+task to an account for good.
+
+`stop_conversation` is **transport-honest**: the `direct` and local transports
+pause the conversation (`POST /api/conversations/{id}/pause`, keeping the
+transcript) and return `True`; the `app` transport returns `False`, because the
+Cloud V1 surface only pauses at the *sandbox* level. A `False` must not be read
+as "stopped" — the branch lock, not the stop, is what guarantees two executors
+do not push to one branch at once.
 
 The operator controls on the studio's «Агент» tab (cancel / resume / retry) still
 apply. To force a switch without the endpoint, disabling the current account

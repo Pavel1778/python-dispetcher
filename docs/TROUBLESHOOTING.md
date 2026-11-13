@@ -1,6 +1,8 @@
 # Troubleshooting
 
-Symptom-first. Every entry names the cause and the fix.
+Symptom-first. Every entry names the cause and the fix. The variables each fix
+names, with their defaults and the module that reads them, are in
+[ENVIRONMENT.md](ENVIRONMENT.md).
 
 ## OpenHands
 

@@ -1852,3 +1852,48 @@ already there (add/edit/remove/test/default-per-account, project executors,
   `tests/test_browser_e2e.py::test_the_openhands_selection_mode_and_fallback_order_are_driven_from_the_settings`
   drives the mode, the order and the default over real Chromium and asserts the
   server state each time.
+
+## Documentation set (this session)
+
+The operator documentation was brought back in step with the code, and one
+missing document was added. Keep these in step when a variable, command, route
+or status changes.
+
+- **`docs/ENVIRONMENT.md` is the one environment reference** (section 14 of the
+  request names it; it did not exist before). It lists every variable the code
+  reads, its default, and the module that reads it, plus the dependencies, the
+  run commands for `web_server` / `lab_worker` / `mcp_server` / `cli`, the
+  required permissions (GitHub scopes, OpenHands key, database, network) and the
+  recovery procedures. `.env.example` and `DEPLOY.md` point to it; the deploy
+  table in `DEPLOY.md` is the subset a deploy sets by hand.
+- **The MCP section of `README.md` was wrong.** It claimed Streamable HTTP was
+  not implemented; it is (`POST /mcp`, `web_server._mcp_http`), and the tool list
+  was missing `list_runs`/`get_run`/`cancel_run`/`list_project_executors`/
+  `assign_project_executor`. A tool carries a scope from `MCP_TOOL_SCOPES`.
+- **`DEPLOY.md` migration list was stale** (it stopped at `0016`). The set is
+  `0001`–`0011`, `0014`–`0032`; `0012`/`0013` stay reserved for the deferred File
+  Lab. The hand-apply block now uses a shell loop over `migrations/*.sql` so it
+  cannot fall behind again.
+- **`DEPLOY.md`'s "contention check" and the direct-transport caution were
+  out of date.** The workspace lock is the partial unique index
+  `uq_tasks_workspace_active` (migration `0015`) claimed inside a `SAVEPOINT`,
+  not a read-then-check; sandbox reuse is scoped by `workspace_key` to the
+  repository and branch. What remains true (an outside writer can still move a
+  branch head; `direct` selects a repository by instruction) is stated as such.
+- **`docs/FAILOVER.md` said the old conversation is not stopped on a manual
+  switch.** It is (best effort, transcript preserved); `stop_conversation` is
+  transport-honest (`app` returns `False`), and the branch lock — not the stop —
+  is what keeps two executors off one checkout.
+- **`docs/OPENHANDS_ACCOUNTS.md` named the wrong verify endpoint.** An account is
+  verified through `GET /api/v1/settings` (`account_capabilities`), not
+  `/api/settings`.
+- The OpenHands diagnostics check list (`docs/OPENHANDS_SETUP.md`,
+  `docs/TESTING.md`) now names `recovery` and `task_completion` and their earned
+  statuses. `docs/ENVIRONMENT.md` is cross-linked from `WORKER_SETUP`,
+  `TROUBLESHOOTING`, `TESTING` and `OPENHANDS_ACCOUNTS`.
+- `.env.example` gained the variables the docs described but the template
+  omitted: `OPENHANDS_TRANSPORT`, `OPENHANDS_DEFAULT_MODEL`, and the
+  `NEXUS_SPEC_*` settings. No secret value is in any committed file.
+
+Verified: `ruff check .` clean; `pytest tests/` (browser E2E excluded) 1337
+passed, 9 skipped against a disposable PostgreSQL on port 5433.
