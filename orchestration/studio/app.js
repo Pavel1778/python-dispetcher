@@ -104,7 +104,8 @@
     mode: 'auto', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
-    work: { items: [], data: {}, timer: null, hidden: {}, keepArchived: {} },
+    work: { items: [], data: {}, timer: null, hidden: {}, keepArchived: {},
+            pendingReports: {} },
     accounts: { github: null, openhands: null },
     pool: null,
     projectSettings: null
@@ -583,6 +584,9 @@
     var seen = {}, items = [];
     S.messages.forEach(function (message) {
       var meta = message.meta || {};
+      // A report message *is* the result, not a link to a run: it carries no
+      // chip (the run itself has already left the list).
+      if (meta.report) return;
       var entry = meta.workflow_id ? { kind: 'workflow', id: String(meta.workflow_id) }
         : meta.run_id ? { kind: 'run', id: String(meta.run_id) } : null;
       if (!entry) return;
@@ -685,7 +689,8 @@
         (info.action ? '<button class="btn btn-sm" type="button" data-action="' + info.action + '">' + esc(info.actionLabel) + '</button>' : '') +
         '</div></div></article>';
     }
-    var entry = meta.workflow_id ? { kind: 'workflow', id: String(meta.workflow_id) }
+    var entry = meta.report ? null
+      : meta.workflow_id ? { kind: 'workflow', id: String(meta.workflow_id) }
       : meta.run_id ? { kind: 'run', id: String(meta.run_id) } : null;
     if (entry) entry.key = entry.kind + ':' + entry.id;
     var label = modelLabel(meta);
@@ -939,6 +944,12 @@
           S.work.data[entry.key] = record;
           return null;
         }
+        // A finished run leaves the list; if its report is in the chat but not
+        // yet shown, remember the message so the transcript is still synced.
+        var report = record.detail && record.detail.report;
+        if (report && report.state === 'delivered' && report.message_id) {
+          S.work.pendingReports[String(report.message_id)] = true;
+        }
         dropWork(entry.key);
         return null;
       }
@@ -1004,6 +1015,11 @@
   function reportMissing() {
     var known = {};
     S.messages.forEach(function (message) { known[String(message.id)] = true; });
+    // A report whose run has already left the list (it completed and hid
+    // itself) is remembered here until its message is shown.
+    for (var id in S.work.pendingReports) {
+      if (!known[id]) return true;
+    }
     return S.work.items.some(function (entry) {
       var record = S.work.data[entry.key];
       var report = record && record.detail && record.detail.report;
@@ -1024,6 +1040,12 @@
       if (convId !== S.convId || S.sending || fresh.length <= S.messages.length) return null;
       var thread = $('#thread'), pinned = threadPinned, top = thread.scrollTop;
       S.messages = fresh;
+      // A remembered report is now in the transcript: forget it.
+      var shown = {};
+      fresh.forEach(function (message) { shown[String(message.id)] = true; });
+      for (var id in S.work.pendingReports) {
+        if (shown[id]) delete S.work.pendingReports[id];
+      }
       var before = S.work.items.length;
       S.work.items = workFromMessages();
       renderThread();
@@ -1045,7 +1067,11 @@
     clearTimeout(S.work.timer);
     S.work.timer = null;
     var convId = S.convId;
-    if (!S.work.items.length && !planningPending()) { renderWorkBadges(); return Promise.resolve(); }
+    if (!S.work.items.length && !planningPending()) {
+      renderWorkBadges();
+      // A finished run's report may still be owed to the open chat.
+      return syncThread();
+    }
     return Promise.all(S.work.items.map(loadWork)).then(function () {
       if (convId !== S.convId) return null;
       patchWorkChips();
