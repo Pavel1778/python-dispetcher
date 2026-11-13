@@ -57,6 +57,7 @@ Membership is checked in the same query that touches a row.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Callable
 from datetime import timedelta
@@ -64,6 +65,8 @@ from typing import Any
 
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
 from .nexus_projects import ProjectService
+
+log = logging.getLogger("nexus_lab_store")
 
 #: Task states that count as "done well enough to unblock a child".
 VERIFIED_STATES = frozenset({"completed_verified"})
@@ -249,6 +252,13 @@ class LabStore:
 
     def __init__(self, store: PostgresStore):
         self.store = store
+        #: The report writer, set by the process that owns one (the web server
+        #: and the lab worker). ``None`` leaves the loop exactly as it was: a
+        #: terminal run simply has no report. It is used for a run that ends
+        #: *without* completing - cancelled or failed - so its chat is told the
+        #: truth at once; a completed run's report is written by the scheduler
+        #: with its final confirmation, through ``ReportService.on_completed``.
+        self.reports: Any | None = None
 
     # ------------------------------------------------------------------ runs
     def start_run(self, principal: str, project_id: str, goal_id: str, *,
@@ -544,6 +554,17 @@ class LabStore:
                         "resume_at=NULL, wait_reason=NULL, cancelled_at=now(), cancelled_by=%s, "
                         "hidden_at=COALESCE(hidden_at, now()), updated_at=now() "
                         "WHERE id=%s RETURNING *", (state, last_error, actor, run_id))
+        elif state == "completed":
+            # A run that completed successfully and was accepted leaves the
+            # active list by itself: it is no longer work in progress, and its
+            # history belongs in the archive. This is not a deletion - the row,
+            # its tasks, its report and its evidence all stay, and it is read
+            # again with ``include_hidden`` or by its id. A *failed* or
+            # *blocked* run is deliberately NOT hidden: it needs attention.
+            cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
+                        "resume_at=NULL, wait_reason=NULL, "
+                        "hidden_at=COALESCE(hidden_at, now()), updated_at=now() "
+                        "WHERE id=%s RETURNING *", (state, last_error, run_id))
         else:
             cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
                         "resume_at=NULL, wait_reason=NULL, updated_at=now() "
@@ -551,13 +572,61 @@ class LabStore:
         run = self._run_view(cur.fetchone())
         if state == "cancelled":
             ProjectService._event(cur, project_id, actor or "system", "run.cancelled", run_id)
+        # A run that ends *without* completing owes its chat a report too, and
+        # one that says what happened - never a success. Written on this cursor,
+        # in the transaction that settles the run, so the run is never terminal
+        # without its report. ``completed`` is excluded: its report needs the
+        # final confirmation, and the scheduler writes it with the completion.
+        if state in ("cancelled", "failed") and self.reports is not None:
+            try:
+                self.reports.write_terminal(cur, run, outcome=state,
+                                            reason=(last_error or "").strip())
+            except Exception:  # noqa: BLE001 - a report must not fail the settle
+                log.exception("could not write the %s report of run %s", state, run_id)
+        # A run that is *blocked* cannot go on without a person, so its chat is
+        # told why at once. It is not terminal (a resume may restart it), so this
+        # is a message, not a report.
+        if state == "blocked":
+            self._tell_chat(cur, run, "Прогон заблокирован.",
+                            (last_error or "").strip())
         # Mirror terminal states onto the goal so the goal is not left
         # "running" after its only run finished.
         if state in TERMINAL_RUN_STATES:
             cur.execute("UPDATE nexus_goals SET state=%s, updated_at=now() WHERE id=%s",
                         (state, run["goal_id"]))
             self._notify(cur, project_id, f"goal_{state}", f"Цель: {state}", run_id)
+            # And onto the conversation the run was started from, so its chat
+            # workflow is not left "EXECUTING" for ever: a later "Запускай"
+            # would otherwise start a second run of a plan that is already
+            # spent. The dialogue moves to its terminal state; a new task needs
+            # a new message.
+            if run.get("conversation_id"):
+                cur.execute(
+                    "UPDATE nexus_conversations SET workflow_state=%s, updated_at=now() "
+                    "WHERE id=%s AND workflow_state IN ('EXECUTING','REPORTING')",
+                    (state.upper(), run["conversation_id"]))
         return run
+
+    @staticmethod
+    def _tell_chat(cur: Any, run: dict, title: str, reason: str) -> None:
+        """Append one assistant note about *run* to its conversation, if it has one.
+
+        Used for a state a person must hear about as it happens (blocked). The
+        run remembers its ``conversation_id``; a run with none is simply not
+        announced. Nothing is fabricated: the note carries the reason as given.
+        """
+        conversation_id = run.get("conversation_id")
+        if not conversation_id:
+            return
+        cur.execute("SELECT 1 FROM nexus_conversations WHERE id=%s FOR KEY SHARE",
+                    (conversation_id,))
+        if cur.fetchone() is None:
+            return
+        text = title + (f" {reason}" if reason else "")
+        from .nexus_conversations import ConversationService
+        ConversationService.append_internal(
+            cur, str(conversation_id), role="assistant", content=text,
+            meta={"mode": "autonomous", "run_id": str(run["id"]), "blocked": True})
 
     @staticmethod
     def _requeue_retryable(cur: Any, run_id: str, why: str, *, new_cycle: bool = False) -> int:

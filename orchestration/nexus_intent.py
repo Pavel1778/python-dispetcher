@@ -39,8 +39,10 @@ AUTONOMOUS = "autonomous"
 
 #: The modes a conversation may be *set* to. ``analysis`` is a real mode (it
 #: reads and answers); ``auto`` is the default that lets the router decide per
-#: message, so a question in an "auto" conversation stays a question.
-CONVERSATION_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto")
+#: message, so a question in an "auto" conversation stays a question. ``manual``
+#: is the deliberate mode: it discusses, proposes a plan and runs only on an
+#: explicit confirmation - a work order proposes a plan instead of starting.
+CONVERSATION_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "manual")
 
 #: The modes that mean "the person chose this; do not start work".
 _QUIET_MODES = ("ask", "plan", "analysis")
@@ -237,6 +239,13 @@ def names_no_work(text: str) -> bool:
     only of such messages gives a go-ahead nothing to refer to."""
     raw = (text or "").strip()
     return not raw or bool(_GREETING.match(raw) or _GO_AHEAD.match(raw))
+
+
+def bare_go_ahead(text: str) -> bool:
+    """Whether the whole of *text* is a go-ahead ("делай", "ладно, запускай"):
+    it says to act and names nothing to act on. Never a question, a
+    prohibition or a condition - any further word stops it being one."""
+    return bool(_GO_AHEAD.match((text or "").strip()))
 
 
 #: A message longer than this is a document (a specification, a brief), not a
@@ -437,8 +446,11 @@ def effective_mode(mode: str | None, intent: Intent) -> str:
     """The mode the *turn* should run in, given the conversation's mode.
 
     An explicit ``ask``/``plan``/``analysis``/``code`` conversation keeps its
-    mode. An ``autonomous`` or ``auto`` conversation runs the mode the router
-    chose, so a question in it is answered instead of starting a run.
+    mode. ``manual`` is the deliberate mode: a work order becomes a *plan* (the
+    caller proposes it and waits for a confirmation) - except a continuation of
+    work already approved, which is handled by the caller. An ``autonomous`` or
+    ``auto`` conversation runs the mode the router chose, so a question in it is
+    answered instead of starting a run.
     """
     mode = (mode or "auto").lower()
     if mode in ("ask", "plan"):
@@ -448,6 +460,15 @@ def effective_mode(mode: str | None, intent: Intent) -> str:
         # starts a run, even when the message is phrased as an order. Work is
         # asked for in "Авто" or "Автономно" mode.
         return "analysis"
+    if mode == "manual":
+        # The person chose "Вручную": they want to see and approve the plan.
+        # An order to do work becomes a plan request; a question is answered;
+        # a continuation is left for the caller (it resumes the approved run).
+        if intent.continue_run:
+            return "manual"
+        if intent.starts_work or (intent.intent == AUTONOMOUS and not intent.question):
+            return "plan"
+        return "analysis" if intent.intent == ANALYSIS else "ask"
     if mode == "code":
         # The person chose "Code" (one OpenHands workflow). An order stays a
         # code task; a question is still a question and is answered, not run.

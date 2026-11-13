@@ -2065,6 +2065,73 @@ A session is now extended by being used, with a hard end
 Tests: `tests/test_auth.py`, section "session lifetime" - real server, real
 HTTP; time passes by moving the session's own times back in the database.
 
+## Chat-first: Auto runs, Manual confirms, Chat answers (this session)
+
+The requirement: NEXUS must be an intelligent environment, not a system that
+asks permission for everything, and not one that runs a job because a message
+contained a verb. The router already existed (`nexus_intent.py`); this adds the
+*deliberate* mode beside it and the run/report behaviour the request names.
+
+- **`orchestration/nexus_workflow.py`** is the pure new module: the dialogue
+  state machine (`DISCOVERY`…`AWAITING_APPROVAL`→`EXECUTING`…`COMPLETED`) and
+  the launch-command classifier. `EXECUTING` is reachable **only** from
+  `AWAITING_APPROVAL` — a discussion cannot become a run. `classify_launch`
+  separates a command ("Запускай", "Execute", "Run it") from a question about
+  launching ("когда запустишь?"), a prohibition ("Не запускай пока") and a
+  condition ("Запускай только после проверки"); none of the last three is a
+  command. Do not "simplify" that to a keyword check: the prohibition regex has
+  no trailing word boundary on purpose (`не запускай` → `запуска` + `й`).
+- **Auto is untouched and must stay autonomous.** `effective_mode("auto", …)`
+  still returns `autonomous` for a work order; Auto plans and runs without
+  asking. The new mode is **`manual`** (migration 0034 widens the mode CHECK):
+  in it a work order becomes a **plan** (`effective_mode` → `plan`), the plan is
+  proposed and stored, and only an explicit launch command starts the run.
+  Delete the manual gate, not Auto's.
+- **The confirmation is bound to the plan's version.** `nexus_conversations`
+  stores `workflow_plan` (the validated tasks), `plan_hash` (a SHA-256 over
+  them, `nexus_workflow.plan_hash_of`) and `plan_approved_hash`. A *new* plan
+  (a replan) clears any stored approval, so a changed plan must be approved
+  again — this is the "a replan must not silently keep the old confirmation"
+  rule; do not drop the `CASE WHEN plan_hash IS DISTINCT FROM %s` clauses.
+- **The confirmation and the run are one fact.** `web_server._launch_initial`
+  stamps the approval inside `LabStore.start_run(..., also=approve_in)`, on the
+  same cursor that creates the run, guarded by the plan hash: an approval for a
+  version nobody saw leaves the run uncreated. Starting is idempotent per goal
+  (`uq_nexus_runs_active_goal` refuses a second active run), so a double submit
+  of "Запускай" starts one run — the concurrency test asserts it.
+- **Finished runs leave the active list; nothing is deleted.** A run that
+  reaches `completed` sets `hidden_at` by itself (in `_apply_run_state`), like a
+  cancelled run already did. `list_runs` (active) then omits it; the **archive**
+  is `GET /runs?archived=1` (`include_hidden`). A **failed**, **blocked** or
+  **paused** run is deliberately **not** hidden: it needs attention. The old
+  `test_cancel_and_completion_at_the_same_moment_end_one_way` asserted the
+  opposite (`hidden is False`) and was updated on purpose.
+- **Terminal runs report honestly, through the same outbox.** `LabStore` holds
+  an optional `reports` writer (set by the web server and `lab_worker`); on a
+  `cancelled`/`failed` transition `_apply_run_state` calls
+  `ReportService.write_terminal` on the transaction's cursor, so a terminal run
+  is never without a report and the report is `outcome=failed`/`cancelled`, never
+  a success. Delivery is the existing `nexus_run_reports` outbox (one row per
+  run, `run_id` primary key). A **blocked** run appends a chat message
+  (`_tell_chat`) with the reason, at once — it is not terminal, so it is a
+  message, not a report. `test_no_report_for_a_run_that_did_not_complete` was
+  split on purpose into "not ended" (no report) and "ended without completing"
+  (an honest report).
+- Routes/UI: the studio has a **Manual** mode button (the mode menu is driven by
+  `Object.keys(MODES)`), an **Архив прогонов** section on the Agent tab
+  (`loadArchive` → `/runs?archived=1`) and an `open-archived` action that shows a
+  finished run's report; `S.work.keepArchived` keeps exactly that run on screen
+  although the refresh drops hidden runs.
+- Migration `0035_chat_workflow.sql` is additive: the conversation workflow
+  columns, the `manual` mode, the `workflow_plan` jsonb, and one spec state
+  (`awaiting_approval`, reserved for a future hold; today the plan is held on
+  the conversation, not the spec). `REQUIRED_COLUMNS` names every new
+  conversation column.
+- Tests: `tests/test_chat_workflow.py` (42 cases; the classifier, the state
+  machine, the observable Manual turn, Auto unchanged, the archive, the
+  terminal report, concurrency, a stale approval) and the split cases in
+  `tests/test_run_reports.py`. Docs: `docs/CHAT-FIRST.md`, README.
+
 ## What production showed on 2026-11-13, and what was changed for it
 
 Read from the production database (Supabase, read-only) the morning after the
@@ -2163,7 +2230,7 @@ that looks like something to simplify and is not.
 ### The OpenHands conversations of work that is over are deleted
 
 Full description: `docs/DURABLE-RUNS.md`, "The conversations of work that is
-over are deleted". Migration `0035_conversation_cleanup.sql`
+over are deleted". Migration `0036_conversation_cleanup.sql`
 (`nexus_conversation_cleanups`, one row per conversation).
 
 - **No bookkeeping at start.** What a run started is read back from what the
@@ -2244,7 +2311,9 @@ the wish it referred to was three messages up.
 - **Nothing after the marker is an obligation.** `build_index` marks no piece
   after the marker normative, so the planner is not held to cover a list in
   somebody's earlier answer; `PLANNER_SYSTEM` rule 8 says how to read it;
-  `goal_label` and the run report (`build_report`) use the message only.
+  `goal_label` and every run report - `build_report` and the report of a run
+  that was stopped or failed, `ReportService.write_terminal` - use the message
+  only (`_quote_message`).
 - **A re-send is the same task.** Earlier copies of the same message and the
   replies that announced a start are left out of what is attached, so a
   double click finds the specification that is already running (`existing`)
@@ -2272,10 +2341,73 @@ given to a model, which said it cannot start a run.
 - In a conversation set to "Автономно", a greeting, a thank-you or a go-ahead
   with nothing before it is answered (`effective_mode`). A plain statement of
   a goal there still starts a run - the mode was chosen for that.
-- Every chat answer is told how work starts (`_HOW_WORK_STARTS`), so a model no
-  longer says that runs are impossible.
+- Every chat answer is told how work starts, so a model no longer says that
+  runs are impossible - and it is told what is true **of the mode the chat is
+  in** (`nexus_chat.WORK_STARTS`, `work_starts_by`): an order starts a run
+  («Авто», «Автономно», «Код»); an order gets a plan and «Запускай» starts it
+  («Вручную»); the mode only answers and is to be switched first («Вопрос»,
+  «Разбор», «План»). One text for all of them sent a person in «Вопрос» to
+  write an order that «Вопрос» answers.
 - Tests: `tests/test_chat_task_context.py` (the pure parts, then the server
   over HTTP), `tests/test_intent_router.py`.
+
+### Where this meets the «Вручную» mode
+
+This work and the chat-first workflow (`nexus_workflow.py`, the section
+"Chat-first: Auto runs, Manual confirms, Chat answers" above) were written side
+by side and both changed `_chat_turn`. Both migrations were numbered `0035`;
+the deletion list is `0036_conversation_cleanup.sql`. What had to be decided
+where they meet, in `web_server._manual_turn` and `_manual_plan`:
+
+- **A short order in «Вручную» takes its conversation too.** `_manual_plan`
+  plans from `task_with_context(text, history)` and stores that text as the
+  goal's specification, so the plan is about what was discussed and the agents
+  of the approved run read the same task. The plan message says so
+  (`meta.context_messages`).
+- **A go-ahead is not a launch command, and must not replan.** The router
+  reads «Делай» after a conversation as an order (`classify`, rule 4a), and in
+  «Вручную» an order makes a plan: with a plan already waiting, the plan a
+  person had just read was replaced by one made from a word. Now a bare
+  go-ahead (`nexus_intent.bare_go_ahead`) that `classify_launch` does not take
+  for a command, while the state is `AWAITING_APPROVAL`, changes nothing, asks
+  no model, and answers with the command that starts the plan. **It does not
+  start the run.** What starts a run in «Вручную» is `classify_launch` alone;
+  do not route go-aheads into `_launch_initial` from here. That also holds for
+  «Ладно, запускай»: `_LAUNCH` allows one opening word from its own list, and
+  widening it is a decision about that classifier, not a side effect of this
+  one.
+- **The answer to the router's clarifying question is read before the launch
+  classifier** (`chose_work`). "Explain it in the chat, or do the work and
+  start a run?" is asked in «Вручную» too, and «Запускай» is a natural answer
+  to it. Read as the launch command, it started the plan that was on offer
+  *before* - one about something else. An answer that chooses the work gives
+  the message the question was about its plan; said again, with that plan on
+  offer and no question pending, «Запускай» is the launch command. Keep the
+  `chose_work` check first in `_manual_turn`.
+- A launch command with **no** plan on offer is answered as before ("сначала
+  опишите задачу"), even after a discussion; «Делай» in the same place gets a
+  plan made from the discussion. The difference is the two word lists, and is
+  known.
+- **A question in «Вручную» is answered like any other**: from the repository
+  (`App.repository_access`), told how work starts in this mode, and - when the
+  message chose "in the chat" after the router's clarifying question - about
+  the message that question was asked about (`request`).
+- Tests: the last section of `tests/test_chat_task_context.py`, the last two
+  tests of `tests/test_chat_repository.py`,
+  `test_a_short_order_is_quoted_without_the_conversation_it_took_along` in
+  `tests/test_run_reports.py`.
+- **Test order.** `0033_chat_intent.sql` re-adds the mode CHECK without
+  `manual`, so it cannot be applied a second time over a table that holds a
+  «Вручную» conversation. Production never does that (`apply_migrations` skips
+  a recorded file - which is one more reason never to edit `0033`). Five old
+  test modules do: `test_cloud_direct`, `test_cloud_dispatcher`,
+  `test_cloud_integration`, `test_reliability`, `test_sr_runtime` drop a few
+  tables and run every migration again over the rest. They pass in the order
+  CI runs the suite, because a module that drops the whole schema comes
+  between them and every module that creates a «Вручную» conversation
+  (`test_cli_mcp` after the `test_chat_*` ones). Run right after such a module
+  they fail at set-up with `nexus_conversations_mode_check ... violated`: that
+  is this, not the code under test.
 
 ### Known limits of this increment
 

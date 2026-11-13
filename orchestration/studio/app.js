@@ -61,6 +61,12 @@
       desc: 'Планирует цель и запускает прогон по задачам с проверкой.',
       placeholder: 'Опишите цель — агент спланирует и выполнит',
       thinking: 'Планирую и запускаю прогон', repo: true, provider: true
+    },
+    manual: {
+      icon: 'plan', label: 'Вручную',
+      desc: 'Обсуждает задачу, предлагает план и ждёт подтверждения «Запускай».',
+      placeholder: 'Опишите задачу — я предложу план и спрошу подтверждение',
+      thinking: 'Готовлю план на подтверждение', repo: true, provider: true
     }
   };
 
@@ -98,7 +104,8 @@
     mode: 'auto', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
-    work: { items: [], data: {}, timer: null, hidden: {} },
+    work: { items: [], data: {}, timer: null, hidden: {}, keepArchived: {},
+            pendingReports: {} },
     accounts: { github: null, openhands: null },
     pool: null,
     projectSettings: null
@@ -577,6 +584,9 @@
     var seen = {}, items = [];
     S.messages.forEach(function (message) {
       var meta = message.meta || {};
+      // A report message *is* the result, not a link to a run: it carries no
+      // chip (the run itself has already left the list).
+      if (meta.report) return;
       var entry = meta.workflow_id ? { kind: 'workflow', id: String(meta.workflow_id) }
         : meta.run_id ? { kind: 'run', id: String(meta.run_id) } : null;
       if (!entry) return;
@@ -710,7 +720,8 @@
         (info.action ? '<button class="btn btn-sm" type="button" data-action="' + info.action + '">' + esc(info.actionLabel) + '</button>' : '') +
         '</div></div></article>';
     }
-    var entry = meta.workflow_id ? { kind: 'workflow', id: String(meta.workflow_id) }
+    var entry = meta.report ? null
+      : meta.workflow_id ? { kind: 'workflow', id: String(meta.workflow_id) }
       : meta.run_id ? { kind: 'run', id: String(meta.run_id) } : null;
     if (entry) entry.key = entry.kind + ':' + entry.id;
     var label = modelLabel(meta);
@@ -958,6 +969,18 @@
       // history stays on the server; only the view drops it.
       var run = entry.kind === 'run' && record.detail && record.detail.run;
       if (record.state === 'cancelled' || (run && run.hidden)) {
+        if (S.work.keepArchived[entry.key]) {
+          // Opened by hand from the archive: keep exactly this one on screen,
+          // even though it left the active list. Data are still loaded.
+          S.work.data[entry.key] = record;
+          return null;
+        }
+        // A finished run leaves the list; if its report is in the chat but not
+        // yet shown, remember the message so the transcript is still synced.
+        var report = record.detail && record.detail.report;
+        if (report && report.state === 'delivered' && report.message_id) {
+          S.work.pendingReports[String(report.message_id)] = true;
+        }
         dropWork(entry.key);
         return null;
       }
@@ -1023,6 +1046,11 @@
   function reportMissing() {
     var known = {};
     S.messages.forEach(function (message) { known[String(message.id)] = true; });
+    // A report whose run has already left the list (it completed and hid
+    // itself) is remembered here until its message is shown.
+    for (var id in S.work.pendingReports) {
+      if (!known[id]) return true;
+    }
     return S.work.items.some(function (entry) {
       var record = S.work.data[entry.key];
       var report = record && record.detail && record.detail.report;
@@ -1043,6 +1071,12 @@
       if (convId !== S.convId || S.sending || fresh.length <= S.messages.length) return null;
       var thread = $('#thread'), pinned = threadPinned, top = thread.scrollTop;
       S.messages = fresh;
+      // A remembered report is now in the transcript: forget it.
+      var shown = {};
+      fresh.forEach(function (message) { shown[String(message.id)] = true; });
+      for (var id in S.work.pendingReports) {
+        if (shown[id]) delete S.work.pendingReports[id];
+      }
       var before = S.work.items.length;
       S.work.items = workFromMessages();
       renderThread();
@@ -1064,7 +1098,11 @@
     clearTimeout(S.work.timer);
     S.work.timer = null;
     var convId = S.convId;
-    if (!S.work.items.length && !planningPending()) { renderWorkBadges(); return Promise.resolve(); }
+    if (!S.work.items.length && !planningPending()) {
+      renderWorkBadges();
+      // A finished run's report may still be owed to the open chat.
+      return syncThread();
+    }
     return Promise.all(S.work.items.map(loadWork)).then(function () {
       if (convId !== S.convId) return null;
       patchWorkChips();
@@ -1343,8 +1381,52 @@
   // phone the last runs could not be reached while a run was at work.
   var agentScroll = { touching: false, at: 0, timer: null };
 
+  // The archive: runs that left the active list (completed cleanly, or
+  // cancelled). Loaded on demand; its rows are read-only records - the work is
+  // over - but each keeps its full report, tasks and history.
+  var archive = { open: false, items: [], loading: false, error: null };
+
+  function loadArchive() {
+    archive.loading = true;
+    archive.error = null;
+    renderAgent();
+    return api(projectUrl('/runs') + '?archived=1')
+      .then(function (data) {
+        archive.items = (data.runs || []);
+        archive.loading = false;
+        renderAgent();
+      }, function (error) {
+        archive.loading = false;
+        archive.error = error.message;
+        renderAgent();
+      });
+  }
+
   function agentListBusy() {
     return agentScroll.touching || Date.now() - agentScroll.at < 400;
+  }
+
+  function archiveRow(run) {
+    var cancelled = run.state === 'cancelled';
+    return '<li class="archive-row" data-id="' + esc(run.id) + '">' +
+      '<span class="dot is-' + stateTone(run.state) + '"></span>' +
+      '<span class="archive-title">' + esc(shortId(run.id)) + ' · ' + esc(stateLabel(run.state)) +
+      (run.workflow_goal_id ? '' : '') + '</span>' +
+      '<span class="archive-when">' + esc(fullTime(run.updated_at || run.created_at)) + '</span>' +
+      '<button class="btn btn-sm" type="button" data-action="open-archived" data-id="' + esc(run.id) + '">' +
+      (cancelled ? 'Подробности' : 'Отчёт') + '</button></li>';
+  }
+
+  function archiveHtml() {
+    var head = '<div class="ws-section-head"><button class="btn btn-sm" type="button" data-action="toggle-archive">' +
+      icon('archive', 'icon-sm') + (archive.open ? 'Скрыть архив' : 'Архив прогонов') + '</button></div>';
+    if (!archive.open) return head;
+    var inner;
+    if (archive.loading) inner = '<p class="step-sub">Загружаю…</p>';
+    else if (archive.error) inner = '<p class="step-sub">' + esc(archive.error) + '</p>';
+    else if (!archive.items.length) inner = '<p class="step-sub">Завершённых прогонов нет.</p>';
+    else inner = '<ul class="archive-list">' + archive.items.map(archiveRow).join('') + '</ul>';
+    return head + inner;
   }
 
   function renderAgent() {
@@ -1352,7 +1434,8 @@
     clearTimeout(agentScroll.timer);
     if (!S.work.items.length) {
       body.innerHTML = emptyHtml('bot', 'Агент ещё не запускался',
-        'Отправьте задачу в режиме «Код» или «Автономно» — здесь появятся шаги, статусы и ссылка на сессию OpenHands.');
+        'Отправьте задачу в режиме «Код», «Автономно» или «Вручную» — здесь появятся ' +
+        'шаги, статусы и ссылка на сессию OpenHands.') + archiveHtml();
       return;
     }
     var html = S.work.items.map(function (entry) {
@@ -1366,7 +1449,7 @@
           '<div class="work-foot"><button class="btn btn-sm" type="button" data-action="refresh-work">Обновить</button></div></section>';
       }
       return entry.kind === 'workflow' ? workflowCard(entry, record.detail) : runCard(entry, record.detail);
-    }).join('');
+    }).join('') + archiveHtml();
     var list = $('.work-list', body);
     if (list && list.__html === html) return;
     if (list && agentListBusy()) {
@@ -2509,6 +2592,25 @@
       }, function () { toast('Не удалось скопировать.', 'bad'); });
     },
     'open-work': function () { setWorkspace(true, 'agent'); refreshWork(); },
+    'toggle-archive': function () {
+      archive.open = !archive.open;
+      if (archive.open && !archive.items.length && !archive.loading) loadArchive();
+      else renderAgent();
+    },
+    // An archived run is opened the same way a live one is: the card shows its
+    // tasks, its report and its history. It is not a second interface. It is
+    // remembered as opened-by-hand so the refresh that drops hidden runs keeps
+    // exactly this one on screen.
+    'open-archived': function (el) {
+      var id = el.getAttribute('data-id');
+      var key = 'run:' + id;
+      S.work.keepArchived[key] = true;
+      delete S.work.hidden[key];
+      if (!S.work.items.some(function (item) { return item.key === key; })) {
+        S.work.items.unshift({ kind: 'run', id: id, key: key });
+      }
+      refreshWork();
+    },
     'refresh-work': function () { refreshWork(); },
     'cancel-workflow': function (el) {
       var id = el.getAttribute('data-id');

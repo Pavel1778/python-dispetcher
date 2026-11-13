@@ -528,12 +528,50 @@ def test_a_turn_that_starts_work_does_not_read_the_repository_itself(studio):
     assert not any("Files:\n" in prompt for prompt in prompts(studio))
 
 
-def test_the_assistant_is_told_how_work_is_started(studio):
+@pytest.mark.parametrize("mode, told, not_told", [
+    # An order starts a run by itself.
+    ("auto", "say that it starts with such an order", "«Запускай» starts it"),
+    ("autonomous", "say that it starts with such an order", "the mode is to be switched"),
+    # An order gets a plan; a launch command starts it.
+    ("manual", "say that an order gets a plan and that «Запускай» starts it",
+     "say that it starts with such an order"),
+    # The mode only answers, an order included: the mode is to be switched.
+    ("ask", "say that the mode is to be switched first",
+     "say that it starts with such an order"),
+    ("analysis", "say that the mode is to be switched first",
+     "say that it starts with such an order"),
+])
+def test_the_assistant_is_told_how_work_is_started_in_the_mode_it_is_in(
+        studio, mode, told, not_told):
     """It used to answer "я не могу запускать прогоны" to a person who asked
-    for one. A reply changes nothing, but the system it speaks for can."""
+    for one. A reply changes nothing, but the system it speaks for can - and
+    how depends on the mode: told the same thing everywhere, it sent a person
+    in «Вопрос» to write an order that «Вопрос» only answers."""
     project, conversation = connected(studio)
-    studio.answers("Чтобы я это сделал, напишите «сделай».")
-    assert ask(studio, project, conversation, "Ты можешь сам переделать фронтенд?")[0] == 200
+    studio.answers("Могу.")
+    assert ask(studio, project, conversation, "Ты можешь сам переделать фронтенд?",
+               mode=mode)[0] == 200
     system = rules(studio)[0]
     assert "NEXUS itself can do the work" in system
     assert "never say that changes or runs are impossible" in system
+    assert told in system and not_told not in system
+
+
+def test_a_question_in_manual_mode_is_answered_from_the_repository_too(studio):
+    """«Вручную» answers a question itself, apart from the other modes; it
+    reads the repository for it like they do."""
+    project, conversation = connected(studio)
+    studio.answers("READ: src/app.py", "Да, вижу: код в src/app.py, там функция add.")
+    status, body = ask(studio, project, conversation, "Ты вообще видишь репозиторий и проект?",
+                       mode="manual")
+    assert status == 200, body
+    reply = body["messages"][-1]
+    assert reply["content"] == "Да, вижу: код в src/app.py, там функция add."
+    assert f"Repository {REPO}, branch main, at commit abc123" in prompts(studio)[0]
+    assert "def add(a, b):" in prompts(studio)[1]
+    assert "REPOSITORY ACCESS" in rules(studio)[0]
+    assert reply["meta"]["repository"]["full_name"] == REPO
+    assert [item["path"] for item in reply["meta"]["repository"]["read"]] == [
+        "README.md", "src/app.py"]
+    # Nothing was planned and nothing started.
+    assert studio.api.get(f"/api/v1/projects/{project}/runs?archived=1")[1]["runs"] == []

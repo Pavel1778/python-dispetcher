@@ -949,15 +949,21 @@ def test_the_report_arrives_in_the_open_chat_by_itself_and_can_be_copied(lab_sta
 
         # What is copied is the report as it is stored, whole.
         principal, project = _owner_principal(stack.app), _first_project(stack.app)
-        run = stack.app.lab.list_runs(principal, project)[0]
+        run = stack.app.lab.list_runs(principal, project, include_hidden=True)[0]
         stored = stack.app.reports.get(principal, project, str(run["id"]))
         assert stored["state"] == "delivered"
         report.locator("[data-action='copy-message']").click()
         expect(page.locator(".toast")).to_contain_text("Отчёт скопирован")
         assert page.evaluate("() => navigator.clipboard.readText()") == stored["body"]
 
-        # The same report in the run's card, with its own copy button.
-        page.locator(".work-chip").first.click()
+        # The same report in the run's card, with its own copy button. A
+        # completed run leaves the active list, so the card is reached through
+        # the archive - not through a chip in the transcript.
+        page.click("#tab-agent")
+        page.wait_for_selector("[data-action='toggle-archive']")
+        page.click("[data-action='toggle-archive']")
+        page.wait_for_selector("[data-action='open-archived']")
+        page.click("[data-action='open-archived']")
         page.wait_for_selector(".work [data-action='copy-report']")
         expect(page.locator(".work .pill").first).to_have_text("готово")
         assert "отправлен в чат" in page.inner_text(".work")

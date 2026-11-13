@@ -234,7 +234,7 @@ to no other task.
 ## The conversations of work that is over are deleted
 
 Every attempt of every task starts a conversation in the OpenHands account it
-runs on. Until migration `0035` nothing removed one: a month of runs left a
+runs on. Until migration `0036` nothing removed one: a month of runs left a
 month of conversations in the account, and a sandbox for most of them.
 
 **What is deleted, and when.** Every conversation a run started - whatever
@@ -420,7 +420,7 @@ database that already holds runs, projects and links.
 (the start a claimed task is waiting for; see "A start outlives the worker that
 asked for it"). No existing row changes.
 
-`0035_conversation_cleanup.sql` adds one table, `nexus_conversation_cleanups`
+`0036_conversation_cleanup.sql` adds one table, `nexus_conversation_cleanups`
 (see "The conversations of work that is over are deleted"). No existing row
 changes; the rows for work that is already over are written by the worker's
 first passes, not by the migration.

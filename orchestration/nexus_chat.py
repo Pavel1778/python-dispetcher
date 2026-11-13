@@ -86,6 +86,9 @@ REPO_MIN_TOKENS = 1_200
 #: What every chat answer is told about the system it speaks for. Without it
 #: a model asked to "do it" answers that it cannot change anything - true of
 #: the reply, false of NEXUS - and the person is left with nowhere to go.
+#: What is true depends on the mode the conversation is set to, so there is
+#: one text for each way work starts (``WORK_STARTS``): told the wrong one, a
+#: model sends the person to write an order that this conversation answers.
 _HOW_WORK_STARTS = (
     " This reply only answers: it changes no file and starts nothing. NEXUS "
     "itself can do the work: when the developer writes an order in this chat "
@@ -96,15 +99,61 @@ _HOW_WORK_STARTS = (
     "developer wants work done, say that it starts with such an order."
 )
 
-_ASK_SYSTEM = (
+#: «Вручную»: an order gets a plan, and only a launch command runs the plan
+#: (``nexus_workflow.classify_launch``).
+_HOW_WORK_STARTS_MANUAL = (
+    " This reply only answers: it changes no file and starts nothing. NEXUS "
+    "itself can do the work. This chat is in the «Вручную» (manual) mode: when "
+    "the developer writes an order in it (for example «сделай ...», «исправь "
+    "...», or simply «делай» after a discussion), NEXUS proposes a plan made "
+    "from the order and the conversation so far, and waits. The developer "
+    "starts the plan with an explicit command, «Запускай»; coding agents then "
+    "carry it out in the repository as an autonomous run. So never say that "
+    "changes or runs are impossible, and never say that work has started; when "
+    "the developer wants work done, say that an order gets a plan and that "
+    "«Запускай» starts it."
+)
+
+#: «Вопрос», «Разбор», «План»: the person chose a mode that only answers, and
+#: an order written in it is answered too (``nexus_intent.effective_mode``).
+_HOW_WORK_STARTS_ELSEWHERE = (
+    " This reply only answers: it changes no file and starts nothing. NEXUS "
+    "itself can do the work, but not in the mode this chat is set to: here an "
+    "order is answered like any other message. Work starts when the developer "
+    "switches the chat to the «Авто» mode (or «Автономно»; or «Вручную», to see "
+    "and approve a plan first) and writes the order there: NEXUS then plans it "
+    "and coding agents carry it out in the repository as an autonomous run. So "
+    "never say that changes or runs are impossible, and never promise that an "
+    "order written in this mode starts them; when the developer wants work "
+    "done, say that the mode is to be switched first."
+)
+
+#: The ways work starts, by the name ``ChatResponder.respond`` is given.
+WORK_STARTS = {
+    "order": _HOW_WORK_STARTS,
+    "launch": _HOW_WORK_STARTS_MANUAL,
+    "mode": _HOW_WORK_STARTS_ELSEWHERE,
+}
+
+
+def work_starts_by(mode: str | None) -> str:
+    """Which of ``WORK_STARTS`` is true of a conversation set to *mode*."""
+    mode = (mode or "auto").lower()
+    if mode == "manual":
+        return "launch"
+    if mode in ("ask", "analysis", "plan"):
+        return "mode"
+    return "order"
+
+
+_ASK_RULES = (
     "You are NEXUS, an AI development assistant embedded in an IDE. Answer the "
     "developer's question about their project concisely and concretely. Use the "
     "provided project context and memory when relevant. Do not invent files or "
     "facts you were not given; say what you would need to check instead."
-    + _HOW_WORK_STARTS
 )
 
-_ANALYSIS_SYSTEM = (
+_ANALYSIS_RULES = (
     "You are NEXUS, an AI development assistant. The developer asked you to look "
     "into something (analyse, find the cause, review, compare). Answer in the "
     "chat from the provided project context, memory and the real state of the "
@@ -112,8 +161,8 @@ _ANALYSIS_SYSTEM = (
     "you had, and never claim work was done. Base every statement about runs, "
     "tasks and results on the given facts; if a fact is not given, say what you "
     "would need to check. Keep it concrete and short."
-    + _HOW_WORK_STARTS
 )
+
 
 #: What the model is told about the repository, added to the mode's own
 #: instructions. Exactly one of the three applies to a turn.
@@ -250,7 +299,7 @@ def task_with_context(text: str, history: list[dict] | None) -> tuple[str, int]:
             + "\n\n".join(kept)), len(kept)
 
 
-def _attached_note(attached: int) -> str:
+def attached_note(attached: int) -> str:
     """What a reply says when the conversation went into the task."""
     if not attached:
         return ""
@@ -408,7 +457,7 @@ class ChatResponder:
                 spec_id: str | None = None,
                 run_facts: dict | None = None,
                 access: RepositoryAccess | None = None,
-                attached: int = 0) -> list[dict]:
+                attached: int = 0, work_starts: str = "order") -> list[dict]:
         """Return the messages to append for this turn.
 
         Each message is ``{"role", "content", "meta"}``. A failure is raised as
@@ -429,14 +478,17 @@ class ChatResponder:
         ``plan`` use it. Without it the turn says nothing of a repository, as
         before. *attached* is how many earlier messages of the conversation
         the caller put into the task of a ``code`` or ``autonomous`` turn; the
-        reply says so.
+        reply says so. *work_starts* names how work is started in this
+        conversation (``WORK_STARTS``, :func:`work_starts_by`): an answer is
+        told that, so it does not send the person the wrong way.
         """
         if mode not in _MODES:
             raise ValueError("mode must be ask, analysis, code, plan or autonomous")
+        how = WORK_STARTS.get(work_starts, _HOW_WORK_STARTS)
         if mode == "ask":
-            return [self._ask(goal, context, memory, history, access)]
+            return [self._ask(goal, context, memory, history, access, how)]
         if mode == "analysis":
-            return [self._analysis(goal, context, memory, history, run_facts, access)]
+            return [self._analysis(goal, context, memory, history, run_facts, access, how)]
         if mode == "plan":
             return [self._plan(goal, context, memory, access)]
         scope = {"project_id": project_id, "principal": principal}
@@ -448,12 +500,15 @@ class ChatResponder:
 
     # ------------------------------------------------------------------- modes
     def _ask(self, goal: str, context: dict | None, memory: list[dict] | None,
-             history: list[dict] | None, access: RepositoryAccess | None = None) -> dict:
-        return self._converse("ask", _ASK_SYSTEM, goal, context, memory, history, None, access)
+             history: list[dict] | None, access: RepositoryAccess | None = None,
+             how: str = _HOW_WORK_STARTS) -> dict:
+        return self._converse("ask", _ASK_RULES + how, goal, context, memory, history,
+                              None, access)
 
     def _analysis(self, goal: str, context: dict | None, memory: list[dict] | None,
                   history: list[dict] | None, run_facts: dict | None,
-                  access: RepositoryAccess | None = None) -> dict:
+                  access: RepositoryAccess | None = None,
+                  how: str = _HOW_WORK_STARTS) -> dict:
         """Answer a request to look into something, read-only.
 
         The prompt carries the project context, the memory, the recent
@@ -463,8 +518,8 @@ class ChatResponder:
         no file is changed. A provider outage is a :class:`ChatError`, never a
         made-up analysis.
         """
-        return self._converse("analysis", _ANALYSIS_SYSTEM, goal, context, memory, history,
-                              run_facts, access)
+        return self._converse("analysis", _ANALYSIS_RULES + how, goal, context, memory,
+                              history, run_facts, access)
 
     def _converse(self, mode: str, system: str, goal: str, context: dict | None,
                   memory: list[dict] | None, history: list[dict] | None,
@@ -634,6 +689,39 @@ class ChatResponder:
                 "meta": {"provider": result.provider, "mode": "plan",
                          "plan": result.plan}}
 
+    def plan_for_approval(self, goal: str, context: dict | None = None,
+                          memory: list[dict] | None = None) -> tuple[list[dict], dict]:
+        """A validated plan the person can approve before anything runs.
+
+        The same plan shape the Autonomous Lab uses (``validate_plan_json``),
+        normalized so every task carries acceptance criteria (an empty list when
+        the model gave none) - what is stored here is exactly what a run is
+        started from on approval. Raises :class:`ChatError` on a provider outage
+        or an invalid plan, so the caller records a failure instead of a plan
+        nobody can approve.
+        """
+        prompt = self._prompt(goal, context, memory, None)
+        try:
+            result = self.providers.plan(prompt, _PLAN_SYSTEM)
+        except AllProvidersFailed as e:
+            raise ChatError(self._failure(e, goal)) from e
+        except ProviderError as e:
+            raise ChatError(str(e)) from e
+        except ValueError as e:
+            raise ChatError(f"provider returned an invalid plan: {e}") from e
+        tasks = []
+        for i, task in enumerate(result.plan, 1):
+            tasks.append({
+                "id": task.get("id") or f"task-{i}",
+                "title": task["title"],
+                "description": task.get("description") or "",
+                "acceptance": list(task.get("acceptance") or []),
+                "dependencies": list(task.get("dependencies") or []),
+            })
+        meta = {"provider": result.provider, "failovers": result.failovers,
+                "task_count": len(tasks)}
+        return tasks, meta
+
     def _code(self, goal: str, repository: str, branch: str,
               scope: dict | None = None, attached: int = 0) -> list[dict]:
         if self._dispatch_code is None:
@@ -650,7 +738,7 @@ class ChatResponder:
         # person reads, so it names the repository and where to watch the work.
         content = (f"Задача передана OpenHands: репозиторий `{repository}`, "
                    f"ветка `{branch}`.\n\n"
-                   "Ход работы виден на вкладке «Агент»." + _attached_note(attached))
+                   "Ход работы виден на вкладке «Агент»." + attached_note(attached))
         tool = {"role": "tool", "content": f"start_workflow → {workflow_id}",
                 "meta": {"tool": "start_workflow", "workflow_id": workflow_id,
                          "repository": repository, "branch": branch}}
@@ -683,7 +771,7 @@ class ChatResponder:
                 f"строится по частям: готово {stages.get('planned', 0)} из "
                 f"{stages.get('total', 0)}. Прогон запустится сам, когда план будет готов, "
                 "и сообщение об этом появится здесь. Повторная отправка этого же текста "
-                "второй прогон не запускает." + _attached_note(attached))
+                "второй прогон не запускает." + attached_note(attached))
             return [{"role": "assistant", "content": content,
                      "meta": {"mode": "autonomous", "spec_id": spec.get("id"),
                               "planning": stages}}]
@@ -698,7 +786,7 @@ class ChatResponder:
         tasks = out.get("tasks") or []
         content = (f"Автономный прогон запущен: репозиторий `{repository}`, "
                    f"ветка `{branch}`, задач в плане: {len(tasks)}.\n\n"
-                   "Ход работы и проверки видны на вкладке «Агент»." + _attached_note(attached))
+                   "Ход работы и проверки видны на вкладке «Агент»." + attached_note(attached))
         tool_meta = {"tool": "start_run", "run_id": run_id,
                      "tasks": len(tasks), "repository": repository,
                      "branch": branch}

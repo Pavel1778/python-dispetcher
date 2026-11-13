@@ -537,3 +537,176 @@ def test_a_short_order_in_code_mode_takes_the_conversation_too(studio):
     detail = studio.api.get(
         f"/api/v1/projects/{project}/workflows/{reply['meta']['workflow_id']}")[1]
     assert detail["workflow"]["state"] == "cancelled" and detail["cleanup"]["due_at"]
+
+
+# ------------------------------------------------------------ the «Вручную» mode
+# In «Вручную» an order gets a plan and only a launch command starts the run
+# (``nexus_workflow``, ``tests/test_chat_workflow.py``). What this file is
+# about holds there too: a short order is no more a task in that mode than in
+# any other, and a go-ahead must not turn the plan a person has just read into
+# another one.
+def workflow_of(studio, project, conversation) -> dict:
+    return studio.api.get(
+        f"/api/v1/projects/{project}/conversations/{conversation}")[1]["conversation"]
+
+
+def task_of_run(studio, run_id) -> str:
+    """The stored task of a run: what its agents are given to read."""
+    with studio.app.store._tx() as cur:
+        cur.execute("SELECT s.content FROM nexus_runs r JOIN nexus_goals g ON g.id = r.goal_id "
+                    "JOIN nexus_specs s ON s.id = g.spec_id WHERE r.id=%s", (run_id,))
+        return cur.fetchone()["content"]
+
+
+@needs_db
+def test_do_it_in_manual_mode_gets_a_plan_made_from_the_discussion(studio):
+    project, conversation = chat(studio, mode="manual")
+    studio.answers("Фронтенд лежит в web/.", PLAN)
+    status, body = send(studio, project, conversation, WISH)
+    assert status == 200 and body["messages"][-1]["meta"]["mode"] == "ask", body
+
+    status, body = send(studio, project, conversation, "Делай")
+    assert status == 200, body
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+    reply = body["messages"][-1]
+    # A plan, not a run: the mode waits for its launch command.
+    assert reply["meta"]["mode"] == "plan" and reply["meta"]["awaiting_approval"] is True
+    assert "Предлагаемый план" in reply["content"] and "Переделать фронтенд" in reply["content"]
+    assert runs(studio, project) == [] and studio.cloud.cloud.conversations == {}
+    assert workflow_of(studio, project, conversation)["workflow_state"] == "AWAITING_APPROVAL"
+    # The plan was asked for with the wish in view, and the reply says that
+    # the conversation went into the task.
+    asked = planning_prompts(studio)
+    assert len(asked) == 1 and WISH in asked[0] and "Делай" in asked[0]
+    assert CONTEXT_MARKER in asked[0]
+    assert reply["meta"]["context_messages"] == 2
+    assert "в задание вошла и предыдущая переписка этого чата (сообщений: 2)" in reply["content"]
+
+    # The launch command starts that plan. The task its agents read is the
+    # message with the conversation; the goal is labelled by the message.
+    status, body = send(studio, project, conversation, "Запускай")
+    assert status == 200, body
+    started = runs(studio, project)
+    assert len(started) == 1
+    message, attached = split_context(task_of_run(studio, started[0]["id"]))
+    assert message == "Делай" and f"[Пользователь]\n{WISH}" in attached
+    detail = studio.api.get(f"/api/v1/projects/{project}/runs/{started[0]['id']}")[1]
+    assert [task["title"] for task in detail["tasks"]] == ["Переделать фронтенд"]
+    goals = studio.api.get(f"/api/v1/projects/{project}/goals")[1]["goals"]
+    assert [goal["text"] for goal in goals] == ["Делай"]
+
+
+@needs_db
+@pytest.mark.parametrize("text", ["Делай", "Сделай", "Да, делай", "Ладно, запускай"])
+def test_a_go_ahead_that_is_not_a_launch_command_leaves_the_offered_plan_alone(studio, text):
+    """With a plan waiting, «Делай» is not one of the launch commands, and it
+    is not a new order either. It used to be planned again - from one word -
+    and the plan the person had read was replaced. Now nothing is asked of a
+    model, the plan is the same, and the reply names the command."""
+    project, conversation = chat(studio, mode="manual")
+    studio.answers(PLAN)
+    assert send(studio, project, conversation, "Реализуй вход по ссылке из письма")[0] == 200
+    offered = workflow_of(studio, project, conversation)
+    assert offered["workflow_state"] == "AWAITING_APPROVAL" and offered["plan_hash"]
+    asked = len(studio.llm.calls)
+
+    status, body = send(studio, project, conversation, text)
+    assert status == 200, body
+    reply = body["messages"][-1]
+    assert reply["meta"] == {"mode": "ask"}
+    assert "План остаётся на подтверждении" in reply["content"]
+    assert "«Запускай»" in reply["content"]
+    assert len(studio.llm.calls) == asked, "a model was asked to plan a go-ahead"
+    after = workflow_of(studio, project, conversation)
+    assert after["plan_hash"] == offered["plan_hash"]
+    assert after["workflow_state"] == "AWAITING_APPROVAL"
+    assert after["workflow_plan"] == offered["workflow_plan"]
+    assert runs(studio, project) == [] and studio.cloud.cloud.conversations == {}
+
+    # The command itself still starts exactly that plan, once.
+    status, body = send(studio, project, conversation, "Запускай")
+    assert status == 200, body
+    started = runs(studio, project)
+    assert len(started) == 1
+    detail = studio.api.get(f"/api/v1/projects/{project}/runs/{started[0]['id']}")[1]
+    assert [task["title"] for task in detail["tasks"]] == ["Переделать фронтенд"]
+
+
+@needs_db
+def test_a_new_order_in_manual_mode_still_replaces_the_offered_plan(studio):
+    """Only a go-ahead leaves the plan alone. A message that names work is a
+    change of requirements: a new plan, to be confirmed on its own."""
+    project, conversation = chat(studio, mode="manual")
+    other = json.dumps({"tasks": [
+        {"id": "sso", "title": "Вход через SSO", "description": "Вместо ссылки.",
+         "acceptance": ["вход работает"], "dependencies": []}]})
+    studio.answers(PLAN, other)
+    assert send(studio, project, conversation, "Реализуй вход по ссылке из письма")[0] == 200
+    first = workflow_of(studio, project, conversation)["plan_hash"]
+
+    status, body = send(studio, project, conversation, "Сделай иначе: вход через SSO")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["awaiting_approval"] is True
+    assert "Вход через SSO" in body["messages"][-1]["content"]
+    after = workflow_of(studio, project, conversation)
+    assert after["plan_hash"] != first and after["plan_approved_hash"] is None
+    # The short order was planned with the earlier one in view.
+    assert "Реализуй вход по ссылке из письма" in planning_prompts(studio)[1]
+    assert runs(studio, project) == []
+
+
+@needs_db
+def test_in_manual_mode_the_answer_to_the_clarifying_question_is_read_too(studio):
+    project, conversation = chat(studio, mode="manual")
+    status, body = send(studio, project, conversation, "Проверь и исправь тесты формы входа")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"].get("clarify") is True
+
+    # "Work": a plan of the message that was asked about, and no run.
+    studio.answers(PLAN)
+    status, body = send(studio, project, conversation, "Сразу работу и прогон")
+    assert status == 200, body
+    reply = body["messages"][-1]
+    assert reply["meta"]["mode"] == "plan" and reply["meta"]["awaiting_approval"] is True
+    asked = planning_prompts(studio)
+    assert len(asked) == 1 and "Проверь и исправь тесты формы входа" in asked[0]
+    assert runs(studio, project) == []
+
+    # «Запускай» is a natural answer to "…or do the work and start a run?".
+    # It answers the question: the message that was asked about gets its plan.
+    # Read as the launch command, it would have started the plan above, which
+    # is about something else.
+    first = workflow_of(studio, project, conversation)["plan_hash"]
+    status, body = send(studio, project, conversation, "Проверь и почини сборку документации")
+    assert status == 200 and body["messages"][-1]["meta"].get("clarify") is True, body
+    docs = json.dumps({"tasks": [
+        {"id": "docs", "title": "Починить сборку документации", "description": "mkdocs.",
+         "acceptance": ["сборка проходит"], "dependencies": []}]})
+    studio.answers(docs)
+    status, body = send(studio, project, conversation, "Запускай")
+    assert status == 200, body
+    reply = body["messages"][-1]
+    assert reply["meta"]["mode"] == "plan" and reply["meta"]["awaiting_approval"] is True
+    assert "Починить сборку документации" in reply["content"]
+    assert "Проверь и почини сборку документации" in planning_prompts(studio)[-1]
+    assert workflow_of(studio, project, conversation)["plan_hash"] != first
+    assert runs(studio, project) == [], "the plan that was on offer before was started"
+    # Said again, with the new plan on offer and no question pending, it is
+    # the launch command: the new plan starts, once.
+    status, body = send(studio, project, conversation, "Запускай")
+    assert status == 200, body
+    started = runs(studio, project)
+    assert len(started) == 1
+    detail = studio.api.get(f"/api/v1/projects/{project}/runs/{started[0]['id']}")[1]
+    assert [task["title"] for task in detail["tasks"]] == ["Починить сборку документации"]
+
+    # "In the chat": the message that was asked about is what gets answered.
+    other = studio.conversation(project, mode="manual")
+    assert send(studio, project, other, "Проверь и исправь тесты формы входа")[0] == 200
+    studio.answers("Тесты формы входа лежат в tests/test_app.py.")
+    status, body = send(studio, project, other, "В чате")
+    assert status == 200, body
+    assert body["messages"][-1]["content"] == "Тесты формы входа лежат в tests/test_app.py."
+    prompt = studio.llm.calls[-1]["body"]["messages"][-1]["content"]
+    assert "Request:\nПроверь и исправь тесты формы входа" in prompt
+    assert len(runs(studio, project)) == 1, "an answer in the chat started a run"
