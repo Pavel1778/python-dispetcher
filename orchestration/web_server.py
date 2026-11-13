@@ -2587,18 +2587,29 @@ class Handler(BaseHTTPRequestHandler):
                 counts = self.app.lab.count_tasks(str(run["id"]))
             except Exception:  # noqa: BLE001 - a facts gather must not fail a turn
                 counts = {}
-            report = self.app.lab.report_for_run(str(run["id"])) or {}
+            # The run's final report, where it has one. It lives with
+            # ``ReportService`` (``nexus_run_reports``; its text is ``body``).
+            # This read used to be ``self.app.lab.report_for_run`` - a method of
+            # an earlier draft that no class has - so an analysis turn in any
+            # project that had a run ended in a 500.
+            try:
+                report = self.app.reports.for_run(str(run["id"])) or {}
+            except Exception:  # noqa: BLE001 - a facts gather must not fail a turn
+                report = {}
             out.append({
                 "id": str(run["id"]),
                 "state": run["state"],
                 "goal_id": str(run.get("goal_id") or ""),
+                "policy": run.get("policy"),
                 "iteration": run.get("iteration"),
                 "max_iterations": run.get("max_iterations"),
-                "retry_attempt": run.get("retry_attempt"),
-                "max_retry_cycles": run.get("max_retry_cycles"),
+                # Where a durable run stands in its retries, and what it waits for.
+                "cycle": run.get("cycle"),
+                "wait_reason": (run.get("wait_reason") or "")[:500],
                 "last_error": (run.get("last_error") or "")[:500],
                 "tasks": counts,
-                "report": (report.get("content") or "")[:3000] if report else "",
+                "report_outcome": report.get("outcome") or "",
+                "report": (report.get("body") or "")[:3000],
             })
         return {"runs": out}
 
