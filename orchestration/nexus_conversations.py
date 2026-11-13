@@ -18,11 +18,26 @@ from typing import Any
 from .cloud_store import NotFound, PostgresStore
 from .nexus_projects import _text
 from .nexus_specs import MESSAGE_CHARS
+from .nexus_workflow import (
+    AWAITING_APPROVAL,
+    approval_matches,
+    check_transition,
+    plan_hash_of,
+)
 
 #: The modes a conversation may be set to. ``auto`` is the default: the Intent
 #: Router decides per message (see ``orchestration/nexus_intent.py``), so a
 #: question in an ``auto`` conversation is answered instead of starting a run.
-_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto")
+_MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "manual")
+
+#: The columns the chat surface reads on a conversation: the row itself plus its
+#: project's bound repository and branch. Kept in one place so every read and
+#: every write returns the same shape.
+_CONVERSATION = (
+    "id, project_id, title, mode, state, archived, run_id, "
+    "workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
+    "workflow_plan, plan_approved_hash, plan_approved_at, plan_approved_by, "
+    "created_at, updated_at")
 
 
 class ConversationService:
@@ -41,8 +56,7 @@ class ConversationService:
             cur.execute(
                 "INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
                 "VALUES (%s,%s,%s,%s) "
-                "RETURNING id, project_id, title, mode, state, archived, run_id, "
-                "  created_at, updated_at",
+                f"RETURNING {_CONVERSATION}",
                 (project_id, title, mode, principal))
             row = cur.fetchone()
             self._event(cur, project_id, principal, "conversation.created", row["id"])
@@ -53,7 +67,7 @@ class ConversationService:
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
             sql = ("SELECT id, project_id, title, mode, state, archived, run_id, "
-                   "created_at, updated_at FROM nexus_conversations "
+                   "workflow_state, created_at, updated_at FROM nexus_conversations "
                    "WHERE project_id=%s")
             params: list[Any] = [project_id]
             if not include_archived:
@@ -70,7 +84,9 @@ class ConversationService:
             self._project(cur, principal, project_id)
             cur.execute(
                 "SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
-                "  c.run_id, c.created_at, c.updated_at, "
+                "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
+                "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
+                "  c.plan_approved_at, c.plan_approved_by, c.created_at, c.updated_at, "
                 "  p.repository_id, p.selected_branch, r.full_name AS repository "
                 "FROM nexus_conversations c "
                 "JOIN nexus_projects p ON p.id = c.project_id "
@@ -90,8 +106,7 @@ class ConversationService:
             cur.execute(
                 "UPDATE nexus_conversations SET title=%s, updated_at=now() "
                 "WHERE id=%s AND project_id=%s "
-                "RETURNING id, project_id, title, mode, state, archived, run_id, "
-                "  created_at, updated_at",
+                f"RETURNING {_CONVERSATION}",
                 (title, conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
@@ -105,8 +120,7 @@ class ConversationService:
             cur.execute(
                 "UPDATE nexus_conversations SET archived=%s, updated_at=now() "
                 "WHERE id=%s AND project_id=%s "
-                "RETURNING id, project_id, title, mode, state, archived, run_id, "
-                "  created_at, updated_at",
+                f"RETURNING {_CONVERSATION}",
                 (bool(archived), conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
@@ -121,8 +135,7 @@ class ConversationService:
             cur.execute(
                 "UPDATE nexus_conversations SET mode=%s, updated_at=now() "
                 "WHERE id=%s AND project_id=%s "
-                "RETURNING id, project_id, title, mode, state, archived, run_id, "
-                "  created_at, updated_at",
+                f"RETURNING {_CONVERSATION}",
                 (mode, conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
@@ -152,13 +165,125 @@ class ConversationService:
             cur.execute(
                 "UPDATE nexus_conversations SET run_id=%s, updated_at=now() "
                 "WHERE id=%s AND project_id=%s "
-                "RETURNING id, project_id, title, mode, state, archived, run_id, "
-                "  created_at, updated_at",
+                f"RETURNING {_CONVERSATION}",
                 (run_id, conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("conversation not found")
             return dict(row)
+
+    # ------------------------------------------------------------- workflow
+    def set_workflow_state(self, principal: str, project_id: str,
+                           conversation_id: str, state: str) -> dict:
+        """Move the conversation's dialogue state, enforcing the machine.
+
+        EXECUTING is reachable only from AWAITING_APPROVAL: a discussion cannot
+        become execution (``nexus_workflow``). Asking for the state it is
+        already in is a no-op.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT workflow_state FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            check_transition(row["workflow_state"], state)
+            cur.execute(
+                "UPDATE nexus_conversations SET workflow_state=%s, updated_at=now() "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (state, conversation_id, project_id))
+            return dict(cur.fetchone())
+
+    def set_workflow_plan(self, principal: str, project_id: str, conversation_id: str,
+                          *, plan: list[dict], goal_id: str | None = None,
+                          spec_id: str | None = None, state: str = AWAITING_APPROVAL) -> dict:
+        """Record the plan a conversation is offering and its version hash.
+
+        The version hash is computed over the plan payload here (the same way a
+        plan is validated, so it is stable and comparable) and written together
+        with the plan. A *new* plan (a replan after a requirement change) clears
+        any stored approval, because the confirmation is bound to the plan's
+        version: the new version must be approved on its own. This is what makes
+        "the plan changed" never silently keep an old approval.
+        """
+        digest = plan_hash_of(plan)
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT workflow_state FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            check_transition(row["workflow_state"], state)
+            cur.execute(
+                "UPDATE nexus_conversations SET workflow_plan=%s::jsonb, plan_hash=%s, "
+                "  workflow_goal_id=COALESCE(%s, workflow_goal_id), "
+                "  workflow_spec_id=COALESCE(%s, workflow_spec_id), "
+                "  plan_approved_hash = CASE WHEN plan_hash IS DISTINCT FROM %s "
+                "    THEN NULL ELSE plan_approved_hash END, "
+                "  plan_approved_at = CASE WHEN plan_hash IS DISTINCT FROM %s "
+                "    THEN NULL ELSE plan_approved_at END, "
+                "  plan_approved_by = CASE WHEN plan_hash IS DISTINCT FROM %s "
+                "    THEN NULL ELSE plan_approved_by END, "
+                "  workflow_state=%s, updated_at=now() "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (_json(plan), digest, goal_id, spec_id, digest, digest, digest,
+                 state, conversation_id, project_id))
+            return dict(cur.fetchone())
+
+    def record_approval(self, principal: str, project_id: str, conversation_id: str,
+                        *, plan_hash: str) -> dict:
+        """Record that a person approved the plan *version* on offer now.
+
+        The comparison and the write are the same statement: the approval is
+        stamped with the hash that was on offer, and the write only applies while
+        the stored hash still equals it. A replayed approval, a concurrent pair,
+        or an approval arriving after a replan therefore cannot approve a version
+        nobody saw. The dialogue state is *not* moved here: the caller moves it to
+        EXECUTING only once the run actually exists.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT plan_hash FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            if row["plan_hash"] != plan_hash:
+                raise ValueError("the plan changed since it was shown; approve the new one")
+            cur.execute(
+                "UPDATE nexus_conversations SET plan_approved_hash=plan_hash, "
+                "  plan_approved_at=now(), plan_approved_by=%s, updated_at=now() "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (principal, conversation_id, project_id))
+            return dict(cur.fetchone())
+
+    def workflow(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """The dialogue state of a conversation, for the chat surface."""
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "SELECT workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
+                "  workflow_plan, plan_approved_hash, plan_approved_at, plan_approved_by "
+                "FROM nexus_conversations WHERE id=%s AND project_id=%s",
+                (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            out = dict(row)
+            for key in ("workflow_goal_id", "workflow_spec_id"):
+                if out.get(key) is not None:
+                    out[key] = str(out[key])
+            out["approved"] = approval_matches(out.get("plan_hash"),
+                                               out.get("plan_approved_hash"))
+            return out
 
     # ---------------------------------------------------------------- messages
     def add_message(self, principal: str, project_id: str, conversation_id: str, *,

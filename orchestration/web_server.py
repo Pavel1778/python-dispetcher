@@ -94,7 +94,14 @@ from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
 from .nexus_binding import AuthorizationError, ProjectBindingError, authorize_run_task
 from .nexus_chat import ChatError
-from .nexus_intent import classify, clarifying_question, effective_mode
+from .nexus_intent import ANALYSIS, AUTONOMOUS, classify, clarifying_question, effective_mode
+from .nexus_workflow import (
+    AWAITING_APPROVAL,
+    EXECUTING,
+    classify_launch,
+    plan_hash_of,
+    render_plan,
+)
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
 from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
@@ -2646,6 +2653,161 @@ class Handler(BaseHTTPRequestHandler):
         return [{"role": "assistant", "content": content,
                  "meta": {"mode": "autonomous", "run_id": run_id, "terminal": True}}]
 
+    # ----------------------------------------------------------- manual mode
+    def _manual_turn(self, principal: str, project_id: str, conversation_id: str,
+                     text: str, intent, active_run: dict | None, conversation: dict,
+                     history: list[dict]) -> list[dict] | None:
+        """One turn in Manual mode: answer, propose a plan, or launch on approval.
+
+        Returns the messages to append, or ``None`` to fall through to the normal
+        turn (a plan-mode request handled by the chat brain). The rules:
+
+        * a question is answered (nothing is planned);
+        * an order to do work proposes a *plan* and waits;
+        * an explicit launch command ("Запускай") starts the run the plan was
+          approved for - and only if the plan on offer is the one approved;
+        * a prohibition or a conditional launch is not a launch: the plan stays
+          on offer and the reply says so.
+        """
+        launch = classify_launch(text)
+        workflow = self.app.conversations.workflow(principal, project_id, conversation_id)
+        plan = list(workflow.get("workflow_plan") or [])
+
+        # A launch command: start the run the plan was approved for.
+        if launch.is_command:
+            return self._launch_initial(principal, project_id, conversation_id, workflow)
+
+        # A prohibition or a condition: say the work is held, change nothing.
+        if launch.prohibition or launch.conditional:
+            if not plan:
+                return self._manual_text(
+                    "Пока ничего не запускаю. Опишите задачу — я разберу требования "
+                    "и предложу план, после чего попрошу подтверждение.")
+            why = ("Вы просили не запускать" if launch.prohibition
+                   else "Вы задали условие; выполню его перед запуском")
+            return self._manual_text(
+                f"План остаётся на подтверждении ({why}). Когда будете готовы, "
+                "напишите «Запускай».")
+
+        # An order to do work: propose a plan (do not run).
+        if intent.starts_work or (intent.intent == AUTONOMOUS and not intent.question):
+            return self._manual_plan(principal, project_id, conversation_id, text,
+                                     conversation, history)
+
+        # A question or a discussion is answered; nothing is planned or run.
+        mode = "analysis" if intent.intent == ANALYSIS else "ask"
+        context = self.app.context.current(principal, project_id)
+        memory = self.app.memory.retrieve(principal, project_id, limit=30)
+        facts = self._run_facts(principal, project_id) if mode == "analysis" else None
+        try:
+            return self.app.chat.respond(
+                mode=mode, goal=text, context=context, memory=memory,
+                history=history, run_facts=facts)
+        except ChatError as e:
+            return self._manual_text(f"Не удалось получить ответ: {e}", error=True)
+
+    def _manual_plan(self, principal: str, project_id: str, conversation_id: str,
+                     text: str, conversation: dict, history: list[dict]) -> list[dict]:
+        """Produce a plan, store it as the plan on offer, and ask for approval."""
+        repository = (conversation.get("repository")
+                      or self.app.project_repos.primary_repository(project_id) or "")
+        branch = conversation.get("selected_branch") or ""
+        if not repository:
+            return self._manual_text(
+                "Репозиторий к проекту не привязан — запустить работу не на чем. "
+                "Подключите репозиторий и повторите.")
+        context = self.app.context.current(principal, project_id)
+        memory = self.app.memory.retrieve(principal, project_id, limit=30)
+        try:
+            plan, meta = self.app.chat.plan_for_approval(text, context, memory)
+        except ChatError as e:
+            return self._manual_text(f"Не удалось составить план: {e}", error=True)
+        # The goal binds the plan to the request (used when the run is started).
+        goal = None
+        try:
+            goal, _created = self.app.specs.create_with_goal(
+                principal, project_id, text, source="chat",
+                conversation_id=conversation_id)
+            goal_id = str(goal["id"])
+        except Exception:  # noqa: BLE001 - the plan can be approved without a goal row
+            goal_id = None
+        self.app.conversations.set_workflow_plan(
+            principal, project_id, conversation_id, plan=plan, goal_id=goal_id,
+            state=AWAITING_APPROVAL)
+        content = render_plan(plan, repository=repository, branch=branch)
+        return [{"role": "assistant", "content": content,
+                 "meta": {"mode": "plan", "awaiting_approval": True,
+                          "plan_hash": plan_hash_of(plan),
+                          "provider": meta.get("provider"), "task_count": len(plan)}}]
+
+    def _launch_initial(self, principal: str, project_id: str, conversation_id: str,
+                        workflow: dict) -> list[dict]:
+        """Start the run for the plan on offer on an explicit launch command.
+
+        "Запускай" *is* the confirmation: it approves the plan version on offer
+        (recorded atomically against that hash) and starts the run in one turn.
+        A plan nobody saw cannot be started: the approval is stamped against the
+        hash that is on offer now, and the state moves to EXECUTING only after the
+        run exists. Starting is idempotent per goal - the lab refuses a second
+        active run for the same goal - so a repeated "Запускай" adds no run.
+        """
+        plan = list(workflow.get("workflow_plan") or [])
+        if not plan:
+            return self._manual_text(
+                "Пока нечего запускать: сначала опишите задачу, я предложу план.")
+        plan_hash = workflow.get("plan_hash")
+        goal_id = workflow.get("workflow_goal_id")
+        if not goal_id:
+            return self._manual_text(
+                "Не удалось связать план с задачей проекта. Опишите задачу заново.")
+        conversation = self.app.conversations.get(principal, project_id, conversation_id)
+        repository = (conversation.get("repository")
+                      or self.app.project_repos.primary_repository(project_id) or "")
+        branch = conversation.get("selected_branch") or ""
+        # Idempotent: a plan already being run is not started a second time.
+        active = self.app.lab.active_run_for_goal(principal, project_id, goal_id)
+        if active is not None:
+            return [{"role": "assistant",
+                     "content": (f"Прогон по этому плану уже идёт (состояние: "
+                                 f"{active['state']}). Второй не запускаю."),
+                     "meta": {"mode": "autonomous", "run_id": str(active["id"]),
+                              "existing": True}}]
+        # Record the confirmation against the version on offer. A plan that
+        # changed since it was last approved is re-approved here (this launch is
+        # the person's new consent to the current version); the write is guarded
+        # so a concurrent replan cannot approve a version nobody saw.
+        try:
+            self.app.conversations.record_approval(
+                principal, project_id, conversation_id, plan_hash=plan_hash)
+        except ValueError as e:
+            return self._manual_text(f"Не удалось подтвердить план: {e}", error=True)
+        try:
+            run = self.app.lab.start_run(
+                principal, project_id, goal_id, plan=plan, repository=repository,
+                branch=branch, policy="durable", conversation_id=conversation_id)
+        except (ValueError, InvalidTransition) as e:
+            return self._manual_text(f"Не удалось запустить прогон: {e}", error=True)
+        run_id = str(run["id"])
+        self.app.conversations.set_workflow_state(
+            principal, project_id, conversation_id, EXECUTING)
+        tasks = len(plan)
+        content = (f"Подтверждено. Автономный прогон запущен: репозиторий "
+                   f"`{repository}`, ветка `{branch}`, задач в плане: {tasks}.\n\n"
+                   "Ход работы и проверки видны на вкладке «Агент». Отчёт придёт "
+                   "в этот чат, когда прогон завершится.")
+        tool = {"role": "tool", "content": f"start_run → {run_id}",
+                "meta": {"tool": "start_run", "run_id": run_id, "tasks": tasks,
+                         "repository": repository, "branch": branch}}
+        reply = {"role": "assistant", "content": content,
+                 "meta": {"mode": "autonomous", "run_id": run_id}}
+        return [tool, reply]
+
+    def _manual_text(self, content: str, *, error: bool = False) -> list[dict]:
+        meta = {"mode": "ask"}
+        if error:
+            meta["error"] = True
+        return [{"role": "assistant", "content": content, "meta": meta}]
+
     def _chat_turn(self, principal: str, project_id: str, conversation_id: str,
                    body: dict) -> None:
         """Store the user turn, produce the assistant turn, return the new messages.
@@ -2757,6 +2919,27 @@ class Handler(BaseHTTPRequestHandler):
                 meta={"mode": "ask", "clarify": True, "intent": intent.intent})
             self._json(200, {"messages": appended + [ask]})
             return
+        # Manual mode: a work order proposes a plan and waits; only an explicit
+        # launch command starts the approved run. The decision to *run* is the
+        # launch command, never the words of the order - a "Manual" mode must
+        # not start work because a message contained an imperative verb.
+        if chosen == "manual" or (turn_mode == "plan" and chosen == "manual"):
+            produced = self._manual_turn(
+                principal, project_id, conversation_id, text, intent, active_run,
+                conversation, history)
+            if produced is not None:
+                for msg in produced:
+                    appended.append(self.app.conversations.add_message(
+                        principal, project_id, conversation_id, role=msg["role"],
+                        content=msg["content"], meta=msg.get("meta")))
+                    meta = msg.get("meta") or {}
+                    if meta.get("run_id") and msg["role"] == "assistant":
+                        self.app.conversations.link_run(
+                            principal, project_id, conversation_id, str(meta["run_id"]))
+                self.app.conversations.set_state(principal, project_id, conversation_id,
+                                                "idle")
+                self._json(200, {"messages": appended})
+                return
         self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
         context = self.app.context.current(principal, project_id)
         memory = self.app.memory.retrieve(principal, project_id, limit=30)

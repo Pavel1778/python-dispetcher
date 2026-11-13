@@ -181,6 +181,39 @@ class ChatResponder:
                 "meta": {"provider": result.provider, "mode": "plan",
                          "plan": result.plan}}
 
+    def plan_for_approval(self, goal: str, context: dict | None = None,
+                          memory: list[dict] | None = None) -> tuple[list[dict], dict]:
+        """A validated plan the person can approve before anything runs.
+
+        The same plan shape the Autonomous Lab uses (``validate_plan_json``),
+        normalized so every task carries acceptance criteria (an empty list when
+        the model gave none) - what is stored here is exactly what a run is
+        started from on approval. Raises :class:`ChatError` on a provider outage
+        or an invalid plan, so the caller records a failure instead of a plan
+        nobody can approve.
+        """
+        prompt = self._prompt(goal, context, memory, None)
+        try:
+            result = self.providers.plan(prompt, _PLAN_SYSTEM)
+        except AllProvidersFailed as e:
+            raise ChatError(self._failure(e, goal)) from e
+        except ProviderError as e:
+            raise ChatError(str(e)) from e
+        except ValueError as e:
+            raise ChatError(f"provider returned an invalid plan: {e}") from e
+        tasks = []
+        for i, task in enumerate(result.plan, 1):
+            tasks.append({
+                "id": task.get("id") or f"task-{i}",
+                "title": task["title"],
+                "description": task.get("description") or "",
+                "acceptance": list(task.get("acceptance") or []),
+                "dependencies": list(task.get("dependencies") or []),
+            })
+        meta = {"provider": result.provider, "failovers": result.failovers,
+                "task_count": len(tasks)}
+        return tasks, meta
+
     def _code(self, goal: str, repository: str, branch: str,
               scope: dict | None = None) -> list[dict]:
         if self._dispatch_code is None:
