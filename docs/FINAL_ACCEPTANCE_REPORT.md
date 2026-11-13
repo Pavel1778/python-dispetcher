@@ -98,11 +98,16 @@ cannot write to the same checkout. A **two-live-account** switch is BLOCKED here
 (one key only) and is not faked.
 
 ### 4. Контекст незавершённой задачи сохраняется — **VERIFIED**
-`tests/test_acceptance_handoff.py` (5 tests): the hand-off carries project, task,
+`tests/test_acceptance_handoff.py` (6 tests): the hand-off carries project, task,
 goal, plan, completed steps, remaining steps, repository, branch, last commit,
-acceptance criteria, previous report and last error; the message marks the
-completed step "do NOT redo"; a real two-task run never restarts the verified
-task.
+**decisions**, **constraints**, **test results**, **uncommitted work**, acceptance
+criteria, previous report and last error; the message marks the completed step
+"do NOT redo"; a real two-task run never restarts the verified task. The four
+items in bold were the one gap the traceability matrix had recorded; they are
+now named fields (`AccountRouter.handoff_context`), read from the project memory
+(`decisions`/`constraints`) and the run's durable QA verdicts (`test_results`),
+with `uncommitted` stating honestly that a fresh sandbox inherits no working
+tree.
 
 ### 5. Старый исполнитель не может конфликтовать с новым — **VERIFIED**
 `tests/test_race_protection.py` (13 tests) and

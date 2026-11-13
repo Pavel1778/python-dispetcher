@@ -1936,3 +1936,45 @@ The §15 acceptance pass. Two things to know before touching this area again.
   skips. The other skips are environmental: 4 Android APK (no SDK build-tools),
   3 Windows `.exe` (no mingw-w64), 1 pooler schema-bootstrap, 1 section F live
   variant.
+
+## The hand-off context, complete (continuation step)
+
+The traceability matrix of the previous step recorded exactly one open gap: the
+failover hand-off carried only ten of the fourteen context items the request
+names — *history of important decisions*, *uncommitted changes*, *test results*
+and *constraints* were implicit (through the branch and the previous report),
+not named fields. That gap is closed in `AccountRouter.handoff_context` /
+`handoff_message` (`orchestration/openhands_router.py`). Keep these invariants:
+
+- **`decisions` and `constraints` are read from the project memory**, not
+  invented: one query over `nexus_memory` for `kind IN ('decision','constraint')`
+  scoped to the project (plus global rows) and `superseded_by IS NULL`. The
+  provenance label travels with each item, so the new executor can see whether a
+  decision was observed or merely reported. Do not add a second store for these.
+- **`test_results` is the run's durable QA outcome**, one entry per settled task
+  (`task_key`, `verdict`, `reason`, `commit`). The verdict and reason are read
+  from the task's `verification` **or** the last `evidence` entry, and fall back
+  to the task's own state; a task that settled with no detail is still reported,
+  never silently dropped. `commit` is the run's last observed `remote_sha`, set
+  only for the task being handed over (an earlier task's commit is not this
+  task's).
+- **`uncommitted` is honest, never a fabricated patch.** A fresh sandbox does
+  not inherit the previous working tree, so `carried` is always `False` and the
+  `note` says so. `base_sha` is the last attempt's recorded base and `changed`
+  is whether the branch moved during it — `None` when that was never recorded,
+  so "unknown" is not reported as "nothing changed".
+- **`previous_report` falls back to the last attempt's recorded `final_text`**
+  when the caller passes none, so the executor's own report of what it ran
+  travels even when the scheduler holds only the task row.
+- **The message prints all four** (`handoff_message`: "Decisions already
+  taken", "Constraints in force", "Test/QA results so far", "Uncommitted work")
+  and rule 4 tells the new executor to keep to the decisions and constraints.
+  The push rule is still appended by `OpenHandsExecutor._hand_in` (rule 6), so
+  `handoff_message` ends at rule 5 — do not renumber them apart.
+- **`jsonb` is decoded defensively** (`_as_dict`/`_as_list` accept a `dict`/`list`
+  from `_task_row` and a `str` from a raw cursor), so the same helper serves a
+  task read either way.
+- Tests: `tests/test_acceptance_handoff.py` (6 cases — the context shape, the
+  message shape, the recorded-report fallback, and the four load-bearing
+  hand-off cases). The context-shape and message-shape cases fail if any of the
+  four fields is dropped, so they are load-bearing.

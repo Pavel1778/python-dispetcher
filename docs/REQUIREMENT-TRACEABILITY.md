@@ -158,14 +158,14 @@ The four modes and the ten failover steps are implemented in
 |---|---|---|
 | Modes MANUAL / AUTO / FAILOVER / LOAD_BALANCING | `openhands_pool.MODES` | `tests/test_openhands_pool.py`, `tests/test_acceptance_account_pool.py` |
 | Detect → record → decide → save → pick → authorise → (re)create conversation → hand context → continue → confirm the new executor works | `AccountRouter`, `OpenHandsExecutor.dispatch`, `AccountRouter.ensure_authorized` | `tests/test_openhands_failover.py`, `tests/test_acceptance_handoff.py`, `tests/test_acceptance_e2e_failover.py` |
-| The transferred context must include project/task/goal/plan/subtasks/completed/remaining/decisions/branch/commit/uncommitted/test results/last errors/constraints/acceptance | `AccountRouter.handoff_context` (project, task, goal, plan, completed, remaining, repository, branch, last_commit, acceptance, previous report, last error) | `tests/test_acceptance_handoff.py::test_the_handoff_context_carries_everything_the_task_text_lists` |
+| The transferred context must include project/task/goal/plan/subtasks/completed/remaining/decisions/branch/commit/uncommitted/test results/last errors/constraints/acceptance | `AccountRouter.handoff_context` (project, task, goal, plan, completed, remaining, repository, branch, last_commit, **decisions**, **constraints**, **test_results**, **uncommitted**, acceptance, previous report, last error) | `tests/test_acceptance_handoff.py::test_the_handoff_context_carries_everything_the_task_text_lists` |
 | Do not assume conversations move between accounts; recover via a new conversation with context + workspace | documented and implemented (a switch is a new conversation) | `tests/test_openhands_failover.py`, inventory §3 |
-| **Gap (recorded, not hidden)** | `handoff_context` does **not** carry *history of important decisions*, *uncommitted changes*, *test results* or *constraints* as structured fields. The project memory (`nexus_context.MemoryService`, kinds `decision`/`constraint`/`completed_work`) holds decisions and constraints, but the hand-off message does not read it; the agent is told to inspect the branch instead. | not asserted by any test today |
+| **Closed (this step)** | The four items previously carried only implicitly are now named fields: `decisions` and `constraints` are read from the project memory (`nexus_context.MemoryService` / `nexus_memory`, kinds `decision`/`constraint`); `test_results` is the run's durable per-task QA verdict (verdict, reason, commit) read from `verification`/`evidence`; `uncommitted` states honestly that a fresh sandbox inherits no working tree, with the last attempt's `base_sha` and whether the branch moved (`changed`). `handoff_message` prints all four, and rule 4 tells the new executor to keep to the decisions and constraints. `previous_report` now falls back to the last attempt's recorded `final_text` when the caller passes none. | `tests/test_acceptance_handoff.py` (6 cases: the context shape, the message shape, the recorded-report fallback, and the four load-bearing hand-off cases) |
 
-The gap is honest: the hand-off is built from the run's own rows and tells the
-new executor to clone the branch and continue from the recorded commit, so the
-work continues; but four of the fourteen named context items are carried only
-implicitly (through the branch and the previous report), not as named fields.
+All fourteen named context items are now carried as structured fields; the
+hand-off is built from the run's own rows (never from the old conversation), so
+it is reproducible after a crash, and it tells the new executor to clone the
+branch and continue from the recorded commit.
 
 ---
 
@@ -214,10 +214,13 @@ admin surface, race protection, evidence and the security checks.
   inventory items has an inventory section; every one of the 13 per-account
   fields, every secret-handling rule, and every one of the 10 supported
   operations has an implementation and a test. Nothing in this slice is omitted.
-- **Sections 4–15: mapped, and present** except for the recorded gap in §4
-  above (four of the fourteen hand-off context items are implicit, not named
-  fields). That gap lies in a later step's slice; it is recorded here so it is
-  not lost.
+- **Sections 4–15: mapped, and present.** The one gap this matrix previously
+  recorded — four of the fourteen hand-off context items (*decisions*,
+  *constraints*, *test results*, *uncommitted changes*) carried only implicitly
+  — was **closed** in the continuation step that followed (see §4 above): all
+  fourteen items are now named fields of `AccountRouter.handoff_context`, they
+  appear in `handoff_message`, and `tests/test_acceptance_handoff.py` asserts
+  them.
 - **BLOCKED / UNVERIFIED** items are the environment-level ones already stated
   in `docs/FINAL_ACCEPTANCE_REPORT.md` §12: a two-live-account failover (one
   key), a live task that must clone and push (the account has no GitHub provider

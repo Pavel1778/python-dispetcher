@@ -123,7 +123,8 @@ def test_the_handoff_context_carries_everything_the_task_text_lists(
 
     Built from the run's rows (never from the old conversation), so it is
     reproducible after a crash. The task text's list: project, task, goal, plan,
-    completed, remaining, repository, branch, commit, acceptance.
+    completed, remaining, repository, branch, commit, decisions, constraints,
+    test results, uncommitted work, acceptance.
     """
     va, vb = _two_accounts(service, clouds)
     lab = LabStore(store)
@@ -132,6 +133,17 @@ def test_the_handoff_context_carries_everything_the_task_text_lists(
     router = AccountRouter(store, pool=pool, lab=lab, principal=PRINCIPAL)
     project, run = _two_task_run(store, lab)
 
+    # A decision and a constraint the project recorded travel with the hand-off.
+    from orchestration.nexus_context import MemoryService
+
+    memory = MemoryService(store)
+    memory.remember(PRINCIPAL, kind="decision", project_id=str(project["id"]),
+                    content="Use the existing GitHub client, do not add a second",
+                    provenance="repository_observed")
+    memory.remember(PRINCIPAL, kind="constraint", project_id=str(project["id"]),
+                    content="Python 3.12 only; no new dependencies",
+                    provenance="repository_observed")
+
     # T1 is done and verified; T2 has a recorded Git state from its last attempt.
     t1 = lab.claim_task(str(run["id"]), "w")
     lab.record_verification(t1["id"], verdict="completed_verified",
@@ -139,7 +151,9 @@ def test_the_handoff_context_carries_everything_the_task_text_lists(
     t2 = lab.claim_task(str(run["id"]), "w")
     lab.mark_running(t2["id"], conversation_id="c-t2", account_id=va["id"])
     lab.record_verification(t2["id"], verdict="completed_unverified",
-                            evidence={"remote_sha": HEAD, "reason": "not the head"})
+                            evidence={"remote_sha": HEAD, "reason": "not the head",
+                                      "base_sha": HEAD, "changed": False,
+                                      "state": "finished", "final_text": "ran pytest: 3 failed"})
     # Re-read T2 after its attempt settled, as a scheduler would.
     t2 = lab.get_task_internal(t2["id"])
 
@@ -159,6 +173,44 @@ def test_the_handoff_context_carries_everything_the_task_text_lists(
         "T1": "completed_verified", "T2": "completed_unverified"}
     assert context["previous_report"] == "commit " + HEAD
     assert context["last_error"] == "account A went away"
+    # The four items the traceability matrix recorded as missing are now named.
+    decisions = [d["content"] for d in context["decisions"]]
+    assert "Use the existing GitHub client, do not add a second" in decisions
+    constraints = [c["content"] for c in context["constraints"]]
+    assert "Python 3.12 only; no new dependencies" in constraints
+    results = {r["task_key"]: r for r in context["test_results"]}
+    assert results["T1"]["verdict"] == "completed_verified"
+    assert results["T2"]["verdict"] == "completed_unverified"
+    assert results["T2"]["reason"] == "not the head"
+    assert context["uncommitted"]["carried"] is False
+    assert context["uncommitted"]["base_sha"] == HEAD
+    assert context["uncommitted"]["changed"] is False
+
+
+def test_a_handoff_with_no_previous_report_falls_back_to_the_recorded_one(
+        store, service, clouds):
+    """The executor's own final message travels when the caller has no report.
+
+    The scheduler does not always hold the last attempt's text; the task row
+    does (its evidence carries ``final_text``), so the context reads it rather
+    than sending the new executor a blank "previous report".
+    """
+    va, vb = _two_accounts(service, clouds)
+    lab = LabStore(store)
+    pool = AccountPool(store, service)
+    router = AccountRouter(store, pool=pool, lab=lab, principal=PRINCIPAL)
+    project, run = _two_task_run(store, lab)
+    t1 = lab.claim_task(str(run["id"]), "w")
+    lab.mark_running(t1["id"], conversation_id="c-t1", account_id=va["id"])
+    lab.record_verification(t1["id"], verdict="completed_unverified",
+                            evidence={"remote_sha": HEAD, "reason": "not the head",
+                                      "state": "finished",
+                                      "final_text": "pytest: 2 passed, 1 failed"})
+    t1 = lab.get_task_internal(t1["id"])
+    context = router.handoff_context(t1)
+    assert context["previous_report"] == "pytest: 2 passed, 1 failed"
+    # With no base_sha recorded, "changed" is honestly unknown, not guessed.
+    assert context["uncommitted"]["changed"] is None
 
 
 def test_the_handoff_message_states_the_continuation_rules():
@@ -174,6 +226,14 @@ def test_the_handoff_message_states_the_continuation_rules():
         "completed_tasks": ["T1"], "remaining_tasks": ["T2"],
         "task_title": "Implement", "task_description": "Do the real work",
         "acceptance": ["it works", "tests pass"],
+        "decisions": [{"content": "keep one GitHub client",
+                       "provenance": "repository_observed"}],
+        "constraints": [{"content": "no new dependencies",
+                         "provenance": "repository_observed"}],
+        "test_results": [{"task_key": "T1", "verdict": "completed_verified",
+                          "reason": "remote branch is at the reported commit",
+                          "commit": HEAD}],
+        "uncommitted": {"carried": False, "base_sha": HEAD, "changed": True},
         "previous_report": "commit " + HEAD, "last_error": "account A went away",
     })
     assert "continuing an interrupted task" in message
@@ -183,6 +243,11 @@ def test_the_handoff_message_states_the_continuation_rules():
     assert "clone the repository" in message.lower()
     assert "it works" in message                 # the acceptance criteria travel
     assert "Ship the change" in message          # the original goal travels
+    # The four items the traceability matrix recorded as missing are in the text.
+    assert "keep one GitHub client" in message
+    assert "no new dependencies" in message
+    assert "completed_verified" in message and "Test/QA results" in message
+    assert "not carried over" in message         # the uncommitted truth is stated
 
 
 # ------------------------------------------------------------- the hand-off
