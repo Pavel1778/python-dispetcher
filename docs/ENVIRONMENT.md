@@ -91,7 +91,7 @@ shell, and double every `$` (`$$`) inside a Docker Compose `env_file`.
 | `PSYCOPG_PREPARE` | off | `cloud_store.py` | Server-side prepared statements. Set to `session` only on a direct session-mode connection; never behind a pooler. |
 | `WEB_AUTH_TOKEN` | — | `web_server.py` | Bearer token for the machine API. Required to bind a public interface. |
 | `AUTH_USERNAME` | — | `web_auth.py` | Owner login name. Required for a public bind. |
-| `AUTH_PASSWORD_HASH` | — | `web_auth.py` | PBKDF2-SHA256 hash of the owner password (`pbkdf2_sha256$<iters>$<salt>$<digest>`). Never the password. |
+| `AUTH_PASSWORD_HASH` | — | `web_auth.py` | PBKDF2-SHA256 hash of the owner password (`pbkdf2_sha256$<iters>$<salt>$<digest>`). Never the password. Replacing it ends every open session. |
 | `AUTH_SESSION_SECRET` | — | `web_auth.py` | Separate secret that signs sessions. Must not be the Cloud key. Changing it ends every open session. |
 | `AUTH_SESSION_TTL_SECONDS` | `2592000` (30 days) | `web_auth.py` | How long a login lasts without being used; each request made with the session starts the count again. `300` .. `34560000`; a value that is not a number falls back to the default. |
 | `AUTH_SESSION_MAX_SECONDS` | `7776000` (90 days) | `web_auth.py` | How long a login lasts at all, however much it is used. Same range. The idle limit is never longer than this one. See DEPLOY.md, "How long a login lasts". |
