@@ -26,11 +26,23 @@
 
   /* ------------------------------------------------------------ vocabulary */
   var MODES = {
+    auto: {
+      icon: 'sparkles', label: 'Авто',
+      desc: 'Сам решает по сообщению: ответ, разбор или автономный прогон.',
+      placeholder: 'Спросите, обсудите или поручите задачу — NEXUS поймёт сам',
+      thinking: 'Определяю, что нужно', provider: true
+    },
     ask: {
       icon: 'message', label: 'Вопрос',
       desc: 'Ответ ассистента по контексту проекта. Ничего не запускает.',
       placeholder: 'Спросите о коде или проекте',
       thinking: 'Думаю над ответом', provider: true
+    },
+    analysis: {
+      icon: 'eye', label: 'Разбор',
+      desc: 'Читает реальное состояние проекта и прогонов. Ничего не меняет.',
+      placeholder: 'Что разобрать? Например: почему прогон остановился',
+      thinking: 'Изучаю состояние проекта', provider: true
     },
     plan: {
       icon: 'plan', label: 'План',
@@ -83,7 +95,7 @@
     projects: [], projectId: null, binding: null,
     chats: [], chatQuery: '', showArchived: false,
     convId: null, conv: null, messages: [],
-    mode: 'ask', sending: false, pending: null,
+    mode: 'auto', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
           expanded: {}, filter: '', file: null, files: {}, pane: 'tree', docView: true },
     work: { items: [], data: {}, timer: null, hidden: {} },
@@ -603,7 +615,7 @@
     ]).then(function (results) {
       S.conv = results[0].conversation;
       S.messages = results[1].messages || [];
-      S.mode = MODES[S.conv.mode] ? S.conv.mode : 'ask';
+      S.mode = MODES[S.conv.mode] ? S.conv.mode : 'auto';
       S.work.items = workFromMessages();
       refreshWork();
     }, function (error) {
