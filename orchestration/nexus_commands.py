@@ -271,12 +271,6 @@ _COMMAND_TOKEN_RE = re.compile(r"/[\w-]+\Z", re.UNICODE)
 _TAG_TOKEN_RE = re.compile(r"#[\w-]+\Z", re.UNICODE)
 
 
-def _tidy(text: str) -> str:
-    """Collapse runs of spaces and drop empty lines, keeping line breaks."""
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
-    return "\n".join(lines).strip()
-
-
 def _remove_tokens(text: str, literals: set[str]) -> str:
     """*text* with the exact *literals* removed, only where they stand alone.
 
@@ -284,12 +278,45 @@ def _remove_tokens(text: str, literals: set[str]) -> str:
     spacing of a pasted specification exactly as they were; only the tokens
     that were recognised as NEXUS instructions are taken out. A token is only
     removed at a word boundary, so ``/tmp`` inside a path is never touched.
+
+    The one and only guarantee this makes: when *nothing* was recognised the
+    text is returned **byte for byte**. A specification with no command and no
+    tag must reach the planner and the agents exactly as it was sent - that is
+    what the long-task tests assert. When something *is* removed, only the
+    token and the single whitespace character before it are taken, so no space
+    the person wrote is ever collapsed.
     """
     if not literals:
-        return _tidy(text)
+        return text
     parts = sorted(literals, key=len, reverse=True)
-    pattern = r"(?:(?<=\s)|^)(?:" + "|".join(re.escape(p) for p in parts) + r")(?=\s|$)"
-    return _tidy(re.sub(pattern, " ", text))
+    token_re = re.compile(r"(?<!\S)(?:" + "|".join(re.escape(p) for p in parts) + r")(?=\s|$)")
+    out: list[str] = []
+    last = 0
+    removed_from_start = False
+    for match in token_re.finditer(text):
+        start, end = match.start(), match.end()
+        if start < last:
+            continue
+        # Take one neighbouring whitespace character with the token, so "a
+        # /plan b" becomes "a b" and not "a  b". The neighbour is not taken if
+        # the previous removal already consumed it. Nothing else is touched: a
+        # space the person wrote between two other words is never collapsed.
+        if start > 0 and start - 1 >= last and text[start - 1] in " \t":
+            start -= 1
+        elif end < len(text) and text[end] in " \t":
+            end += 1
+        elif end < len(text) and text[end] == "\n":
+            # A command on its own line: take the line break too, so the
+            # request does not begin (or continue) with a blank line the
+            # person never wrote.
+            end += 1
+        if start == 0 and not out:
+            removed_from_start = True
+        out.append(text[last:start])
+        last = end
+    out.append(text[last:])
+    result = "".join(out)
+    return result.lstrip() if removed_from_start else result
 
 
 def parse(text: str, *, mode: str | None = None) -> Parsed:

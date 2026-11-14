@@ -3064,10 +3064,13 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(400, {"error": "text is required"})
             return
-        # What the person actually typed. A UI button adds an ``action`` token
-        # for the parser; the transcript shows the message as it was written,
-        # never the token the interface injected.
-        typed = text
+        # What the person actually typed, before any trimming. A specification
+        # must reach the planner and the agents byte for byte - leading and
+        # trailing whitespace and all - so the parser works on this, not on the
+        # trimmed ``text``. A UI button adds an ``action`` token for the parser;
+        # the transcript shows the message as it was written, never the token
+        # the interface injected.
+        typed = sent
         mode = body.get("mode")
         conversation = self.app.conversations.get(principal, project_id, conversation_id)
         # Everything that can refuse the message is checked before anything is
@@ -3089,14 +3092,15 @@ class Handler(BaseHTTPRequestHandler):
         # The same parser serves the interface buttons (they post ``action``),
         # so a button and a slash command can never drift apart.
         action = body.get("action")
+        parse_text = typed
         if action is not None:
             if not isinstance(action, str):
                 self._json(400, {"error": "action must be a string"})
                 return
             # The action is a command token; it is parsed exactly like one typed
             # at the start of the message. The message's own text is kept.
-            text = (action + " " + text).strip() if text else action.strip()
-        parsed = parse_command(text, mode=chosen)
+            parse_text = (action + " " + typed) if typed.strip() else action.strip()
+        parsed = parse_command(parse_text, mode=chosen)
         # The request the router and the model work from: commands and tags
         # removed. A message that was only commands has no request of its own,
         # so the stored turn keeps the full text (the transcript shows what was
