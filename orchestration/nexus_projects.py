@@ -122,13 +122,13 @@ class ProjectService:
             if cur.fetchone() is None:
                 raise NotFound("project not found")
 
-            def count(sql: str) -> int:
-                cur.execute(sql, (project_id,))
+            def count(sql: str, params: tuple = ()) -> int:
+                cur.execute(sql, (project_id, *params))
                 return int(cur.fetchone()["n"])
 
             active_runs = count(
                 "SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s "
-                "AND state = ANY(%s)")
+                "AND state = ANY(%s)", (_active_run_states(),))
             repositories = []
             cur.execute("SELECT r.full_name, pr.branch, pr.enabled "
                         "FROM nexus_project_repositories pr "

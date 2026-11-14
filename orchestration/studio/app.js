@@ -548,10 +548,10 @@
   /* ----------------------------------------------------------------- chats */
   function loadChats() {
     if (!S.projectId) { S.chats = []; return Promise.resolve(); }
-    // Archived conversations come in the same answer. They stay folded under
-    // one line, and that line exists only when there is something behind it.
-    var query = ['archived=1'];
-    if (S.showTrash) query.push('deleted=1');
+    // Archived and trashed conversations come in the same answer, so their
+    // folds show a real count; ``renderChats`` only draws the trashed ones
+    // when the trash is unfolded.
+    var query = ['archived=1', 'deleted=1'];
     if (S.chatQuery) query.push('q=' + enc(S.chatQuery));
     return api(projectUrl('/conversations?' + query.join('&')))
       .then(function (data) { S.chats = data.conversations || []; },

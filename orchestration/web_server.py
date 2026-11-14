@@ -1915,6 +1915,17 @@ class Handler(BaseHTTPRequestHandler):
             return parts[3], f"conversation:{rest[1]}:{rest[2]}"
         return None
 
+    def _project_lifecycle_get(self, principal: str, project_id: str, action: str):
+        """The read half of a lifecycle route: ``stats`` only."""
+        if action == "stats":
+            return self._json(200, self.app.projects.stats(principal, project_id))
+        if action.startswith("conversation:"):
+            _, conv_id, verb = action.split(":", 2)
+            if verb == "stats":
+                return self._json(200, self.app.conversations.stats(
+                    principal, project_id, conv_id))
+        return self._json(404, {"error": "not found"})
+
     def _project_lifecycle_post(self, principal: str, project_id: str, action: str,
                                 body: dict):
         """A project or conversation lifecycle action. Writes only."""
@@ -3808,6 +3819,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"projects": self.app.projects.list(
                     self._project_principal(), include_archived=include_archived,
                     include_deleted=include_deleted)})
+            lifecycle = self._project_lifecycle(path)
+            if lifecycle is not None and lifecycle[1].endswith("stats"):
+                # ``stats`` is a read: it is served on GET as well as POST, so
+                # a client can fetch what a delete would touch before asking.
+                return self._project_lifecycle_get(self._project_principal(), *lifecycle)
             nested = self._project_nested(path)
             if nested is not None:
                 return self._project_nested_get(*nested)
