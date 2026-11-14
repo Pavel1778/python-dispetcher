@@ -221,3 +221,57 @@ def test_restart_on_a_migrated_schema_behind_a_pooler() -> None:
     # raises DuplicatePreparedStatement: prepared statement "_pg3_0" already exists.
     second = PostgresStore(POOLER_DSN)
     second.close()
+
+
+def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
+    """Every migration must apply on a server that *has* the Supabase roles.
+
+    ``0037`` declared its revoke loop variable as ``record`` instead of ``text``.
+    A record loop variable renders as ``(authenticated)`` in ``format('%I', r)``,
+    so the statement became ``REVOKE ... FROM "(authenticated)"`` and the whole
+    migration failed with ``role "(authenticated)" does not exist`` on any server
+    that has that role - i.e. on the Supabase production database, which is the
+    one place the migration had to run. The defect was invisible locally because
+    a plain PostgreSQL has neither ``anon`` nor ``authenticated``, so the loop
+    body never executed.
+
+    This test creates the two roles (dropping them again afterwards, so a plain
+    PostgreSQL is left exactly as it was), applies every migration on a fresh
+    schema, and asserts none of them raises. It fails on the ``record`` bug and
+    passes once the variable is ``text``.
+    """
+    import psycopg
+
+    _drop_schema()
+    # Create the roles only if they do not already exist, and only for the
+    # duration of this test. A database user without CREATEROLE cannot do it;
+    # that is not the code under test, so the case is skipped, not failed.
+    created: list[str] = []
+    try:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                for role in ("anon", "authenticated"):
+                    cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+                    if cur.fetchone() is None:
+                        cur.execute(f'CREATE ROLE "{role}" NOLOGIN')
+                        created.append(role)
+    except psycopg.errors.InsufficientPrivilege:
+        pytest.skip("this database user cannot create the Supabase roles")
+    try:
+        store = PostgresStore(DSN, auto_migrate=False)
+        try:
+            applied = store.apply_migrations()
+            assert applied, "a fresh schema should apply the migrations"
+        finally:
+            store.close()
+    finally:
+        # Drop only the roles this test created, and release anything the
+        # migrations attached to them first (a policy or grant makes the role
+        # own objects, and DROP ROLE refuses while they exist). A role that was
+        # already there is left untouched.
+        if created:
+            with psycopg.connect(DSN, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    for role in created:
+                        cur.execute(f'DROP OWNED BY "{role}"')
+                        cur.execute(f'DROP ROLE IF EXISTS "{role}"')

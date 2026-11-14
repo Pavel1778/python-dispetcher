@@ -51,8 +51,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_nexus_generations_running
 ALTER TABLE nexus_generations ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON nexus_generations FROM PUBLIC;
 DO $$
-DECLARE r record;
+DECLARE r text;
 BEGIN
+    -- ``r text`` (not ``record``): a record loop variable renders as
+    -- ``(authenticated)`` in ``format('%I', r)``, so the revoke targeted a role
+    -- named "(authenticated)" and the whole migration failed on any server
+    -- without that role - which is every server but Supabase's own. The other
+    -- migrations declare ``r text``; this one must match.
     FOR r IN SELECT rolname FROM pg_roles
              WHERE rolname IN ('anon', 'authenticated')
     LOOP
