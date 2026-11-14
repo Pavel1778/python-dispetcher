@@ -132,14 +132,20 @@ new destructive routes require membership and are two-step; a non-member gets
 ## H. Test results
 
 - `ruff check .` — clean.
-- Local full suite — see the run recorded in the session log (expected: ~1860
-  passed, ~9 skipped, 0 failed).
-- New tests this increment: `test_project_lifecycle.py` (+4),
-  `test_lab_http.py` (+1), `test_auth.py` (+3), `test_schema_bootstrap.py` (+1),
-  route-auth coverage for every new route.
-- Browser E2E (Chromium) — 37 passed (previous run; the new controls are covered
-  by the studio-UI wiring test).
-- CI — green for the pushed commits.
+- **Local full suite: `1835 passed, 9 skipped, 0 failed`.** The 29 *setup
+  errors* in that run were all `FATAL: sorry, too many clients already` —
+  PostgreSQL connection exhaustion from several test runs sharing the local
+  server (max_connections 100) at the same time as another session's run, not a
+  code failure. Both erroring modules pass in isolation
+  (`test_chat_repository.py`: 30 passed) and the same suite reached 96% with no
+  failure before the connections ran out. **0 tests failed.**
+- **Browser E2E (Chromium): 37 passed.**
+- New tests this increment: `test_project_lifecycle.py` (+4 permanent delete,
+  census, active-run refusal), `test_lab_http.py` (+1 notification lifecycle),
+  `test_auth.py` (+3 session list/revoke), `test_schema_bootstrap.py` (+1 the
+  role regression), plus route-auth coverage for every new route.
+- CI — the GitHub Actions run is green for the pushed commits (the runner has
+  its own PostgreSQL, so no local connection limit applies).
 
 ---
 
