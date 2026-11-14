@@ -2453,15 +2453,26 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "run"):
             self._lab_start_run(principal, project_id, rest[1], body)
             return True
-        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel|hide}
+        # POST /api/v1/projects/{id}/runs/{run_id}/
+        #      {pause|resume|cancel|hide|show|retry-failed}
         #   cancel is durable and idempotent: the run is settled and hidden from
         #   the active lists at once, and the loop signals the executor. A
-        #   second cancel is a no-op, never an error.
+        #   second cancel is a no-op, never an error. hide/show take a finished
+        #   run out of the lists or put it back; retry-failed puts a finished
+        #   run back to work with only its unsuccessful tasks.
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
-                and rest[2] in ("pause", "resume", "cancel", "hide")):
-            if rest[2] == "hide":
+                and rest[2] in ("pause", "resume", "cancel", "hide", "show",
+                                "retry-failed")):
+            if rest[2] in ("hide", "show"):
                 self._json(200, {"run": self.app.lab.set_hidden(
-                    principal, project_id, rest[1], True)})
+                    principal, project_id, rest[1], rest[2] == "hide")})
+                return True
+            if rest[2] == "retry-failed":
+                try:
+                    self._json(200, {"run": self.app.lab.retry_failed(
+                        principal, project_id, rest[1])})
+                except InvalidTransition as e:
+                    self._json(409, {"error": str(e)})
                 return True
             # ``cancelled`` settles the run, takes it out of the lists and
             # leaves a stop signal for every conversation at work for it - all
@@ -4408,6 +4419,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
                 self.app.conversations.set_archived(principal, project_id, rest[1], True)
                 return self._json(200, {"archived": rest[1]})
+            # DELETE /api/v1/projects/{id}/runs/{run_id}   (remove from history)
+            if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
+                try:
+                    return self._json(200, self.app.lab.delete_run(
+                        principal, project_id, rest[1]))
+                except InvalidTransition as e:
+                    return self._json(409, {"error": str(e)})
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})

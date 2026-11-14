@@ -220,7 +220,10 @@ def test_protected_patch_and_delete_endpoints_require_auth(base):
         ("PATCH", f"/api/v1/projects/{UUID}", {"name": "x"}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"archived": True}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"title": "x"}),
+        ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"pinned": True}),
+        ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"deleted": True}),
         ("DELETE", f"/api/v1/projects/{UUID}/conversations/{UUID}", None),
+        ("DELETE", f"/api/v1/projects/{UUID}/runs/{UUID}", None),
     ]:
         assert _status(method, base + path, body) == 401, (method, path)
 
