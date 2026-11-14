@@ -355,7 +355,13 @@ psql "$SUPABASE_DB_URL" -f migrations/0001_init.sql
 for f in $(ls migrations/*.sql | sort); do psql "$SUPABASE_DB_URL" -f "$f"; done
 ```
 
-The migrations are `0001`–`0011`, `0014`–`0036`. `0012` and `0013` are
+If a database recorded a *defective* body of an already-shipped migration
+(only `0037`'s first body, in `MIGRATION_CORRECTIONS`), the runner re-applies the
+corrected idempotent body and moves the recorded checksum forward. Any other
+edited body is refused with `MigrationError`. A schema change is always a new
+migration.
+
+The migrations are `0001`–`0011`, `0014`–`0038`. `0012` and `0013` are
 intentionally unused (reserved for the deferred File Lab, D-1). The runner
 applies every `*.sql` in lexical order and does not require a contiguous
 sequence, so the gap is safe. The set includes the auth tables (`0004`), the
@@ -370,6 +376,18 @@ the durable-run/connection/project-repository tables (`0030`–`0032`), the
 chat's intent record (`0033`), the start a task is waiting for (`0034`), the
 chat-first workflow columns and the `manual` mode (`0035`) and the list of
 OpenHands conversations that are owed a deletion (`0036`).
+
+The conversation management increment (`0037_conversation_management.sql`)
+adds the conversation pin/soft-delete columns, the `nexus_generations` table and
+the indexes the pinned/live conversation lists read. It loops over the Supabase
+`anon`/`authenticated` roles to revoke their default grants; on a plain
+PostgreSQL server that has neither role the loop is empty and the statement is a
+safe no-op, so the file applies on both. (`format('%I', r)` is only correct when
+`r` is the `text` loop variable -- a `record` there serialises to
+`(authenticated)` and quotes it, which aborts the migration.)
+
+`0038_project_lifecycle.sql` adds the project archive/trash columns
+(`archived_at`, `deleted_at`), additive and reversible.
 
 `0014_nexus_project_binding.sql` is additive: it adds the project↔repository
 link table, nullable `project_id` on `tasks`/`workflows`, the canonical

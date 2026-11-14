@@ -7,6 +7,26 @@ is versioned in `pyproject.toml`.
 
 ### Fixed
 
+- **Production startup: a single-word typo in migration `0037` aborted the
+  boot.** `0037_conversation_management.sql` declared its role-loop variable as
+  `record` (every other migration declares `text`). `format('%I', <record>)`
+  serialises the whole row to `(authenticated)` and then quotes it, so the
+  `REVOKE` targeted a role literally named `"(authenticated)"` and the whole
+  migration aborted with `UndefinedObject: role "(authenticated)" does not
+  exist` on any server that has the Supabase role -- the Render failure. The
+  variable is now `text`, so `format('%I', r)` yields the bare role name and the
+  `pg_roles` loop stays a safe no-op on a plain PostgreSQL server. Verified on a
+  real PostgreSQL 17 with the role present, without it, on a fresh database and
+  on an existing one.
+- **A database that recorded the defective `0037` body is corrected, not
+  refused.** A plain PostgreSQL server (no `anon`/`authenticated` role) ran the
+  empty loop, so it recorded the defective body; the checksum guard would then
+  refuse the corrected file. `MIGRATION_CORRECTIONS` names the exact superseded
+  bodies, and only those are re-applied (the corrected body is idempotent) with
+  the recorded checksum moved forward. Any other edited body is still refused.
+  This is the one narrow, auditable exception to "never edit an applied
+  migration"; a schema change is still always a new migration.
+
 - **Migrations: an edited, already-applied file is refused, not re-run.**
   `PostgresStore.apply_migrations` used `ON CONFLICT DO UPDATE` and executed a
   changed body under its recorded name, so the history could claim one thing

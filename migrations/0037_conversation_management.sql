@@ -50,8 +50,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_nexus_generations_running
 
 ALTER TABLE nexus_generations ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON nexus_generations FROM PUBLIC;
+-- Browser access through PostgREST is refused, as everywhere in this schema.
+-- The loop variable is declared ``text`` (like every other migration), not
+-- ``record``: ``format('%I', <record>)`` serialises the whole row to
+-- ``(authenticated)`` and then quotes it, so the REVOKE targets a role named
+-- ``"(authenticated)"`` that does not exist and the whole migration aborts.
+-- With ``text``, ``format('%I', r)`` yields the bare role name, and the loop
+-- over ``pg_roles`` already skips a role the server does not have (a plain
+-- PostgreSQL install), so the statement is a safe no-op there.
 DO $$
-DECLARE r record;
+DECLARE r text;
 BEGIN
     FOR r IN SELECT rolname FROM pg_roles
              WHERE rolname IN ('anon', 'authenticated')

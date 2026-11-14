@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from orchestration.cloud_store import PostgresStore  # noqa: E402
+from orchestration.cloud_store import MIGRATION_CORRECTIONS, MigrationError, PostgresStore  # noqa: E402
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
 
@@ -87,6 +87,97 @@ def test_migrations_are_recorded_and_not_reapplied() -> None:
         assert first, "a fresh database should apply at least one migration"
         # The second run must be a no-op: the checksums are already recorded.
         assert store.apply_migrations() == []
+    finally:
+        store.close()
+
+
+def _ensure_supabase_roles() -> bool:
+    """Create ``anon``/``authenticated`` if the test role may, else return False.
+
+    The production server is Supabase, which ships these roles; the CI
+    PostgreSQL service does not. The defect only shows when the role exists, so
+    the regression test creates them. Returns ``False`` (and the test skips)
+    when the connection's role may not create roles.
+    """
+    import psycopg
+    from psycopg import sql
+
+    try:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN (%s, %s)",
+                            ("anon", "authenticated"))
+                present = {row[0] for row in cur.fetchall()}
+                for role in set(("anon", "authenticated")) - present:
+                    cur.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role)))
+        return True
+    except psycopg.Error:
+        return False
+
+
+def test_migration_0037_applies_when_the_supabase_role_exists() -> None:
+    """The production reproduction: 0037 must apply on a server with the role.
+
+    Without the roles the ``FOR r IN SELECT ... WHERE rolname IN
+    ('anon','authenticated')`` loop is empty and the defective body silently
+    "passes", which is why the existing suite missed it. With ``authenticated``
+    present the ``record``-typed body aborted the whole migration; the corrected
+    body applies, records the file, keeps RLS on, and grants the client role
+    nothing.
+    """
+    if not _ensure_supabase_roles():
+        pytest.skip("the test role may not create roles")
+    _drop_schema()
+    store = PostgresStore(DSN)
+    try:
+        with store._tx() as cur:
+            cur.execute("SELECT filename FROM schema_migrations WHERE filename = %s",
+                        ("0037_conversation_management.sql",))
+            assert cur.fetchone() is not None, "0037 must be recorded"
+            cur.execute("SELECT relrowsecurity FROM pg_class WHERE oid = %s::regclass",
+                        ("nexus_generations",))
+            assert cur.fetchone()["relrowsecurity"] is True
+            cur.execute("SELECT has_table_privilege('authenticated', "
+                        "'nexus_generations', 'SELECT') AS allowed")
+            assert cur.fetchone()["allowed"] is False
+        assert store.apply_migrations() == []  # idempotent
+    finally:
+        store.close()
+
+
+def test_registered_correction_supersedes_the_old_0037_body() -> None:
+    """A database that recorded the defective 0037 body converges.
+
+    The defective body is a registered correction (``MIGRATION_CORRECTIONS``):
+    when a recorded checksum is a superseded body, the corrected idempotent body
+    is re-applied and the recorded checksum moves forward. An *unregistered*
+    mismatch is still refused (asserted at the end, so the registry cannot be
+    mistaken for a general "edit in place" escape hatch).
+    """
+    name = "0037_conversation_management.sql"
+    superseded = MIGRATION_CORRECTIONS[name]
+    assert superseded, "the old 0037 body must be registered"
+    _drop_schema()
+    store = PostgresStore(DSN, auto_migrate=False)
+    try:
+        store.apply_migrations()
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s", (name,))
+            current = cur.fetchone()["checksum"]
+        old = next(iter(superseded))
+        assert current != old
+        with store._tx() as cur:
+            cur.execute("UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                        (old, name))
+        assert store.apply_migrations() == [name]
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s", (name,))
+            assert cur.fetchone()["checksum"] == current
+        with store._tx() as cur:
+            cur.execute("UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                        ("0" * 64, name))
+        with pytest.raises(MigrationError):
+            store.apply_migrations()
     finally:
         store.close()
 

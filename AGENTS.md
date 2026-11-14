@@ -2538,6 +2538,34 @@ The repository was synchronized and released. What a future change must know:
   migrations by executing each `*.sql` directly, so a manifest would not be
   exercised and would add a large, unproven surface.
 
+### A role-loop variable must be `text`, never `record`
+
+Migration `0037_conversation_management.sql` declared its role-loop variable as
+`record`; every other migration declares `text`. In a `FOR r IN SELECT rolname
+FROM pg_roles ...` loop, `format('%I', r)` with `r` a `record` serialises the
+whole row to `(authenticated)` and then quotes it, so the `REVOKE` targets a
+role literally named `"(authenticated)"`. On a Supabase server (which has the
+role) the migration aborts with `UndefinedObject: role "(authenticated)" does
+not exist`, which was the production startup failure; on a plain server the
+`pg_roles` filter matches nothing, the loop is empty and the defect is invisible
+-- which is why the CI PostgreSQL service never caught it. The fix is the
+declaration (`DECLARE r text;`), not a change to the loop. Guards:
+`tests/test_migration_sql_guards.py::test_no_migration_uses_a_record_variable_in_format`
+(no database needed) and
+`tests/test_schema_bootstrap.py::test_migration_0037_applies_when_the_supabase_role_exists`
+(creates the role, so it reproduces the production path).
+
+### A registered correction supersedes a defective already-recorded body
+
+The checksum guard above refuses an edited, applied file. A defect in a shipped
+body that no database could depend on (the `0037` typo) is the one exception:
+`cloud_store.MIGRATION_CORRECTIONS` maps a filename to the exact *superseded*
+body checksums, and only a recorded checksum in that set is re-applied (the
+corrected body is idempotent) with the recorded checksum moved forward. Any
+other mismatch is still refused. Keep the list tiny and auditable; a real schema
+change is still a new migration. Guards:
+`tests/test_schema_bootstrap.py::test_registered_correction_supersedes_the_old_0037_body`.
+
 ### The migrations runner refuses an edited, applied file
 
 `PostgresStore.apply_migrations` used `ON CONFLICT DO UPDATE` and executed a
