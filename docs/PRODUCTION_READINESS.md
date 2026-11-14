@@ -88,9 +88,17 @@ on production and the schema guard passed.
 `https://api.render.com/v1/services` answers `401`). The deploy was therefore
 performed by the service's own `autoDeploy: true` on the `main` push, which is
 the configured, safe path; nothing about the Render service was changed by hand.
+
+**Update 2026-11-14 22:40 UTC — the CRUD increment is deployed too.** The
+permanent-delete, notification-lifecycle and session-management work
+(`9e01f2f`) is live: the served `static/app.js` matches the local file, the
+rendered `ASSET_VERSION` (`56cadf6b9482`) matches the local build, and the new
+features (`purge-chat`, `project-purge`, `open-notifications`, `notif-read-all`,
+`open-sessions`) are in the served bundle. `/healthz` and `/readyz` both `200`.
+
 Status: **PRODUCTION READY** for the code and deployment; the only unverified
 items are the authenticated smoke tests (no production credentials exist here —
-see `docs/MASTER_COMPLETION_REPORT.md`).
+see `docs/MASTER_COMPLETION_REPORT.md` and `docs/KNOWN_LIMITATIONS.md`).
 
 ## Summary
 
