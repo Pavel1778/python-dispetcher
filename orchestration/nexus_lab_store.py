@@ -537,6 +537,12 @@ class LabStore:
             # are the durable proof and the audit reads them by subject id.
             cur.execute("SELECT count(*) AS n FROM nexus_run_tasks WHERE run_id=%s", (run_id,))
             tasks = cur.fetchone()["n"]
+            # A goal points at its active run by a plain uuid column (no foreign
+            # key), so removing the run must clear that pointer or the goal
+            # would reference a row that is gone. The goal itself and its state
+            # are kept: the request it stands for is not deleted.
+            cur.execute("UPDATE nexus_goals SET active_run_id=NULL "
+                        "WHERE active_run_id=%s AND project_id=%s", (run_id, project_id))
             # Delete the run row. Everything run-scoped that references it by a
             # foreign key is removed with it (ON DELETE CASCADE): tasks,
             # executions, hand-offs, report, stop signals. The conversation

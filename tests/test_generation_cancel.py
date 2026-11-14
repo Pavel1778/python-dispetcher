@@ -199,3 +199,50 @@ def test_stopping_generation_does_not_touch_a_run(studio):
     detail = studio.api.get(f"/api/v1/projects/{project}/runs/{run_id}")[1]["run"]
     assert detail["id"] == run_id
     assert detail["state"] != "cancelled"
+
+
+def test_a_second_answer_is_refused_while_one_is_generating(studio):
+    """One generation per conversation: a second request while the first is
+    generating is a 409, the conversation is not left stuck in "thinking", and
+    the first can still be stopped (its token stays registered)."""
+    project = studio.project()
+    conversation = _conversation(studio, project)
+    started = threading.Event()
+
+    def slow(body):
+        started.set()
+        time.sleep(4)
+        return 200, {"choices": [{"message": {"content": "первый ответ"}}]}
+
+    studio.llm.respond = slow
+    first: dict = {}
+
+    def send_first():
+        first["status"], first["body"] = studio.api.post(
+            f"/api/v1/projects/{project}/conversations/{conversation}/messages",
+            {"text": "Первый вопрос"})
+
+    worker = threading.Thread(target=send_first, daemon=True)
+    worker.start()
+    assert started.wait(timeout=10), "the first answer never started"
+
+    status, body = studio.api.post(
+        f"/api/v1/projects/{project}/conversations/{conversation}/messages",
+        {"text": "Второй вопрос"})
+    assert status == 409, body
+    assert "уже генерируется" in body["error"]
+
+    # The first generation is still running and can be stopped.
+    assert studio.api.post(
+        f"/api/v1/projects/{project}/conversations/{conversation}/cancel", {})[0] == 200
+    worker.join(timeout=15)
+    assert first["status"] == 200
+
+    # The conversation is usable again.
+    studio.llm.respond = None
+    studio.answers("Новый ответ.")
+    status, body = studio.api.post(
+        f"/api/v1/projects/{project}/conversations/{conversation}/messages",
+        {"text": "Третий вопрос"})
+    assert status == 200, body
+    assert body["messages"][-1]["content"] == "Новый ответ."

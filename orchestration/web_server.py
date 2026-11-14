@@ -3325,8 +3325,19 @@ class Handler(BaseHTTPRequestHandler):
         token = None
         generation_id = None
         if turn_mode in ("ask", "analysis", "plan"):
-            generation = self.app.conversations.start_generation(
-                principal, project_id, conversation_id, mode=turn_mode)
+            try:
+                generation = self.app.conversations.start_generation(
+                    principal, project_id, conversation_id, mode=turn_mode)
+            except ValueError:
+                # One answer at a time per conversation. A second request while
+                # one is generating is refused with 409 rather than run in
+                # parallel, and the conversation is left idle (not stuck in
+                # "thinking") so the person can stop the first and ask again.
+                self.app.conversations.set_state(principal, project_id,
+                                                 conversation_id, "idle")
+                self._json(409, {"error": "ответ уже генерируется; сначала остановите его",
+                                 "messages": appended})
+                return
             generation_id = str(generation["id"])
             token = GenerationToken(generation_id)
             self.app.generations.register(token)
