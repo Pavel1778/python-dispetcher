@@ -95,6 +95,15 @@ from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
 from .nexus_binding import AuthorizationError, ProjectBindingError, authorize_run_task
 from .nexus_chat import ChatError, attached_note, task_with_context, work_starts_by
+from .nexus_commands import (
+    EXECUTE,
+    help_text,
+    metadata as command_metadata,
+    parse as parse_command,
+    registry as command_registry,
+    suggest as command_suggest,
+    task_text as command_task_text,
+)
 from .nexus_intent import (
     ANALYSIS,
     AUTONOMOUS,
@@ -3027,6 +3036,10 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(400, {"error": "text is required"})
             return
+        # What the person actually typed. A UI button adds an ``action`` token
+        # for the parser; the transcript shows the message as it was written,
+        # never the token the interface injected.
+        typed = text
         mode = body.get("mode")
         conversation = self.app.conversations.get(principal, project_id, conversation_id)
         # Everything that can refuse the message is checked before anything is
@@ -3035,21 +3048,67 @@ class Handler(BaseHTTPRequestHandler):
         # answered 400, or 413 for a text that is too long.
         if mode:
             self.app.conversations.check_mode(mode)
-        # The Intent Router decides what this message asks for, before any mode
-        # is applied: a question must not start a run just because the
-        # conversation's mode is ``autonomous``. ``auto`` (the default) and
-        # ``autonomous`` leave the decision to the message; an explicit
-        # ask/plan/analysis/code mode is the person's own choice.
         active_run = self.app.conversations.linked_run(principal, project_id, conversation_id)
         chosen = mode or conversation["mode"]
         # What was said before this turn. The turn's own text is the request
         # and is not part of it.
         history = self.app.conversations.list_messages(principal, project_id, conversation_id)
-        intent = classify(text, mode=chosen, has_active_run=active_run is not None,
+
+        # The Command System runs first. A message may carry slash commands
+        # (``/plan``, ``/autorun``), hashtags (``#backend #security``) and typed
+        # parameters; the parser turns them into a decision before the Intent
+        # Router sees the message, so an explicit command is never guessed at.
+        # The same parser serves the interface buttons (they post ``action``),
+        # so a button and a slash command can never drift apart.
+        action = body.get("action")
+        if action is not None:
+            if not isinstance(action, str):
+                self._json(400, {"error": "action must be a string"})
+                return
+            # The action is a command token; it is parsed exactly like one typed
+            # at the start of the message. The message's own text is kept.
+            text = (action + " " + text).strip() if text else action.strip()
+        parsed = parse_command(text, mode=chosen)
+        # The request the router and the model work from: commands and tags
+        # removed. A message that was only commands has no request of its own,
+        # so the stored turn keeps the full text (the transcript shows what was
+        # typed) and the router reads it as the plain text.
+        request = parsed.text or text
+        if parsed.unknown_commands:
+            self._json(400, {"error": "unknown command: " + ", ".join(parsed.unknown_commands)})
+            return
+        if not parsed.ok:
+            self._json(400, {"error": "; ".join(parsed.errors), "commands": parsed.errors})
+            return
+        if parsed.help:
+            # ``/help`` answers with the vocabulary; it starts nothing and asks
+            # no model. It wins over any request written beside it.
+            user_msg = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role="user", content=typed,
+                meta={"command": command_metadata(parsed)})
+            help_msg = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role="assistant",
+                content=help_text(), meta={"mode": "help", "help": True})
+            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+            self._json(200, {"messages": [user_msg, help_msg]})
+            return
+        # An explicit mode command overrides the conversation's mode for this
+        # turn only; the conversation keeps its own setting.
+        chosen = parsed.mode or chosen
+
+        # The Intent Router decides what this message asks for, before any mode
+        # is applied: a question must not start a run just because the
+        # conversation's mode is ``autonomous``. ``auto`` (the default) and
+        # ``autonomous`` leave the decision to the message; an explicit
+        # ask/plan/analysis/code mode is the person's own choice. A command that
+        # names work (``/autorun``, ``/fix``) is the person's explicit order, so
+        # it is never turned into a clarifying question.
+        intent = classify(request, mode=chosen, has_active_run=active_run is not None,
                           has_context=_names_work(history))
+        if any(c.effect == EXECUTE for c in parsed.commands):
+            intent = Intent(AUTONOMOUS, reason="explicit command")
         # The request a model is asked to answer; the message itself, except
         # when the message only says how an earlier one is to be handled.
-        request = text
         chose_work = False
         asked_about = _asked_about(history)
         if asked_about is not None and not intent.continue_run:
@@ -3090,26 +3149,36 @@ class Handler(BaseHTTPRequestHandler):
             # history reads as what was asked. This only fills a blank; a title
             # the user chose is never replaced.
             self.app.conversations.rename(
-                principal, project_id, conversation_id, title_from_message(text))
+                principal, project_id, conversation_id, title_from_message(typed))
         # A turn that starts work has a task, and a short message is not one by
         # itself: "делай" says to act, and what to do was said before it. Such
         # a message takes the conversation with it (``task_with_context``), so
         # the planner and the agents are given what the person meant, not one
         # word. A long message is a document and is the task as it stands.
-        task, attached = sent, 0
+        # A message that named its own commands and tags carries them into the
+        # task too (``command_task_text``), so a plan of "#backend #security" is
+        # planned for backend security and not for the bare sentence.
+        task, attached = request, 0
         if turn_mode in ("autonomous", "code") and not (intent.continue_run and active_run):
-            task, attached = task_with_context(sent, history)
+            task, attached = task_with_context(request, history)
+        task = command_task_text(parsed, task)
         # An autonomous turn's task is stored first, exactly as it is - not
         # trimmed, any size the server accepts - with its SHA-256, as a
         # specification; planning and the agents work from that copy. The same
         # text in the same conversation is the same row, which is what lets a
         # repeated send be recognised.
         spec = None
-        shown, user_meta = text, None
+        shown = typed
+        # The command decision travels with the stored turn, so the transcript
+        # can show what a message meant (which command, which tags) and the UI
+        # can render it. It is stored only when there was something to record.
+        user_meta = {"command": command_metadata(parsed)} if (
+            parsed.commands or parsed.tag_list() or parsed.params) else None
         if turn_mode == "autonomous":
             spec, _new = self.app.specs.create(
                 principal, project_id, task, source="chat", conversation_id=conversation_id)
-            user_meta = {"spec": SpecService.summary(spec)}
+            user_meta = user_meta or {}
+            user_meta["spec"] = SpecService.summary(spec)
             if attached:
                 # The transcript shows the message as it was written; that the
                 # conversation went into the task is recorded with it.
@@ -3117,7 +3186,7 @@ class Handler(BaseHTTPRequestHandler):
             elif spec["char_count"] > inline_chars():
                 # The transcript shows the beginning; the message says so and
                 # points at the whole text. Nothing downstream reads this copy.
-                shown = preview(sent)
+                shown = preview(request)
                 user_meta["spec"]["preview"] = True
         # Persist the user turn first: it must not be lost to an assistant failure.
         user_msg = self.app.conversations.add_message(
@@ -3718,6 +3787,17 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if path == "/api/studio":
                 return self._json(200, self.app.studio_status())
+            if path == "/api/commands":
+                # The chat command vocabulary: every slash command, every tag
+                # group, the help text, and (with ``?q=``) completions for a
+                # partial token. Static and secret-free, so the interface can
+                # build its menus from the same source the server parses with.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                prefix = (query.get("q") or [""])[0]
+                payload = command_registry()
+                if prefix:
+                    payload["suggestions"] = command_suggest(prefix)
+                return self._json(200, payload)
             if path == "/api/dashboard":
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
