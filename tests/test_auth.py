@@ -1603,3 +1603,63 @@ def test_global_ceiling_holds_when_the_ip_is_untrustworthy(server):
 def test_the_global_ceiling_defaults_to_120_a_minute(server):
     throttle = server.app.login_throttle
     assert (throttle.global_max_attempts, throttle.global_window_seconds) == (120, 60.0)
+
+
+# ------------------------------------------------------- session management
+def test_sessions_can_be_listed_and_revoked(server, browser):
+    """A signed-in owner can see their live sessions and revoke one.
+
+    The list never carries the token - only a prefix of the stored HMAC, which
+    is enough to revoke a session and useless to an attacker.
+    """
+    browser.login()
+    # A second, independent session (a second browser, say).
+    other = Browser(f"http://127.0.0.1:{server.port}")
+    other.login()
+    csrf = browser.json("GET", "/api/session")[1]["csrf_token"]
+
+    st, body, _ = browser.json("GET", "/api/sessions")
+    assert st == 200 and len(body["sessions"]) >= 2, body
+    # No token, no hash: only a short id.
+    for s in body["sessions"]:
+        assert "token" not in s and "token_hash" not in s
+        assert len(s["id"]) == 12
+
+    # Revoke the *other* session by its id; the caller's own is marked and
+    # stays. Exactly one row is "current" (the caller's).
+    currents = [s for s in body["sessions"] if s["current"]]
+    assert len(currents) == 1
+    others = [s for s in body["sessions"] if not s["current"]]
+    assert others, "the second session should be listed"
+    other_id = others[0]["id"]
+    st, body, _ = browser.json("DELETE", f"/api/sessions/{other_id}",
+                               headers={"X-CSRF-Token": csrf})
+    assert st == 200 and body["revoked"] >= 1
+
+    # The caller's session still works.
+    assert browser.json("GET", "/api/session")[0] == 200
+    # The other browser is signed out: its session no longer resolves.
+    st, body, _ = other.json("GET", "/api/session")
+    assert st == 200 and body.get("username") == "api" or st == 401
+
+
+def test_revoking_all_other_sessions_keeps_the_caller(server, browser):
+    browser.login()
+    other = Browser(f"http://127.0.0.1:{server.port}")
+    other.login()
+    csrf = browser.json("GET", "/api/session")[1]["csrf_token"]
+    st, body, _ = browser.json("DELETE", "/api/sessions", headers={"X-CSRF-Token": csrf})
+    assert st == 200 and body["revoked"] >= 1
+    # The caller stays signed in.
+    assert browser.json("GET", "/api/session")[1]["username"] == "owner"
+    # The other is gone.
+    st, body, _ = other.json("GET", "/api/session")
+    assert st == 401 or body.get("username") == "api"
+
+
+def test_a_short_session_id_is_refused(browser):
+    browser.login()
+    csrf = browser.json("GET", "/api/session")[1]["csrf_token"]
+    st, body, _ = browser.json("DELETE", "/api/sessions/abc",
+                               headers={"X-CSRF-Token": csrf})
+    assert st == 400 and "short" in body["error"]

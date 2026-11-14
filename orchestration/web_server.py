@@ -3988,6 +3988,21 @@ class Handler(BaseHTTPRequestHandler):
                     "username": s.username if s else "api",
                     "csrf_token": s.csrf_token if s else "",
                 })
+            if path == "/api/sessions":
+                # The caller's own live sessions, never the token: the id is a
+                # prefix of the stored HMAC, which is enough to revoke one and
+                # useless to an attacker. A bearer client sees none (it holds no
+                # browser session).
+                s = self._session()
+                if s is None:
+                    return self._json(200, {"sessions": []})
+                current = self.app.auth.token_id(s.token)[:12]
+                sessions = self.app.store.list_sessions(s.username)
+                for row in sessions:
+                    # Mark the caller's own session so the interface can say
+                    # "this device" and never offer to revoke it by mistake.
+                    row["current"] = row["id"] == current
+                return self._json(200, {"sessions": sessions})
             if path == "/api/studio":
                 return self._json(200, self.app.studio_status())
             if path == "/api/commands":
@@ -4463,6 +4478,27 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._require_write():
                 return
+            # DELETE /api/sessions/{id}   (revoke one of the caller's sessions)
+            #   ``{id}`` is a prefix of the stored HMAC; the token itself is
+            #   never known to the server. Only the caller's own sessions can be
+            #   revoked, so a prefix cannot reach another user's.
+            if path.startswith("/api/sessions/"):
+                prefix = path.rsplit("/", 1)[-1]
+                s = self._session()
+                if s is None:
+                    return self._json(404, {"error": "not found"})
+                if not prefix or len(prefix) < 8:
+                    return self._json(400, {"error": "session id is too short"})
+                gone = self.app.store.revoke_session_prefix(s.username, prefix)
+                return self._json(200, {"revoked": gone})
+            # DELETE /api/sessions   (revoke every other session of the caller)
+            if path == "/api/sessions":
+                s = self._session()
+                if s is None:
+                    return self._json(404, {"error": "not found"})
+                gone = self.app.store.revoke_other_sessions(
+                    s.username, self.app.auth.token_id(s.token))
+                return self._json(200, {"revoked": gone})
             parsed = self._project_subpath(path)
             if parsed is None:
                 return self._json(404, {"error": "not found"})
