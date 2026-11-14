@@ -225,14 +225,23 @@ def test_rename_archive_and_mode_change(http_server):
     st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
                       {"archived": False}, session=alice)
     assert out["conversation"]["archived"] is False
-    # DELETE moves the conversation to the trash (reversible), and it leaves
-    # the active list at once.
+    # DELETE still only archives (unchanged, existing behaviour); the trash is
+    # the ``deleted`` key, and it leaves the active list at once.
     st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
                     session=alice)
     assert st == 200
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?archived=1",
+                          session=alice)
+    assert len(listing["conversations"]) == 1 and listing["conversations"][0]["deleted_at"] is None
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
+                      {"archived": False}, session=alice)
+    assert out["conversation"]["archived"] is False
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
+                      {"deleted": True}, session=alice)
+    assert st == 200 and out["conversation"]["deleted_at"] is not None
     st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
     assert listing["conversations"] == []
-    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1&archived=1",
                           session=alice)
     assert len(listing["conversations"]) == 1
     assert listing["conversations"][0]["deleted_at"] is not None

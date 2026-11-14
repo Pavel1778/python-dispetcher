@@ -303,14 +303,12 @@ a:hover { text-decoration: underline; }
 .sb-state { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .sb-state.is-thinking { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 .sb-state.is-error { background: var(--bad); }
-.sb-pin { display: inline-flex; flex: none; color: var(--text-3); }
-.sb-pin .icon-xs { width: 12px; height: 12px; }
 .sb-empty { margin: 18px 10px; color: var(--text-3); font-size: 13px; line-height: 1.5; }
-.sb-more { display: flex; align-items: center; gap: 8px; width: 100%; height: 32px; margin: 12px 0 2px; padding: 0 10px; border-radius: 9px; color: var(--text-3); font-size: 12.5px; font-weight: 500; }
-.sb-more:hover { background: var(--surface); color: var(--text-2); }
-.sb-more > span { flex: 1; }
-.sb-more .icon-xs { transition: transform 0.15s var(--ease); }
-.sb-more[aria-expanded="true"] .icon-xs { transform: rotate(90deg); }
+.sb-more, .sb-trash { display: flex; align-items: center; gap: 8px; width: 100%; height: 32px; margin: 12px 0 2px; padding: 0 10px; border-radius: 9px; color: var(--text-3); font-size: 12.5px; font-weight: 500; }
+.sb-more:hover, .sb-trash:hover { background: var(--surface); color: var(--text-2); }
+.sb-more > span, .sb-trash > span { flex: 1; }
+.sb-more .icon-xs, .sb-trash .icon-xs { transition: transform 0.15s var(--ease); }
+.sb-more[aria-expanded="true"] .icon-xs, .sb-trash[aria-expanded="true"] .icon-xs { transform: rotate(90deg); }
 
 .sb-foot { padding: 8px 12px 12px; border-top: 1px solid var(--line); }
 .sb-user { display: flex; align-items: center; gap: 10px; width: 100%; padding: 6px 8px; border-radius: 10px; color: var(--text-2); }
@@ -378,6 +376,10 @@ a:hover { text-decoration: underline; }
 .send:disabled { background: var(--surface-3); color: var(--text-3); }
 .send.is-busy .icon { display: none; }
 .send.is-busy::after { content: ""; width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--text-3); border-top-color: var(--text); animation: spin 0.7s linear infinite; }
+/* The send button becomes a stop button while an answer is generating: same
+   place, same size, a square instead of an arrow, in the danger colour. */
+.send-stop { background: var(--bad); color: var(--bg); }
+.send-stop:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
 .composer-note { margin: 8px 6px 0; min-height: 17px; font-size: 12px; color: var(--text-3); text-align: center; }
 .composer-note.is-warn { color: var(--warn); }
 
@@ -629,10 +631,6 @@ a:hover { text-decoration: underline; }
 .menu-item-text small { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-item-text.wrap small { white-space: normal; }
 .menu-item .icon.check { color: var(--accent-strong); opacity: 0; }
-.menu-row { display: flex; align-items: center; gap: 2px; }
-.menu-row > .menu-item { flex: 1; min-width: 0; }
-.menu-row > .icon-btn { flex: none; }
-.menu-row:hover > .icon-btn { opacity: 1; }
 .menu-item[aria-checked="true"] .icon.check { opacity: 1; }
 .menu-sep { height: 1px; margin: 6px 4px; background: var(--line); }
 .menu-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px; }
@@ -687,17 +685,6 @@ a:hover { text-decoration: underline; }
 .kv dt { color: var(--text-3); }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
 .kv .dot { display: inline-block; margin-right: 8px; vertical-align: 1px; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 0 0 12px; }
-.stat { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
-.stat-label { font-size: 12px; color: var(--text-3); }
-.stat-value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.stat-value.is-ok { color: var(--ok); }
-.stat-value.is-warn { color: var(--warn); }
-.stat-value.is-bad { color: var(--bad); }
-table.latency { width: 100%; border-collapse: collapse; margin: 0 0 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
-table.latency th, table.latency td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
-table.latency th { color: var(--text-3); font-weight: 500; }
-table.latency td:not(:first-child), table.latency th:not(:first-child) { text-align: right; }
 details.add { border: 1px dashed var(--line-strong); border-radius: 12px; padding: 0 12px; margin: 0 0 14px; }
 .account-form .field { margin-bottom: 8px; }
 .account-form .field-hint { margin: 0 0 12px; }

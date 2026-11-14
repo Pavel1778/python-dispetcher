@@ -69,22 +69,24 @@ class ProjectService:
 
     def list(self, principal: str, *, include_archived: bool = False,
              include_deleted: bool = False) -> list[dict]:
-        """The principal's projects, newest first.
+        """The caller's projects, newest first.
 
-        A project that was archived is left out unless *include_archived*; one
-        that is in the trash (``deleted_at``) is left out unless *include_deleted*.
+        An archived or deleted project is left out by default, so the ordinary
+        picker does not have to scroll past ones nobody works in any more;
+        either flag brings them back for an archive/trash view. ``deleted`` is
+        the stronger state: once a project is in the trash, ``include_deleted``
+        alone is enough to see it (whether or not it is also archived).
         """
         with self.store._tx() as cur:
-            sql = ("SELECT p.id, p.name, p.description, p.archived_at, p.deleted_at, "
-                   "  p.created_at, p.updated_at "
-                   "FROM nexus_projects p JOIN nexus_project_members m ON m.project_id=p.id "
-                   "WHERE m.principal=%s")
-            if not include_deleted:
-                sql += " AND p.deleted_at IS NULL"
-            if not include_archived:
-                sql += " AND p.archived_at IS NULL"
-            sql += " ORDER BY p.created_at DESC, p.id"
-            cur.execute(sql, (principal,))
+            cur.execute(
+                "SELECT p.id, p.name, p.description, p.archived_at, p.deleted_at, "
+                "  p.created_at, p.updated_at "
+                "FROM nexus_projects p JOIN nexus_project_members m ON m.project_id=p.id "
+                "WHERE m.principal=%s AND ("
+                "  (p.deleted_at IS NULL AND (p.archived_at IS NULL OR %s))"
+                "  OR (p.deleted_at IS NOT NULL AND %s)) "
+                "ORDER BY p.created_at DESC, p.id",
+                (principal, include_archived, include_deleted))
             return [dict(row) for row in cur.fetchall()]
 
     def get(self, principal: str, project_id: str) -> dict:
@@ -93,13 +95,12 @@ class ProjectService:
 
     @staticmethod
     def _project(cur: Any, principal: str, project_id: str) -> dict:
-        # A project in the trash reads as "not found" everywhere, so a deleted
-        # project is invisible to every member operation without each service
-        # having to remember to check.
-        cur.execute("SELECT p.id, p.name, p.description, p.created_at, p.updated_at "
+        # A deleted project is still *readable* by a member, so it can be
+        # restored; it is ``_refuse_if_deleted`` that stops new work in it.
+        cur.execute("SELECT p.id, p.name, p.description, p.archived_at, p.deleted_at, "
+                    "  p.created_at, p.updated_at "
                     "FROM nexus_projects p JOIN nexus_project_members m ON m.project_id=p.id "
-                    "WHERE p.id=%s AND m.principal=%s AND p.deleted_at IS NULL "
-                    "FOR KEY SHARE OF m", (project_id, principal))
+                    "WHERE p.id=%s AND m.principal=%s FOR KEY SHARE OF m", (project_id, principal))
         row = cur.fetchone()
         if row is None:
             raise NotFound("project not found")
@@ -149,75 +150,15 @@ class ProjectService:
                 "has_active_runs": active_runs > 0,
             }
 
-    def archive(self, principal: str, project_id: str, archived: bool = True) -> dict:
-        """Take a project out of the active list, or put it back. Nothing is
-        deleted; an archived project stays fully usable."""
-        with self.store._tx() as cur:
-            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
-            cur.execute(
-                "UPDATE nexus_projects SET archived_at = CASE WHEN %s THEN now() ELSE NULL END, "
-                "updated_at=now() WHERE id=%s "
-                "RETURNING id, name, description, archived_at, deleted_at, created_at, updated_at",
-                (bool(archived), project_id))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("project not found")
-            self._event(cur, project_id, principal,
-                        "project.archived" if archived else "project.restored", project_id)
-            return dict(row)
-
-    def delete(self, principal: str, project_id: str) -> dict:
-        """Move a project to the trash (soft delete). Reversible.
-
-        Refused while any run of the project is still active: a run that is at
-        work must be stopped or allowed to finish first, so its conversations
-        are not left running against a project nobody can see. Nothing is
-        removed from the database - ``restore`` brings it back, and
-        ``purge`` is the separate, explicit, irreversible step.
-        """
-        with self.store._tx() as cur:
-            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
-            cur.execute("SELECT id FROM nexus_projects WHERE id=%s AND deleted_at IS NULL",
-                        (project_id,))
-            if cur.fetchone() is None:
-                raise NotFound("project not found")
-            cur.execute("SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s "
-                        "AND state = ANY(%s)", (project_id, _active_run_states()))
-            active = int(cur.fetchone()["n"])
-            if active:
-                raise ProjectInUse(
-                    f"the project has {active} active run(s); stop them before deleting")
-            cur.execute("UPDATE nexus_projects SET deleted_at=now(), archived_at=NULL, "
-                        "updated_at=now() WHERE id=%s "
-                        "RETURNING id, name, description, archived_at, deleted_at, "
-                        "created_at, updated_at", (project_id,))
-            row = cur.fetchone()
-            self._event(cur, project_id, principal, "project.deleted", project_id)
-            return dict(row)
-
-    def restore(self, principal: str, project_id: str) -> dict:
-        """Bring a project back from the trash."""
-        with self.store._tx() as cur:
-            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
-            cur.execute("UPDATE nexus_projects SET deleted_at=NULL, updated_at=now() "
-                        "WHERE id=%s AND deleted_at IS NOT NULL "
-                        "RETURNING id, name, description, archived_at, deleted_at, "
-                        "created_at, updated_at", (project_id,))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("project not found in the trash")
-            self._event(cur, project_id, principal, "project.restored", project_id)
-            return dict(row)
-
     def purge(self, principal: str, project_id: str, *, confirm: bool) -> dict:
         """Remove a project and everything inside it for good. Irreversible.
 
-        Refused without ``confirm`` and refused while a run is active. Only
-        rows inside this project are removed; the external GitHub repositories
-        it was bound to are never touched (the links go, the repositories do
-        not). The rows that reference the project ``ON DELETE SET NULL``
-        (evidence, legacy tasks) keep their content and lose the link, so no
-        other project is affected.
+        Refused without ``confirm`` and refused (409) while a run is active.
+        Only rows inside this project are removed; the external GitHub
+        repositories it was bound to are never touched (the links go, the
+        repositories do not). The rows that reference the project ``ON DELETE
+        SET NULL`` (evidence, legacy tasks) keep their content and lose the
+        link, so no other project is affected.
         """
         if not confirm:
             raise ValueError("purging a project requires explicit confirmation")
@@ -228,9 +169,7 @@ class ProjectService:
             if row is None:
                 raise NotFound("project not found")
             name = row["name"]
-            cur.execute("SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s "
-                        "AND state = ANY(%s)", (project_id, _active_run_states()))
-            active = int(cur.fetchone()["n"])
+            active = self._active_runs(cur, project_id)
             if active:
                 raise ProjectInUse(
                     f"the project has {active} active run(s); stop them before purging")
@@ -243,6 +182,103 @@ class ProjectService:
                 counts[table] = int(cur.fetchone()["n"])
             cur.execute("DELETE FROM nexus_projects WHERE id=%s", (project_id,))
             return {"purged": True, "name": name, "removed": counts}
+
+    @staticmethod
+    def _refuse_if_deleted(cur: Any, project_id: str) -> None:
+        """Refuse *new* work in a project that is in the trash.
+
+        Called where new activity would start (a new conversation, a new
+        goal): a deleted project is inert, not merely hidden, so it cannot
+        grow new history while nobody is looking at it. An *archived* project
+        has no such restriction - archiving only changes what the default list
+        shows, exactly like archiving a conversation.
+        """
+        cur.execute("SELECT deleted_at FROM nexus_projects WHERE id=%s", (project_id,))
+        row = cur.fetchone()
+        if row is not None and row["deleted_at"] is not None:
+            raise ValueError("project is deleted; restore it before adding new work")
+
+    #: Run states that count as "this project has something active in it" for
+    #: the purposes of refusing a delete. Mirrors ``ACTIVE_RUN_STATES`` in the
+    #: lab store; kept as a plain tuple to avoid a dependency from the project
+    #: layer onto the lab execution layer for one constant.
+    _ACTIVE_RUN_STATES = ("running", "paused", "waiting_for_approval", "blocked")
+
+    def _active_runs(self, cur: Any, project_id: str) -> int:
+        cur.execute("SELECT count(*) AS n FROM nexus_runs "
+                    "WHERE project_id=%s AND state = ANY(%s)",
+                    (project_id, list(self._ACTIVE_RUN_STATES)))
+        return cur.fetchone()["n"]
+
+    def set_archived(self, principal: str, project_id: str, archived: bool) -> dict:
+        """Archive or restore a project. Reversible; never touches its data.
+
+        An archived project drops out of the default list but is otherwise
+        untouched: its conversations, runs and repository links are not
+        affected, and it can still be opened and worked in. This mirrors the
+        conversation archive, so the two behave the same way.
+        """
+        with self.store._tx() as cur:
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
+            cur.execute(
+                "UPDATE nexus_projects SET archived_at=CASE WHEN %s THEN now() ELSE NULL END "
+                "WHERE id=%s "
+                "RETURNING id, name, description, archived_at, deleted_at, created_at, updated_at",
+                (bool(archived), project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project not found")
+            self._event(cur, project_id, principal,
+                        "project.archived" if archived else "project.unarchived", project_id)
+            return dict(row)
+
+    #: ``archive`` is the name the lifecycle routes use; ``set_archived`` is the
+    #: one the PATCH handler uses. One implementation, two names.
+    def archive(self, principal: str, project_id: str, archived: bool = True) -> dict:
+        return self.set_archived(principal, project_id, archived)
+
+    def delete(self, principal: str, project_id: str) -> dict:
+        """Soft-delete a project: move it to the trash, nothing is destroyed.
+
+        Refused (409, ``ProjectInUse``) while the project has an active run -
+        the agent working on it would otherwise be cut off mid-step with
+        nothing to report. The caller cancels those runs first (a separate,
+        explicit action), so a delete can never silently stop work the user did
+        not ask to stop. Nothing cascades: the project row and all its data
+        stay, ``deleted_at`` is a marker, and no other project or external
+        repository is touched. A repeat delete is idempotent.
+        """
+        with self.store._tx() as cur:
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
+            active = self._active_runs(cur, project_id)
+            if active:
+                raise ProjectInUse(
+                    f"project has {active} active run(s); cancel them before deleting")
+            cur.execute(
+                "UPDATE nexus_projects SET deleted_at=now() WHERE id=%s AND deleted_at IS NULL "
+                "RETURNING id, name, description, archived_at, deleted_at, created_at, updated_at",
+                (project_id,))
+            row = cur.fetchone()
+            if row is None:
+                # Either missing, or already deleted; re-read to tell which, so
+                # a double delete stays idempotent rather than raising.
+                return self._project(cur, principal, project_id)
+            self._event(cur, project_id, principal, "project.deleted", project_id)
+            return dict(row)
+
+    def restore(self, principal: str, project_id: str) -> dict:
+        """Undo :meth:`delete`: clear ``deleted_at``. Idempotent."""
+        with self.store._tx() as cur:
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
+            cur.execute(
+                "UPDATE nexus_projects SET deleted_at=NULL WHERE id=%s "
+                "RETURNING id, name, description, archived_at, deleted_at, created_at, updated_at",
+                (project_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project not found")
+            self._event(cur, project_id, principal, "project.restored", project_id)
+            return dict(row)
 
     @staticmethod
     def role(cur: Any, principal: str, project_id: str) -> str:
@@ -298,6 +334,7 @@ class ProjectService:
             key = _text(key, "Idempotency-Key", maximum=200)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
+            self._refuse_if_deleted(cur, project_id)
             cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, idempotency_key) "
                         "VALUES (%s,%s,%s,%s) ON CONFLICT (project_id, idempotency_key) "
                         "DO NOTHING RETURNING id, project_id, text, state, created_by, created_at",

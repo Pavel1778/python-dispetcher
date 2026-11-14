@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .nexus_generation import GenerationCancelled
 from .nexus_repo_reader import (
     ReadRefused,
     RepositoryAccess,
@@ -457,7 +458,8 @@ class ChatResponder:
                 spec_id: str | None = None,
                 run_facts: dict | None = None,
                 access: RepositoryAccess | None = None,
-                attached: int = 0, work_starts: str = "order") -> list[dict]:
+                attached: int = 0, work_starts: str = "order",
+                token: Any = None) -> list[dict]:
         """Return the messages to append for this turn.
 
         Each message is ``{"role", "content", "meta"}``. A failure is raised as
@@ -486,11 +488,12 @@ class ChatResponder:
             raise ValueError("mode must be ask, analysis, code, plan or autonomous")
         how = WORK_STARTS.get(work_starts, _HOW_WORK_STARTS)
         if mode == "ask":
-            return [self._ask(goal, context, memory, history, access, how)]
+            return [self._ask(goal, context, memory, history, access, how, token)]
         if mode == "analysis":
-            return [self._analysis(goal, context, memory, history, run_facts, access, how)]
+            return [self._analysis(goal, context, memory, history, run_facts, access, how,
+                                   token)]
         if mode == "plan":
-            return [self._plan(goal, context, memory, access)]
+            return [self._plan(goal, context, memory, access, token)]
         scope = {"project_id": project_id, "principal": principal}
         if mode == "code":
             return self._code(goal, repository, branch, scope, attached)
@@ -501,14 +504,14 @@ class ChatResponder:
     # ------------------------------------------------------------------- modes
     def _ask(self, goal: str, context: dict | None, memory: list[dict] | None,
              history: list[dict] | None, access: RepositoryAccess | None = None,
-             how: str = _HOW_WORK_STARTS) -> dict:
+             how: str = _HOW_WORK_STARTS, token: Any = None) -> dict:
         return self._converse("ask", _ASK_RULES + how, goal, context, memory, history,
-                              None, access)
+                              None, access, token)
 
     def _analysis(self, goal: str, context: dict | None, memory: list[dict] | None,
                   history: list[dict] | None, run_facts: dict | None,
                   access: RepositoryAccess | None = None,
-                  how: str = _HOW_WORK_STARTS) -> dict:
+                  how: str = _HOW_WORK_STARTS, token: Any = None) -> dict:
         """Answer a request to look into something, read-only.
 
         The prompt carries the project context, the memory, the recent
@@ -519,11 +522,12 @@ class ChatResponder:
         made-up analysis.
         """
         return self._converse("analysis", _ANALYSIS_RULES + how, goal, context, memory,
-                              history, run_facts, access)
+                              history, run_facts, access, token)
 
     def _converse(self, mode: str, system: str, goal: str, context: dict | None,
                   memory: list[dict] | None, history: list[dict] | None,
-                  run_facts: dict | None, access: RepositoryAccess | None) -> dict:
+                  run_facts: dict | None, access: RepositoryAccess | None,
+                  token: Any = None) -> dict:
         """One answer in prose, read from the repository where there is one.
 
         With a view the model is shown the file list and may open files for a
@@ -536,24 +540,32 @@ class ChatResponder:
         if access is not None and access.view is not None:
             try:
                 response = self._read_and_answer(system, goal, context, memory, history,
-                                                 run_facts, access.view, meta)
+                                                 run_facts, access.view, meta, token)
             except _DoesNotFit as e:
                 access = RepositoryAccess(full_name=access.full_name, branch=access.branch,
                                           error=str(e))
         if response is None:
             note, rule = self._repository_note(access)
             prompt = self._prompt(goal, context, memory, history, run_facts, repository=note)
-            response = self._text(prompt, system + rule, goal)
+            response = self._text(prompt, system + rule, goal, token)
             if access is not None and access.full_name:
                 meta["repository"] = {"full_name": access.full_name, "branch": access.branch,
                                       "error": access.error or "not read"}
         return {"role": "assistant", "content": response.data["text"],
                 "meta": {"provider": response.provider, "model": response.model, **meta}}
 
-    def _text(self, prompt: str, system: str, goal: str) -> ProviderResponse:
-        """One request for prose; a failure is a :class:`ChatError`."""
+    def _text(self, prompt: str, system: str, goal: str,
+              token: Any = None) -> ProviderResponse:
+        """One request for prose; a failure is a :class:`ChatError`.
+
+        A cancelled generation is not a failure: it is re-raised as
+        :class:`GenerationCancelled` so the caller saves what was produced and
+        marks the message stopped, instead of recording an error.
+        """
         try:
-            return self.providers.text(prompt, system)
+            return self.providers.text(prompt, system, token=token)
+        except GenerationCancelled:
+            raise
         except AllProvidersFailed as e:
             raise ChatError(self._failure(e, goal)) from e
         except ProviderError as e:
@@ -589,7 +601,8 @@ class ChatResponder:
     def _read_and_answer(self, system: str, goal: str, context: dict | None,
                          memory: list[dict] | None, history: list[dict] | None,
                          run_facts: dict | None, view: RepositoryView,
-                         meta: dict[str, Any]) -> ProviderResponse:
+                         meta: dict[str, Any],
+                         token: Any = None) -> ProviderResponse:
         """Ask, serve what the model asks to open, ask again; return its answer.
 
         Each round is one request. The model either answers or names files
@@ -618,7 +631,9 @@ class ChatResponder:
                                   repository=reading.section(),
                                   closing=_MUST_ANSWER if last else _MAY_READ)
             try:
-                response = self.providers.text(prompt, rules)
+                response = self.providers.text(prompt, rules, token=token)
+            except GenerationCancelled:
+                raise
             except AllProvidersFailed as e:
                 if "too_large" in (e.kinds or []):
                     if rounds == 0:
@@ -648,12 +663,13 @@ class ChatResponder:
             "или сузьте его до конкретных файлов.")
 
     def _plan(self, goal: str, context: dict | None, memory: list[dict] | None,
-              access: RepositoryAccess | None = None) -> dict:
+              access: RepositoryAccess | None = None, token: Any = None) -> dict:
         """A plan, drawn with the repository's file list in view.
 
         A plan is one JSON answer, so nothing is opened here: the model sees
         which files exist and plans against them. When the list does not fit
-        the model's window the plan is made without it, as before.
+        the model's window the plan is made without it, as before. A cancelled
+        generation is re-raised as :class:`GenerationCancelled`.
         """
         prompt = self._prompt(goal, context, memory, None)
         repository = None
@@ -668,10 +684,14 @@ class ChatResponder:
                 result = self.providers.plan(
                     self._prompt(goal, context, memory, None, repository=repository)
                     if repository else prompt, _PLAN_SYSTEM)
+            except GenerationCancelled:
+                raise
             except AllProvidersFailed as e:
                 if not repository or "too_large" not in (e.kinds or []):
                     raise
                 result = self.providers.plan(prompt, _PLAN_SYSTEM)
+        except GenerationCancelled:
+            raise
         except AllProvidersFailed as e:
             raise ChatError(self._failure(e, goal)) from e
         except ProviderError as e:

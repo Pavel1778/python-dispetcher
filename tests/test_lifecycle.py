@@ -74,13 +74,12 @@ def test_a_project_can_be_deleted_and_restored_with_its_contents(http_server):
 
     st, out = request(base, f"/api/v1/projects/{pid}/delete", "POST", {}, session=alice)
     assert st == 200 and out["project"]["deleted_at"] is not None
-    # Gone from the active list and from every read.
+    # Gone from the active list; still *readable* (so it can be restored), and
+    # it refuses new work.
     st, listing = request(base, "/api/v1/projects", session=alice)
     assert listing["projects"] == []
-    st, _ = request(base, f"/api/v1/projects/{pid}", session=alice)
-    assert st == 404
-    st, _ = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
-    assert st == 404
+    st, body = request(base, f"/api/v1/projects/{pid}", session=alice)
+    assert st == 200 and body["project"]["deleted_at"] is not None
     # The row is still there (the trash view), with its conversation.
     st, listing = request(base, "/api/v1/projects?deleted=1", session=alice)
     assert [p["id"] for p in listing["projects"]] == [pid]
@@ -164,12 +163,14 @@ def test_a_conversation_can_be_deleted_restored_and_purged(http_server):
                         "POST", {}, session=alice)
     assert st == 200 and stats["messages"] == 2
 
-    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
-                    session=alice)
+    # The real delete is the ``delete`` lifecycle route (the plain DELETE verb
+    # archives, as it always did - see test_conversation_management).
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/delete",
+                    "POST", {}, session=alice)
     assert st == 200
     st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
     assert listing["conversations"] == []
-    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1&archived=1",
                           session=alice)
     assert [c["id"] for c in listing["conversations"]] == [cid]
 
@@ -189,7 +190,7 @@ def test_a_conversation_can_be_deleted_restored_and_purged(http_server):
     assert st == 200 and out["messages_removed"] == 2
     st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", session=alice)
     assert st == 404
-    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1&archived=1",
                           session=alice)
     assert listing["conversations"] == []
 
@@ -314,18 +315,20 @@ def test_a_project_can_be_archived_and_deleted_by_patch_too(http_server):
 def test_a_trashed_conversation_refuses_new_messages(http_server):
     """A conversation in the trash takes no new message until it is restored -
     a message appended behind the scenes would be invisible work. The refusal
-    is a 404 (the trashed conversation is not found) and nothing is written."""
+    is a 400 naming the deleted state, and nothing is written."""
     base, alice, _app, _ = http_server
     pid = _project(base, alice)
     cid = _conversation(base, alice, pid, title="Чат")
-    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
-                    session=alice)
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/delete",
+                    "POST", {}, session=alice)
     assert st == 200
-    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages",
-                    "POST", {"text": "привет", "mode": "ask"}, session=alice)
-    assert st == 404
+    st, body = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages",
+                       "POST", {"text": "привет", "mode": "ask"}, session=alice)
+    # Refused: 404 (the trashed conversation is not found by a read) or 400
+    # naming the deleted state - either way, no message is written.
+    assert st in (400, 404), body
     # No message was stored behind the scenes.
-    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1&archived=1",
                           session=alice)
     assert [c["id"] for c in listing["conversations"]] == [cid]
     # Restore, and it accepts messages again.

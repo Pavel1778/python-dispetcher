@@ -48,6 +48,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .nexus_generation import GenerationCancelled
+
 from .nexus_policy import UnsafeTarget, check_outbound_url
 
 # --------------------------------------------------------------------- errors
@@ -388,15 +390,31 @@ class Provider:
             raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
 
     def _post(self, prompt: str, system: str, *, prose: bool = False,
-              timeout: float | None = None) -> Any:
+              timeout: float | None = None, token: Any = None) -> Any:
         data = json.dumps(self._payload(prompt, system, prose=prose)).encode()
         req = urllib.request.Request(self._endpoint(), data=data, method="POST")
         for key, value in self._headers().items():
             req.add_header(key, value)
+        # The response object is bound to the generation token *before* it is
+        # read, so a cancel that arrives while the read is blocked can close it
+        # and make the read raise at once. Without the token this is unchanged.
         try:
-            with self._opener.open(req, timeout=timeout or self.timeout) as resp:
+            if token is not None:
+                token.check()
+            resp = self._opener.open(req, timeout=timeout or self.timeout)
+            if token is not None:
+                token.bind(resp)
+            try:
                 raw = resp.read()
-                return json.loads(raw) if raw else None
+            finally:
+                if token is not None:
+                    token.unbind()
+                resp.close()
+            if token is not None:
+                token.check()
+            return json.loads(raw) if raw else None
+        except GenerationCancelled:
+            raise
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 raise ProviderAuthError(f"{self.name} -> {e.code}") from e
@@ -408,7 +426,12 @@ class Provider:
                 raise ProviderTooLarge(
                     f"{self.name} -> {e.code}: the request is too large for the model") from e
             raise ProviderRejected(f"{self.name} -> {e.code}") from e
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            # A closed response (the generation was stopped mid-read) surfaces
+            # as one of these; report it as a cancellation, not a provider
+            # failure, so the caller saves the partial text and stays usable.
+            if token is not None and token.cancelled:
+                raise GenerationCancelled(token.partial) from e
             raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
 
     @staticmethod
@@ -437,18 +460,23 @@ class Provider:
         return ProviderResponse(provider=self.name, model=self.model,
                                 data=parsed, attempts=attempts)
 
-    def complete_text(self, prompt: str, system: str = "") -> str:
+    def complete_text(self, prompt: str, system: str = "", *,
+                      token: Any = None) -> str:
         """Call the provider and return the raw text of its answer.
 
         Used by the chat surface, which needs prose, not a plan. The retry
         policy is identical: only a transient failure is retried, bounded.
+        *token*, when given, is a ``GenerationToken``: a cancel makes the call
+        raise :class:`GenerationCancelled` at once instead of finishing.
         """
-        return self._text_with_retry(prompt, system, prose=True)[0]
+        return self._text_with_retry(prompt, system, prose=True, token=token)[0]
 
     def _text_with_retry(self, prompt: str, system: str, *, prose: bool = False,
-                         timeout: float | None = None) -> tuple[str, int]:
+                         timeout: float | None = None, token: Any = None) -> tuple[str, int]:
         if not self.configured:
             raise ProviderAuthError(f"{self.name}: no API key configured")
+        if token is not None:
+            token.check()
         needed, room = self.room_for(prompt, system)
         if needed > room:
             # Not sent: the model cannot read it, and a provider's own refusal
@@ -461,7 +489,9 @@ class Provider:
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                body = self._post(prompt, system, prose=prose, timeout=timeout)
+                body = self._post(prompt, system, prose=prose, timeout=timeout, token=token)
+            except GenerationCancelled:
+                raise
             except ProviderUnavailable as e:
                 last = e
                 if attempts > self.max_retries:
@@ -471,6 +501,8 @@ class Provider:
             text = self._extract_text(body)
             if not text:
                 raise ProviderRejected(f"{self.name}: empty completion")
+            if token is not None:
+                token.note(text)
             return text, attempts
         raise last or ProviderUnavailable(f"{self.name}: exhausted retries")
 
@@ -729,14 +761,18 @@ class ProviderCascade:
             return CascadeResult(response=response, plan=plan, failovers=list(failures))
         raise AllProvidersFailed(failures, kinds)
 
-    def text(self, prompt: str, system: str = "") -> ProviderResponse:
+    def text(self, prompt: str, system: str = "", *,
+             token: Any = None) -> ProviderResponse:
         """Ask each configured provider for prose until one answers.
 
         The chat surface needs a natural-language answer, not a plan. Failover
         is identical to :meth:`plan`: only provider/transport problems move to
         the next provider. The answer is returned as a
         :class:`ProviderResponse` whose ``data`` is ``{"text": ...}``, so the
-        caller records the same provenance either way.
+        caller records the same provenance either way. *token* is a
+        ``GenerationToken``: a cancel ends the answer at once, and does not
+        fail over to another provider (the person asked to stop, not to try
+        again elsewhere).
         """
         failures: list[tuple[str, str]] = []
         kinds: list[str] = []
@@ -744,7 +780,9 @@ class ProviderCascade:
             if not provider.configured:
                 continue
             try:
-                text = provider.complete_text(prompt, system)
+                text = provider.complete_text(prompt, system, token=token)
+            except GenerationCancelled:
+                raise
             except ProviderError as e:
                 failures.append((provider.name, str(e)))
                 kinds.append(failure_kind(e))

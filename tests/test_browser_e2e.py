@@ -1980,3 +1980,86 @@ def test_the_form_does_not_send_the_visitor_round_in_circles(stack, chromium):
             assert watch.problems == []
     finally:
         ctx.close()
+
+
+# ----------------------------------------------- the ultimate-increment controls
+def test_the_composer_stops_a_generation_and_the_chat_stays_usable(stack, chromium):
+    """Stop generation: the send button becomes a stop button, the cancel
+    aborts the answer at once, and a new message can be sent immediately."""
+    ctx, page, watch = _open(chromium)
+    # A cancel can race the answer's own completion; a 409 then means nothing
+    # was left to stop, which is the honest answer and not a failure. The
+    # browser also logs the 409 as a console error.
+    watch.allow(r"HTTP 409 POST .*/cancel")
+    watch.allow(r"Failed to load resource.*409")
+    try:
+        _login(page, stack.base)
+        # A slow answer, so the stop button is on screen while it generates.
+        stack.llm.respond = lambda body: (time.sleep(4),
+                                          (200, {"choices": [{"message": {"content": "поздний ответ"}}]}))[1]
+        page.fill("#prompt", "Проанализируй весь backend")
+        page.keyboard.press("Enter")
+        # The send button is replaced by a stop button in the same place.
+        expect(page.locator("#stop")).to_be_visible()
+        expect(page.locator("#send")).to_be_hidden()
+        page.click("#stop")
+        # The answer is stopped and the partial text is shown with the mark.
+        page.wait_for_selector(".msg.assistant")
+        expect(page.locator("#send")).to_be_visible()
+        # A new message goes through at once.
+        stack.llm.respond = None
+        stack.answers("Новый ответ.")
+        _send(page, "Стоп. Проверь только авторизацию")
+        expect(page.locator(".msg.assistant .md").last).to_have_text("Новый ответ.")
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_pin_export_and_delete_a_chat_from_its_menu(stack, chromium):
+    """Pin, export and delete are real: the pinned chat is at the top, the
+    delete leaves the list and can be restored from the trash."""
+    stack.answers("Ответ.")
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _send(page, "Первый вопрос")
+        page.wait_for_selector(".msg.assistant .md")
+        page.click("#new-chat")
+        _send(page, "Второй вопрос")
+        page.wait_for_selector(".msg.assistant .md")
+        expect(page.locator(".sb-item")).to_have_count(2)
+
+        # Pin the older chat (the one that is not open); it moves to the top
+        # in its own pinned section, above the day groups.
+        older = page.locator(".sb-item", has_text="Первый вопрос")
+        older.hover()
+        older.locator("[data-action='chat-menu']").click()
+        page.click(".menu-item[data-action='pin-chat']")
+        expect(page.locator(".sb-group").first).to_have_text("Закреплённые")
+        expect(page.locator(".sb-item.is-pinned .sb-link")).to_contain_text("Первый вопрос")
+
+        # Export downloads a JSON document (the browser is offered a file).
+        with page.expect_download() as download_info:
+            pinned = page.locator(".sb-item.is-pinned")
+            pinned.hover()
+            pinned.locator("[data-action='chat-menu']").click()
+            page.click(".menu-item[data-action='export-chat']")
+        download = download_info.value
+        assert download.suggested_filename.endswith(".json")
+
+        # Delete the open chat: it leaves the list, the start screen returns.
+        other = page.locator(".sb-item:not(.is-pinned)").nth(0)
+        other.hover()
+        other.locator("[data-action='chat-menu']").click()
+        page.click(".menu-item[data-action='delete-chat']")
+        page.click("#confirm-ok")
+        expect(page.locator(".hero h1")).to_be_visible()
+        # The trash holds it, and restore brings it back.
+        page.click(".sb-trash")
+        page.wait_for_selector("[data-action='restore-chat']")
+        page.click("[data-action='restore-chat']")
+        expect(page.locator(".sb-item:not(.is-archived)")).to_have_count(2)
+        assert watch.problems == []
+    finally:
+        ctx.close()

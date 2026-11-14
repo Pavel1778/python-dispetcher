@@ -81,7 +81,6 @@
     waiting: ['ждёт повтора', 'warn'],
     pending: ['ожидает', 'idle'], dispatched: ['отправлена', 'run'],
     completed_verified: ['готово, проверено', 'ok'],
-    completed_no_changes: ['готово, без изменений', 'ok'],
     completed_unverified: ['готово, без проверки', 'warn'],
     partial: ['выполнено частично', 'warn'],
     active: ['активен', 'ok'], invalid: ['отклонён', 'bad'], revoked: ['отключён', 'idle']
@@ -89,6 +88,9 @@
   var TOOLS = { start_workflow: 'Запуск задачи OpenHands', start_run: 'Запуск автономного прогона' };
   // States that change on their own, so they are worth polling.
   var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1, waiting: 1 };
+  // A task of a finished run that did not verify, and so can be retried
+  // (``LabStore.retry_failed``). A task that verified is never in this set.
+  var FAILED_TASK_STATES = { completed_unverified: 1, partial: 1, failed: 1, blocked: 1 };
 
   function stateLabel(state) { return (STATES[state] || [state || 'неизвестно'])[0]; }
   function stateTone(state) { return (STATES[state] || ['', 'idle'])[1]; }
@@ -100,8 +102,7 @@
   var S = {
     csrf: '', user: '', status: null,
     projects: [], projectId: null, binding: null,
-    chats: [], chatQuery: '', showArchived: false, showTrash: false,
-    showArchivedProjects: false,
+    chats: [], chatQuery: '', showArchived: false, showTrash: false, trash: [],
     convId: null, conv: null, messages: [],
     mode: 'auto', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
@@ -462,16 +463,7 @@
   }
 
   function loadProjects() {
-    var query = S.showArchivedProjects ? '?archived=1&deleted=1' : '';
-    return api('/api/v1/projects' + query).then(function (data) {
-      S.projects = data.projects || [];
-      // A project that was deleted or archived since the last load must not
-      // stay selected: fall back to the first live one, or none.
-      if (S.projectId && !S.projects.some(function (p) { return p.id === S.projectId; })) {
-        S.projectId = S.projects.length ? S.projects[0].id : null;
-        store.set('project', S.projectId);
-      }
-    });
+    return api('/api/v1/projects').then(function (data) { S.projects = data.projects || []; });
   }
 
   function selectProject(projectId) {
@@ -547,15 +539,21 @@
 
   /* ----------------------------------------------------------------- chats */
   function loadChats() {
-    if (!S.projectId) { S.chats = []; return Promise.resolve(); }
-    // Archived and trashed conversations come in the same answer, so their
-    // folds show a real count; ``renderChats`` only draws the trashed ones
-    // when the trash is unfolded.
-    var query = ['archived=1', 'deleted=1'];
+    if (!S.projectId) { S.chats = []; S.trash = []; return Promise.resolve(); }
+    // Archived conversations come in the same answer. They stay folded under
+    // one line, and that line exists only when there is something behind it.
+    // The trash is a separate, small read, and only when it has been opened.
+    var query = ['archived=1'];
     if (S.chatQuery) query.push('q=' + enc(S.chatQuery));
-    return api(projectUrl('/conversations?' + query.join('&')))
+    var reads = [api(projectUrl('/conversations?' + query.join('&')))
       .then(function (data) { S.chats = data.conversations || []; },
-            function () { S.chats = []; });
+            function () { S.chats = []; })];
+    if (S.showTrash) {
+      reads.push(api(projectUrl('/conversations?deleted=1&archived=1'))
+        .then(function (data) { S.trash = data.conversations || []; },
+              function () { S.trash = []; }));
+    }
+    return Promise.all(reads);
   }
 
   function chatItemHtml(chat) {
@@ -563,21 +561,26 @@
     var current = chat.id === S.convId;
     var stateDot = chat.state === 'thinking' ? '<span class="sb-state is-thinking" title="Ассистент отвечает"></span>'
       : chat.state === 'error' ? '<span class="sb-state is-error" title="Последний ответ не получен"></span>' : '';
-    var pinMark = chat.pinned ? '<span class="sb-pin" title="Закреплён">' + icon('pin', 'icon-xs') + '</span>' : '';
-    return '<div class="sb-item' + (current ? ' is-active' : '') + (chat.archived ? ' is-archived' : '') + '">' +
+    var pin = chat.pinned ? icon('arrow-up', 'icon-xs') : '';
+    return '<div class="sb-item' + (current ? ' is-active' : '') + (chat.archived ? ' is-archived' : '') + (chat.pinned ? ' is-pinned' : '') + '">' +
       '<a class="sb-link" href="#/p/' + esc(S.projectId) + '/c/' + esc(chat.id) + '" title="' + esc(title) + '"' +
-      (current ? ' aria-current="page"' : '') + '>' + stateDot + pinMark + '<span>' + esc(title) + '</span></a>' +
+      (current ? ' aria-current="page"' : '') + '>' + stateDot + pin + '<span>' + esc(title) + '</span></a>' +
       '<button class="icon-btn sm" type="button" data-action="chat-menu" data-id="' + esc(chat.id) + '" aria-haspopup="menu" aria-expanded="false" aria-label="Действия с чатом «' + esc(title) + '»">' + icon('more', 'icon-sm') + '</button>' +
       '</div>';
   }
 
   function renderChats() {
-    var deleted = S.chats.filter(function (chat) { return chat.deleted_at; });
-    var live = S.chats.filter(function (chat) { return !chat.deleted_at; });
-    var active = live.filter(function (chat) { return !chat.archived; });
-    var archived = live.filter(function (chat) { return chat.archived; });
+    var active = S.chats.filter(function (chat) { return !chat.archived; });
+    var archived = S.chats.filter(function (chat) { return chat.archived; });
+    var pinned = active.filter(function (chat) { return chat.pinned; });
+    var rest = active.filter(function (chat) { return !chat.pinned; });
     var html = '', group = '';
-    active.forEach(function (chat) {
+    // Pinned conversations are their own section, at the top, in pin order
+    // (newest pin first) - the order the person controls.
+    if (pinned.length) {
+      html += '<div class="sb-group">Закреплённые</div>' + pinned.map(chatItemHtml).join('');
+    }
+    rest.forEach(function (chat) {
       var label = dayGroup(chat.updated_at);
       if (label !== group) { group = label; html += '<div class="sb-group">' + esc(label) + '</div>'; }
       html += chatItemHtml(chat);
@@ -592,10 +595,18 @@
         icon('archive', 'icon-sm') + '<span>Архив · ' + archived.length + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
       if (S.showArchived) html += archived.map(chatItemHtml).join('');
     }
-    if (deleted.length) {
-      html += '<button class="sb-more" type="button" data-action="toggle-trash" aria-expanded="' + S.showTrash + '">' +
-        icon('x', 'icon-sm') + '<span>Корзина · ' + deleted.length + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
-      if (S.showTrash) html += deleted.map(chatItemHtml).join('');
+    html += '<button class="sb-trash" type="button" data-action="toggle-trash" aria-expanded="' + S.showTrash + '">' +
+      icon('x', 'icon-sm') + '<span>Корзина' + (S.trash.length ? ' · ' + S.trash.length : '') + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
+    if (S.showTrash) {
+      html += S.trash.length
+        ? S.trash.map(function (chat) {
+            var title = chat.title || 'Новый чат';
+            return '<div class="sb-item is-archived"><span class="sb-link" title="' + esc(title) + '">' +
+              '<span>' + esc(title) + '</span></span>' +
+              '<button class="icon-btn sm" type="button" data-action="restore-chat" data-id="' + esc(chat.id) + '" title="Восстановить">' +
+              icon('refresh', 'icon-sm') + '</button></div>';
+          }).join('')
+        : '<p class="sb-empty">Корзина пуста.</p>';
     }
     $('#chat-list').innerHTML = html;
   }
@@ -857,10 +868,39 @@
     syncSend();
   }
 
+  // Modes whose turn asks a model for prose and so opens a stoppable
+  // generation (``nexus_generation``). ``code``/``autonomous`` dispatch work
+  // and ``manual`` proposes a plan through its own path: none of them is a
+  // generation, so the stop button stays hidden for them.
+  var TEXT_MODES = { ask: 1, analysis: 1, plan: 1, auto: 1 };
+
   function syncSend() {
     var button = $('#send');
+    // While a text answer is being generated the send button becomes a stop
+    // button, in the same place, so the person can stop with one tap. It is
+    // shown only while a generation is running that the server can stop.
+    var stop = $('#stop');
+    var generating = !!(S.sending && S.pending && TEXT_MODES[S.pending.mode]);
+    button.hidden = generating;
+    stop.hidden = !generating;
     button.disabled = S.sending || routing > 0 || !$('#prompt').value.trim();
     button.classList.toggle('is-busy', S.sending);
+  }
+
+  // Stop the answer in flight: send the cancel for the running generation and
+  // let the in-flight request finish (it returns with the partial text). The
+  // composer is left usable at once; a new message may be typed while the
+  // cancel travels.
+  function stopGeneration() {
+    if (!S.convId || !S.sending) return;
+    var url = projectUrl('/conversations/' + enc(S.convId) + '/cancel');
+    api(url, { method: 'POST', body: {} }).then(function () {
+      toast('Генерация остановлена.');
+    }, function (error) {
+      // 409 means nothing was running (it may have just finished); say so and
+      // let the normal flow settle the message list.
+      if (error.status !== 409) toast(explain(error.message).text, 'bad');
+    });
   }
 
   function growPrompt() {
@@ -1358,6 +1398,15 @@
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
     if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
     if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    // A finished run's own actions: retry only the tasks that failed, take it
+    // out of the lists, or remove it from history. None of them touches the
+    // repository; the confirmation says so for the one that is irreversible.
+    if (!live) {
+      var failed = tasks.filter(function (task) { return FAILED_TASK_STATES[task.state]; }).length;
+      if (failed) actions += '<button class="btn btn-sm" type="button" data-action="retry-failed" data-id="' + esc(entry.id) + '">' + icon('refresh', 'icon-sm') + 'Повторить неудачные (' + failed + ')</button>';
+      actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="hide" data-id="' + esc(entry.id) + '">' + icon('archive', 'icon-sm') + 'Скрыть</button>';
+      actions += '<button class="btn btn-sm btn-danger" type="button" data-action="delete-run" data-id="' + esc(entry.id) + '">' + icon('x', 'icon-sm') + 'Удалить из истории</button>';
+    }
     // The report is the run's own record: the same text delivered to the chat.
     // It is copied in full, never the truncated view.
     var reportSection = report && report.body
@@ -1943,9 +1992,8 @@
   var settingsTab = null;
 
   function openSettings(tab) {
-    settingsTab = tab === 'project' ? 'project' : (tab === 'diagnostics' ? 'diagnostics' : 'connections');
-    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект'],
-                ['diagnostics', 'zap', 'Диагностика']];
+    settingsTab = tab === 'project' ? 'project' : 'connections';
+    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект']];
     openDialog({
       title: 'Настройки',
       className: 'is-wide is-settings',
@@ -1981,9 +2029,6 @@
              return { context: parts[0], executors: parts[1], repositories: parts[2] };
            })
          : Promise.resolve(null))
-      : tab === 'diagnostics'
-      ? api('/api/observability').then(function (data) { return data; },
-                                       function (error) { return { error: error.message }; })
       : Promise.all([
           loadGithubAccounts().catch(function () { S.accounts.github = []; }),
           loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
@@ -1995,61 +2040,10 @@
       if (tab === 'project') {
         S.projectSettings = result || null;
         pane.innerHTML = projectSettingsHtml(result);
-      } else if (tab === 'diagnostics') {
-        pane.innerHTML = diagnosticsHtml(result);
       } else {
         pane.innerHTML = connectionsHtml();
       }
     });
-  }
-
-  // What the execution path is doing right now, and how slow each stage is.
-  // Everything comes from GET /api/observability; the panel decides nothing.
-  function diagnosticsHtml(data) {
-    if (!data || data.error) {
-      return '<div class="section"><h3 class="section-title">' + icon('alert', 'icon-sm') +
-        'Диагностика недоступна</h3><p class="section-note">' + esc((data && data.error) || 'нет ответа') +
-        '</p><div class="row"><button class="btn" type="button" data-action="refresh-settings">Обновить</button></div></div>';
-    }
-    var q = data.queue || {};
-    var workers = data.workers || {};
-    var latency = data.latency || { stages: {} };
-    function stat(label, value, tone) {
-      return '<div class="stat"><span class="stat-label">' + esc(label) + '</span>' +
-        '<span class="stat-value' + (tone ? ' is-' + tone : '') + '">' + esc(String(value)) + '</span></div>';
-    }
-    var workerLine = (workers.count ? workers.count + ' активно' : 'нет активных');
-    var rows = Object.keys(latency.stages || {}).map(function (stage) {
-      var s = latency.stages[stage];
-      return '<tr><td>' + esc(stage) + '</td><td>' + s.count + '</td><td>' + s.p50_ms +
-        ' мс</td><td>' + s.p95_ms + ' мс</td><td>' + s.max_ms + ' мс</td><td>' + s.errors + '</td></tr>';
-    }).join('');
-    var stuck = (data.stuck_tasks || []).map(function (t) {
-      if (t.error) return '<li>' + esc(t.error) + '</li>';
-      return '<li><code>' + esc(t.task_key) + '</code> · прогон ' + esc(stateLabel(t.run_state)) +
-        ' · ожидает ' + Math.round(t.age_seconds / 60) + ' мин · попытка ' + t.attempt + '/' + t.max_attempts +
-        (t.reason ? ' · ' + esc(clip(t.reason, 160)) : '') + '</li>';
-    }).join('');
-    return '<div class="section"><h3 class="section-title">' + icon('zap', 'icon-sm') +
-      'Состояние системы</h3><div class="stats">' +
-      stat('Воркеры', workerLine, workers.count ? 'ok' : 'warn') +
-      stat('Активных прогонов', q.active_runs == null ? '—' : q.active_runs) +
-      stat('В очереди', q.pending == null ? '—' : q.pending, q.pending ? 'warn' : 'ok') +
-      stat('Выполняется', q.running == null ? '—' : q.running) +
-      stat('Сбойных', q.failed == null ? '—' : q.failed, q.failed ? 'bad' : 'ok') +
-      stat('OpenHands', data.openhands_reachable ? 'доступен' : 'недоступен',
-           data.openhands_reachable ? 'ok' : 'bad') +
-      '</div>' +
-      '<p class="section-note">Зависших задач (готовы к запуску, но не запущены дольше 5 минут): ' +
-      (data.stuck_tasks || []).length + '.</p>' +
-      (stuck ? '<ul class="events">' + stuck + '</ul>' : '') +
-      '</div>' +
-      '<div class="section"><h3 class="section-title">' + icon('clock', 'icon-sm') + 'Задержки по этапам</h3>' +
-      (rows
-        ? '<table class="latency"><thead><tr><th>Этап</th><th>N</th><th>p50</th><th>p95</th><th>макс</th><th>ошибок</th></tr></thead><tbody>' + rows + '</tbody></table>'
-        : '<p class="section-note">Измерений пока нет. Задержки собираются при выполнении задач (включите NEXUS_TRACE=1, чтобы видеть их здесь).</p>') +
-      '<div class="row"><button class="btn" type="button" data-action="refresh-settings">Обновить</button></div>' +
-      '</div>';
   }
 
   function loadOpenhandsAccounts() {
@@ -2289,7 +2283,17 @@
         : '<p class="section-note">Контекст ещё не собран.</p>') +
       '<button class="btn" type="button" data-action="refresh-context"' + (repoName() ? '' : ' disabled') + '>' + icon('refresh', 'icon-sm') +
       (context ? 'Изучить заново' : 'Изучить репозиторий') + '</button></div>' +
-      projectExecutorsHtml(data.executors);
+      projectExecutorsHtml(data.executors) +
+      // The project's own lifecycle. Archive is reversible and touches nothing;
+      // delete (trash) is refused while a run is active and is reversible too.
+      '<div class="section"><h3 class="section-title">' + icon('archive', 'icon-sm') + 'Архив и удаление</h3>' +
+      '<p class="section-note">Архив убирает проект из списка, ничего не меняя. Удаление переносит проект в корзину: ' +
+      'новые диалоги и цели не создаются, пока проект не восстановлен. Данные не удаляются безвозвратно.</p>' +
+      '<div class="row">' +
+      '<button class="btn" type="button" data-action="project-archive" data-archived="1">' + icon('archive', 'icon-sm') + 'В архив</button>' +
+      '<button class="btn" type="button" data-action="project-archive" data-archived="0">Вернуть из архива</button>' +
+      '<button class="btn btn-danger" type="button" data-action="project-delete">В корзину</button>' +
+      '</div></div>';
   }
 
   // What the last access check of a repository found, in a line.
@@ -2386,43 +2390,51 @@
   function projectMenu(anchor) {
     var html = '<div class="menu-title">Проекты</div>' + S.projects.map(function (item) {
       var current = item.id === S.projectId;
-      return '<div class="menu-row">' +
-        '<button class="menu-item" type="button" role="menuitemradio" aria-checked="' + current + '" data-action="pick-project" data-id="' + esc(item.id) + '">' +
+      return '<button class="menu-item" type="button" role="menuitemradio" aria-checked="' + current + '" data-action="pick-project" data-id="' + esc(item.id) + '">' +
         icon('layers', 'icon-sm') + '<span class="menu-item-text"><span>' + esc(item.name) + '</span>' +
         (current && repoName() ? '<small>' + esc(repoName()) + ' · ' + esc(branchName()) + '</small>' : '') + '</span>' +
-        icon('check', 'icon-sm check') + '</button>' +
-        '<button class="icon-btn sm" type="button" data-action="project-actions" data-id="' + esc(item.id) + '" aria-haspopup="menu" aria-expanded="false" aria-label="Действия с проектом «' + esc(item.name) + '»">' + icon('more', 'icon-sm') + '</button>' +
-        '</div>';
+        icon('check', 'icon-sm check') + '</button>';
     }).join('');
     if (!S.projects.length) html += '<p class="sb-empty">Проектов пока нет.</p>';
     html += '<div class="menu-sep"></div>' +
       '<button class="menu-item" type="button" role="menuitem" data-action="new-project">' + icon('plus', 'icon-sm') + '<span>Новый проект</span></button>' +
       (S.projectId ? '<button class="menu-item" type="button" role="menuitem" data-action="open-settings" data-tab="project">' + icon('settings', 'icon-sm') + '<span>Настройки проекта</span></button>' : '') +
-      (S.showArchivedProjects ? '' : '<button class="menu-item" type="button" role="menuitem" data-action="toggle-archived-projects">' + icon('archive', 'icon-sm') + '<span>Показать архив и корзину</span></button>') +
-      (S.showArchivedProjects ? '<button class="menu-item" type="button" role="menuitem" data-action="toggle-archived-projects">' + icon('layers', 'icon-sm') + '<span>Скрыть архив и корзину</span></button>' : '');
+      // Archived and deleted projects drop out of the list above; this opens a
+      // dialog that lists them and offers a restore, so a project put aside is
+      // never lost.
+      '<button class="menu-item" type="button" role="menuitem" data-action="project-lifecycle">' + icon('archive', 'icon-sm') + '<span>Архив и корзина</span></button>';
     openMenu(anchor, html);
   }
 
-  function projectActionsMenu(anchor) {
-    var id = anchor.getAttribute('data-id');
-    var item = S.projects.filter(function (p) { return p.id === id; })[0];
-    if (!item) return;
-    var isDeleted = !!item.deleted_at;
-    var isArchived = !!item.archived_at;
-    var html = '<div class="menu-title">' + esc(item.name) + '</div>' +
-      '<button class="menu-item" type="button" role="menuitem" data-action="pick-project" data-id="' + esc(id) + '">' + icon('external', 'icon-sm') + '<span>Открыть</span></button>';
-    if (isDeleted) {
-      html += '<button class="menu-item" type="button" role="menuitem" data-action="project-restore" data-id="' + esc(id) + '">' + icon('refresh', 'icon-sm') + '<span>Восстановить</span></button>' +
-        '<button class="menu-item is-danger" type="button" role="menuitem" data-action="project-purge" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить навсегда</span></button>';
-    } else {
-      html += '<button class="menu-item" type="button" role="menuitem" data-action="project-rename" data-id="' + esc(id) + '">' + icon('pencil', 'icon-sm') + '<span>Переименовать</span></button>' +
-        '<button class="menu-item" type="button" role="menuitem" data-action="open-settings" data-tab="project">' + icon('settings', 'icon-sm') + '<span>Настройки</span></button>' +
-        (isArchived
-          ? '<button class="menu-item" type="button" role="menuitem" data-action="project-unarchive" data-id="' + esc(id) + '">' + icon('refresh', 'icon-sm') + '<span>Вернуть из архива</span></button>'
-          : '<button class="menu-item" type="button" role="menuitem" data-action="project-archive" data-id="' + esc(id) + '">' + icon('archive', 'icon-sm') + '<span>В архив</span></button>') +
-        '<button class="menu-item is-danger" type="button" role="menuitem" data-action="project-delete" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить</span></button>';
+  // The archive/trash view for projects. The server is the one that decides
+  // what is archived or deleted; this only asks and shows it.
+  function openProjectLifecycle() {
+    closeMenu();
+    function load() {
+      return Promise.all([
+        api('/api/v1/projects?archived=1'),
+        api('/api/v1/projects?deleted=1')]).then(function (out) {
+        return { archived: out[0].projects || [], deleted: out[1].projects || [] };
+      });
     }
-    openMenu(anchor, html, { alignRight: true });
+    function render(data) {
+      function rows(items, kind, label) {
+        if (!items.length) return '<p class="sb-empty">' + esc(label) + ': пусто.</p>';
+        return '<div class="lifecycle-group"><p class="work-section-title">' + esc(label) + '</p>' +
+          items.map(function (p) {
+            return '<div class="lifecycle-row"><span>' + esc(p.name) + '</span>' +
+              '<button class="btn btn-sm" type="button" data-action="project-restore" data-id="' + esc(p.id) + '" data-kind="' + esc(kind) + '">Восстановить</button></div>';
+          }).join('') + '</div>';
+      }
+      return rows(data.archived, 'archived', 'Архив') + rows(data.deleted, 'deleted', 'Корзина');
+    }
+    load().then(function (data) {
+      openDialog({
+        title: 'Архив и корзина проектов',
+        body: render(data),
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>'
+      });
+    }, function (error) { toast(explain(error.message).text, 'bad'); });
   }
 
   function modeMenu(anchor) {
@@ -2452,18 +2464,17 @@
     var id = anchor.getAttribute('data-id');
     var chat = findChat(id);
     if (!chat) return;
-    var items = '<button class="menu-item" type="button" role="menuitem" data-action="rename-chat" data-id="' + esc(id) + '">' + icon('pencil', 'icon-sm') + '<span>Переименовать</span></button>' +
-      '<button class="menu-item" type="button" role="menuitem" data-action="pin-chat" data-id="' + esc(id) + '" data-pinned="' + (chat.pinned ? '0' : '1') + '">' +
-      icon('pin', 'icon-sm') + '<span>' + (chat.pinned ? 'Открепить' : 'Закрепить') + '</span></button>';
-    if (chat.deleted_at) {
-      items += '<button class="menu-item" type="button" role="menuitem" data-action="restore-chat" data-id="' + esc(id) + '">' + icon('refresh', 'icon-sm') + '<span>Восстановить</span></button>' +
-        '<button class="menu-item is-danger" type="button" role="menuitem" data-action="purge-chat" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить навсегда</span></button>';
-    } else {
-      items += (chat.archived
+    var items =
+      '<button class="menu-item" type="button" role="menuitem" data-action="rename-chat" data-id="' + esc(id) + '">' + icon('pencil', 'icon-sm') + '<span>Переименовать</span></button>' +
+      (chat.pinned
+        ? '<button class="menu-item" type="button" role="menuitem" data-action="pin-chat" data-id="' + esc(id) + '" data-pinned="0">' + icon('x', 'icon-sm') + '<span>Открепить</span></button>'
+        : '<button class="menu-item" type="button" role="menuitem" data-action="pin-chat" data-id="' + esc(id) + '" data-pinned="1">' + icon('arrow-up', 'icon-sm') + '<span>Закрепить</span></button>') +
+      '<button class="menu-item" type="button" role="menuitem" data-action="export-chat" data-id="' + esc(id) + '">' + icon('external', 'icon-sm') + '<span>Экспорт</span></button>' +
+      (chat.archived
         ? '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="0">' + icon('refresh', 'icon-sm') + '<span>Вернуть из архива</span></button>'
         : '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="1">' + icon('archive', 'icon-sm') + '<span>В архив</span></button>') +
-        '<button class="menu-item is-danger" type="button" role="menuitem" data-action="delete-chat" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить</span></button>';
-    }
+      '<div class="menu-sep"></div>' +
+      '<button class="menu-item is-danger" type="button" role="menuitem" data-action="delete-chat" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить</span></button>';
     openMenu(anchor, items, { alignRight: true });
   }
 
@@ -2571,112 +2582,6 @@
     });
   }
 
-  /* --------------------------------------------- project & chat lifecycle */
-  // Every lifecycle action goes through the server; the interface never decides
-  // locally that something is deleted. The list is reloaded from the server
-  // after each action, so a stale cache can never leave a deleted item on screen.
-  function projectUrlFor(id) { return '/api/v1/projects/' + enc(id); }
-
-  function projectAction(id, action, body, done) {
-    return api(projectUrlFor(id) + '/' + action, { method: 'POST', body: body || {} })
-      .then(function () {
-        return loadProjects().then(function () {
-          toast(done);
-          return renderProjectsAndChats();
-        });
-      }, function (error) { toast(error.message, 'bad'); });
-  }
-
-  function renderProjectsAndChats() {
-    renderProject();
-    // If the open chat belongs to a project that is gone from the list, there
-    // is nothing to show: go to the start screen.
-    var known = S.projects.some(function (p) { return p.id === S.projectId; });
-    if (!known) return go(null, null).then(function () { return null; });
-    return loadChats().then(function () {
-      if (S.convId && !S.chats.some(function (c) { return c.id === S.convId; })) {
-        return go(S.projectId, null);
-      }
-      renderChats();
-      return null;
-    });
-  }
-
-  function confirmProjectDelete(id, stats) {
-    var item = S.projects.filter(function (p) { return p.id === id; })[0] || { name: '' };
-    var lines = ['Проект «' + item.name + '» будет перемещён в корзину. Его можно восстановить.'];
-    lines.push('Внутри: ' + stats.conversations + ' диалог(ов), ' + stats.runs + ' прогон(ов), '
-      + stats.tasks + ' задач(ей), ' + stats.goals + ' цель(ей).');
-    if (stats.repositories && stats.repositories.length) {
-      lines.push('Связанные репозитории (' + stats.repositories.map(function (r) { return r.full_name; }).join(', ')
-        + ') на GitHub не затрагиваются.');
-    }
-    if (stats.has_active_runs) {
-      lines.push('Внимание: есть активные прогоны — сначала остановите их.');
-    }
-    confirmDialog('Удалить проект?', lines.join(' '), 'Удалить', function () {
-      projectAction(id, 'delete', {}, 'Проект перемещён в корзину.');
-    }, true);
-  }
-
-  function confirmProjectPurge(id, stats) {
-    var item = S.projects.filter(function (p) { return p.id === id; })[0] || { name: '' };
-    confirmDialog('Удалить навсегда?',
-      'Проект «' + item.name + '» и все его диалоги, прогоны и задачи будут удалены безвозвратно. '
-      + 'Внешние репозитории на GitHub не удаляются. Отменить это нельзя.',
-      'Удалить навсегда', function () {
-        projectAction(id, 'purge', { confirm: true }, 'Проект удалён.');
-      }, true);
-  }
-
-  function confirmChatDelete(id) {
-    var chat = findChat(id);
-    if (!chat) return;
-    return api(projectUrl('/conversations/' + enc(id) + '/stats'))
-      .then(function (stats) {
-        var lines = ['Чат «' + (chat.title || 'Новый чат') + '» будет перемещён в корзину. Его можно восстановить.'];
-        lines.push('Сообщений: ' + stats.messages + '.');
-        if (stats.has_active_run) lines.push('Внимание: у чата активный прогон — сначала остановите его.');
-        confirmDialog('Удалить чат?', lines.join(' '), 'Удалить', function () {
-          api(projectUrl('/conversations/' + enc(id)), { method: 'DELETE' })
-            .then(function () {
-              toast('Чат перемещён в корзину.');
-              return loadChats().then(function () {
-                if (id === S.convId) return go(S.projectId, null);
-                renderChats();
-                return null;
-              });
-            }, function (error) { toast(error.message, 'bad'); });
-        }, true);
-        return null;
-      }, function (error) { toast(error.message, 'bad'); return null; });
-  }
-
-  function chatLifecycle(id, action, done) {
-    return api(projectUrl('/conversations/' + enc(id) + '/' + action), { method: 'POST', body: {} })
-      .then(function () { return loadChats().then(function () { toast(done); renderChats(); return null; }); },
-            function (error) { toast(error.message, 'bad'); return null; });
-  }
-
-  function confirmChatPurge(id) {
-    var chat = findChat(id);
-    if (!chat) return;
-    confirmDialog('Удалить навсегда?',
-      'Чат «' + (chat.title || 'Новый чат') + '» и все его сообщения будут удалены безвозвратно. '
-      + 'Прогоны, которые из него запускались, сохранятся. Отменить это нельзя.',
-      'Удалить навсегда', function () {
-        api(projectUrl('/conversations/' + enc(id) + '/purge'), { method: 'POST', body: { confirm: true } })
-          .then(function () {
-            toast('Чат удалён.');
-            return loadChats().then(function () {
-              if (id === S.convId) return go(S.projectId, null);
-              renderChats();
-              return null;
-            });
-          }, function (error) { toast(error.message, 'bad'); });
-      }, true);
-  }
-
   /* --------------------------------------------------------------- actions */
   // What a copy button does with its text: copy it and say so, or - when the
   // browser lets nothing be copied for it - put the whole text in front of the
@@ -2697,6 +2602,21 @@
     });
   }
 
+  // Offer a JSON document as a download. The data is built locally from a
+  // server answer; no script or foreign origin is involved.
+  function downloadJson(filename, data) {
+    var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    toast('Экспорт сохранён.');
+  }
+
   var ACTIONS = {
     'toggle-sidebar': function () { setSidebar(!sidebarOpen(), true); },
     'close-overlays': function () {
@@ -2715,75 +2635,45 @@
       else $('#prompt').focus();
     },
     'project-menu': projectMenu,
-    'project-actions': function (el) { projectActionsMenu(el); },
-    'toggle-archived-projects': function () {
-      closeMenu();
-      S.showArchivedProjects = !S.showArchivedProjects;
-      loadProjects().then(renderProject);
-    },
-    'project-rename': function (el) {
-      closeMenu();
-      var id = el.getAttribute('data-id');
-      var item = S.projects.filter(function (p) { return p.id === id; })[0] || {};
-      formDialog({
-        title: 'Название проекта', ok: 'Сохранить', max: 120, value: item.name || '',
-        submit: function (name) {
-          return api(projectUrlFor(id), { method: 'PATCH', body: { name: name } })
-            .then(function () {
-              closeDialog();
-              return loadProjects().then(renderProject);
-            }, function (error) { throw error; });
-        }
-      });
-    },
-    'project-archive': function (el) {
-      closeMenu();
-      projectAction(el.getAttribute('data-id'), 'archive', {}, 'Проект в архиве.');
-    },
-    'project-unarchive': function (el) {
-      closeMenu();
-      projectAction(el.getAttribute('data-id'), 'unarchive', {}, 'Проект возвращён из архива.');
-    },
-    'project-delete': function (el) {
-      closeMenu();
-      var id = el.getAttribute('data-id');
-      api(projectUrlFor(id) + '/stats').then(function (stats) {
-        confirmProjectDelete(id, stats);
-      }, function (error) { toast(error.message, 'bad'); });
-    },
-    'project-restore': function (el) {
-      closeMenu();
-      projectAction(el.getAttribute('data-id'), 'restore', {}, 'Проект восстановлен.');
-    },
-    'project-purge': function (el) {
-      closeMenu();
-      var id = el.getAttribute('data-id');
-      api(projectUrlFor(id) + '/stats').then(function (stats) {
-        confirmProjectPurge(id, stats);
-      }, function (error) { toast(error.message, 'bad'); });
-    },
     'mode-menu': modeMenu,
     'user-menu': userMenu,
     'chat-menu': chatMenu,
-    'toggle-trash': function () { S.showTrash = !S.showTrash; renderChats(); },
-    'pin-chat': function (el) {
-      closeMenu();
-      var id = el.getAttribute('data-id'), pinned = el.getAttribute('data-pinned') === '1';
-      api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { pinned: pinned } })
-        .then(function () {
-          toast(pinned ? 'Чат закреплён.' : 'Чат откреплён.');
-          return loadChats().then(renderChats);
-        }, function (error) { toast(error.message, 'bad'); });
-    },
-    'delete-chat': function (el) { closeMenu(); confirmChatDelete(el.getAttribute('data-id')); },
-    'restore-chat': function (el) {
-      closeMenu();
-      chatLifecycle(el.getAttribute('data-id'), 'restore', 'Чат восстановлен.');
-    },
-    'purge-chat': function (el) { closeMenu(); confirmChatPurge(el.getAttribute('data-id')); },
     'pick-project': function (el) { closeMenu(); go(el.getAttribute('data-id'), null); },
     'pick-mode': function (el) { closeMenu(); setMode(el.getAttribute('data-mode')); $('#prompt').focus(); },
     'new-project': function () { closeMenu(); newProjectDialog(); },
+    'project-lifecycle': function () { openProjectLifecycle(); },
+    'project-archive': function (el) {
+      var archived = el.getAttribute('data-archived') === '1';
+      api(projectUrl(''), { method: 'PATCH', body: { archived: archived } }).then(function () {
+        toast(archived ? 'Проект в архиве.' : 'Проект возвращён из архива.');
+        return loadProjects().then(function () { closeDialog(); renderProject(); });
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'project-delete': function () {
+      confirmDialog('Удалить проект в корзину?',
+        'Проект исчезнет из списка, и в нём нельзя будет создавать диалоги и цели, пока вы его не восстановите. ' +
+        'Данные не удаляются безвозвратно: проект и вся его история остаются и восстанавливаются из «Архив и корзина».',
+        'В корзину', function () {
+          api(projectUrl(''), { method: 'PATCH', body: { deleted: true } }).then(function () {
+            toast('Проект в корзине. Восстановить можно из «Архив и корзина».');
+            return loadProjects().then(function () {
+              closeDialog();
+              go(S.projects[0] ? S.projects[0].id : null, null);
+            });
+          }, function (error) { toast(explain(error.message).text, 'bad'); });
+        }, true);
+    },
+    'project-restore': function (el) {
+      var id = el.getAttribute('data-id'), kind = el.getAttribute('data-kind');
+      var body = kind === 'deleted' ? { deleted: false } : { archived: false };
+      api('/api/v1/projects/' + enc(id), { method: 'PATCH', body: body }).then(function () {
+        toast('Проект восстановлен.');
+        return loadProjects().then(function () {
+          renderProject();
+          openProjectLifecycle();
+        });
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'open-settings': function (el) {
       var tab = el.getAttribute('data-tab');
       closeMenu();
@@ -2791,7 +2681,6 @@
       else if (tab) { settingsTab = tab; refreshSettings(); }
     },
     'settings-tab': function (el) { settingsTab = el.getAttribute('data-tab'); refreshSettings(); },
-    'refresh-settings': function () { refreshSettings(); },
     'open-repo': function (el) {
       closeMenu();
       if (repoState) return;
@@ -2811,6 +2700,19 @@
       api('/logout', { method: 'POST' }).then(leave, leave);
     },
     'toggle-archived': function () { S.showArchived = !S.showArchived; renderChats(); },
+    'toggle-trash': function () {
+      S.showTrash = !S.showTrash;
+      // The trash is read when it is first opened (and whenever it is opened).
+      loadChats().then(renderChats);
+    },
+    'restore-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { deleted: false } })
+        .then(function () {
+          toast('Чат восстановлен.');
+          return loadChats().then(renderChats);
+        }, function (error) { toast(error.message, 'bad'); });
+    },
     'rename-chat': function (el) { closeMenu(); renameChat(el.getAttribute('data-id') || S.convId); },
     'archive-chat': function (el) {
       var id = el.getAttribute('data-id'), archived = el.getAttribute('data-archived') === '1';
@@ -2826,6 +2728,44 @@
         });
       }, function (error) { toast(error.message, 'bad'); });
     },
+    'pin-chat': function (el) {
+      var id = el.getAttribute('data-id'), pinned = el.getAttribute('data-pinned') === '1';
+      closeMenu();
+      api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { pinned: pinned } })
+        .then(function () {
+          toast(pinned ? 'Чат закреплён.' : 'Чат откреплён.');
+          return loadChats().then(renderChats);
+        }, function (error) { toast(error.message, 'bad'); });
+    },
+    'export-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      closeMenu();
+      // The export is a self-contained JSON document from the server; it is
+      // offered as a download so the whole transcript can be kept.
+      api(projectUrl('/conversations/' + enc(id) + '/export')).then(function (data) {
+        var title = (data.conversation && data.conversation.title) || 'conversation';
+        downloadJson(title.replace(/[^\w\u0400-\u04ff.-]+/g, '_') + '.json', data);
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'delete-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      closeMenu();
+      confirmDialog('Удалить чат?',
+        'Чат уйдёт из списка; его можно восстановить в течение срока хранения. ' +
+        'История сообщений сохранится. Проект и репозиторий не затрагиваются.',
+        'Удалить', function () {
+          api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { deleted: true } })
+            .then(function () {
+              toast('Чат удалён. Восстановить можно из корзины.');
+              return loadChats().then(function () {
+                if (id === S.convId) return go(S.projectId, null);
+                renderChats();
+                return null;
+              });
+            }, function (error) { toast(error.message, 'bad'); });
+        }, true);
+    },
+    'stop-generation': function () { stopGeneration(); },
     'start': function (el) {
       var start = ($('#home-extras').starts || [])[Number(el.getAttribute('data-index'))];
       if (!start) return;
@@ -2907,9 +2847,30 @@
     'retry-task': function (el) {
       workAction(el, api('/api/tasks/' + enc(el.getAttribute('data-id')) + '/retry', { method: 'POST', body: {} }), 'Задача снова в очереди.');
     },
+    'retry-failed': function (el) {
+      var id = el.getAttribute('data-id');
+      workAction(el, api(projectUrl('/runs/' + enc(id) + '/retry-failed'),
+                         { method: 'POST', body: {} }),
+                 'Неудачные задачи снова в работе.');
+    },
+    'delete-run': function (el) {
+      var id = el.getAttribute('data-id');
+      confirmDialog('Удалить прогон из истории?',
+        'Уйдёт только запись об этом прогоне. Коммиты в репозитории, цель, ' +
+        'переписка чата и доказательства проверки останутся. Действие необратимо.',
+        'Удалить из истории', function () {
+          api(projectUrl('/runs/' + enc(id)), { method: 'DELETE' }).then(function () {
+            dropWork('run:' + id);
+            toast('Прогон удалён из истории.');
+            return refreshWork();
+          }, function (error) { toast(explain(error.message).text, 'bad'); });
+        }, true);
+    },
     'run-state': function (el) {
       var id = el.getAttribute('data-id'), op = el.getAttribute('data-op');
-      var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.', cancel: 'Прогон отменён.' }[op];
+      var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.',
+                   cancel: 'Прогон отменён.', hide: 'Прогон скрыт.',
+                   show: 'Прогон возвращён в список.' }[op];
       if (!done) return;
       if (op !== 'cancel') {
         workAction(el, api(projectUrl('/runs/' + enc(id) + '/' + op), { method: 'POST', body: {} }), done);

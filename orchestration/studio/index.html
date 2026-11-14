@@ -71,8 +71,6 @@
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.6 1.6"/><path d="M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.6-1.6"/></symbol>
   <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
-  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M15 3 9 9l-4 1 1 1 3 3-4 5 5-4 3 3 1 1 1-4 6-6-6-6Z"/></symbol>
-  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/></symbol>
 </svg>
 
 <div class="app" id="app" data-view="home">
@@ -157,6 +155,10 @@
             <svg class="icon icon-xs" aria-hidden="true"><use href="#i-chevron-down"/></svg>
           </button>
           <span class="composer-hint" id="composer-hint"></span>
+          <button class="send send-stop" type="button" id="stop" data-action="stop-generation"
+                  aria-label="Остановить генерацию" title="Остановить генерацию" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-stop"/></svg>
+          </button>
           <button class="send" type="submit" id="send" aria-label="Отправить" title="Отправить (Enter)" disabled>
             <svg class="icon" aria-hidden="true"><use href="#i-arrow-up"/></svg>
           </button>

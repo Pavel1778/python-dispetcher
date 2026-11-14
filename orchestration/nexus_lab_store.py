@@ -480,6 +480,98 @@ class LabStore:
                                   "run.hidden" if hidden else "run.shown", run_id)
             return run
 
+    def retry_failed(self, principal: str, project_id: str, run_id: str) -> dict:
+        """Retry *only* the tasks of a finished run that did not verify.
+
+        A run that is over (failed, blocked or cancelled) is put back to work
+        with exactly its unsuccessful tasks requeued - the ones that ended
+        ``completed_unverified``, ``partial``, ``failed`` or ``blocked`` - and
+        nothing else. A task that is already ``completed_verified`` is left
+        alone: re-running verified work is not what "retry the failed tasks"
+        means, and it would spend attempts and conversations for nothing. The
+        run moves back to ``running`` in the same transaction, so the worker
+        picks it up on the next pass.
+
+        A run with no unsuccessful task has nothing to retry and is refused,
+        rather than silently moved to ``running`` to do nothing.
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (run_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("run not found")
+            if row["state"] not in TERMINAL_RUN_STATES:
+                raise InvalidTransition(
+                    f"a {row['state']} run is not over; cancel it before retrying its tasks")
+            requeued = self._requeue_retryable(cur, run_id, "retry failed tasks",
+                                               new_cycle=True)
+            if not requeued:
+                raise InvalidTransition("nothing to retry: every task verified")
+            # A deliberate operator retry, from any terminal state - including
+            # ``failed`` and ``cancelled``, which the ordinary state machine
+            # does not move back to ``running``. It is set directly here, and
+            # the run is brought back into the active lists (a cancelled run
+            # had been hidden).
+            cur.execute("UPDATE nexus_runs SET state='running', hidden_at=NULL, "
+                        "last_error=NULL, updated_at=now() WHERE id=%s RETURNING *",
+                        (run_id,))
+            run = self._run_view(cur.fetchone())
+            ProjectService._event(cur, project_id, principal, "run.retry_failed", run_id)
+            return {**run, "retried": requeued}
+
+    def delete_run(self, principal: str, project_id: str, run_id: str) -> dict:
+        """Remove a finished run from the history. Nothing else is touched.
+
+        Only a run that is over can be removed, so an active run is refused.
+        What goes is the run's own record: its task rows, its executions, its
+        hand-offs and its report - all of which belong to this run alone. What
+        does **not** go:
+
+        * the **evidence** the run produced (``nexus_evidence``), kept for
+          integrity, so a task's verified outcome is still auditable after the
+          run's own row is gone;
+        * the **goal** the run was started from, and the specification behind
+          it, so the request is not lost;
+        * the **conversation** the run was reported to - only the link from the
+          conversation to the run is cleared (a foreign key set to NULL), never
+          the chat;
+        * anything in the **repository**: a commit the run pushed is Git's, and
+          deleting a history row never rewrites or removes it.
+
+        Returns ``{"deleted": run_id, "tasks": n}``.
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT state FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (run_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("run not found")
+            if row["state"] not in TERMINAL_RUN_STATES:
+                raise InvalidTransition(
+                    f"a {row['state']} run cannot be removed from history; cancel it first")
+            # The evidence rows are kept; only their run_id back-reference (a
+            # jsonb field, not a foreign key) is left as it is, because they
+            # are the durable proof and the audit reads them by subject id.
+            cur.execute("SELECT count(*) AS n FROM nexus_run_tasks WHERE run_id=%s", (run_id,))
+            tasks = cur.fetchone()["n"]
+            # A goal points at its active run by a plain uuid column (no foreign
+            # key), so removing the run must clear that pointer or the goal
+            # would reference a row that is gone. The goal itself and its state
+            # are kept: the request it stands for is not deleted.
+            cur.execute("UPDATE nexus_goals SET active_run_id=NULL "
+                        "WHERE active_run_id=%s AND project_id=%s", (run_id, project_id))
+            # Delete the run row. Everything run-scoped that references it by a
+            # foreign key is removed with it (ON DELETE CASCADE): tasks,
+            # executions, hand-offs, report, stop signals. The conversation
+            # link and the goal reference are ON DELETE SET NULL, so the chat
+            # and the goal survive.
+            cur.execute("DELETE FROM nexus_runs WHERE id=%s", (run_id,))
+            ProjectService._event(cur, project_id, principal, "run.deleted", run_id)
+            return {"deleted": run_id, "tasks": int(tasks)}
+
     def set_run_state_internal(self, run_id: str, state: str,
                                *, last_error: str | None = None,
                                also: Callable[[Any, dict], None] | None = None) -> dict | None:

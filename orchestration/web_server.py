@@ -95,6 +95,16 @@ from .multipart import MultipartError, parse_multipart
 from .nexus_actions import ActionStateError, ConfirmationMismatch, PendingActions
 from .nexus_binding import AuthorizationError, ProjectBindingError, authorize_run_task
 from .nexus_chat import ChatError, attached_note, task_with_context, work_starts_by
+from .nexus_commands import (
+    EXECUTE,
+    help_text,
+    metadata as command_metadata,
+    parse as parse_command,
+    registry as command_registry,
+    suggest as command_suggest,
+    task_text as command_task_text,
+)
+from .nexus_generation import GenerationCancelled, GenerationToken
 from .nexus_intent import (
     ANALYSIS,
     AUTONOMOUS,
@@ -175,16 +185,18 @@ def _names_work(history: list[dict]) -> bool:
 
 
 def _continues_analysis(history: list[dict]) -> bool:
-    """Whether the last assistant turn read the project's run state (an
-    ``analysis`` turn), so a plain follow-up question continues on it.
+    """Whether the conversation's last assistant turn read the project's run
+    state (``analysis`` mode), so a plain follow-up question continues on it.
 
-    "Покажи последний успешный прогон" -> "Нашёл прогон ABC" -> "А что в нём
-    исправлено?" must stay on ABC. The second question names no run itself
-    ("в нём" is a pronoun), so the Intent Router alone reads it as a bare
-    ``chat`` question and :func:`effective_mode` would send it to ``ask`` - a
-    turn with no run facts in its prompt. This only widens *that* one case: a
-    real topic change (a greeting, an order, a plan request) is a different
-    ``reason`` and is not affected; see the call site in ``_chat_turn``.
+    Section 8's own example: "Покажи последний успешный прогон" -> "Нашёл
+    прогон ABC" -> "А что в нём исправлено?" must stay on ABC, not fall back
+    to a contextless answer that never asked the database at all. The second
+    question names no run itself ("в нём" is a pronoun), so the Intent Router
+    alone reads it as a bare ``chat`` question and :func:`effective_mode`
+    would send it to ``ask`` - a turn with no run facts in its prompt. This
+    only widens *that* one case: an actual topic change (a greeting, a
+    discussion, an order, a plan request) is a different ``reason`` and is
+    not affected; see the call site in :meth:`Handler._chat_turn`.
     """
     for message in reversed(history):
         if message.get("role") != "assistant":
@@ -543,6 +555,11 @@ class App:
         from .nexus_chat import ChatResponder
         from .nexus_conversations import ConversationService
         self.conversations = ConversationService(self.store)
+        # The running AI answers of this process, by generation id. A cancel
+        # ("stop generation") finds the token here and trips it, aborting the
+        # live provider call; it is separate from cancelling a run.
+        from .nexus_generation import GenerationRegistry
+        self.generations = GenerationRegistry()
         self.chat = ChatResponder(
             self.providers,
             dispatch_code=self._chat_dispatch_code,
@@ -2031,9 +2048,15 @@ class Handler(BaseHTTPRequestHandler):
         #   history and report.
         if rest == ["runs"]:
             params = urllib.parse.parse_qs(urlparse(self.path).query)
-            archived = (params.get("archived") or ["0"])[0] not in ("", "0", "false")
+            # ``archived`` is the historical spelling; ``include_hidden`` is the
+            # name of the underlying flag. Both ask for the same list (every run
+            # that left the active list, with its history and report), so the
+            # route accepts either rather than making callers guess.
+            truthy = ("1", "true", "yes", "on")
+            wanted = ((params.get("archived") or ["0"])[0].lower() in truthy
+                      or (params.get("include_hidden") or ["0"])[0].lower() in truthy)
             return (200, {"runs": self.app.lab.list_runs(
-                principal, project_id, include_hidden=archived)}, None)
+                principal, project_id, include_hidden=wanted)}, None)
         # GET /api/v1/projects/{id}/runs/{run_id}
         if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
             run = self.app.lab.get_run(principal, project_id, rest[1])
@@ -2079,7 +2102,7 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/v1/projects/{id}/notifications
         if rest == ["notifications"]:
             return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
-        # GET /api/v1/projects/{id}/conversations[?q=&archived=1]
+        # GET /api/v1/projects/{id}/conversations[?q=&archived=1&deleted=1]
         if rest and rest[0] == "conversations" and len(rest) == 1:
             # The query lives on the raw request target, not the stripped path.
             from urllib.parse import parse_qs
@@ -2099,6 +2122,11 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "messages"):
             return (200, {"messages": self.app.conversations.list_messages(
                 principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/conversations/{cid}/export
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "export"):
+            return (200, self.app.conversations.export(
+                principal, project_id, rest[1]), None)
         # GET /api/v1/projects/{id}/agents  (agent sessions)
         if rest == ["agents"]:
             return (200, {"sessions": self.app.conversations.list_agent_sessions(
@@ -2569,15 +2597,26 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "run"):
             self._lab_start_run(principal, project_id, rest[1], body)
             return True
-        # POST /api/v1/projects/{id}/runs/{run_id}/{pause|resume|cancel|hide}
+        # POST /api/v1/projects/{id}/runs/{run_id}/
+        #      {pause|resume|cancel|hide|show|retry-failed}
         #   cancel is durable and idempotent: the run is settled and hidden from
         #   the active lists at once, and the loop signals the executor. A
-        #   second cancel is a no-op, never an error.
+        #   second cancel is a no-op, never an error. hide/show take a finished
+        #   run out of the lists or put it back; retry-failed puts a finished
+        #   run back to work with only its unsuccessful tasks.
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
-                and rest[2] in ("pause", "resume", "cancel", "hide")):
-            if rest[2] == "hide":
+                and rest[2] in ("pause", "resume", "cancel", "hide", "show",
+                                "retry-failed")):
+            if rest[2] in ("hide", "show"):
                 self._json(200, {"run": self.app.lab.set_hidden(
-                    principal, project_id, rest[1], True)})
+                    principal, project_id, rest[1], rest[2] == "hide")})
+                return True
+            if rest[2] == "retry-failed":
+                try:
+                    self._json(200, {"run": self.app.lab.retry_failed(
+                        principal, project_id, rest[1])})
+                except InvalidTransition as e:
+                    self._json(409, {"error": str(e)})
                 return True
             # ``cancelled`` settles the run, takes it out of the lists and
             # leaves a stop signal for every conversation at work for it - all
@@ -2618,6 +2657,11 @@ class Handler(BaseHTTPRequestHandler):
         if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
                 and rest[2] == "messages"):
             self._chat_turn(principal, project_id, rest[1], body)
+            return True
+        # POST /api/v1/projects/{id}/conversations/{cid}/cancel   (stop generation)
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "cancel"):
+            self._cancel_generation(principal, project_id, rest[1], body)
             return True
         # POST /api/v1/projects/{id}/repository   (connect: verify, allowlist, bind)
         #   {"full_name": "owner/name", "branch"?: "...", "account_id"?: uuid | null}
@@ -3164,6 +3208,13 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(400, {"error": "text is required"})
             return
+        # What the person actually typed, before any trimming. A specification
+        # must reach the planner and the agents byte for byte - leading and
+        # trailing whitespace and all - so the parser works on this, not on the
+        # trimmed ``text``. A UI button adds an ``action`` token for the parser;
+        # the transcript shows the message as it was written, never the token
+        # the interface injected.
+        typed = sent
         mode = body.get("mode")
         conversation = self.app.conversations.get(principal, project_id, conversation_id)
         # Everything that can refuse the message is checked before anything is
@@ -3172,21 +3223,68 @@ class Handler(BaseHTTPRequestHandler):
         # answered 400, or 413 for a text that is too long.
         if mode:
             self.app.conversations.check_mode(mode)
-        # The Intent Router decides what this message asks for, before any mode
-        # is applied: a question must not start a run just because the
-        # conversation's mode is ``autonomous``. ``auto`` (the default) and
-        # ``autonomous`` leave the decision to the message; an explicit
-        # ask/plan/analysis/code mode is the person's own choice.
         active_run = self.app.conversations.linked_run(principal, project_id, conversation_id)
         chosen = mode or conversation["mode"]
         # What was said before this turn. The turn's own text is the request
         # and is not part of it.
         history = self.app.conversations.list_messages(principal, project_id, conversation_id)
-        intent = classify(text, mode=chosen, has_active_run=active_run is not None,
+
+        # The Command System runs first. A message may carry slash commands
+        # (``/plan``, ``/autorun``), hashtags (``#backend #security``) and typed
+        # parameters; the parser turns them into a decision before the Intent
+        # Router sees the message, so an explicit command is never guessed at.
+        # The same parser serves the interface buttons (they post ``action``),
+        # so a button and a slash command can never drift apart.
+        action = body.get("action")
+        parse_text = typed
+        if action is not None:
+            if not isinstance(action, str):
+                self._json(400, {"error": "action must be a string"})
+                return
+            # The action is a command token; it is parsed exactly like one typed
+            # at the start of the message. The message's own text is kept.
+            parse_text = (action + " " + typed) if typed.strip() else action.strip()
+        parsed = parse_command(parse_text, mode=chosen)
+        # The request the router and the model work from: commands and tags
+        # removed. A message that was only commands has no request of its own,
+        # so the stored turn keeps the full text (the transcript shows what was
+        # typed) and the router reads it as the plain text.
+        request = parsed.text or text
+        if parsed.unknown_commands:
+            self._json(400, {"error": "unknown command: " + ", ".join(parsed.unknown_commands)})
+            return
+        if not parsed.ok:
+            self._json(400, {"error": "; ".join(parsed.errors), "commands": parsed.errors})
+            return
+        if parsed.help:
+            # ``/help`` answers with the vocabulary; it starts nothing and asks
+            # no model. It wins over any request written beside it.
+            user_msg = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role="user", content=typed,
+                meta={"command": command_metadata(parsed)})
+            help_msg = self.app.conversations.add_message(
+                principal, project_id, conversation_id, role="assistant",
+                content=help_text(), meta={"mode": "help", "help": True})
+            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+            self._json(200, {"messages": [user_msg, help_msg]})
+            return
+        # An explicit mode command overrides the conversation's mode for this
+        # turn only; the conversation keeps its own setting.
+        chosen = parsed.mode or chosen
+
+        # The Intent Router decides what this message asks for, before any mode
+        # is applied: a question must not start a run just because the
+        # conversation's mode is ``autonomous``. ``auto`` (the default) and
+        # ``autonomous`` leave the decision to the message; an explicit
+        # ask/plan/analysis/code mode is the person's own choice. A command that
+        # names work (``/autorun``, ``/fix``) is the person's explicit order, so
+        # it is never turned into a clarifying question.
+        intent = classify(request, mode=chosen, has_active_run=active_run is not None,
                           has_context=_names_work(history))
+        if any(c.effect == EXECUTE for c in parsed.commands):
+            intent = Intent(AUTONOMOUS, reason="explicit command")
         # The request a model is asked to answer; the message itself, except
         # when the message only says how an earlier one is to be handled.
-        request = text
         chose_work = False
         asked_about = _asked_about(history)
         if asked_about is not None and not intent.continue_run:
@@ -3208,8 +3306,9 @@ class Handler(BaseHTTPRequestHandler):
         if (turn_mode == "ask" and intent.intent == CHAT and intent.reason == "question"
                 and _continues_analysis(history)):
             # A plain follow-up question ("А что в нём исправлено?") that names
-            # no new topic, right after a turn that read the run state, stays
-            # an analysis turn rather than falling back to a context-free ask.
+            # no new topic, right after a turn that read the run state, is still
+            # about that run: stay on it rather than answering with no facts at
+            # all (section 8).
             turn_mode = "analysis"
         if (turn_mode == "autonomous" and chosen != "autonomous"
                 and not (conversation.get("repository")
@@ -3233,26 +3332,36 @@ class Handler(BaseHTTPRequestHandler):
             # history reads as what was asked. This only fills a blank; a title
             # the user chose is never replaced.
             self.app.conversations.rename(
-                principal, project_id, conversation_id, title_from_message(text))
+                principal, project_id, conversation_id, title_from_message(typed))
         # A turn that starts work has a task, and a short message is not one by
         # itself: "делай" says to act, and what to do was said before it. Such
         # a message takes the conversation with it (``task_with_context``), so
         # the planner and the agents are given what the person meant, not one
         # word. A long message is a document and is the task as it stands.
-        task, attached = sent, 0
+        # A message that named its own commands and tags carries them into the
+        # task too (``command_task_text``), so a plan of "#backend #security" is
+        # planned for backend security and not for the bare sentence.
+        task, attached = request, 0
         if turn_mode in ("autonomous", "code") and not (intent.continue_run and active_run):
-            task, attached = task_with_context(sent, history)
+            task, attached = task_with_context(request, history)
+        task = command_task_text(parsed, task)
         # An autonomous turn's task is stored first, exactly as it is - not
         # trimmed, any size the server accepts - with its SHA-256, as a
         # specification; planning and the agents work from that copy. The same
         # text in the same conversation is the same row, which is what lets a
         # repeated send be recognised.
         spec = None
-        shown, user_meta = text, None
+        shown = typed
+        # The command decision travels with the stored turn, so the transcript
+        # can show what a message meant (which command, which tags) and the UI
+        # can render it. It is stored only when there was something to record.
+        user_meta = {"command": command_metadata(parsed)} if (
+            parsed.commands or parsed.tag_list() or parsed.params) else None
         if turn_mode == "autonomous":
             spec, _new = self.app.specs.create(
                 principal, project_id, task, source="chat", conversation_id=conversation_id)
-            user_meta = {"spec": SpecService.summary(spec)}
+            user_meta = user_meta or {}
+            user_meta["spec"] = SpecService.summary(spec)
             if attached:
                 # The transcript shows the message as it was written; that the
                 # conversation went into the task is recorded with it.
@@ -3260,7 +3369,7 @@ class Handler(BaseHTTPRequestHandler):
             elif spec["char_count"] > inline_chars():
                 # The transcript shows the beginning; the message says so and
                 # points at the whole text. Nothing downstream reads this copy.
-                shown = preview(sent)
+                shown = preview(request)
                 user_meta["spec"]["preview"] = True
         # Persist the user turn first: it must not be lost to an assistant failure.
         user_msg = self.app.conversations.add_message(
@@ -3323,29 +3432,79 @@ class Handler(BaseHTTPRequestHandler):
         # the turns that answer in words: they read files instead of guessing.
         access = (self.app.repository_access(project_id, conversation)
                   if turn_mode in ("ask", "analysis", "plan") else None)
+        # A generation is opened for an answer that asks a model (ask, analysis,
+        # plan). It is what "stop generation" acts on: the answer carries a
+        # token, and a cancel trips it, aborting the live provider call at once.
+        # The token is registered only for the answer's lifetime. A mode that
+        # dispatches (code, autonomous) does no waiting on a model, so it opens
+        # no generation - stopping it is a run/task action, not a generation one.
+        token = None
+        generation_id = None
+        if turn_mode in ("ask", "analysis", "plan"):
+            try:
+                generation = self.app.conversations.start_generation(
+                    principal, project_id, conversation_id, mode=turn_mode)
+            except ValueError:
+                # One answer at a time per conversation. A second request while
+                # one is generating is refused with 409 rather than run in
+                # parallel, and the conversation is left idle (not stuck in
+                # "thinking") so the person can stop the first and ask again.
+                self.app.conversations.set_state(principal, project_id,
+                                                 conversation_id, "idle")
+                self._json(409, {"error": "ответ уже генерируется; сначала остановите его",
+                                 "messages": appended})
+                return
+            generation_id = str(generation["id"])
+            token = GenerationToken(generation_id)
+            self.app.generations.register(token)
         try:
-            produced = self.app.chat.respond(
-                mode=turn_mode,
-                goal=task.strip() if turn_mode == "code" and attached else request,
-                context=context, memory=memory,
-                repository=conversation.get("repository") or "",
-                branch=conversation.get("selected_branch") or "",
-                history=history,
-                # The work a turn starts belongs to this conversation's project
-                # and to the person who asked for it.
-                project_id=project_id, principal=principal,
-                conversation_id=conversation_id,
-                spec_id=spec["id"] if spec else None,
-                run_facts=run_facts, access=access, attached=attached,
-                # An answer says how work starts in the mode this chat is in.
-                work_starts=work_starts_by(chosen))
-        except ChatError as e:
-            self.app.conversations.set_state(principal, project_id, conversation_id, "error")
-            err = self.app.conversations.add_message(
-                principal, project_id, conversation_id, role="system",
-                content=f"Не удалось получить ответ: {e}", meta={"error": True})
-            self._json(502, {"error": str(e), "messages": appended + [err]})
-            return
+            try:
+                produced = self.app.chat.respond(
+                    mode=turn_mode,
+                    goal=task.strip() if turn_mode == "code" and attached else request,
+                    context=context, memory=memory,
+                    repository=conversation.get("repository") or "",
+                    branch=conversation.get("selected_branch") or "",
+                    history=history,
+                    # The work a turn starts belongs to this conversation's project
+                    # and to the person who asked for it.
+                    project_id=project_id, principal=principal,
+                    conversation_id=conversation_id,
+                    spec_id=spec["id"] if spec else None,
+                    run_facts=run_facts, access=access, attached=attached,
+                    # An answer says how work starts in the mode this chat is in.
+                    work_starts=work_starts_by(chosen),
+                    token=token)
+            except GenerationCancelled as e:
+                # The answer was stopped. If this call wins the race to mark
+                # the generation cancelled it records the stop with whatever
+                # was produced; if the cancel request already did, this writes
+                # nothing, so the stop appears exactly once. Either way the
+                # conversation is left idle and immediately usable.
+                stopped = None
+                if self._finish_generation(generation_id, "cancelled"):
+                    stopped = self._record_stopped(principal, project_id,
+                                                   conversation_id, generation_id,
+                                                   turn_mode, e.partial)
+                else:
+                    self.app.conversations.set_state(principal, project_id,
+                                                     conversation_id, "idle")
+                self._json(200, {"messages": appended + ([stopped] if stopped else []),
+                                 "cancelled": True, "generation_id": generation_id})
+                return
+            except ChatError as e:
+                self._finish_generation(generation_id, "failed")
+                self.app.conversations.set_state(principal, project_id,
+                                                 conversation_id, "error")
+                err = self.app.conversations.add_message(
+                    principal, project_id, conversation_id, role="system",
+                    content=f"Не удалось получить ответ: {e}", meta={"error": True})
+                self._json(502, {"error": str(e), "messages": appended + [err]})
+                return
+        finally:
+            if generation_id is not None:
+                self.app.generations.unregister(generation_id)
+        self._finish_generation(generation_id, "finished")
         # Persist each produced message, attaching any run/task ids to the
         # conversation so the agent panel can follow it.
         for msg in produced:
@@ -3362,6 +3521,71 @@ class Handler(BaseHTTPRequestHandler):
                     principal, project_id, conversation_id, str(meta["run_id"]))
         self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
         self._json(200, {"messages": appended})
+
+    def _finish_generation(self, generation_id: str | None, state: str) -> bool:
+        """Close a generation row; ``True`` if this call owned the outcome.
+
+        Best effort: the answer's outcome is already decided, and a bookkeeping
+        failure must never turn it into an error. ``False`` (no id, or the row
+        was already moved by someone else) means this caller must not record
+        the outcome a second time.
+        """
+        if not generation_id:
+            return False
+        try:
+            return self.app.conversations.finish_generation(generation_id, state)
+        except Exception:  # noqa: BLE001 - the row is a side record
+            log.warning("could not mark generation %s %s", generation_id, state,
+                        exc_info=True)
+            return False
+
+    def _record_stopped(self, principal: str, project_id: str, conversation_id: str,
+                        generation_id: str, mode: str, partial: str) -> dict:
+        """Save what a stopped answer produced, marked as stopped."""
+        self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+        return self.app.conversations.add_message(
+            principal, project_id, conversation_id, role="assistant",
+            content=partial or "Генерация остановлена.",
+            meta={"mode": mode, "cancelled": True, "generation_id": generation_id,
+                  "partial": bool(partial)})
+
+    def _cancel_generation(self, principal: str, project_id: str,
+                           conversation_id: str, body: dict) -> None:
+        """``POST …/conversations/{id}/cancel``: stop the AI answer in flight.
+
+        This is *only* the text generation - it is not a run cancel and does
+        not touch any autonomous run of the project. It trips the in-process
+        token (aborting the live provider call at once) and, if the answer is
+        still running, marks the generation cancelled and records the stop with
+        the partial text produced so far. A conversation with no running answer
+        is a 409, so the caller knows nothing was stopped rather than believing
+        it was.
+        """
+        self.app.conversations.get(principal, project_id, conversation_id)
+        named = body.get("generation_id")
+        running = self.app.conversations.running_generation(conversation_id)
+        if running is None:
+            self._json(409, {"error": "no generation is running for this conversation"})
+            return
+        if named is not None and str(named) != str(running["id"]):
+            # The caller named a different (older) generation: refuse rather
+            # than stop the wrong one.
+            self._json(409, {"error": "that generation is not the one running"})
+            return
+        generation_id = str(running["id"])
+        token = self.app.generations.get(generation_id)
+        partial = token.partial if token is not None else ""
+        self.app.generations.cancel(generation_id)
+        # Whoever marks the row cancelled first owns the outcome. If the answer
+        # itself wins the race it records the stop; only if it has not (yet)
+        # does this request record it, so the stop is written exactly once.
+        if self.app.conversations.finish_generation(generation_id, "cancelled"):
+            self._record_stopped(principal, project_id, conversation_id,
+                                 generation_id, running.get("mode") or "", partial)
+        else:
+            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+        self._json(200, {"cancelled": True, "generation_id": generation_id,
+                         "stopped": token is not None})
 
     def _record_agent_session(self, principal: str, project_id: str,
                               conversation_id: str, meta: dict, msg: dict) -> None:
@@ -3813,17 +4037,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"plan": self.app.plans.get(principal, project_id, item_id)})
                 return self._json(404, {"error": "not found"})
             if path == "/api/v1/projects":
-                query = urllib.parse.parse_qs(urlparse(self.path).query)
-                include_archived = query.get("archived", ["0"])[0] in ("1", "true", "yes")
-                include_deleted = query.get("deleted", ["0"])[0] in ("1", "true", "yes")
+                # ``archived=1`` / ``deleted=1`` bring back projects that the
+                # default list leaves out (an archive / trash view).
+                params = urllib.parse.parse_qs(urlparse(self.path).query)
+                truthy = ("1", "true", "yes", "on")
+                include_archived = (params.get("archived") or ["0"])[0].lower() in truthy
+                include_deleted = (params.get("deleted") or ["0"])[0].lower() in truthy
                 return self._json(200, {"projects": self.app.projects.list(
                     self._project_principal(), include_archived=include_archived,
                     include_deleted=include_deleted)})
-            lifecycle = self._project_lifecycle(path)
-            if lifecycle is not None and lifecycle[1].endswith("stats"):
-                # ``stats`` is a read: it is served on GET as well as POST, so
-                # a client can fetch what a delete would touch before asking.
-                return self._project_lifecycle_get(self._project_principal(), *lifecycle)
             nested = self._project_nested(path)
             if nested is not None:
                 return self._project_nested_get(*nested)
@@ -3871,6 +4093,17 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if path == "/api/studio":
                 return self._json(200, self.app.studio_status())
+            if path == "/api/commands":
+                # The chat command vocabulary: every slash command, every tag
+                # group, the help text, and (with ``?q=``) completions for a
+                # partial token. Static and secret-free, so the interface can
+                # build its menus from the same source the server parses with.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                prefix = (query.get("q") or [""])[0]
+                payload = command_registry()
+                if prefix:
+                    payload["suggestions"] = command_suggest(prefix)
+                return self._json(200, payload)
             if path == "/api/dashboard":
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
@@ -4372,12 +4605,15 @@ class Handler(BaseHTTPRequestHandler):
             # Refused while its run is at work (409). Use PATCH archived to
             # archive instead of deleting.
             if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
-                return self._json(200, {"conversation": self.app.conversations.delete(
-                    principal, project_id, rest[1])})
-            # DELETE /api/v1/projects/{id}: move the project to the trash.
-            if not rest:
-                return self._json(200, {"project": self.app.projects.delete(
-                    principal, project_id)})
+                self.app.conversations.set_archived(principal, project_id, rest[1], True)
+                return self._json(200, {"archived": rest[1]})
+            # DELETE /api/v1/projects/{id}/runs/{run_id}   (remove from history)
+            if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
+                try:
+                    return self._json(200, self.app.lab.delete_run(
+                        principal, project_id, rest[1]))
+                except InvalidTransition as e:
+                    return self._json(409, {"error": str(e)})
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
@@ -4427,22 +4663,20 @@ class Handler(BaseHTTPRequestHandler):
                         conversation = self.app.conversations.set_archived(
                             principal, project_id, rest[1], body["archived"])
                     if "pinned" in body:
+                        # A durable pin, so the pinned section survives a
+                        # restart and is the same on every device.
                         if not isinstance(body["pinned"], bool):
                             return self._json(400, {"error": "pinned must be a boolean"})
                         conversation = self.app.conversations.set_pinned(
                             principal, project_id, rest[1], body["pinned"])
                     if "deleted" in body:
-                        # The trash, reachable by PATCH as well as by the
-                        # ``DELETE`` route, so both clients work; refused with
-                        # 409 while the conversation's run is at work.
+                        # A soft delete (or a restore). Real - the conversation
+                        # leaves every list - and reversible within the
+                        # retention window. Nothing else is removed.
                         if not isinstance(body["deleted"], bool):
                             return self._json(400, {"error": "deleted must be a boolean"})
-                        if body["deleted"]:
-                            conversation = self.app.conversations.delete(
-                                principal, project_id, rest[1])
-                        else:
-                            conversation = self.app.conversations.restore(
-                                principal, project_id, rest[1])
+                        conversation = self.app.conversations.set_deleted(
+                            principal, project_id, rest[1], body["deleted"])
                     return self._json(200, {"conversation": conversation})
                 # Any other sub-resource falls through to the project PATCH below.
             parsed = self._project_path(path)
@@ -4452,23 +4686,25 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
             principal = self._project_principal()
-            # A PATCH may carry the lifecycle keys as well as name/description,
-            # so a client that only patches (the other line's API) works too;
-            # the dedicated POST routes stay. ``deleted``/``archived`` are
-            # refused with 409 while an active run exists.
-            if "deleted" in body:
-                if not isinstance(body["deleted"], bool):
-                    return self._json(400, {"error": "deleted must be a boolean"})
-                project = (self.app.projects.delete(principal, parsed[0])
-                           if body["deleted"]
-                           else self.app.projects.restore(principal, parsed[0]))
-                return self._json(200, {"project": project})
+            # ``archived`` and ``deleted`` are the lifecycle states; ``name`` /
+            # ``description`` change what the project *is*. They may be combined,
+            # but each is validated so a wrong type is a 400, not a 500.
+            project = None
             if "archived" in body:
                 if not isinstance(body["archived"], bool):
                     return self._json(400, {"error": "archived must be a boolean"})
-                return self._json(200, {"project": self.app.projects.archive(
-                    principal, parsed[0], body["archived"])})
-            project = self.app.projects.update(principal, parsed[0], body)
+                project = self.app.projects.set_archived(
+                    principal, parsed[0], body["archived"])
+            if "deleted" in body:
+                if not isinstance(body["deleted"], bool):
+                    return self._json(400, {"error": "deleted must be a boolean"})
+                project = (self.app.projects.restore(principal, parsed[0])
+                           if not body["deleted"]
+                           else self.app.projects.delete(principal, parsed[0]))
+            if set(body) & {"name", "description"}:
+                project = self.app.projects.update(principal, parsed[0], body)
+            if project is None:
+                raise ValueError("provide name, description, archived and/or deleted")
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})

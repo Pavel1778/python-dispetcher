@@ -60,10 +60,11 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/conversations",
     f"/api/v1/projects/{UUID}/conversations/{UUID}",
     f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
+    f"/api/v1/projects/{UUID}/conversations/{UUID}/export",
     f"/api/v1/projects/{UUID}/agents", f"/api/v1/projects/{UUID}/binding",
     "/api/openhands/accounts", f"/api/openhands/accounts/{UUID}",
     "/api/openhands/pool", "/api/openhands/diagnostics", "/api/providers",
-    "/api/security/policy", "/api/observability",
+    "/api/security/policy", "/api/observability", "/api/commands",
     "/api/openhands/tools",
     f"/api/github/accounts/{UUID}/repositories",
     "/api/github/accounts", f"/api/github/accounts/{UUID}",
@@ -95,6 +96,7 @@ PROTECTED_POST = [
     f"/api/v1/projects/{UUID}/evidence/{UUID}/verify",
     f"/api/v1/projects/{UUID}/conversations",
     f"/api/v1/projects/{UUID}/conversations/{UUID}/messages",
+    f"/api/v1/projects/{UUID}/conversations/{UUID}/cancel",
     f"/api/v1/projects/{UUID}/binding", f"/api/v1/projects/{UUID}/binding/branch",
     f"/api/v1/projects/{UUID}/repository", f"/api/v1/projects/{UUID}/context/refresh",
     f"/api/v1/projects/{UUID}/runs/{UUID}/pause", f"/api/v1/projects/{UUID}/runs/{UUID}/cancel",
@@ -225,7 +227,10 @@ def test_protected_patch_and_delete_endpoints_require_auth(base):
         ("PATCH", f"/api/v1/projects/{UUID}", {"name": "x"}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"archived": True}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"title": "x"}),
+        ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"pinned": True}),
+        ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"deleted": True}),
         ("DELETE", f"/api/v1/projects/{UUID}/conversations/{UUID}", None),
+        ("DELETE", f"/api/v1/projects/{UUID}/runs/{UUID}", None),
     ]:
         assert _status(method, base + path, body) == 401, (method, path)
 

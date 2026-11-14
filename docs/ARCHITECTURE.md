@@ -1,91 +1,164 @@
-# Architecture
+# NEXUS Architecture
 
-NEXUS is a durable control plane. It owns task state, leases, assignment and
-recovery; it does not own the runtime. Conversations execute in OpenHands
-(either the Cloud V1 API or, by default, a sandbox's own agent-server).
+NEXUS is the durable control plane for orchestrating OpenHands agent
+conversations. It owns task state, leases, assignment and recovery; it does not
+own the runtime — conversations execute in the OpenHands agent-server (Cloud).
 
-```
-                 ┌──────────────────────────── PostgreSQL ───────────────────────────┐
-                 │ nexus_projects  nexus_conversations  nexus_goals  nexus_specs    │
-                 │ nexus_runs      nexus_run_tasks      nexus_task_executions       │
-                 │ nexus_evidence  nexus_lab_workers    nexus_conversation_cleanups│
-                 └──────────────────────────────────────────────────────────────────┘
-   browser (studio)                    ▲                     ▲
-        │  HTTP /api/v1/...             │                     │
-        ▼                               │                     │
-   web_server.App ──────────────────────┘                     │
-        │  inline lab loop (default)                          │  lab_worker process
-        ▼                                                     ▼
-   LabScheduler.tick  ◀──────────── claim_task (FOR UPDATE SKIP LOCKED, lease) ────┐
-        │                                                                          │
-        ├─ authorize_run_task  (project ↔ repository link, re-checked each start)  │
-        ├─ OpenHandsExecutor.dispatch  ──▶ OpenHands (start conversation)          │
-        ├─ OpenHandsExecutor.poll      ──▶ OpenHands (read the conversation)       │
-        ├─ GitVerifier.verify          ──▶ GitHub (read the branch head)           │
-        └─ set_run_state_internal / report ──▶ the chat the run was asked for in ───┘
-```
+This document is the map: what the components are, what each is responsible
+for, and how they interact. For the invariants each module must keep, read
+`AGENTS.md`; for the request paths, read `README.md`; for the operator view,
+read `docs/OPERATIONS.md`.
 
-## The pieces
-
-- **`control_plane.py`** — the legacy SQLite task store (workflows/tasks/Sr/Jr).
-- **`cloud_store.py`** — `PostgresStore`: one connection for the process, the
-  reconnect-and-backoff logic, `verify_schema`, and the legacy workflow/task
-  tables.
-- **`nexus_projects.py`** — projects, membership, RBAC scopes, goals, and the
-  project/conversation lifecycle (archive, trash, restore, purge).
-- **`nexus_conversations.py`** — persistent conversations, messages, attachments,
-  agent sessions; project-isolated.
-- **`nexus_lab_store.py`** — runs, run tasks, executions, notifications, worker
-  heartbeats. Holds the invariants: atomic claim with a lease and a fencing
-  token, dependency gating (`completed_verified`/`completed_no_changes`), branch
-  occupancy (`_BRANCH_FREE`), and the run state machine (`_RUN_ENTERED_FROM`).
-- **`nexus_lab.py`** — `OpenHandsExecutor` (dispatch + poll; never decides
-  completion), `GitVerifier` (checks the *real* branch), `LabScheduler` (one tick
-  = reclaim → follow starts → stop abandoned → poll → verify → claim → authorize
-  → dispatch → decide). This is the only place that moves a run forward.
-- **`lab_worker.py`** — the loop that advances runs. It holds no per-run state,
-  so a restart is a non-event. It runs as a separate process
-  (`python -m orchestration.lab_worker`) and/or inside the web server
-  (`NEXUS_LAB_INLINE`, on by default).
-- **`nexus_binding.py`** — the project↔repository link and the authorization
-  gates (`authorize_dispatch` for workflows, `authorize_run_task` for runs).
-- **`openhands_router.py` / `openhands_pool.py`** — which OpenHands account runs
-  a task, and the failover hand-off when one fails.
-- **`nexus_evidence.py` / `evidence_trust.py`** — the Evidence Trust Engine: an
-  Ed25519 signature over a canonical encoding, so a verdict is earned.
-- **`nexus_reports.py`** — the run's report, written in the transaction that
-  completes the run and delivered to the chat once.
-- **`tracing.py`** — one secret-free span per stage (dispatch, poll, verify).
-- **`web_server.py`** — the HTTP API and the studio's static files.
-- **`studio/`** — the front end: one chat application, no framework, no build.
-
-## The execution state machine
-
-A run task moves through:
+## 1. The whole system
 
 ```
-pending → dispatched → running → verifying → completed_verified
-                                            → completed_no_changes
-                                            → completed_unverified → (retry)
-                                            → partial / failed / blocked
+                 browser (studio)            machine client (CLI / MCP)
+                        │                              │
+                        ▼                              ▼
+        ┌───────────────────────────────────────────────────────────┐
+        │  orchestration/web_server.py  (stdlib HTTP, one process)    │
+        │   auth (session + bearer) · routes · the lab loop thread    │
+        └───────────────────────────────────────────────────────────┘
+             │                 │                 │              │
+             ▼                 ▼                 ▼              ▼
+     nexus_intent      nexus_conversations   nexus_lab       providers
+     nexus_commands    (chat, messages,      (scheduler,     (Gemini →
+     (router)           pins, generations)    executor,       Groq →
+                                             verifier)       OpenRouter →
+             │                 │                 │           OpenHands)
+             ▼                 ▼                 ▼
+        nexus_specs       nexus_generation   nexus_lab_store ── cloud_store
+        nexus_spec_planner  (stop token)      (runs, tasks)     (PostgreSQL)
+             │                                   │
+             ▼                                   ▼
+        providers.py                     openhands_router / pool
+        (LLM planning)                   (account selection, failover)
+                                                 │
+                                                 ▼
+                                     CloudClient / CloudDirectClient
+                                     (OpenHands Cloud + sandbox agent-server)
 ```
 
-`completed_verified` and `completed_no_changes` are the two accepted states; only
-they unblock a dependent task and let a run complete. A `durable` run reworks a
-task that did not verify (in the same conversation, then in a new one); a
-`bounded` run stops when its attempts or budgets are spent. The transitions are
-atomic (one `UPDATE ... RETURNING`) and fenced by the task's `lease_token`.
+State lives in PostgreSQL. Conversations run on OpenHands Cloud. The `direct`
+transport provisions a sandbox and drives its agent-server; the `app`
+transport uses the legacy app-conversation endpoint. `build_cloud_client`
+picks between them from `OPENHANDS_TRANSPORT` (default `direct`).
 
-## Multi-worker, multi-instance
+## 2. Layers and responsibilities
 
-Every claim is a lease in PostgreSQL, so N workers claim N distinct tasks rather
-than one worker locking the queue. A worker that dies is recovered when its
-lease expires (`reclaim_expired`), and a conversation it started is followed by
-whichever worker ticks next (the start is on the task's `pending_start`). Two
-workers never start a second conversation for one task: the binding is
-idempotent (`mark_running` is a no-op for the conversation the task already has)
-and the branch is held (`_BRANCH_FREE`).
+### 2.1 HTTP surface — `web_server.py`
 
-See [DURABLE-RUNS.md](DURABLE-RUNS.md) for the durable-run rules and
-[OBSERVABILITY.md](OBSERVABILITY.md) for how to tell a live worker from a dead
-one.
+One `ThreadingHTTPServer` handler. It owns:
+
+- **Authentication**: a browser session (PBKDF2 + server-side sessions +
+  double-submit CSRF, `web_auth.py`) and a machine bearer token. Every route
+  below `/` requires one of them (`_require_read` / `_require_write`).
+- **Routing**: a long `do_GET` / `do_POST` / `do_PATCH` / `do_DELETE`, keyed by
+  path. Project-scoped routes resolve `{project_id}` and authorize membership;
+  a non-member gets 404, never 403.
+- **The chat turn** (`_chat_turn`): the single place a message becomes a reply,
+  a plan or a run. It is the integration point for the command parser, the
+  intent router, the conversation service, the generation registry and the
+  dispatch hooks.
+- **The lab loop** (`App._run_lab`): a thread that advances autonomous runs,
+  unless `NEXUS_LAB_INLINE` switches it off (then `lab_worker.py` does it).
+- **The MCP Streamable HTTP endpoint** (`POST /mcp`).
+
+### 2.2 The chat decision path
+
+Order matters, and each step is a separate, tested module:
+
+1. **`nexus_commands.parse`** reads slash commands, hashtags and typed
+   parameters into a pure `Parsed` decision. `#read-only` downgrades an execute
+   command; an impossible restriction is refused. A UI button posts
+   `{"action": "/plan"}` and goes through the same parser.
+2. **`nexus_intent.classify`** reads the *message* (a question is never an
+   order; an order is only an order when it names work). `effective_mode` turns
+   the intent into the mode the turn runs in. `_continues_analysis` keeps a
+   bare follow-up question on the run state the previous answer read.
+3. **`nexus_chat.ChatResponder.respond`** produces the reply: `ask`/`analysis`
+   answer in prose (reading the repository through `nexus_repo_reader`),
+   `plan` returns a validated plan, `code`/`autonomous` call the dispatch hooks.
+4. **`nexus_conversations`** stores the turn, the title, the pins, the
+   generations and the workflow state.
+5. **`nexus_generation`** carries a cancellable token for an answer in flight;
+   "stop generation" trips it and aborts the live provider call.
+
+### 2.3 The autonomous pipeline
+
+`nexus_specs` (the task text, any size) → `nexus_spec_planner` (a plan, in
+parts if large) → `nexus_lab_store.start_run` (the run and its DAG) →
+`nexus_lab.LabScheduler` (reclaim → claim → dispatch → poll → verify → record →
+decide) → `nexus_lab.OpenHandsExecutor` (dispatch and poll; never decides
+completion) → `nexus_lab.GitVerifier` (the real remote branch head) →
+`nexus_evidence` (the signed record) → `nexus_reports` (the report, delivered
+to the chat).
+
+`openhands_router` and `openhands_pool` choose which OpenHands account runs a
+task and hand off context on a switch. `openhands_diagnostics` proves each
+integration with an earned status.
+
+### 2.4 Storage — `cloud_store.py` and `nexus_lab_store.py`
+
+`PostgresStore` holds one connection, reconnects on evidence, and applies
+migrations (refusing an edited applied migration). `nexus_lab_store.LabStore`
+owns the run/task state machine, atomic claim with a lease and a fencing token,
+dependency gating (`completed_verified` only), branch exclusivity and recovery.
+
+### 2.5 Front end — `orchestration/studio/`
+
+Static files (no framework, no build step). `web_ui.py` serves a closed mapping
+of URL → bytes. Events are delegated from `document` through `data-action` and
+the `ACTIONS` table, so a missing element never aborts the interface. Untrusted
+text reaches `innerHTML` only through `markdown.js` / `highlight.js`, which
+escape by construction.
+
+### 2.6 Security
+
+`nexus_policy` (SSRF/redaction), `net_guard` (outbound URL check),
+`secrets.py` (Fernet at rest), `archive_safety.py` (no member name ever
+becomes a path), `web_auth.py` (sessions, CSRF, throttling),
+`nexus_binding.authorize_dispatch` (the single dispatch gate).
+
+## 3. Data model (the load-bearing tables)
+
+| Area | Tables |
+| --- | --- |
+| Dispatcher | `workflows`, `tasks`, `conversations`, `task_events`, `sr_tool_calls` |
+| Auth | `sessions`, `login_attempts` |
+| Projects | `nexus_projects`, `nexus_project_members`, `nexus_project_repositories`, `nexus_project_executors`, `nexus_project_events` |
+| Chat | `nexus_conversations`, `nexus_conversation_messages`, `nexus_conversation_attachments`, `nexus_agent_sessions`, `nexus_generations` |
+| Runs | `nexus_runs`, `nexus_run_tasks`, `nexus_run_reports`, `nexus_executor_stops`, `nexus_task_executions`, `nexus_task_handoffs`, `nexus_conversation_cleanups` |
+| Specs/plans | `nexus_goals`, `nexus_specs`, `nexus_spec_sections`, `nexus_spec_requirements`, `nexus_spec_links`, `nexus_spec_stages`, `nexus_plans` |
+| Evidence | `nexus_evidence` |
+| Context/memory | `nexus_context`, `nexus_memory` |
+| Files | `nexus_files`, `nexus_workspaces`, `nexus_workspace_files`, `nexus_voice_notes` |
+| Accounts | `nexus_github_accounts`, `nexus_openhands_accounts`, `nexus_openhands_account_events`, `nexus_openhands_pool`, `nexus_cloud_sandboxes` |
+| Workers | `nexus_lab_workers` |
+| Actions | `nexus_pending_actions` |
+
+Migrations are `0001`–`0011`, `0014`–`0037`. `0012`/`0013` are reserved. The
+runner applies every `*.sql` in lexical order.
+
+## 4. Request lifecycle (one autonomous run)
+
+1. `POST …/conversations/{id}/messages` with a work order.
+2. `_chat_turn` parses commands, classifies intent, picks `autonomous`.
+3. The text is stored as a specification (`nexus_specs`), planned
+   (`nexus_spec_planner`, inline or in the background), and `start_run` creates
+   the run and its tasks in one transaction.
+4. `LabScheduler.tick` (from the loop thread or `lab_worker`) claims a task
+   (lease + fencing token), dispatches it to OpenHands (the account the pool
+   chose), and records the start durably.
+5. On the next passes it polls the conversation, verifies the real commit with
+   `GitVerifier`, records evidence, and decides the run's fate.
+6. A completed run's report is written and delivered to the originating chat;
+   its OpenHands conversations are queued for deletion.
+
+## 5. What is not in this process
+
+- The runtime (OpenHands) — reached over HTTP.
+- The database — PostgreSQL, reached over one connection.
+- The LLM providers — reached over HTTP through the cascade.
+
+Nothing else is required to run NEXUS; see `DEPLOY.md` and `docs/OPERATIONS.md`.

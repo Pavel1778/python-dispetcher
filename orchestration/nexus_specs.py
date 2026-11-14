@@ -831,6 +831,8 @@ class SpecService:
         index = build_index(text)
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
+            # A project in the trash is inert: it cannot grow a new goal.
+            ProjectService._refuse_if_deleted(cur, project_id)
             if key is not None:
                 cur.execute(f"SELECT {_GOAL} FROM nexus_goals "
                             "WHERE project_id=%s AND idempotency_key=%s", (project_id, key))

@@ -1,20 +1,16 @@
 """The lifecycle/pin migrations on a database that already holds something.
 
-Three files are involved and two of them came from two independent lines of
-work that both claimed the number ``0037``:
+Two lines of work collided on migration numbers. This branch's are
+``0037_task_kind.sql`` / ``0038_lifecycle.sql`` / ``0039_conversation_pin.sql``;
+the line now merged into ``main`` has ``0037_conversation_management.sql`` and
+``0038_project_lifecycle.sql``. All five are in the tree and every column the
+code reads exists (some are added by more than one file, idempotently).
 
-* ``0037_task_kind.sql`` - this branch's, for the ``completed_no_changes``
-  task kind;
-* ``0038_lifecycle.sql`` - this branch's, for archive/trash on projects and
-  conversations;
-* ``0039_conversation_pin.sql`` - the one column the other line
-  (``arena/ab0d7665``) had and this one did not.
-
-The runner keys on the *filename*, not the number, so distinct names coexist
-and an already-migrated database re-runs nothing. These tests prove that on a
-real PostgreSQL 17: a clean install has every column; an upgrade from a
-schema without the three files gains them without losing a row; and applying
-the files again changes nothing.
+The runner keys on the *filename*, not the number, and applies ``*.sql`` in
+lexical order, so distinct names coexist and an already-migrated database
+re-runs nothing. These tests prove that on a real PostgreSQL 17: a clean
+install has every column; an upgrade from a schema without these files gains
+them without losing a row; and applying the files again changes nothing.
 """
 from __future__ import annotations
 
@@ -33,7 +29,11 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="set TEST_SUPABASE_DB_URL to a disposable PostgreSQL database")
 
 _MIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
-NEW = ("0037_task_kind.sql", "0038_lifecycle.sql", "0039_conversation_pin.sql")
+#: The files this increment is about: this branch's three plus the two the
+#: other line (now on ``main``) contributed.
+NEW = ("0037_task_kind.sql", "0037_conversation_management.sql",
+       "0038_lifecycle.sql", "0038_project_lifecycle.sql",
+       "0039_conversation_pin.sql")
 
 
 def _apply(conn, names) -> None:
@@ -67,12 +67,14 @@ def _columns(conn, table: str) -> set[str]:
     return {r["column_name"] for r in rows}
 
 
-def test_the_three_files_are_distinct_and_the_numbers_do_not_collide():
-    """Two lines of work both wrote a ``0037``; the files must have distinct
-    names so the runner (which keys on the filename) keeps both."""
+def test_the_colliding_numbers_have_distinct_filenames():
+    """Two lines of work both wrote a ``0037`` (and both a ``0038``); the files
+    must have distinct names so the runner (which keys on the filename) keeps
+    them all, and the columns are not lost."""
     names = sorted(n for n in os.listdir(_MIG) if n.startswith("0037"))
-    assert names == ["0037_task_kind.sql"], names
-    assert "0038_lifecycle.sql" in os.listdir(_MIG)
+    assert names == ["0037_conversation_management.sql", "0037_task_kind.sql"], names
+    names38 = sorted(n for n in os.listdir(_MIG) if n.startswith("0038"))
+    assert names38 == ["0038_lifecycle.sql", "0038_project_lifecycle.sql"], names38
     assert "0039_conversation_pin.sql" in os.listdir(_MIG)
 
 
@@ -86,8 +88,11 @@ def test_an_upgrade_gains_the_columns_and_keeps_every_row(before):
     _apply(conn, NEW)
 
     assert {"archived_at", "deleted_at"} <= _columns(conn, "nexus_projects")
-    assert {"deleted_at", "pinned"} <= _columns(conn, "nexus_conversations")
+    assert {"deleted_at", "pinned", "pinned_at"} <= _columns(conn, "nexus_conversations")
     assert "kind" in _columns(conn, "nexus_run_tasks")
+    assert "nexus_generations" in {r["table_name"] for r in conn.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = current_schema()").fetchall()}
     # The existing rows are still there and readable, with the additive
     # defaults (NULL / false / 'implementation').
     row = conn.execute("SELECT name, archived_at, deleted_at FROM nexus_projects "

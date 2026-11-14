@@ -28,16 +28,22 @@ Cloud transport provisions a sandbox and drives its agent-server directly
 
 Start here:
 
-- [docs/MVP_RELEASE_REPORT.md](docs/MVP_RELEASE_REPORT.md) — what is
-  implemented, tested and verified, and what still needs a live OpenHands key.
-- [docs/AUTONOMOUS-LAB.md](docs/AUTONOMOUS-LAB.md) — honest per-stage status
-  (implemented / tested / live verified / blocked / not implemented).
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the component map and how the
+  parts interact.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — run, monitor, diagnose, recover,
+  back up.
+- [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) — per-subsystem
+  readiness with the real evidence.
+- [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) — what is not done and
+  what is only proven against the stand-in servers.
+- [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md) — how to exercise
+  the live OpenHands / GitHub / LLM / PostgreSQL.
+- [docs/BRANCHES.md](docs/BRANCHES.md) — branching, merging and cleanup.
 - [AGENTS.md](AGENTS.md) — repository layout and hard-won runtime facts.
-- [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md) — the target architecture.
-- [CLOUD-INTEGRATION-MAP.md](CLOUD-INTEGRATION-MAP.md) — the Cloud API surface.
-- [DEPLOY.md](DEPLOY.md) — deployment guide.
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable, run
   command, dependency and required permission in one place.
+- [DEPLOY.md](DEPLOY.md) — deployment guide.
+- [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.
 
 ## What is ready today
 
@@ -80,6 +86,26 @@ are manual and need a live LLM):
   needs attention. A run that ended without completing (cancelled, failed)
   writes an honest report to its own chat at once — never as a success. A
   blocked run tells its chat why, immediately.
+- **Chat command system**: slash commands (`/chat /plan /autorun /audit /fix
+  /test /review /deploy /research /status /help`), four hashtag groups
+  (technology, quality, execution, restriction) and typed parameters
+  (`--repo`, `--branch`). Restrictions have priority — `#read-only` downgrades
+  an execute command to a read-only analysis, and `/deploy #no-deploy` is
+  refused. One parser serves both typed commands and interface buttons, so they
+  cannot drift apart. See `docs/COMMANDS.md`; `GET /api/commands` is the
+  vocabulary.
+- **Conversation management**: pin/unpin (durable, a pinned section at the top),
+  archive/restore, soft delete/restore (a real, reversible delete that leaves
+  the project, the repository and the transcript alone), search by title and by
+  the text of messages, and a self-contained JSON export. The studio sidebar has
+  a pinned section, an archive and a trash.
+- **Stop generation**: the answer in flight can be stopped at once — the cancel
+  aborts the live provider call, keeps whatever was produced with a "stopped"
+  mark, and leaves the chat immediately usable. It is a separate action from
+  cancelling a run: stopping a text answer never touches an autonomous run.
+- **Run history**: hide/show a finished run, remove it from history (its own
+  record only — the goal, the chat, the evidence and the repository stay), and
+  retry *only* the tasks that failed.
 - **Authentication**: browser session (PBKDF2 + server-side sessions + CSRF)
   and a machine bearer token, plus login rate limiting and proxy-aware client
   IP handling.
