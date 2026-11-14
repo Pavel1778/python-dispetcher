@@ -8,7 +8,7 @@ order; the runner does not require a contiguous sequence, so the reserved gap at
 
 ## Migrations
 
-`0001`–`0011`, `0014`–`0038`. The two most recent are the ones this increment
+`0001`–`0011`, `0014`–`0039`. The three most recent are the ones this increment
 added:
 
 - **`0037_task_kind.sql`** — `nexus_run_tasks.kind` (a `CHECK` of the five
@@ -17,10 +17,28 @@ added:
 - **`0038_lifecycle.sql`** — `nexus_projects.archived_at`,
   `nexus_projects.deleted_at`, `nexus_conversations.deleted_at` (all nullable,
   `NULL` = live) and two partial indexes. Additive.
+- **`0039_conversation_pin.sql`** — `nexus_conversations.pinned` (boolean, not
+  null, default false) and a partial index for the pinned-first list. Additive.
 
-Both are safe to apply to a live database and to a fresh one; neither rewrites
+All three are safe to apply to a live database and to a fresh one; none rewrites
 an existing row. Rolling back is dropping the columns and indexes; no data is
 lost by applying them.
+
+### Two `0037`s in the repository's history
+
+Two independent lines of work both wrote a `0037` migration. This branch's is
+`0037_task_kind.sql`; the other line (`arena/ab0d7665`, PR #38) wrote
+`0037_project_conversation_lifecycle.sql` with the same `deleted_at`/`archived_at`
+columns this branch has in `0038`. The runner keys on the **filename**, not the
+number, and applies `*.sql` in lexical order, so:
+- the two files cannot both be in the tree (this branch keeps only its own);
+- the column the other line had and this one lacked (`pinned`) was added under a
+  fresh number, `0039`;
+- an already-migrated database re-runs nothing (`schema_migrations` is keyed on
+  the filename).
+
+`tests/test_lifecycle_migrations.py` proves a clean install, an upgrade from a
+schema without the three files, and a re-apply that changes nothing.
 
 ## Tables and their relationships
 
@@ -66,6 +84,8 @@ the link row goes; the `repositories` allowlist entry stays.
   poll paths.
 - `idx_nexus_projects_live`, `idx_nexus_conversations_live` (partial, over
   `deleted_at IS NULL`) — the lifecycle lists added by `0038`.
+- `idx_nexus_conversations_pinned` (partial, over `deleted_at IS NULL`) — the
+  pinned-first chat list added by `0039`.
 
 ## Orphan records
 

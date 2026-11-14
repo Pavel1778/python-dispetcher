@@ -488,10 +488,15 @@ class ConversationService:
         content = _text(content, "content", maximum=MESSAGE_CHARS, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            cur.execute("SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s",
-                        (conversation_id, project_id))
-            if cur.fetchone() is None:
+            cur.execute("SELECT id, deleted_at FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            found = cur.fetchone()
+            if found is None:
                 raise NotFound("conversation not found")
+            if found["deleted_at"] is not None:
+                # A trashed conversation is read-only until it is restored; a
+                # message appended behind the scenes would be invisible work.
+                raise ValueError("conversation is deleted; restore it before adding messages")
             return self.append_internal(cur, conversation_id, role=role, content=content,
                                         meta=meta)
 

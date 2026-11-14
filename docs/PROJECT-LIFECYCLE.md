@@ -66,10 +66,16 @@ project (evidence, legacy tasks). Therefore:
 | rename | `PATCH …/conversations/{cid}` `{"title": …}` | |
 | mode | `PATCH …/conversations/{cid}` `{"mode": …}` | |
 | archive | `PATCH …/conversations/{cid}` `{"archived": true|false}` | reversible |
-| delete | `DELETE …/conversations/{cid}` or `POST …/conversations/{cid}/delete` | sets `deleted_at` |
-| restore | `POST …/conversations/{cid}/restore` | clears `deleted_at` |
-| stats | `POST …/conversations/{cid}/stats` | message/attachment/session counts |
+| pin | `PATCH …/conversations/{cid}` `{"pinned": true|false}` | sorts it first |
+| delete | `DELETE …/conversations/{cid}` or `POST …/conversations/{cid}/delete` or `PATCH … {"deleted": true}` | sets `deleted_at` |
+| restore | `POST …/conversations/{cid}/restore` or `PATCH … {"deleted": false}` | clears `deleted_at` |
+| stats | `GET`/`POST …/conversations/{cid}/stats` | message/attachment/session counts |
 | purge | `POST …/conversations/{cid}/purge` `{"confirm": true}` | removes it and its messages |
+
+**Pin** is ordering only: a pinned conversation sorts to the top of the list
+(`ORDER BY pinned DESC, updated_at DESC`); it changes nothing else. It was added
+by `0039_conversation_pin.sql` when the two independent lifecycle lines were
+merged (see [../CHANGELOG.md](../CHANGELOG.md)).
 
 `delete` and `purge` refuse (409) while a run the conversation started is still
 at work - the active execution would otherwise be stranded with no chat to

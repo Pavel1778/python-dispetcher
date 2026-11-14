@@ -23,7 +23,7 @@ cannot be reached. A route whose body is over its cap is `413`.
 | POST | `/api/v1/projects/{id}/unarchive` | clears it |
 | POST | `/api/v1/projects/{id}/delete` | trash (reversible) |
 | POST | `/api/v1/projects/{id}/restore` | from the trash |
-| POST | `/api/v1/projects/{id}/stats` | what it holds, for the confirmation |
+| GET/POST | `/api/v1/projects/{id}/stats` | what it holds, for the confirmation |
 | POST | `/api/v1/projects/{id}/purge` | `{"confirm": true}`; irreversible |
 | DELETE | `/api/v1/projects/{id}` | same as `delete` |
 
@@ -37,12 +37,12 @@ guards.
 | GET | `/api/v1/projects/{id}/conversations` | `?q=&archived=1&deleted=1` |
 | POST | `/api/v1/projects/{id}/conversations` | `{"title", "mode"}` |
 | GET | `/api/v1/projects/{id}/conversations/{cid}` | |
-| PATCH | `/api/v1/projects/{id}/conversations/{cid}` | `{"title"|"mode"|"archived"}` |
+| PATCH | `/api/v1/projects/{id}/conversations/{cid}` | `{"title"|"mode"|"archived"|"pinned"|"deleted"}` |
 | DELETE | `/api/v1/projects/{id}/conversations/{cid}` | trash |
 | POST | `/api/v1/projects/{id}/conversations/{cid}/delete` | trash |
 | POST | `/api/v1/projects/{id}/conversations/{cid}/restore` | |
 | POST | `/api/v1/projects/{id}/conversations/{cid}/purge` | `{"confirm": true}` |
-| POST | `/api/v1/projects/{id}/conversations/{cid}/stats` | counts |
+| GET/POST | `/api/v1/projects/{id}/conversations/{cid}/stats` | counts |
 | GET | `/api/v1/projects/{id}/conversations/{cid}/messages` | |
 | POST | `/api/v1/projects/{id}/conversations/{cid}/messages` | `{"text", "mode"}` |
 

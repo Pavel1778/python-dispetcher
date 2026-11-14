@@ -277,6 +277,85 @@ def test_a_conversation_can_be_trashed_and_restored_by_patch(http_server):
     assert st == 200 and out["conversation"]["deleted_at"] is None
     _, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
     assert [c["id"] for c in listing["conversations"]] == [cid]
+def test_a_project_can_be_archived_and_deleted_by_patch_too(http_server):
+    """The lifecycle keys are accepted on PATCH as well as on the dedicated
+    POST routes, so a client that only patches works; a delete is refused (409)
+    while an active run exists, and succeeds after the run is cancelled."""
+    base, alice, app, _ = http_server
+    pid = _project(base, alice)
+    st, out = request(base, f"/api/v1/projects/{pid}", "PATCH",
+                      {"archived": True}, session=alice)
+    assert st == 200 and out["project"]["archived_at"] is not None
+    st, out = request(base, f"/api/v1/projects/{pid}", "PATCH",
+                      {"archived": False}, session=alice)
+    assert out["project"]["archived_at"] is None
+
+    # A run at work blocks the delete.
+    from orchestration.nexus_lab_store import LabStore
+    from orchestration.nexus_projects import principal_for_session
+
+    principal = principal_for_session(alice.username)
+    lab = LabStore(app.store)
+    goal = str(app.projects.create_goal(principal, pid, "goal")[0]["id"])
+    run = lab.start_run(principal, pid, goal)
+    st, body = request(base, f"/api/v1/projects/{pid}", "PATCH",
+                       {"deleted": True}, session=alice)
+    assert st == 409 and "active run" in body["error"], body
+
+    lab.set_run_state(principal, pid, str(run["id"]), "cancelled")
+    st, out = request(base, f"/api/v1/projects/{pid}", "PATCH",
+                      {"deleted": True}, session=alice)
+    assert st == 200 and out["project"]["deleted_at"] is not None
+    st, out = request(base, f"/api/v1/projects/{pid}", "PATCH",
+                      {"deleted": False}, session=alice)
+    assert st == 200 and out["project"]["deleted_at"] is None
+
+
+def test_a_trashed_conversation_refuses_new_messages(http_server):
+    """A conversation in the trash takes no new message until it is restored -
+    a message appended behind the scenes would be invisible work. The refusal
+    is a 404 (the trashed conversation is not found) and nothing is written."""
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    cid = _conversation(base, alice, pid, title="Чат")
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
+                    session=alice)
+    assert st == 200
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages",
+                    "POST", {"text": "привет", "mode": "ask"}, session=alice)
+    assert st == 404
+    # No message was stored behind the scenes.
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+                          session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [cid]
+    # Restore, and it accepts messages again.
+    request(base, f"/api/v1/projects/{pid}/conversations/{cid}/restore", "POST",
+            {}, session=alice)
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages",
+                    "POST", {"text": "привет", "mode": "ask"}, session=alice)
+    assert st == 200
+
+
+def test_lifecycle_actions_require_the_owner_role(http_server):
+    """Archive, delete and purge need the owner scope; a plain member is
+    refused (404, never 403 - a project's existence is not disclosed)."""
+    base, alice, app, _ = http_server
+    pid = _project(base, alice)
+    # Add a second, non-owner member.
+    bob = app.auth._open_session("bob")
+    with app.store._tx() as cur:
+        cur.execute("INSERT INTO nexus_project_members(project_id, principal, role) "
+                    "VALUES (%s, 'user:bob', 'member')", (pid,))
+    st, _ = request(base, f"/api/v1/projects/{pid}/archive", "POST", {}, session=bob)
+    assert st == 404
+    st, _ = request(base, f"/api/v1/projects/{pid}/delete", "POST", {}, session=bob)
+    assert st == 404
+    st, _ = request(base, f"/api/v1/projects/{pid}/purge", "POST", {"confirm": True},
+                    session=bob)
+    assert st == 404
+    # The owner can.
+    st, _ = request(base, f"/api/v1/projects/{pid}/archive", "POST", {}, session=alice)
+    assert st == 200
 
 
 def test_lifecycle_routes_require_auth(http_server):

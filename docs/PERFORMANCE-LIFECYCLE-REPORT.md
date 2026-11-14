@@ -80,7 +80,35 @@ the ones this work added; nothing on `main` was left failing.
   `tools/benchmark.py`.
 - The stage-latency table is empty until `NEXUS_TRACE=1`; that is by design
   (collection is opt-in) and stated in the UI.
-- The studio's new context menus and dialogs are covered by the structure tests
-  (`tests/test_studio_ui.py`) and the HTTP tests; the Chromium journey tests
-  cover the surrounding flows. They were not re-run under Chromium in this
-  session for the new controls specifically.
+- The studio's new context menus and dialogs are now covered by real Chromium
+  journeys as well (`tests/test_browser_e2e.py`: a chat pinned/trashed/restored/
+  purged and a project deleted/restored, driven through the menus) plus the
+  structure tests (`tests/test_studio_ui.py`) and the HTTP tests.
+
+## 7. PR #39 finalization: history reconciliation
+
+The previous stage's report named a line of work that **does not exist in this
+repository** — `5c4f08c`, `orchestration/nexus_commands.py`,
+`orchestration/nexus_generation.py`, `LabStore.retry_failed`,
+`LabStore.delete_run`, `tools/benchmark_compare.py`, and a prior `0037` for
+command/dialog management. Every one was searched for across every ref
+(`git rev-list --all`, `git grep` on all branches, `git log --all -- <path>`)
+and none is present; the only `0037` files are this branch's
+`0037_task_kind.sql` and `arena/ab0d7665`'s
+`0037_project_conversation_lifecycle.sql`.
+
+What *is* real is a parallel line, **PR #38** (`arena/ab0d7665`, 4 commits from
+`42609a4`), which implemented the same project/conversation lifecycle
+independently. The two lines collided on migration number `0037`. This branch
+keeps its lifecycle as the superset and ports PR #38's two unique pieces
+(conversation pin; analysis-turn continuity) plus its concurrent-runs contract
+test, under a fresh migration number `0039`. See [../CHANGELOG.md](../CHANGELOG.md)
+and [DATABASE.md](DATABASE.md), "Two `0037`s in the repository's history".
+
+Bugs found while verifying the new menus over Chromium (all fixed):
+
+- `ProjectService.stats` passed one parameter to a two-placeholder query (the
+  active-runs count) — a `500` on the delete confirmation, previously untested.
+- `GET …/stats` was `POST`-only, so the studio's confirmation never opened.
+- `loadChats` did not fetch the trash by default, so the trash fold showed no
+  count.

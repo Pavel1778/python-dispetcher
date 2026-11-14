@@ -4451,7 +4451,24 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body(max_bytes=4 * 1024 * 1024)
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
-            project = self.app.projects.update(self._project_principal(), parsed[0], body)
+            principal = self._project_principal()
+            # A PATCH may carry the lifecycle keys as well as name/description,
+            # so a client that only patches (the other line's API) works too;
+            # the dedicated POST routes stay. ``deleted``/``archived`` are
+            # refused with 409 while an active run exists.
+            if "deleted" in body:
+                if not isinstance(body["deleted"], bool):
+                    return self._json(400, {"error": "deleted must be a boolean"})
+                project = (self.app.projects.delete(principal, parsed[0])
+                           if body["deleted"]
+                           else self.app.projects.restore(principal, parsed[0]))
+                return self._json(200, {"project": project})
+            if "archived" in body:
+                if not isinstance(body["archived"], bool):
+                    return self._json(400, {"error": "archived must be a boolean"})
+                return self._json(200, {"project": self.app.projects.archive(
+                    principal, parsed[0], body["archived"])})
+            project = self.app.projects.update(principal, parsed[0], body)
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})

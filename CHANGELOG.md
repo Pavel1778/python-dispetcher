@@ -51,3 +51,30 @@
 - `0037_task_kind.sql` — `nexus_run_tasks.kind` and the `completed_no_changes`
   state. Additive.
 - `0038_lifecycle.sql` — `archived_at`/`deleted_at`. Additive.
+- `0039_conversation_pin.sql` — `nexus_conversations.pinned`. Additive.
+
+## PR #39 finalization — history reconciliation and integration
+
+The previous stage's report named a line of work (`5c4f08c`, `nexus_commands.py`,
+`nexus_generation.py`, `LabStore.retry_failed`/`delete_run`,
+`benchmark_compare.py`) that **does not exist in this repository** (checked
+across every ref). The real parallel line is **PR #38** (`arena/ab0d7665`),
+which implemented the same project/conversation lifecycle independently and
+both lines claimed migration `0037`. This branch keeps its lifecycle as the
+superset and ports the two things PR #38 had that it lacked:
+
+- **Conversation pin** (`0039_conversation_pin.sql`, `set_pinned`, `PATCH
+  pinned`, the studio menu + `i-pin` icon). A fresh number keeps both `0037`s
+  distinct (the runner keys on the filename).
+- **Analysis-turn continuity** (`web_server._continues_analysis`): a bare
+  follow-up question after an analysis turn stays on the run it found.
+- Ported `tests/test_concurrent_runs_policy.py` and an analysis-continuity
+  regression; new `tests/test_lifecycle_migrations.py`.
+
+Bugs found and fixed while verifying the new menus over Chromium:
+
+- `ProjectService.stats` passed one parameter to a two-placeholder query (the
+  active-runs count) — a 500 on the delete confirmation.
+- `GET …/stats` was POST-only, so the studio's confirmation never opened; a
+  read is now served on GET too.
+- `loadChats` now always fetches the trash so the fold shows a real count.
