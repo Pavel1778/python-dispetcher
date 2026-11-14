@@ -13,8 +13,10 @@ pooler-specific reproduction additionally needs ``TEST_POOLER_DSN``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +87,52 @@ def test_migrations_are_recorded_and_not_reapplied() -> None:
         assert first, "a fresh database should apply at least one migration"
         # The second run must be a no-op: the checksums are already recorded.
         assert store.apply_migrations() == []
+    finally:
+        store.close()
+
+
+def test_an_edited_migration_is_refused_not_reapplied(tmp_path) -> None:
+    """A migration already applied with one body must never be re-run with
+    another. The old runner wrote the new checksum over the old and executed
+    the changed SQL, so the recorded history claimed one thing and the schema
+    was another. Editing an applied migration is now a refusal that names the
+    file; a *new* file still applies normally."""
+    from orchestration.cloud_store import MigrationError
+
+    _drop_schema()
+    store = PostgresStore(DSN, auto_migrate=False)
+    try:
+        first = store.apply_migrations()
+        assert first, "a fresh database should apply at least one migration"
+        name = first[0]
+
+        # A directory with the same first migration, edited, plus nothing else.
+        original = (Path(__file__).resolve().parent.parent / "migrations" / name)
+        edited = tmp_path / name
+        edited.write_text(original.read_text(encoding="utf-8")
+                          + "\n-- an edit that must not be applied\n",
+                          encoding="utf-8")
+        with pytest.raises(MigrationError) as caught:
+            store.apply_migrations(str(tmp_path))
+        assert name in str(caught.value)
+        assert "different body" in str(caught.value)
+
+        # The recorded history still holds the original checksum (nothing ran).
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
+                        (name,))
+            recorded = cur.fetchone()["checksum"]
+        assert recorded == hashlib.sha256(original.read_bytes()).hexdigest()
+
+        # A genuinely new migration in the same directory still applies.
+        (tmp_path / "9999_a_new_step.sql").write_text(
+            "CREATE TABLE IF NOT EXISTS a_new_step (id int)", encoding="utf-8")
+        # Remove the edited copy so the run sees only the new file.
+        edited.unlink()
+        assert "9999_a_new_step.sql" in store.apply_migrations(str(tmp_path))
+        with store._tx() as cur:
+            cur.execute("SELECT 1 FROM pg_tables WHERE tablename = 'a_new_step'")
+            assert cur.fetchone() is not None
     finally:
         store.close()
 

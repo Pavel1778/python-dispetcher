@@ -57,6 +57,17 @@ class StoreUnavailable(StoreError):
     """
 
 
+class MigrationError(StoreError):
+    """A migration problem that must stop the run.
+
+    Raised instead of the driver's own error so the operator gets a message
+    that names the file, not a psycopg stack. A migration that has already been
+    applied is never edited in place: that would re-run a different body under
+    a recorded name, so the database's history would claim one thing and the
+    schema would be another.
+    """
+
+
 class NotFound(StoreError):
     """The requested row does not exist."""
 
@@ -286,6 +297,14 @@ class PostgresStore:
         Each file runs through ``_tx``, so a file that fails is rolled back and
         the original SQL error reaches the caller instead of leaving the shared
         connection aborted.
+
+        An already-applied file whose body changed is a hard refusal
+        (:class:`MigrationError`), not a silent re-run. Re-running a different
+        body under a recorded name leaves the database's history claiming one
+        thing and the schema being another; the fix is a new migration, never an
+        edit to an applied one. A *new* file is applied normally. This is the
+        one real defect the old runner had: it wrote the new checksum over the
+        old with ``ON CONFLICT DO UPDATE`` and executed the changed SQL.
         """
         base = Path(directory) if directory else Path(__file__).resolve().parent.parent / "migrations"
         files = sorted(base.glob("*.sql"))
@@ -306,13 +325,17 @@ class PostgresStore:
                 cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
                             (path.name,))
                 row = cur.fetchone()
-                if row is not None and row["checksum"] == checksum:
-                    continue
+                if row is not None:
+                    if row["checksum"] == checksum:
+                        continue
+                    raise MigrationError(
+                        f"{path.name} was already applied with a different body; "
+                        "ship a new migration instead of editing an applied one "
+                        "(editing it would re-run a different body under a "
+                        "recorded name)")
                 cur.execute(sql)
                 cur.execute(
-                    "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s) "
-                    "ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum,"
-                    " applied_at = now()",
+                    "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s)",
                     (path.name, checksum),
                 )
             applied.append(path.name)
