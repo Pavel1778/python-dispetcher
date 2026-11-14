@@ -633,3 +633,62 @@ def test_run_detail_reports_every_executor_switch(harness):
     assert switch["task_key"] == "audit"
     # The from side had no account (the server key): it stays null, never faked.
     assert switch["from_account_id"] is None and switch["from_label"] is None
+
+
+def test_notification_lifecycle_read_unread_and_delete(harness):
+    """A notification can be listed, marked read/unread, bulk-marked and deleted.
+
+    The ``read_at`` column existed but had no route, so a notification could be
+    created and listed and nothing else. This pins the whole lifecycle.
+    """
+    pid = _project(harness, "Notif")
+    base = harness["base"]
+    # Create two notifications directly through the store (the loop writes them
+    # in normal use; here the transport is not the subject).
+    with harness["app"].store._tx() as cur:
+        for i in (1, 2):
+            cur.execute("INSERT INTO nexus_notifications(project_id, kind, title) "
+                        "VALUES (%s,'test',%s)", (pid, f"note {i}"))
+    _, listed = request(base, f"/api/v1/projects/{pid}/notifications",
+                        session=harness["alice"])
+    assert len(listed["notifications"]) == 2
+    first = listed["notifications"][0]["id"]
+
+    # Unread filter.
+    _, unread = request(base, f"/api/v1/projects/{pid}/notifications?unread=1",
+                        session=harness["alice"])
+    assert len(unread["notifications"]) == 2
+
+    # Mark one read, then unread again.
+    st, body = request(base, f"/api/v1/projects/{pid}/notifications/{first}",
+                       "PATCH", {"read": True}, session=harness["alice"])
+    assert st == 200 and body["notification"]["read_at"], body
+    _, unread = request(base, f"/api/v1/projects/{pid}/notifications?unread=1",
+                        session=harness["alice"])
+    assert len(unread["notifications"]) == 1
+    st, body = request(base, f"/api/v1/projects/{pid}/notifications/{first}",
+                       "PATCH", {"read": False}, session=harness["alice"])
+    assert st == 200 and body["notification"]["read_at"] is None
+
+    # A wrong type is a 400, not a 500.
+    assert request(base, f"/api/v1/projects/{pid}/notifications/{first}",
+                   "PATCH", {"read": "yes"}, session=harness["alice"])[0] == 400
+
+    # Bulk mark-all-read.
+    st, body = request(base, f"/api/v1/projects/{pid}/notifications/read", "POST", {},
+                       session=harness["alice"])
+    assert st == 200 and body["marked"] == 2
+    _, unread = request(base, f"/api/v1/projects/{pid}/notifications?unread=1",
+                        session=harness["alice"])
+    assert unread["notifications"] == []
+
+    # Delete one; the other stays.
+    st, _ = request(base, f"/api/v1/projects/{pid}/notifications/{first}", "DELETE",
+                    session=harness["alice"])
+    assert st == 200
+    _, left = request(base, f"/api/v1/projects/{pid}/notifications",
+                      session=harness["alice"])
+    assert len(left["notifications"]) == 1
+    # A second delete is a 404.
+    assert request(base, f"/api/v1/projects/{pid}/notifications/{first}", "DELETE",
+                   session=harness["alice"])[0] == 404

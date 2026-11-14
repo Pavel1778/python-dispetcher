@@ -2443,6 +2443,35 @@
     }, function (error) { toast(explain(error.message).text, 'bad'); });
   }
 
+  // The notification centre: list, mark read/unread, delete, bulk mark-all-read.
+  // The server owns the state; this only asks and shows it.
+  function openNotifications() {
+    if (!S.projectId) { toast('Сначала создайте проект.', 'bad'); return; }
+    api(projectUrl('/notifications')).then(function (data) {
+      var items = data.notifications || [];
+      var unread = items.filter(function (n) { return !n.read_at; }).length;
+      var body;
+      if (!items.length) {
+        body = '<p class="sb-empty">Уведомлений пока нет.</p>';
+      } else {
+        body = items.map(function (n) {
+          return '<div class="lifecycle-row' + (n.read_at ? '' : ' is-unread') + '">' +
+            '<span><strong>' + esc(n.title) + '</strong><br><small>' + esc(n.kind) + ' · ' + esc(fullTime(n.created_at)) + '</small></span>' +
+            '<button class="btn btn-sm" type="button" data-action="notif-read" data-id="' + esc(n.id) + '" data-read="' + (n.read_at ? '0' : '1') + '">' +
+            (n.read_at ? 'Непрочитано' : 'Прочитано') + '</button>' +
+            '<button class="btn btn-sm btn-danger" type="button" data-action="notif-delete" data-id="' + esc(n.id) + '">Удалить</button>' +
+            '</div>';
+        }).join('');
+      }
+      openDialog({
+        title: 'Уведомления' + (unread ? ' · ' + unread + ' новых' : ''),
+        body: body,
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>' +
+          (unread ? '<button class="btn btn-primary" type="button" data-action="notif-read-all">Отметить все прочитанными</button>' : '')
+      });
+    }, function (error) { toast(explain(error.message).text, 'bad'); });
+  }
+
   function modeMenu(anchor) {
     openMenu(anchor, '<div class="menu-title">Режим</div>' + Object.keys(MODES).map(function (key) {
       var mode = MODES[key];
@@ -2648,6 +2677,24 @@
     'pick-mode': function (el) { closeMenu(); setMode(el.getAttribute('data-mode')); $('#prompt').focus(); },
     'new-project': function () { closeMenu(); newProjectDialog(); },
     'project-lifecycle': function () { openProjectLifecycle(); },
+    'open-notifications': function () { openNotifications(); },
+    'notif-read': function (el) {
+      var id = el.getAttribute('data-id'), read = el.getAttribute('data-read') === '1';
+      api(projectUrl('/notifications/' + enc(id)), { method: 'PATCH', body: { read: read } })
+        .then(openNotifications, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'notif-delete': function (el) {
+      var id = el.getAttribute('data-id');
+      api(projectUrl('/notifications/' + enc(id)), { method: 'DELETE' })
+        .then(openNotifications, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'notif-read-all': function () {
+      api(projectUrl('/notifications/read'), { method: 'POST', body: {} })
+        .then(function (data) {
+          toast('Отмечено прочитанными: ' + (data.marked || 0) + '.');
+          return openNotifications();
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'project-purge': function (el) {
       var id = el.getAttribute('data-id');
       // Show what will be removed before confirming: the census is what makes

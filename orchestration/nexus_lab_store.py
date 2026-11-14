@@ -2348,13 +2348,55 @@ class LabStore:
         cur.execute("INSERT INTO nexus_notifications(project_id, kind, title, resource_id) "
                     "VALUES (%s,%s,%s,%s)", (project_id, kind, title[:200], resource_id))
 
-    def notifications(self, principal: str, project_id: str, *, limit: int = 50) -> list[dict]:
+    def notifications(self, principal: str, project_id: str, *, limit: int = 50,
+                      unread_only: bool = False) -> list[dict]:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
-            cur.execute("SELECT id, kind, title, body, resource_id, created_at, read_at "
-                        "FROM nexus_notifications WHERE project_id=%s "
-                        "ORDER BY created_at DESC, id LIMIT %s", (project_id, limit))
+            sql = ("SELECT id, kind, title, body, resource_id, created_at, read_at "
+                   "FROM nexus_notifications WHERE project_id=%s")
+            if unread_only:
+                sql += " AND read_at IS NULL"
+            sql += " ORDER BY created_at DESC, id LIMIT %s"
+            cur.execute(sql, (project_id, limit))
             return [dict(r) for r in cur.fetchall()]
+
+    def set_notification_read(self, principal: str, project_id: str, notification_id: str,
+                              read: bool) -> dict:
+        """Mark one notification read or unread. Idempotent.
+
+        A member of the project may; a non-member gets ``NotFound`` (the
+        membership check runs first, so the id never leaks across projects).
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute(
+                "UPDATE nexus_notifications SET read_at=CASE WHEN %s THEN "
+                "COALESCE(read_at, now()) ELSE NULL END "
+                "WHERE id=%s AND project_id=%s "
+                "RETURNING id, kind, title, body, resource_id, created_at, read_at",
+                (bool(read), notification_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("notification not found")
+            return dict(row)
+
+    def mark_all_notifications_read(self, principal: str, project_id: str) -> int:
+        """Mark every unread notification of a project read. Returns how many."""
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("UPDATE nexus_notifications SET read_at=now() "
+                        "WHERE project_id=%s AND read_at IS NULL", (project_id,))
+            return cur.rowcount
+
+    def delete_notification(self, principal: str, project_id: str,
+                            notification_id: str) -> bool:
+        """Remove one notification. A notification is a message, not history,
+        so it is deleted outright rather than trashed."""
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("DELETE FROM nexus_notifications WHERE id=%s AND project_id=%s",
+                        (notification_id, project_id))
+            return cur.rowcount == 1
 
     # -------------------------------------------------------- worker heartbeat
     def register_worker(self, worker_id: str, *, kind: str = "worker") -> None:

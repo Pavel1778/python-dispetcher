@@ -130,6 +130,11 @@
       </button>
       <button class="title-btn" type="button" id="conv-title" data-action="rename-chat" hidden></button>
       <div class="topbar-spacer"></div>
+      <button class="icon-btn" type="button" id="notif-btn" data-action="open-notifications"
+              aria-label="Уведомления" title="Уведомления">
+        <svg class="icon"><use href="#i-info"/></svg>
+        <span class="badge-dot" id="notif-dot" hidden></span>
+      </button>
       <button class="chip" type="button" id="repo-chip" data-action="open-repo" title="Репозиторий и ветка">
         <svg class="icon icon-sm" aria-hidden="true"><use href="#i-branch"/></svg>
         <span id="repo-chip-text">Подключить репозиторий</span>

@@ -1983,9 +1983,12 @@ class Handler(BaseHTTPRequestHandler):
                 from urllib.parse import parse_qs
                 query = (parse_qs(path.split("?", 1)[1]).get("q") or [None])[0]
             return (200, {"memory": self.app.memory.retrieve(principal, project_id, query=query)}, None)
-        # GET /api/v1/projects/{id}/notifications
+        # GET /api/v1/projects/{id}/notifications[?unread=1]
         if rest == ["notifications"]:
-            return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
+            params = urllib.parse.parse_qs(urlparse(self.path).query)
+            unread_only = (params.get("unread") or ["0"])[0].lower() in ("1", "true", "yes", "on")
+            return (200, {"notifications": self.app.lab.notifications(
+                principal, project_id, unread_only=unread_only)}, None)
         # GET /api/v1/projects/{id}/conversations[?q=&archived=1&deleted=1]
         if rest and rest[0] == "conversations" and len(rest) == 1:
             # The query lives on the raw request target, not the stripped path.
@@ -2471,6 +2474,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
                 return True
             self._json(200, {"repository": link})
+            return True
+        # POST /api/v1/projects/{id}/notifications/read  (mark every unread read)
+        if rest == ["notifications", "read"]:
+            marked = self.app.lab.mark_all_notifications_read(principal, project_id)
+            self._json(200, {"marked": marked})
             return True
         # POST /api/v1/projects/{id}/context/refresh  (analyze the repository)
         if rest == ["context", "refresh"]:
@@ -4491,6 +4499,11 @@ class Handler(BaseHTTPRequestHandler):
                         principal, project_id, rest[1]))
                 self.app.conversations.set_archived(principal, project_id, rest[1], True)
                 return self._json(200, {"archived": rest[1]})
+            # DELETE /api/v1/projects/{id}/notifications/{nid}
+            if len(rest) == 2 and rest[0] == "notifications" and UUID_RE.fullmatch(rest[1]):
+                if self.app.lab.delete_notification(principal, project_id, rest[1]):
+                    return self._json(200, {"deleted": rest[1]})
+                return self._json(404, {"error": "not found"})
             # DELETE /api/v1/projects/{id}/runs/{run_id}   (remove from history)
             if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
                 try:
@@ -4530,6 +4543,17 @@ class Handler(BaseHTTPRequestHandler):
             sub = self._project_subpath(path)
             if sub is not None:
                 project_id, rest = sub
+                # PATCH /api/v1/projects/{id}/notifications/{nid}  (read/unread)
+                if (len(rest) == 2 and rest[0] == "notifications"
+                        and UUID_RE.fullmatch(rest[1])):
+                    body = self._body(max_bytes=64 * 1024)
+                    if not isinstance(body, dict) or "read" not in body:
+                        return self._json(400, {"error": "body must be {\"read\": true|false}"})
+                    if not isinstance(body["read"], bool):
+                        return self._json(400, {"error": "read must be a boolean"})
+                    notification = self.app.lab.set_notification_read(
+                        self._project_principal(), project_id, rest[1], body["read"])
+                    return self._json(200, {"notification": notification})
                 if (len(rest) == 2 and rest[0] == "conversations"
                         and UUID_RE.fullmatch(rest[1])):
                     body = self._body(max_bytes=64 * 1024)
