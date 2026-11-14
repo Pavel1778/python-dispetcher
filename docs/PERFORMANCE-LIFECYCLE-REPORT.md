@@ -59,9 +59,17 @@ without an artefact behind it.
 
 ## 5. Test result
 
-Final full-suite numbers are recorded in the pull request and in the commit
-history (run on PostgreSQL 17 against a disposable database). The baseline was
-1734 passed / 1 failed / 44 skipped; this branch is compared against that.
+Final full suite on PostgreSQL 17 (disposable database):
+
+```
+1762 passed, 44 skipped in 1456.95s (0:24:16)
+ruff check .  -> All checks passed!
+```
+
+The baseline was **1734 passed, 1 failed, 44 skipped** (the single failure,
+`test_auth.py::test_expired_sessions_and_stale_attempts_are_swept`, is a
+pre-existing load-sensitive flake that passes on its own). The 28 new tests are
+the ones this work added; nothing on `main` was left failing.
 
 ## 6. Known limitations (honest)
 
