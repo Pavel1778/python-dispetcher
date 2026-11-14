@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT))
 from tests.test_studio_api import _reset_schema  # noqa: E402
 from orchestration.cloud_store import PostgresStore  # noqa: E402
 from orchestration.nexus_projects import ProjectService  # noqa: E402
-from orchestration.file_lab import FileLabService
+from orchestration.file_lab import FileLabService  # noqa: E402
 from orchestration import archive_safety  # noqa: E402
 
 PRINCIPAL = "bench-principal"

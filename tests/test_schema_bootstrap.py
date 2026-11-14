@@ -166,17 +166,22 @@ def test_prepared_statements_are_off_by_default() -> None:
     store = PostgresStore(DSN)
     try:
         # None is what psycopg uses to mean "never prepare server-side".
-        assert store._conn.prepare_threshold is None
         assert store.prepare_threshold is None
-        # Execute the same statement more than the default threshold (5); with
-        # preparation disabled the server must not hold a prepared statement,
-        # because a pooled connection may be handed to another client.
-        with store._conn.cursor() as cur:
-            for _ in range(8):
-                cur.execute("SELECT 1 AS n")
-                cur.fetchone()
-            cur.execute("SELECT count(*) AS n FROM pg_prepared_statements")
-            assert cur.fetchone()["n"] == 0
+        # Every pooled connection must be opened with that policy, because a
+        # pooled connection may be handed to another client.
+        with store._connection() as conn:
+            assert conn.prepare_threshold is None
+            # Execute the same statement more than the default threshold (5);
+            # with preparation disabled the server must not hold a prepared
+            # statement, because a pooled connection may be handed to another
+            # client.
+            with conn.cursor() as cur:
+                for _ in range(8):
+                    cur.execute("SELECT 1 AS n")
+                    cur.fetchone()
+                cur.execute("SELECT count(*) AS n FROM pg_prepared_statements")
+                assert cur.fetchone()["n"] == 0
+            conn.rollback()
     finally:
         store.close()
 
@@ -190,8 +195,9 @@ def test_prepare_can_be_opted_in_for_a_direct_connection() -> None:
     finally:
         os.environ.pop("PSYCOPG_PREPARE", None)
     try:
-        assert store._conn.prepare_threshold == 5
         assert store.prepare_threshold == 5
+        with store._connection() as conn:
+            assert conn.prepare_threshold == 5
     finally:
         store.close()
 

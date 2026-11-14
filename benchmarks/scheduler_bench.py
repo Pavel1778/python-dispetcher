@@ -75,7 +75,7 @@ def main() -> int:
         cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, state) "
                     "VALUES (%s,%s,%s,'draft') RETURNING id",
                     (project, "goal", PRINCIPAL))
-        goal = cur.fetchone()["id"]
+        cur.fetchone()
 
     out: dict = {"environment": {"python": sys.version.split()[0]}, "measurements": {}}
     m = out["measurements"]
@@ -132,8 +132,10 @@ def main() -> int:
                 claimed[0] += n
         th = [threading.Thread(target=w) for _ in range(workers)]
         t0 = time.perf_counter()
-        for t in th: t.start()
-        for t in th: t.join()
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
         wall = time.perf_counter() - t0
         conc[str(workers)] = {"workers": workers, "claimed": claimed[0],
                               "wall_s": round(wall, 4),

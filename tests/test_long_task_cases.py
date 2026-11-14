@@ -277,9 +277,23 @@ def test_a_resend_while_the_plan_is_being_built_does_not_plan_twice(lab):
 
 
 def _gone():
-    from orchestration.cloud_store import StoreUnavailable
+    """Take the database away from a store: every later call is unavailable.
 
-    raise StoreUnavailable("this process has been stopped")
+    Replaces the store's pool with one pointed at a port nothing listens on, so
+    the process under test cannot write anything more (the same effect the old
+    ``_reconnect`` hook produced, now expressed on the pool).
+    """
+    import psycopg_pool
+    from orchestration import cloud_store
+
+    def detach(store):
+        store._pool.close()
+        dead = "postgresql://127.0.0.1:1/nexus-gone"
+        store._pool = psycopg_pool.ConnectionPool(
+            dead, kwargs=store._connect_kwargs, min_size=0, max_size=1,
+            open=True, timeout=0.5, reconnect_timeout=0.5,
+            check=cloud_store._pool_check_connection)
+    return detach
 
 
 def test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on(lab):
@@ -314,7 +328,7 @@ def test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on
         # the "process" is threads of this one and that thread is still inside
         # its request, so its database is taken away: once the server has
         # stopped, nothing more is written on its behalf.
-        studio.app.store._reconnect = _gone
+        _gone()(studio.app.store)                      # take its database away now
         studio.server.stop()                           # with the third request still open
         app = studio.boot()
         app.spec_planner.retry_delay = lambda attempts: 0

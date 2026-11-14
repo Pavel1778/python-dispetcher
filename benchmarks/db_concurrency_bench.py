@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import statistics
+import sys
 import threading
 import time
 from pathlib import Path
@@ -158,7 +159,8 @@ def main() -> int:
     for _ in range(20):
         with psycopg.connect(dsn) as c:
             with c.cursor() as cur:
-                cur.execute(SQL, (cid,)); cur.fetchone()
+                cur.execute(SQL, (cid,))
+                cur.fetchone()
 
     a = VariantA(dsn)
     b = VariantB(dsn, max_size=max(args.pool_max, 100))

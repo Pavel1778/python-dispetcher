@@ -77,8 +77,10 @@ def _level(base: str, path: str, concurrency: int, per_worker: int) -> dict:
             lat.extend(local)
     th = [threading.Thread(target=worker) for _ in range(concurrency)]
     t0 = time.perf_counter()
-    for t in th: t.start()
-    for t in th: t.join()
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
     wall = time.perf_counter() - t0
     ops = concurrency * per_worker
     return {"concurrency": concurrency, "total_ops": ops, "wall_s": round(wall, 4),
