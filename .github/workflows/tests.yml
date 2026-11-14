@@ -14,7 +14,11 @@ jobs:
     # 24.04 ships pg_dump 16 (the drill fails with "server version mismatch"),
     # 26.04 ships 18. Both were run side by side on 2026-11-11 to establish this.
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    # The suite grew with the chat/command/conversation/run-history/project
+    # increments; on a shared runner it reached ~29 minutes and was cancelled
+    # by the old 30-minute limit at 96% with no failure. The job's own steps
+    # each carry their own timeout; this is the outer bound for a slow runner.
+    timeout-minutes: 50
 
     # The Cloud integration tests run against a real PostgreSQL server and skip
     # cleanly when it is absent, so the service is only here to keep them
