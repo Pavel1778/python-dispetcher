@@ -43,6 +43,27 @@ stand-in servers on loopback unless stated).
 | Android / Windows client packages | VERIFIED (build only) | `tests/test_android_apk.py`, `tests/test_windows_exe.py` — not runtime-verified (no emulator / no Windows host) |
 | iOS client | NOT IMPLEMENTED | — |
 
+## Deployment (production)
+
+The live service `https://python-dispetcher-1.onrender.com` was checked
+2026-11-14 20:55 UTC:
+
+| Check | Result |
+| --- | --- |
+| `GET /healthz` | `200 {"status": "ok"}` |
+| `GET /readyz` | `200 {"status": "ready", "database": true}` |
+| Headers | `server: cloudflare`, `x-render-origin-server: SrJrDispatcher/2.0 Python/3.12.6` |
+| Deployed front end | `static/app.js` md5 `0003a2ec…` — **identical to `main` at `42609a4`** (the pre-increment build) |
+
+**The deployment is up and healthy but has not picked up this increment.**
+`render.yaml` declares `autoDeploy: true` for both services, yet the served
+assets are still the `42609a4` build, so the deploy either has not run or the
+running service was created by hand in the dashboard (the header shows Python
+3.12.6, matching `render.yaml`, so it is this repository's code). No
+`RENDER_API_KEY` or deploy hook exists in this environment, so a deploy cannot
+be triggered from here; rebuilding by hand in the Render dashboard is the
+reliable path. Status: **RELEASE READY — DEPLOYMENT PENDING**.
+
 ## Summary
 
 - Every subsystem that runs in this environment is **VERIFIED** against real
