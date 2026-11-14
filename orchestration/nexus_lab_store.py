@@ -1885,6 +1885,74 @@ class LabStore:
                 "  WHERE dep.state = ANY(%s))", (run_id, list(_RETRYABLE_TASK_STATES)))
             return cur.fetchone()["n"] > 0
 
+    def queue_snapshot(self) -> dict[str, Any]:
+        """What the lab queue holds right now, across every project.
+
+        Counts only; no project or task content. ``stuck`` is a task that is
+        ``pending`` or ``waiting`` with no live lease and no wait left - it is
+        claimable in principle, so if it stays that way it means nobody is
+        claiming it (the symptom "running + pending" the request names). The
+        oldest such task's age is what tells a slow worker from a dead one.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT state, count(*) AS n FROM nexus_run_tasks GROUP BY state")
+            by_state = {r["state"]: int(r["n"]) for r in cur.fetchall()}
+            cur.execute(
+                "SELECT count(*) AS n, "
+                "  COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)::int AS oldest "
+                "FROM nexus_run_tasks "
+                "WHERE state IN ('pending','waiting') "
+                "  AND (lease_expires IS NULL OR lease_expires < now()) "
+                "  AND (retry_at IS NULL OR retry_at <= now())")
+            row = cur.fetchone()
+            claimable, oldest = int(row["n"]), int(row["oldest"] or 0)
+            cur.execute(
+                "SELECT count(*) AS n FROM nexus_runs WHERE state = ANY(%s)",
+                (list(ACTIVE_RUN_STATES),))
+            active_runs = int(cur.fetchone()["n"])
+        return {
+            "tasks_by_state": by_state,
+            "pending": by_state.get("pending", 0) + by_state.get("waiting", 0),
+            "running": sum(by_state.get(s, 0) for s in IN_FLIGHT_TASK_STATES),
+            "failed": by_state.get("failed", 0) + by_state.get("blocked", 0),
+            "retrying": by_state.get("waiting", 0),
+            "claimable_now": claimable,
+            "oldest_claimable_seconds": oldest,
+            "active_runs": active_runs,
+        }
+
+    def stuck_tasks(self, *, min_age_seconds: int = 300, limit: int = 20) -> list[dict]:
+        """Claimable tasks that have waited longer than *min_age_seconds*.
+
+        A task that is due (no live lease, its wait is over) and still not
+        claimed after this long is the "running run, pending task, attempt 0"
+        state the request names. Each entry says why it is not moving: the run's
+        state, the task's reason, and how long it has waited. No secrets - the
+        ids and the reason only.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT t.id, t.run_id, t.project_id, t.task_key, t.state, t.attempt, "
+                "  t.max_attempts, t.wait_reason, t.last_error, t.created_at, "
+                "  EXTRACT(EPOCH FROM (now() - t.created_at))::int AS age_seconds, "
+                "  r.state AS run_state "
+                "FROM nexus_run_tasks t JOIN nexus_runs r ON r.id = t.run_id "
+                "WHERE t.state IN ('pending','waiting') "
+                "  AND (t.lease_expires IS NULL OR t.lease_expires < now()) "
+                "  AND (t.retry_at IS NULL OR t.retry_at <= now()) "
+                "  AND t.created_at < now() - (%s || ' seconds')::interval "
+                "  AND r.state = ANY(%s) "
+                "ORDER BY t.created_at LIMIT %s",
+                (max(0, int(min_age_seconds)), list(ACTIVE_RUN_STATES), max(1, int(limit))))
+            return [{
+                "task_id": str(r["id"]), "run_id": str(r["run_id"]),
+                "project_id": str(r["project_id"]), "task_key": r["task_key"],
+                "state": r["state"], "run_state": r["run_state"],
+                "attempt": int(r["attempt"]), "max_attempts": int(r["max_attempts"]),
+                "age_seconds": int(r["age_seconds"] or 0),
+                "reason": (r["wait_reason"] or r["last_error"] or "")[:300],
+            } for r in cur.fetchall()]
+
     def next_wake(self, run_id: str) -> dict | None:
         """What a run that has nothing in flight is waiting for: the earliest
         moment one of its tasks may be taken again, and that task's reason."""

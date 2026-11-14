@@ -151,7 +151,7 @@ from .web_auth import (
     parse_cookie,
     session_cookie_header,
 )
-from . import web_ui
+from . import tracing, web_ui
 from .workflow_verifier import WorkflowVerifier
 
 log = logging.getLogger("web_server")
@@ -1421,6 +1421,46 @@ class App:
                 {"provider": r.provider, "model": r.model, "kind": r.kind,
                  "detail": r.detail, "model_available": r.model_available}
                 for r in self.providers.probe_all()]
+        return out
+
+    def observability(self) -> dict[str, Any]:
+        """What the execution path is doing now, and how slow each stage is.
+
+        Booleans, counts and durations only; never a secret and never a
+        project's content. Everything that can fail is answered as an error
+        field, so the endpoint never 500s (it is read during an outage).
+        """
+        out: dict[str, Any] = {}
+        try:
+            out["queue"] = self.lab.queue_snapshot()
+        except Exception as e:  # noqa: BLE001 - diagnostics must not raise
+            out["queue"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            out["stuck_tasks"] = self.lab.stuck_tasks()
+        except Exception as e:  # noqa: BLE001
+            out["stuck_tasks"] = [{"error": f"{type(e).__name__}: {e}"}]
+        try:
+            workers = self.lab.live_workers(max_age_seconds=120)
+            out["workers"] = {
+                "live": [{"worker_id": w["worker_id"], "kind": w["kind"],
+                          "age_seconds": w["age_seconds"], "last_error": w["last_error"]}
+                         for w in workers],
+                "count": len(workers),
+            }
+        except Exception as e:  # noqa: BLE001
+            out["workers"] = {"error": f"{type(e).__name__}: {e}"}
+        last = self.last_lab_tick or {}
+        out["last_tick"] = {"at": last.get("at"), "advanced": last.get("advanced"),
+                            "errors": last.get("errors")}
+        # Per-stage latency from the tracer: queue wait is dispatch latency;
+        # poll is how long a look at OpenHands took; verify is the GitHub read.
+        out["latency"] = tracing.tracer.summary()
+        # Connectivity, by presence and a bounded error, never a value.
+        try:
+            out["openhands_reachable"] = bool(self.client.health())
+        except Exception as e:  # noqa: BLE001
+            out["openhands_reachable"] = False
+            out["openhands_error"] = type(e).__name__
         return out
 
     def system_info(self) -> dict[str, Any]:
@@ -3793,6 +3833,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
                 return self._json(200, self.app.system_info())
+            if path == "/api/observability":
+                # Queue depth, stuck tasks, worker heartbeat, per-stage latency.
+                # Booleans, counts and durations only; never a secret.
+                return self._json(200, self.app.observability())
             if path == "/api/security/policy":
                 # The NEXUS permission policy: roles and their scopes, the scope
                 # every MCP tool needs, and the SSRF/redaction configuration.

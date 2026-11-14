@@ -53,7 +53,7 @@ from .cloud_client import (
 )
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
-from . import nexus_retry
+from . import nexus_retry, tracing
 from .nexus_binding import AuthorizationError, ProjectRepositoryService, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_evidence import LabEvidence
@@ -1579,7 +1579,10 @@ class LabScheduler:
             if not conv or task.get("held"):
                 in_flight += 1
                 continue
-            report = self.executor.poll(task, conv)
+            with tracing.span("poll", project_id=task.get("project_id"),
+                              task_id=task.get("id"), conversation_id=conv,
+                              attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
+                report = self.executor.poll(task, conv)
             if report.state == "running":
                 over = self._over_limit(task, conv, durable)
                 if over is None:
@@ -1622,7 +1625,10 @@ class LabScheduler:
                 result.note = "executor gone: task requeued for failover"
                 continue
             else:
-                verdict = self.verifier.verify(task, report)
+                with tracing.span("verify", project_id=task.get("project_id"),
+                                  task_id=task.get("id"), conversation_id=conv,
+                                  attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
+                    verdict = self.verifier.verify(task, report)
             # The account produced a terminal result, so it is working: mark it
             # healthy again. Without this an account excluded by one transient
             # failure would never come back into the pool.
@@ -1814,7 +1820,10 @@ class LabScheduler:
             task = {**task, "project_repositories": ProjectRepositoryService(
                 self.store.store).context(str(task["project_id"]))}
         try:
-            conversation_id = self.executor.dispatch(task)
+            with tracing.span("dispatch", project_id=task.get("project_id"),
+                              task_id=task.get("id"),
+                              attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
+                conversation_id = self.executor.dispatch(task)
         except NoUsableAccount as e:
             # The pool has nothing left for this task (every account tried
             # or unusable).
