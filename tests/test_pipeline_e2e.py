@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -70,6 +71,9 @@ def evidence_key(monkeypatch):
 #: The commit the fake GitHub reports as the branch head. The agent names it and
 #: the Git verifier accepts the task only because the two agree.
 HEAD = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+HEAD2 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+#: The commit the branch is at before any task runs.
+BASE = "0123456789abcdef0123456789abcdef01234567"
 
 #: The PLANNER's answer: a two-task DAG with a real dependency (audit → change).
 PLAN = {"tasks": [
@@ -99,7 +103,9 @@ def _start_run(studio, *, text="Цель: покрыть модуль теста
     project = studio.project()
     assert studio.api.post(f"/api/v1/projects/{project}/repository",
                            {"full_name": REPO, "account_id": studio.account()})[0] == 200
-    studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+    # The branch starts at BASE; an agent that pushes HEAD moves it, which the
+    # verifier requires for a task to be accepted.
+    studio.github.commits = [{"sha": BASE, "commit": {"message": "start"}}]
     conversation = studio.conversation(project, mode="autonomous")
     studio.answers(json.dumps(PLAN))
     status, reply = studio.api.post(
@@ -125,7 +131,15 @@ def _conversation_for(studio, key):
 
 
 def _finish(studio, cid, text):
-    """The agent's conversation ends, with *text* as its report."""
+    """The agent's conversation ends, with *text* as its report.
+
+    A task verifies only when the branch moved (``GitVerifier``), so the commit
+    the report names is pushed as a real agent's ``git push`` would - unless it
+    is already the head.
+    """
+    match = re.search(r"\b[0-9a-f]{7,40}\b", text or "")
+    if match and studio.github.head(REPO) != match.group(0):
+        studio.github.push(REPO, match.group(0), "work")
     studio.cloud.cloud.add_assistant_message(cid, text)
     studio.cloud.cloud.conversations[cid]["execution_status"] = "finished"
 
@@ -192,7 +206,7 @@ def test_the_full_pipeline_runs_every_stage_in_order(monkeypatch):
         # --- the dependent task now starts --------------------------------
         second = _until(lambda: _conversation_for(studio, "change"),
                         what="the dependent task to start after its dependency verified")
-        _finish(studio, second, f"Готово. Коммит {HEAD}.")
+        _finish(studio, second, f"Готово. Коммит {HEAD2}.")
 
         # --- ACCEPTANCE: the run completes only when every task verified -----
         done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
@@ -261,14 +275,15 @@ def test_a_text_answer_is_never_proof_of_work(monkeypatch):
         ev = _until(lambda: _evidence_for_task(studio, project, tasks["audit"]["id"]),
                     what="the EVIDENCE stage to write the signed record")
         assert ev["verdict"] == "VERIFIED"
-        assert ev["commit_sha"] == HEAD, "the record must bind the observed branch head"
+        # The branch was not pushed, so the observed head is still the start.
+        assert ev["commit_sha"] == BASE, "the record must bind the observed branch head"
         assert ev["body"]["detail"]["verdict"] == "completed_unverified"
 
         # Told what was missing, the agent names the commit; now it counts.
         _finish(studio, first, f"Коммит {HEAD}")
         second = _until(lambda: _conversation_for(studio, "change"),
                         what="the dependent task to start once its dependency verified")
-        _finish(studio, second, f"Коммит {HEAD}")
+        _finish(studio, second, f"Коммит {HEAD2}")
         done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
             _detail(studio, project, run)), what="the run to finish")
         assert done["run"]["state"] == "completed"
@@ -302,7 +317,7 @@ def test_the_loop_is_advanced_by_the_separate_worker_not_the_server(monkeypatch)
         _finish(studio, first, f"Коммит {HEAD}")
         second = _until(lambda: (worker.tick_once(), _conversation_for(studio, "change"))[1],
                         what="the worker to dispatch the second task")
-        _finish(studio, second, f"Коммит {HEAD}")
+        _finish(studio, second, f"Коммит {HEAD2}")
         _until(lambda: (worker.tick_once(),
                         _detail(studio, project, run)["run"]["state"] == "completed")[1],
                what="the worker to complete the run")

@@ -35,6 +35,7 @@ from tests.test_studio_api import DSN, studio_stack  # noqa: E402
 pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run lab tests")
 
 HEAD = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+HEAD2 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
 
 def _detail(studio, project, run):
@@ -72,7 +73,7 @@ def test_the_api_and_a_separate_worker_advance_a_run_with_no_client(monkeypatch)
             _finish(studio, first, f"Готово. Коммит {HEAD}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the worker to continue with no client connected")
-            _finish(studio, second, f"Готово. Коммит {HEAD}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2}.")
 
             done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
                 _detail(studio, project, run)), what="the run to finish")
@@ -97,7 +98,7 @@ def test_a_result_is_readable_after_reconnecting(monkeypatch):
             _finish(studio, first, f"Готово. Коммит {HEAD}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the worker to continue")
-            _finish(studio, second, f"Готово. Коммит {HEAD}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2}.")
             _until(lambda: (lambda d: d if d["run"]["state"] == "completed" else None)(
                 _detail(studio, project, run)), what="the run to finish")
         finally:
@@ -133,7 +134,7 @@ def test_the_worker_outlives_the_server_process(monkeypatch):
             _finish(studio, first, f"Готово. Коммит {HEAD}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the worker to continue after the server stopped")
-            _finish(studio, second, f"Готово. Коммит {HEAD}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2}.")
 
             # Read the run straight from the database: there is no HTTP server.
             from orchestration.nexus_lab_store import LabStore

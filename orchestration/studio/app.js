@@ -1942,8 +1942,9 @@
   var settingsTab = null;
 
   function openSettings(tab) {
-    settingsTab = tab === 'project' ? 'project' : 'connections';
-    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект']];
+    settingsTab = tab === 'project' ? 'project' : (tab === 'diagnostics' ? 'diagnostics' : 'connections');
+    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект'],
+                ['diagnostics', 'zap', 'Диагностика']];
     openDialog({
       title: 'Настройки',
       className: 'is-wide is-settings',
@@ -1979,6 +1980,9 @@
              return { context: parts[0], executors: parts[1], repositories: parts[2] };
            })
          : Promise.resolve(null))
+      : tab === 'diagnostics'
+      ? api('/api/observability').then(function (data) { return data; },
+                                       function (error) { return { error: error.message }; })
       : Promise.all([
           loadGithubAccounts().catch(function () { S.accounts.github = []; }),
           loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
@@ -1990,10 +1994,61 @@
       if (tab === 'project') {
         S.projectSettings = result || null;
         pane.innerHTML = projectSettingsHtml(result);
+      } else if (tab === 'diagnostics') {
+        pane.innerHTML = diagnosticsHtml(result);
       } else {
         pane.innerHTML = connectionsHtml();
       }
     });
+  }
+
+  // What the execution path is doing right now, and how slow each stage is.
+  // Everything comes from GET /api/observability; the panel decides nothing.
+  function diagnosticsHtml(data) {
+    if (!data || data.error) {
+      return '<div class="section"><h3 class="section-title">' + icon('alert', 'icon-sm') +
+        'Диагностика недоступна</h3><p class="section-note">' + esc((data && data.error) || 'нет ответа') +
+        '</p><div class="row"><button class="btn" type="button" data-action="refresh-settings">Обновить</button></div></div>';
+    }
+    var q = data.queue || {};
+    var workers = data.workers || {};
+    var latency = data.latency || { stages: {} };
+    function stat(label, value, tone) {
+      return '<div class="stat"><span class="stat-label">' + esc(label) + '</span>' +
+        '<span class="stat-value' + (tone ? ' is-' + tone : '') + '">' + esc(String(value)) + '</span></div>';
+    }
+    var workerLine = (workers.count ? workers.count + ' активно' : 'нет активных');
+    var rows = Object.keys(latency.stages || {}).map(function (stage) {
+      var s = latency.stages[stage];
+      return '<tr><td>' + esc(stage) + '</td><td>' + s.count + '</td><td>' + s.p50_ms +
+        ' мс</td><td>' + s.p95_ms + ' мс</td><td>' + s.max_ms + ' мс</td><td>' + s.errors + '</td></tr>';
+    }).join('');
+    var stuck = (data.stuck_tasks || []).map(function (t) {
+      if (t.error) return '<li>' + esc(t.error) + '</li>';
+      return '<li><code>' + esc(t.task_key) + '</code> · прогон ' + esc(stateLabel(t.run_state)) +
+        ' · ожидает ' + Math.round(t.age_seconds / 60) + ' мин · попытка ' + t.attempt + '/' + t.max_attempts +
+        (t.reason ? ' · ' + esc(clip(t.reason, 160)) : '') + '</li>';
+    }).join('');
+    return '<div class="section"><h3 class="section-title">' + icon('zap', 'icon-sm') +
+      'Состояние системы</h3><div class="stats">' +
+      stat('Воркеры', workerLine, workers.count ? 'ok' : 'warn') +
+      stat('Активных прогонов', q.active_runs == null ? '—' : q.active_runs) +
+      stat('В очереди', q.pending == null ? '—' : q.pending, q.pending ? 'warn' : 'ok') +
+      stat('Выполняется', q.running == null ? '—' : q.running) +
+      stat('Сбойных', q.failed == null ? '—' : q.failed, q.failed ? 'bad' : 'ok') +
+      stat('OpenHands', data.openhands_reachable ? 'доступен' : 'недоступен',
+           data.openhands_reachable ? 'ok' : 'bad') +
+      '</div>' +
+      '<p class="section-note">Зависших задач (готовы к запуску, но не запущены дольше 5 минут): ' +
+      (data.stuck_tasks || []).length + '.</p>' +
+      (stuck ? '<ul class="events">' + stuck + '</ul>' : '') +
+      '</div>' +
+      '<div class="section"><h3 class="section-title">' + icon('clock', 'icon-sm') + 'Задержки по этапам</h3>' +
+      (rows
+        ? '<table class="latency"><thead><tr><th>Этап</th><th>N</th><th>p50</th><th>p95</th><th>макс</th><th>ошибок</th></tr></thead><tbody>' + rows + '</tbody></table>'
+        : '<p class="section-note">Измерений пока нет. Задержки собираются при выполнении задач (включите NEXUS_TRACE=1, чтобы видеть их здесь).</p>') +
+      '<div class="row"><button class="btn" type="button" data-action="refresh-settings">Обновить</button></div>' +
+      '</div>';
   }
 
   function loadOpenhandsAccounts() {
@@ -2724,6 +2779,7 @@
       else if (tab) { settingsTab = tab; refreshSettings(); }
     },
     'settings-tab': function (el) { settingsTab = el.getAttribute('data-tab'); refreshSettings(); },
+    'refresh-settings': function () { refreshSettings(); },
     'open-repo': function (el) {
       closeMenu();
       if (repoState) return;

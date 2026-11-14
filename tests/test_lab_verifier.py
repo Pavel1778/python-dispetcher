@@ -165,6 +165,56 @@ def test_named_shas_are_distinct_and_in_order():
     assert _named_shas("") == [] and _named_shas(None) == []
 
 
+# ------------------------------------------------ the branch must have moved
+def test_a_task_whose_branch_did_not_move_is_not_verified(github):
+    """The defect: an agent whose push was refused names the head it found. The
+    head SHA alone does not prove a new change, so a change-requiring task whose
+    branch is still at the commit the attempt started from is not accepted."""
+    _, client, _ = github
+    task = _task(base_sha=HEAD)                 # the branch started at HEAD
+    verdict = GitVerifier(client).verify(task, _finished(f"Commit {HEAD}"))
+    assert verdict.verdict == "completed_unverified"
+    assert verdict.reason == (
+        "the branch did not move: the reported commit is the one the attempt started from")
+    assert verdict.evidence["changed"] is False
+    assert verdict.retry == "followup"
+
+
+def test_a_task_whose_branch_moved_is_verified(github):
+    _, client, _ = github
+    task = _task(base_sha=OTHER)                # started elsewhere, now at HEAD
+    verdict = GitVerifier(client).verify(task, _finished(f"Commit {HEAD}"))
+    assert verdict.verdict == "completed_verified"
+    assert verdict.evidence["changed"] is True
+
+
+def test_a_verification_task_without_a_change_is_completed_no_changes(github):
+    """A task whose kind does not change the code is accepted without the branch
+    moving - and said as what it is, not as a change."""
+    _, client, _ = github
+    task = _task(base_sha=HEAD, kind="verification_only", expects_change=False)
+    verdict = GitVerifier(client).verify(task, _finished(f"Commit {HEAD}"))
+    assert verdict.verdict == "completed_no_changes"
+    assert verdict.reason == "no repository change, as this task's kind expects"
+
+
+def test_a_research_task_is_told_by_its_kind_when_no_flag_is_given(github):
+    _, client, _ = github
+    verdict = GitVerifier(client).verify(
+        _task(base_sha=HEAD, kind="research_audit"), _finished(f"Commit {HEAD}"))
+    assert verdict.verdict == "completed_no_changes"
+
+
+def test_an_unknown_start_commit_still_verifies_when_the_head_is_named(github):
+    """No base recorded: whether the branch moved is unknown, not "nothing
+    changed", so a named head still verifies (the pre-existing behaviour for a
+    run that began before the start commit was recorded)."""
+    _, client, _ = github
+    verdict = GitVerifier(client).verify(_task(), _finished(f"Commit {HEAD}"))
+    assert verdict.verdict == "completed_verified"
+    assert verdict.evidence["changed"] is None
+
+
 # -------------------------------------------------- whose eyes the branch is read with
 @pytest.mark.parametrize("error", [
     NotFound("account not found"), ValueError("account is revoked"),

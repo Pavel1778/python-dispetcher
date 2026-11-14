@@ -685,6 +685,17 @@ a:hover { text-decoration: underline; }
 .kv dt { color: var(--text-3); }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
 .kv .dot { display: inline-block; margin-right: 8px; vertical-align: 1px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 0 0 12px; }
+.stat { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.stat-label { font-size: 12px; color: var(--text-3); }
+.stat-value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat-value.is-ok { color: var(--ok); }
+.stat-value.is-warn { color: var(--warn); }
+.stat-value.is-bad { color: var(--bad); }
+table.latency { width: 100%; border-collapse: collapse; margin: 0 0 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.latency th, table.latency td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+table.latency th { color: var(--text-3); font-weight: 500; }
+table.latency td:not(:first-child), table.latency th:not(:first-child) { text-align: right; }
 details.add { border: 1px dashed var(--line-strong); border-radius: 12px; padding: 0 12px; margin: 0 0 14px; }
 .account-form .field { margin-bottom: 8px; }
 .account-form .field-hint { margin: 0 0 12px; }

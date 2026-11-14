@@ -63,7 +63,7 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/agents", f"/api/v1/projects/{UUID}/binding",
     "/api/openhands/accounts", f"/api/openhands/accounts/{UUID}",
     "/api/openhands/pool", "/api/openhands/diagnostics", "/api/providers",
-    "/api/security/policy",
+    "/api/security/policy", "/api/observability",
     "/api/openhands/tools",
     f"/api/github/accounts/{UUID}/repositories",
     "/api/github/accounts", f"/api/github/accounts/{UUID}",

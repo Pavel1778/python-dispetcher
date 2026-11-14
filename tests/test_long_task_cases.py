@@ -21,7 +21,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.long_task_kit import (  # noqa: E402
-    HEAD,
     Lab,
     agent_bytes,
     completion,
@@ -551,7 +550,11 @@ def test_every_task_of_every_part_is_given_the_whole_text_and_the_run_completes(
                                    + ("\n" if last < len(lines) else "")).encode("utf-8")
         # Later parts wait for earlier ones: nothing else has been started.
         assert len(lab.studio.sandbox.conversations) == position
-        lab.studio.sandbox.finish(conversation.id, f"Готово. Коммит {HEAD}.")
+        # Each task pushes a commit of its own, so the branch really moves and
+        # the task verifies (a task whose branch did not move is reworked).
+        commit = f"c0{position:038x}"
+        lab.push(commit)
+        lab.studio.sandbox.finish(conversation.id, f"Готово. Коммит {commit}.")
 
     done = until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
         lab.run(run_id)), timeout=30, what="the run to finish")
@@ -951,7 +954,12 @@ def _through_the_run(studio, lab, run_id, *, timeout=120.0):
                 continue
             messages[tags["nexustask"]] = (
                 cloud.start_bodies[cid]["initial_message"]["content"][0]["text"])
-            cloud.add_assistant_message(cid, f"Готово. Коммит {HEAD}.")
+            # A commit of this task's own, pushed, so the branch really moves.
+            # The fake GitHub is taken from *studio*, not ``lab``: a test may
+            # have restarted the server, and ``lab.studio`` is then the old one.
+            commit = f"c0{len(messages):038x}"
+            studio.github.push(lab.repo, commit, "work")
+            cloud.add_assistant_message(cid, f"Готово. Коммит {commit}.")
             conversation["execution_status"] = "finished"
         detail = lab.run(run_id)
         if detail["run"]["state"] != "running":

@@ -40,6 +40,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: The commit the fake GitHub reports as the branch head; the agent names it.
 HEAD_TEXT = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+#: A second, distinct head, so the second task's branch really moves.
+HEAD2_TEXT = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
 
 def _detail(studio, project, run):
@@ -140,7 +142,7 @@ def test_the_worker_process_registers_heartbeats_and_completes_a_run(monkeypatch
             _finish(studio, first, f"Готово. Коммит {HEAD_TEXT}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the worker to dispatch the second task")
-            _finish(studio, second, f"Готово. Коммит {HEAD_TEXT}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2_TEXT}.")
 
             # 4. The run reaches completed - the worker, and only the worker,
             #    did it.
@@ -189,7 +191,7 @@ def test_a_restarted_worker_process_continues_the_run(monkeypatch):
             _finish(studio, first, f"Готово. Коммит {HEAD_TEXT}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the second worker to continue the run")
-            _finish(studio, second, f"Готово. Коммит {HEAD_TEXT}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2_TEXT}.")
             done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
                 _detail(studio, project, run)), what="the run to finish")
             assert done["run"]["state"] == "completed", done["run"]
@@ -215,7 +217,7 @@ def test_the_worker_keeps_working_with_no_client_connected(monkeypatch):
             _finish(studio, first, f"Готово. Коммит {HEAD_TEXT}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the worker to keep going without a client")
-            _finish(studio, second, f"Готово. Коммит {HEAD_TEXT}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2_TEXT}.")
             done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
                 _detail(studio, project, run)), what="the run to finish")
             assert done["run"]["state"] == "completed"

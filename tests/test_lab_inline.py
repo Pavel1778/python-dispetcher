@@ -91,6 +91,22 @@ def _task_conversation(studio, key):
 
 
 def _finish(studio, cid, text):
+    """The agent ends its conversation, and the commit its report names is the
+    head of the branch.
+
+    A task verifies only when the branch actually moved (``GitVerifier``), so a
+    test that has the agent name a commit must also have it pushed - exactly as
+    a real agent does. The commit is taken from the report text and pushed only
+    when it is not already the head, so a caller that pushed it first is not
+    double-counted.
+    """
+    import re
+
+    match = re.search(r"\b[0-9a-f]{7,40}\b", text or "")
+    if match:
+        commit = match.group(0)
+        if studio.github.head(REPO) != commit:
+            studio.github.push(REPO, commit, "work")
     studio.cloud.cloud.add_assistant_message(cid, text)
     studio.cloud.cloud.conversations[cid]["execution_status"] = "finished"
 
