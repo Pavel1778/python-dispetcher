@@ -233,6 +233,52 @@ def test_the_lifecycle_columns_are_in_the_schema_guard(http_server):
     assert app.store.verify_schema() == []
 
 
+
+def test_a_conversation_can_be_pinned_and_sorts_first(http_server):
+    """Pin is ordering only: a pinned conversation sorts to the top of the
+    list regardless of recency, and unpinning restores recency order."""
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    first = _conversation(base, alice, pid, title="Первый")
+    _conversation(base, alice, pid, title="Второй")
+
+    def titles():
+        _, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+        return [c["title"] for c in listing["conversations"]]
+
+    # Newest first by default: the second one was created after the first.
+    assert titles() == ["Второй", "Первый"]
+    # Pinning the *older* one lifts it above the newer one.
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{first}", "PATCH",
+                      {"pinned": True}, session=alice)
+    assert st == 200 and out["conversation"]["pinned"] is True
+    assert titles() == ["Первый", "Второй"], "a pinned chat must sort first"
+    # Unpinning clears the flag (its own updated_at moves, which is fine - the
+    # assertion is that pin is a boolean the server round-trips).
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{first}", "PATCH",
+                      {"pinned": False}, session=alice)
+    assert out["conversation"]["pinned"] is False
+
+
+def test_a_conversation_can_be_trashed_and_restored_by_patch(http_server):
+    """The trash is reachable by PATCH too, not only by the DELETE route, so a
+    client that only patches works; restore is the same call with deleted=false."""
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    cid = _conversation(base, alice, pid, title="Чат")
+
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
+                      {"deleted": True}, session=alice)
+    assert st == 200 and out["conversation"]["deleted_at"] is not None
+    _, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert listing["conversations"] == []
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
+                      {"deleted": False}, session=alice)
+    assert st == 200 and out["conversation"]["deleted_at"] is None
+    _, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [cid]
+
+
 def test_lifecycle_routes_require_auth(http_server):
     base, alice, _app, _ = http_server
     pid = _project(base, alice)

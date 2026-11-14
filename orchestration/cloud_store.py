@@ -361,7 +361,7 @@ class PostgresStore:
         "nexus_openhands_pool": ("principal", "selection_mode", "fallback_order"),
         "nexus_projects": ("id", "name", "description", "archived_at", "deleted_at"),
         "nexus_conversations": ("id", "project_id", "title", "mode", "state",
-                                "archived", "deleted_at", "workflow_state",
+                                "archived", "pinned", "deleted_at", "workflow_state",
                                 "workflow_goal_id",
                                 "workflow_spec_id", "plan_hash", "workflow_plan",
                                 "plan_approved_hash", "plan_approved_at",

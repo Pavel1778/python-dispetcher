@@ -48,7 +48,7 @@ _MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "manual")
 #: project's bound repository and branch. Kept in one place so every read and
 #: every write returns the same shape.
 _CONVERSATION = (
-    "id, project_id, title, mode, state, archived, run_id, "
+    "id, project_id, title, mode, state, archived, pinned, run_id, "
     "workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
     "workflow_plan, plan_approved_hash, plan_approved_at, plan_approved_by, "
     "deleted_at, created_at, updated_at")
@@ -81,7 +81,7 @@ class ConversationService:
              include_deleted: bool = False) -> list[dict]:
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            sql = ("SELECT id, project_id, title, mode, state, archived, run_id, "
+            sql = ("SELECT id, project_id, title, mode, state, archived, pinned, run_id, "
                    "workflow_state, deleted_at, created_at, updated_at "
                    "FROM nexus_conversations WHERE project_id=%s")
             params: list[Any] = [project_id]
@@ -94,7 +94,9 @@ class ConversationService:
             if query:
                 sql += " AND lower(title) LIKE %s"
                 params.append("%" + query.strip().lower() + "%")
-            sql += " ORDER BY updated_at DESC, id LIMIT 200"
+            # A pinned conversation stays at the top of the list, whatever its
+            # recency; otherwise newest first.
+            sql += " ORDER BY pinned DESC, updated_at DESC, id LIMIT 200"
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
 
@@ -104,7 +106,8 @@ class ConversationService:
             self._project(cur, principal, project_id)
             cur.execute(
                 "SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
-                "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
+                "  c.pinned, c.run_id, c.workflow_state, c.workflow_goal_id, "
+                "  c.workflow_spec_id, "
                 "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
                 "  c.plan_approved_at, c.plan_approved_by, c.deleted_at, "
                 "  c.created_at, c.updated_at, "
@@ -144,6 +147,25 @@ class ConversationService:
                 "WHERE id=%s AND project_id=%s "
                 f"RETURNING {_CONVERSATION}",
                 (bool(archived), conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            return dict(row)
+
+    def set_pinned(self, principal: str, project_id: str, conversation_id: str,
+                   pinned: bool) -> dict:
+        """Pin or unpin a conversation: pinned ones sort first in ``list``.
+
+        Purely ordering - it changes nothing else about the conversation and
+        works whatever its archived/deleted state.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "UPDATE nexus_conversations SET pinned=%s, updated_at=now() "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (bool(pinned), conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("conversation not found")

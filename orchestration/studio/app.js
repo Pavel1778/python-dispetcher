@@ -563,9 +563,10 @@
     var current = chat.id === S.convId;
     var stateDot = chat.state === 'thinking' ? '<span class="sb-state is-thinking" title="Ассистент отвечает"></span>'
       : chat.state === 'error' ? '<span class="sb-state is-error" title="Последний ответ не получен"></span>' : '';
+    var pinMark = chat.pinned ? '<span class="sb-pin" title="Закреплён">' + icon('pin', 'icon-xs') + '</span>' : '';
     return '<div class="sb-item' + (current ? ' is-active' : '') + (chat.archived ? ' is-archived' : '') + '">' +
       '<a class="sb-link" href="#/p/' + esc(S.projectId) + '/c/' + esc(chat.id) + '" title="' + esc(title) + '"' +
-      (current ? ' aria-current="page"' : '') + '>' + stateDot + '<span>' + esc(title) + '</span></a>' +
+      (current ? ' aria-current="page"' : '') + '>' + stateDot + pinMark + '<span>' + esc(title) + '</span></a>' +
       '<button class="icon-btn sm" type="button" data-action="chat-menu" data-id="' + esc(chat.id) + '" aria-haspopup="menu" aria-expanded="false" aria-label="Действия с чатом «' + esc(title) + '»">' + icon('more', 'icon-sm') + '</button>' +
       '</div>';
   }
@@ -2451,7 +2452,9 @@
     var id = anchor.getAttribute('data-id');
     var chat = findChat(id);
     if (!chat) return;
-    var items = '<button class="menu-item" type="button" role="menuitem" data-action="rename-chat" data-id="' + esc(id) + '">' + icon('pencil', 'icon-sm') + '<span>Переименовать</span></button>';
+    var items = '<button class="menu-item" type="button" role="menuitem" data-action="rename-chat" data-id="' + esc(id) + '">' + icon('pencil', 'icon-sm') + '<span>Переименовать</span></button>' +
+      '<button class="menu-item" type="button" role="menuitem" data-action="pin-chat" data-id="' + esc(id) + '" data-pinned="' + (chat.pinned ? '0' : '1') + '">' +
+      icon('pin', 'icon-sm') + '<span>' + (chat.pinned ? 'Открепить' : 'Закрепить') + '</span></button>';
     if (chat.deleted_at) {
       items += '<button class="menu-item" type="button" role="menuitem" data-action="restore-chat" data-id="' + esc(id) + '">' + icon('refresh', 'icon-sm') + '<span>Восстановить</span></button>' +
         '<button class="menu-item is-danger" type="button" role="menuitem" data-action="purge-chat" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить навсегда</span></button>';
@@ -2763,6 +2766,15 @@
     'user-menu': userMenu,
     'chat-menu': chatMenu,
     'toggle-trash': function () { S.showTrash = !S.showTrash; renderChats(); },
+    'pin-chat': function (el) {
+      closeMenu();
+      var id = el.getAttribute('data-id'), pinned = el.getAttribute('data-pinned') === '1';
+      api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { pinned: pinned } })
+        .then(function () {
+          toast(pinned ? 'Чат закреплён.' : 'Чат откреплён.');
+          return loadChats().then(renderChats);
+        }, function (error) { toast(error.message, 'bad'); });
+    },
     'delete-chat': function (el) { closeMenu(); confirmChatDelete(el.getAttribute('data-id')); },
     'restore-chat': function (el) {
       closeMenu();

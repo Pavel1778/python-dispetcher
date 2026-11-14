@@ -174,6 +174,26 @@ def _names_work(history: list[dict]) -> bool:
                for m in history)
 
 
+def _continues_analysis(history: list[dict]) -> bool:
+    """Whether the last assistant turn read the project's run state (an
+    ``analysis`` turn), so a plain follow-up question continues on it.
+
+    "Покажи последний успешный прогон" -> "Нашёл прогон ABC" -> "А что в нём
+    исправлено?" must stay on ABC. The second question names no run itself
+    ("в нём" is a pronoun), so the Intent Router alone reads it as a bare
+    ``chat`` question and :func:`effective_mode` would send it to ``ask`` - a
+    turn with no run facts in its prompt. This only widens *that* one case: a
+    real topic change (a greeting, an order, a plan request) is a different
+    ``reason`` and is not affected; see the call site in ``_chat_turn``.
+    """
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        return meta.get("mode") == "analysis"
+    return False
+
+
 def _asked_about(history: list[dict]) -> str | None:
     """The message the router's clarifying question was about, when that
     question is the last thing said in the conversation; else ``None``."""
@@ -3174,6 +3194,12 @@ class Handler(BaseHTTPRequestHandler):
                                 question=True, reason="chose the chat when asked")
                 request = asked_about
         turn_mode = effective_mode(chosen, intent)
+        if (turn_mode == "ask" and intent.intent == CHAT and intent.reason == "question"
+                and _continues_analysis(history)):
+            # A plain follow-up question ("А что в нём исправлено?") that names
+            # no new topic, right after a turn that read the run state, stays
+            # an analysis turn rather than falling back to a context-free ask.
+            turn_mode = "analysis"
         if (turn_mode == "autonomous" and chosen != "autonomous"
                 and not (conversation.get("repository")
                          or self.app.project_repos.primary_repository(project_id))):
@@ -4366,7 +4392,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(body, dict):
                         return self._json(400, {"error": "body must be a JSON object"})
                     principal = self._project_principal()
-                    conversation = self.app.conversations.get(principal, project_id, rest[1])
+                    # ``include_deleted`` so a trashed conversation can be
+                    # patched - notably to restore it (``deleted: false``).
+                    conversation = self.app.conversations.get(
+                        principal, project_id, rest[1], include_deleted=True)
                     if "title" in body:
                         conversation = self.app.conversations.rename(
                             principal, project_id, rest[1], body["title"])
@@ -4374,12 +4403,30 @@ class Handler(BaseHTTPRequestHandler):
                         conversation = self.app.conversations.set_mode(
                             principal, project_id, rest[1], body["mode"])
                     if "archived" in body:
-                        # DELETE archives; this is the way back. Without it an
-                        # archived conversation could never be restored.
+                        # This is the way back from the archive (the trash uses
+                        # ``deleted`` below). Without it an archived
+                        # conversation could never be restored.
                         if not isinstance(body["archived"], bool):
                             return self._json(400, {"error": "archived must be a boolean"})
                         conversation = self.app.conversations.set_archived(
                             principal, project_id, rest[1], body["archived"])
+                    if "pinned" in body:
+                        if not isinstance(body["pinned"], bool):
+                            return self._json(400, {"error": "pinned must be a boolean"})
+                        conversation = self.app.conversations.set_pinned(
+                            principal, project_id, rest[1], body["pinned"])
+                    if "deleted" in body:
+                        # The trash, reachable by PATCH as well as by the
+                        # ``DELETE`` route, so both clients work; refused with
+                        # 409 while the conversation's run is at work.
+                        if not isinstance(body["deleted"], bool):
+                            return self._json(400, {"error": "deleted must be a boolean"})
+                        if body["deleted"]:
+                            conversation = self.app.conversations.delete(
+                                principal, project_id, rest[1])
+                        else:
+                            conversation = self.app.conversations.restore(
+                                principal, project_id, rest[1])
                     return self._json(200, {"conversation": conversation})
                 # Any other sub-resource falls through to the project PATCH below.
             parsed = self._project_path(path)
@@ -4392,6 +4439,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except (ProjectInUse, ConversationInUse) as e:
+            # The project or conversation still has an active run. A conflict,
+            # not a bad request: stopping the run makes it possible.
+            return self._json(409, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except StoreUnavailable:
