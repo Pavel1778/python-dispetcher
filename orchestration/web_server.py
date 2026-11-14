@@ -1965,16 +1965,17 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/v1/projects/{id}/notifications
         if rest == ["notifications"]:
             return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
-        # GET /api/v1/projects/{id}/conversations[?q=&archived=1]
+        # GET /api/v1/projects/{id}/conversations[?q=&archived=1&deleted=1]
         if rest and rest[0] == "conversations" and len(rest) == 1:
             # The query lives on the raw request target, not the stripped path.
             from urllib.parse import parse_qs
             params = parse_qs(urlparse(self.path).query)
             query = (params.get("q") or [None])[0]
             include_archived = (params.get("archived") or ["0"])[0] in ("1", "true")
+            include_deleted = (params.get("deleted") or ["0"])[0] in ("1", "true")
             return (200, {"conversations": self.app.conversations.list(
                 principal, project_id, include_archived=include_archived,
-                query=query)}, None)
+                include_deleted=include_deleted, query=query)}, None)
         # GET /api/v1/projects/{id}/conversations/{cid}
         if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
             return (200, {"conversation": self.app.conversations.get(
@@ -3699,7 +3700,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"plan": self.app.plans.get(principal, project_id, item_id)})
                 return self._json(404, {"error": "not found"})
             if path == "/api/v1/projects":
-                return self._json(200, {"projects": self.app.projects.list(self._project_principal())})
+                from urllib.parse import parse_qs
+                params = parse_qs(urlparse(self.path).query)
+                include_archived = (params.get("archived") or ["0"])[0] in ("1", "true")
+                include_deleted = (params.get("deleted") or ["0"])[0] in ("1", "true")
+                return self._json(200, {"projects": self.app.projects.list(
+                    self._project_principal(), include_archived=include_archived,
+                    include_deleted=include_deleted)})
             nested = self._project_nested(path)
             if nested is not None:
                 return self._project_nested_get(*nested)
@@ -4278,6 +4285,21 @@ class Handler(BaseHTTPRequestHandler):
                             return self._json(400, {"error": "archived must be a boolean"})
                         conversation = self.app.conversations.set_archived(
                             principal, project_id, rest[1], body["archived"])
+                    if "pinned" in body:
+                        if not isinstance(body["pinned"], bool):
+                            return self._json(400, {"error": "pinned must be a boolean"})
+                        conversation = self.app.conversations.set_pinned(
+                            principal, project_id, rest[1], body["pinned"])
+                    if "deleted" in body:
+                        # A step past "archived": the conversation goes to the
+                        # trash (``deleted_at`` set) or comes back
+                        # (``deleted: false`` = restore). Distinct from the
+                        # DELETE verb below, which only archives.
+                        if not isinstance(body["deleted"], bool):
+                            return self._json(400, {"error": "deleted must be a boolean"})
+                        conversation = (self.app.conversations.delete(principal, project_id, rest[1])
+                                       if body["deleted"]
+                                       else self.app.conversations.restore(principal, project_id, rest[1]))
                     return self._json(200, {"conversation": conversation})
                 # Any other sub-resource falls through to the project PATCH below.
             parsed = self._project_path(path)
@@ -4286,7 +4308,23 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body(max_bytes=4 * 1024 * 1024)
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
-            project = self.app.projects.update(self._project_principal(), parsed[0], body)
+            principal = self._project_principal()
+            project_id = parsed[0]
+            project = None
+            if "archived" in body:
+                if not isinstance(body["archived"], bool):
+                    return self._json(400, {"error": "archived must be a boolean"})
+                project = self.app.projects.set_archived(principal, project_id, body["archived"])
+            if "deleted" in body:
+                if not isinstance(body["deleted"], bool):
+                    return self._json(400, {"error": "deleted must be a boolean"})
+                project = (self.app.projects.delete(principal, project_id) if body["deleted"]
+                          else self.app.projects.restore(principal, project_id))
+            if "name" in body or "description" in body:
+                changes = {k: body[k] for k in ("name", "description") if k in body}
+                project = self.app.projects.update(principal, project_id, changes)
+            if project is None:
+                return self._json(400, {"error": "provide name, description, archived and/or deleted"})
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})

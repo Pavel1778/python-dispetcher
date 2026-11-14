@@ -64,6 +64,24 @@ def test_every_control_has_a_handler_and_every_handler_a_control():
     assert handlers - used == set(), "handlers nothing can trigger"
 
 
+def test_project_and_conversation_lifecycle_actions_are_present():
+    """Archive/delete/pin for projects and conversations are real UI, not just API.
+
+    ``_handlers()``/``_actions_in_markup()`` already prove each of these is
+    wired both ways; this pins the specific names down, so a future refactor
+    that silently drops one of these controls (rather than renaming it
+    consistently) fails loudly here instead of only showing up as a missing
+    feature in manual testing.
+    """
+    handlers = _handlers()
+    for action in (
+        "archive-project", "delete-project", "restore-project",
+        "archived-projects", "restore-hidden-project",
+        "pin-chat", "delete-chat",
+    ):
+        assert action in handlers, f"missing project/conversation lifecycle action: {action}"
+
+
 def test_the_script_only_asks_for_elements_that_exist():
     page, script = read("index.html"), read("app.js")
     defined = set(re.findall(r'\bid="([\w-]+)"', page)) | set(re.findall(r'\bid="([\w-]+)"', script))

@@ -35,7 +35,7 @@ _MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "manual")
 #: project's bound repository and branch. Kept in one place so every read and
 #: every write returns the same shape.
 _CONVERSATION = (
-    "id, project_id, title, mode, state, archived, run_id, "
+    "id, project_id, title, mode, state, archived, pinned, deleted_at, run_id, "
     "workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
     "workflow_plan, plan_approved_hash, plan_approved_at, plan_approved_by, "
     "created_at, updated_at")
@@ -54,6 +54,10 @@ class ConversationService:
         title = _text(title, "title", maximum=200, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
+            cur.execute("SELECT deleted_at FROM nexus_projects WHERE id=%s", (project_id,))
+            prow = cur.fetchone()
+            if prow is not None and prow["deleted_at"] is not None:
+                raise ValueError("project is deleted; restore it before adding conversations")
             cur.execute(
                 "INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
                 "VALUES (%s,%s,%s,%s) "
@@ -64,19 +68,27 @@ class ConversationService:
             return dict(row)
 
     def list(self, principal: str, project_id: str, *,
-             include_archived: bool = False, query: str | None = None) -> list[dict]:
+             include_archived: bool = False, include_deleted: bool = False,
+             query: str | None = None) -> list[dict]:
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            sql = ("SELECT id, project_id, title, mode, state, archived, run_id, "
-                   "workflow_state, created_at, updated_at FROM nexus_conversations "
-                   "WHERE project_id=%s")
-            params: list[Any] = [project_id]
-            if not include_archived:
-                sql += " AND archived=false"
+            # Deleted is the stronger state: once a conversation is in the
+            # trash, whether it also happens to be archived no longer matters
+            # for visibility - ``include_deleted`` alone is enough to see it.
+            # A live (non-deleted) conversation is still subject to the
+            # archived filter as usual.
+            sql = ("SELECT id, project_id, title, mode, state, archived, pinned, "
+                   "deleted_at, run_id, workflow_state, created_at, updated_at "
+                   "FROM nexus_conversations WHERE project_id=%s AND ("
+                   "  (deleted_at IS NULL AND (archived=false OR %s))"
+                   "  OR (deleted_at IS NOT NULL AND %s)"
+                   ")")
+            params: list[Any] = [project_id, include_archived, include_deleted]
             if query:
                 sql += " AND lower(title) LIKE %s"
                 params.append("%" + query.strip().lower() + "%")
-            sql += " ORDER BY updated_at DESC, id LIMIT 200"
+            # Pinned conversations stay first regardless of recency.
+            sql += " ORDER BY pinned DESC, updated_at DESC, id LIMIT 200"
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
 
@@ -85,6 +97,7 @@ class ConversationService:
             self._project(cur, principal, project_id)
             cur.execute(
                 "SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
+                "  c.pinned, c.deleted_at, "
                 "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
                 "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
                 "  c.plan_approved_at, c.plan_approved_by, c.created_at, c.updated_at, "
@@ -123,6 +136,80 @@ class ConversationService:
                 "WHERE id=%s AND project_id=%s "
                 f"RETURNING {_CONVERSATION}",
                 (bool(archived), conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            return dict(row)
+
+    def set_pinned(self, principal: str, project_id: str, conversation_id: str,
+                   pinned: bool) -> dict:
+        """Pin or unpin a conversation: pinned ones sort first in ``list``.
+
+        Purely cosmetic ordering - it changes nothing else about the
+        conversation and works regardless of archived/active state.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "UPDATE nexus_conversations SET pinned=%s, updated_at=now() "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (bool(pinned), conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            return dict(row)
+
+    def delete(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """Soft-delete one conversation: moves it to the trash, nothing cascades.
+
+        Distinct from ``set_archived``: archiving only hides a conversation
+        from the default list and leaves it fully usable; delete is one step
+        more final; it is what the UI's "Удалить" action performs (the
+        existing "Архивировать" action keeps calling ``set_archived``
+        unchanged). Refused while the conversation has its own active run -
+        the run must be cancelled first - so an agent mid-task is never cut
+        off by a delete. Other conversations in the same project, and the
+        project itself, are never touched.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "SELECT c.run_id, r.state AS run_state FROM nexus_conversations c "
+                "LEFT JOIN nexus_runs r ON r.id = c.run_id "
+                "WHERE c.id=%s AND c.project_id=%s", (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            if row["run_state"] in ("running", "paused", "waiting_for_approval", "blocked"):
+                raise ValueError(
+                    "conversation has an active run; cancel it before deleting")
+            cur.execute(
+                "UPDATE nexus_conversations SET deleted_at=now(), updated_at=now() "
+                "WHERE id=%s AND project_id=%s AND deleted_at IS NULL "
+                f"RETURNING {_CONVERSATION}",
+                (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                # Already deleted: idempotent re-read rather than an error on
+                # a repeat click.
+                cur.execute(
+                    f"SELECT {_CONVERSATION} FROM nexus_conversations "
+                    "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+                row = cur.fetchone()
+                if row is None:
+                    raise NotFound("conversation not found")
+            return dict(row)
+
+    def restore(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """Undo ``delete``: clear ``deleted_at``. Idempotent."""
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "UPDATE nexus_conversations SET deleted_at=NULL, updated_at=now() "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("conversation not found")
@@ -315,10 +402,13 @@ class ConversationService:
         content = _text(content, "content", maximum=MESSAGE_CHARS, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            cur.execute("SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s",
-                        (conversation_id, project_id))
-            if cur.fetchone() is None:
+            cur.execute("SELECT id, deleted_at FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            found = cur.fetchone()
+            if found is None:
                 raise NotFound("conversation not found")
+            if found["deleted_at"] is not None:
+                raise ValueError("conversation is deleted; restore it before adding messages")
             return self.append_internal(cur, conversation_id, role=role, content=content,
                                         meta=meta)
 
