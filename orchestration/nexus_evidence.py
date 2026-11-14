@@ -23,6 +23,7 @@ from typing import Any
 import psycopg
 
 from .cloud_store import NotFound, PostgresStore, StoreError
+from .nexus_lab_store import VERIFIED_STATES
 from .evidence_trust import (
     FORMAT_VERSION,
     LEGACY_FORMAT_VERSION,
@@ -352,8 +353,8 @@ class LabEvidence:
         if self.service is None:
             self._note_missing_signer()
             return None
-        verified = [t for t in tasks if t.get("state") == "completed_verified"]
-        if state == "completed" and len(verified) == len(tasks) and tasks:
+        accepted = [t for t in tasks if t.get("state") in VERIFIED_STATES]
+        if state == "completed" and len(accepted) == len(tasks) and tasks:
             decision = "ACCEPTED"
         elif state == "cancelled":
             decision = "NOT_READY"
@@ -362,7 +363,7 @@ class LabEvidence:
         reasons = [
             {"task_key": t.get("task_key"), "state": t.get("state"),
              "reason": (t.get("verification") or {}).get("reason")}
-            for t in tasks if t.get("state") != "completed_verified"
+            for t in tasks if t.get("state") not in VERIFIED_STATES
         ]
         record, _created = self.service.record_once(
             evidence_id=lab_evidence_id(run_id, run_id, "run"),
@@ -374,7 +375,7 @@ class LabEvidence:
                 "decision": decision,
                 "run_state": state,
                 "tasks_total": len(tasks),
-                "tasks_verified": len(verified),
+                "tasks_verified": len(accepted),
                 "unverified": reasons,
                 "last_error": last_error,
             },

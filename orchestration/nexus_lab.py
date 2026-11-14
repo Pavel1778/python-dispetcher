@@ -62,6 +62,7 @@ from .nexus_lab_store import (
     TERMINAL_RUN_STATES,
     UNFINISHED_TASK_STATES,
     LabStore,
+    expects_change as expects_change_for_kind,
 )
 from .nexus_spec_delivery import Delivery, prepare, prepare_request
 from .nexus_specs import SpecService
@@ -84,6 +85,12 @@ _STOPPED = {"paused", "finished", "error", "stuck", "deleting"}
 #:   reverify - the work may be fine, the check could not be made; check later
 #:   never    - trying again cannot change the outcome
 RETRY_HINTS = ("followup", "restart", "reverify", "never")
+
+#: The verdicts that count as an accepted result: the branch was at the
+#: reported commit *and* (for a change-requiring task) it had moved, or the
+#: task was one that legitimately changes nothing. Anything else is reworked in
+#: a durable run.
+VERIFIED_VERDICTS = frozenset({"completed_verified", "completed_no_changes"})
 
 
 @dataclass
@@ -887,18 +894,29 @@ def project_github(store: PostgresStore, fallback: GitHubClient, *,
 class GitVerifier:
     """Check a task's result against the real repository.
 
-    A task is `completed_verified` only when the conversation finished *and*
-    the head of the task's branch, read from GitHub now, is a commit the agent
+    A task is `completed_verified` only when the conversation finished, the
+    head of the task's branch, read from GitHub now, is a commit the agent
     named in its report (in full, or by an abbreviation of seven characters or
-    more). Everything else is something weaker: a finished conversation that
-    names no commit, or a commit that is not the head, is
-    `completed_unverified`; a branch that cannot be read is `blocked`.
+    more), **and the branch actually moved** during the attempt. Everything
+    else is something weaker: a finished conversation that names no commit, or
+    a commit that is not the head, is `completed_unverified`; a branch that
+    cannot be read is `blocked`.
 
-    What this does **not** establish: that the commit is new, or that it does
-    what the task asked. An agent that changed nothing and named the existing
-    head is verified; so "verified" means "the report refers to the real,
-    current state of the branch", and the acceptance criteria remain the
-    agent's own claim.
+    The branch moving is what separates "a new change was produced" from "the
+    report refers to whatever was already there". An agent whose push was
+    refused - or that did nothing - names the head it found, and that alone is
+    not a result NEXUS can vouch for. So a change-requiring task whose branch
+    is still at the commit the attempt started from is `completed_unverified`,
+    not verified, and is reworked.
+
+    A task whose *kind* does not change the code (``verification_only``,
+    ``research_audit``) is not held to that: its accepted outcome is
+    `completed_no_changes` - the conversation finished and the branch is where
+    it was, which is correct for a task that was asked to inspect rather than
+    to change.
+
+    What this still does **not** establish: that the commit does what the task
+    asked. That remains the acceptance criteria's business.
 
     *client_for* picks the GitHub identity per task (see ``project_github``).
     """
@@ -953,12 +971,21 @@ class GitVerifier:
                                 {**evidence, "error": str(e)}, retry="reverify")
         evidence["remote_sha"] = sha
         evidence["branch"] = branch or "(default)"
-        if task.get("base_sha"):
-            # Whether the branch moved while the task was at work. A task that
-            # named the head it started from changed nothing; that is said in
-            # the run's report, not hidden behind "verified".
-            evidence["base_sha"] = task["base_sha"]
-            evidence["changed"] = bool(sha) and sha != task["base_sha"]
+        # Whether the branch moved while the task was at work, from the head
+        # the attempt started from. ``changed`` is ``True``/``False`` when that
+        # head is known and ``None`` when it is not, so "unknown" is never read
+        # as "nothing changed".
+        base = task.get("base_sha")
+        changed: bool | None = None
+        if base:
+            evidence["base_sha"] = base
+            changed = bool(sha) and sha != base
+            evidence["changed"] = changed
+        else:
+            evidence["changed"] = None
+        expects_change = task.get("expects_change")
+        if expects_change is None:
+            expects_change = expects_change_for_kind(task.get("kind"))
         if not sha:
             return Verification("completed_unverified",
                                 "branch has no readable commit", evidence, retry="followup")
@@ -969,18 +996,37 @@ class GitVerifier:
         if named:
             match = next((token for token in named if sha.startswith(token)), None)
             evidence["named_sha"] = match or named[0]
-            if match:
-                return Verification("completed_verified",
-                                    "remote branch is at the reported commit", evidence)
-            return Verification("completed_unverified",
-                                "reported commit is not the branch head", evidence,
-                                retry="followup")
-        if not self.require_commit:
+            if not match:
+                return Verification("completed_unverified",
+                                    "reported commit is not the branch head", evidence,
+                                    retry="followup")
+        elif not self.require_commit:
             return Verification("completed_unverified",
                                 "no commit reported", evidence, retry="followup")
-        return Verification("completed_unverified",
-                            "no verifiable commit reported by the agent", evidence,
-                            retry="followup")
+        else:
+            return Verification("completed_unverified",
+                                "no verifiable commit reported by the agent", evidence,
+                                retry="followup")
+        # The report refers to the real, current head. Whether that is a *new*
+        # change is a separate question, and the one the old rule left open.
+        if changed is False:
+            if not expects_change:
+                # A task that was asked to inspect, not to change: accepted, and
+                # said as what it is.
+                return Verification("completed_no_changes",
+                                    "no repository change, as this task's kind expects",
+                                    evidence)
+            return Verification(
+                "completed_unverified",
+                "the branch did not move: the reported commit is the one the attempt started from",
+                evidence, retry="followup")
+        if changed is None and expects_change and base is not None and sha == base:
+            # ``base`` was recorded and the head is it, so ``changed`` would be
+            # False; this branch is unreachable. Kept for clarity of the cases.
+            return Verification("completed_unverified",
+                                "the branch did not move", evidence, retry="followup")
+        return Verification("completed_verified",
+                            "remote branch is at the reported commit", evidence)
 
     def confirm(self, tasks: list[dict], *, bases: dict[tuple[str, str], str] | None = None
                 ) -> dict[str, Any]:
@@ -1582,7 +1628,7 @@ class LabScheduler:
             # failure would never come back into the pool.
             if self.router is not None and report.state in ("finished", "error", "stuck"):
                 self.router.note_success(task)
-            if durable and verdict.verdict != "completed_verified":
+            if durable and verdict.verdict not in VERIFIED_VERDICTS:
                 if self._retry(task, verdict, report, result):
                     if (verdict.retry or "") == "reverify":
                         in_flight += 1
@@ -2004,7 +2050,9 @@ class LabScheduler:
         if total == 0:
             # A run with nothing in it has not achieved its goal.
             return ("failed", "the run has no tasks", "failed: no tasks")
-        if counts.get("completed_verified", 0) == total:
+        accepted = sum(counts.get(state, 0) for state in ("completed_verified",
+                                                          "completed_no_changes"))
+        if accepted == total:
             return ("completed", None, "") if self._complete(run_id) else None
         unfinished = sum(counts.get(state, 0) for state in UNFINISHED_TASK_STATES)
         if unfinished == 0:

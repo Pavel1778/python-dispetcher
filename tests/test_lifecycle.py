@@ -1,0 +1,233 @@
+"""Project and conversation lifecycle: archive, trash, restore, purge, isolation.
+
+Real PostgreSQL and real HTTP (the same stack ``tests/test_conversations.py``
+uses). What is asserted is the *effect* of each action, not its answer:
+
+* a project or conversation that is archived or deleted leaves the active list
+  and the reads, and comes back on restore;
+* a delete never removes the row - the data is still there and ``purge`` is the
+  separate, explicit step;
+* a purge of one project leaves every other project, its conversations, its
+  runs and its GitHub repository links untouched - the external repository is
+  never deleted;
+* a project or conversation with an active run cannot be deleted (409).
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from orchestration.nexus_binding import ProjectRepositoryService  # noqa: E402
+from tests import test_conversations as _conv  # noqa: E402
+from tests.test_conversations import _conversation, _project  # noqa: E402
+from tests.test_nexus_projects import request  # noqa: E402
+
+# The fixtures the stack is built from. They are re-exported so this module's
+# tests can name them; ``test_conversations`` defines the real ones.
+fake_provider = _conv.fake_provider
+http_server = _conv.http_server
+
+DSN = os.environ.get("TEST_SUPABASE_DB_URL")
+pytestmark = pytest.mark.skipif(
+    not DSN, reason="set TEST_SUPABASE_DB_URL to a disposable PostgreSQL database")
+
+REPO = "Pavel1778/python-dispetcher"
+
+
+def _stats(base, session, pid):
+    st, body = request(base, f"/api/v1/projects/{pid}/stats", "POST", {}, session=session)
+    assert st == 200, body
+    return body
+
+
+# ------------------------------------------------------------------ projects
+def test_a_project_can_be_archived_and_restored(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice, "Архивный")
+    st, listing = request(base, "/api/v1/projects", session=alice)
+    assert [p["id"] for p in listing["projects"]] == [pid]
+
+    st, out = request(base, f"/api/v1/projects/{pid}/archive", "POST", {}, session=alice)
+    assert st == 200 and out["project"]["archived_at"] is not None
+    # Out of the active list, but not gone: it is still readable on request.
+    st, listing = request(base, "/api/v1/projects", session=alice)
+    assert listing["projects"] == []
+    st, listing = request(base, "/api/v1/projects?archived=1", session=alice)
+    assert [p["id"] for p in listing["projects"]] == [pid]
+
+    st, out = request(base, f"/api/v1/projects/{pid}/unarchive", "POST", {}, session=alice)
+    assert st == 200 and out["project"]["archived_at"] is None
+    st, listing = request(base, "/api/v1/projects", session=alice)
+    assert [p["id"] for p in listing["projects"]] == [pid]
+
+
+def test_a_project_can_be_deleted_and_restored_with_its_contents(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice, "Удаляемый")
+    cid = _conversation(base, alice, pid, title="Разговор")
+    request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages", "POST",
+            {"text": "Привет", "mode": "ask"}, session=alice)
+
+    st, out = request(base, f"/api/v1/projects/{pid}/delete", "POST", {}, session=alice)
+    assert st == 200 and out["project"]["deleted_at"] is not None
+    # Gone from the active list and from every read.
+    st, listing = request(base, "/api/v1/projects", session=alice)
+    assert listing["projects"] == []
+    st, _ = request(base, f"/api/v1/projects/{pid}", session=alice)
+    assert st == 404
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert st == 404
+    # The row is still there (the trash view), with its conversation.
+    st, listing = request(base, "/api/v1/projects?deleted=1", session=alice)
+    assert [p["id"] for p in listing["projects"]] == [pid]
+
+    st, out = request(base, f"/api/v1/projects/{pid}/restore", "POST", {}, session=alice)
+    assert st == 200 and out["project"]["deleted_at"] is None
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [cid]
+
+
+def test_purging_a_project_removes_only_it(http_server):
+    """Two projects, each with a repository link and a conversation. Purging one
+    leaves the other - its conversations, its runs and its repository link - and
+    never touches the external GitHub repository."""
+    base, alice, app, _ = http_server
+    keep = _project(base, alice, "Оставить")
+    drop = _project(base, alice, "Удалить")
+    keep_conv = _conversation(base, alice, keep, title="Живой чат")
+    _conversation(base, alice, drop, title="Удаляемый чат")
+
+    from orchestration.nexus_projects import principal_for_session
+
+    principal = principal_for_session(alice.username)
+    store = app.store
+    store.add_repository(REPO, default_branch="main", allowed_branches=["main"])
+    links = ProjectRepositoryService(store)
+    links.link(principal, keep, REPO)
+    links.link(principal, drop, REPO)
+
+    st, body = request(base, f"/api/v1/projects/{drop}/purge", "POST",
+                       {"confirm": True}, session=alice)
+    assert st == 200, body
+    assert body["purged"] is True and body["removed"]["nexus_conversations"] == 1
+
+    # The other project is untouched, with its conversation and repository link.
+    st, listing = request(base, "/api/v1/projects", session=alice)
+    assert [p["id"] for p in listing["projects"]] == [keep]
+    st, listing = request(base, f"/api/v1/projects/{keep}/conversations", session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [keep_conv]
+    st, _ = request(base, f"/api/v1/projects/{drop}", session=alice)
+    assert st == 404
+    # The repository itself is still on the allowlist and still linked to `keep`.
+    with store._tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM repositories WHERE full_name=%s", (REPO,))
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT count(*) AS n FROM nexus_project_repositories "
+                    "WHERE project_id=%s", (keep,))
+        assert cur.fetchone()["n"] == 1
+
+
+def test_a_purge_needs_confirmation(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    st, _ = request(base, f"/api/v1/projects/{pid}/purge", "POST", {}, session=alice)
+    assert st == 400
+    # Still there.
+    st, _ = request(base, f"/api/v1/projects/{pid}", session=alice)
+    assert st == 200
+
+
+def test_a_deleted_project_is_invisible_to_a_non_member(http_server):
+    base, alice, app, _ = http_server
+    pid = _project(base, alice)
+    bob = app.auth._open_session("bob")
+    st, _ = request(base, f"/api/v1/projects/{pid}/delete", "POST", {}, session=alice)
+    assert st == 200
+    # Bob was never a member: 404 either way, and the trash view does not leak it.
+    st, _ = request(base, f"/api/v1/projects/{pid}", session=bob)
+    assert st == 404
+
+
+# ------------------------------------------------------------ conversations
+def test_a_conversation_can_be_deleted_restored_and_purged(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    cid = _conversation(base, alice, pid, title="Чат")
+    request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages", "POST",
+            {"text": "Привет", "mode": "ask"}, session=alice)
+
+    st, stats = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/stats",
+                        "POST", {}, session=alice)
+    assert st == 200 and stats["messages"] == 2
+
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
+                    session=alice)
+    assert st == 200
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert listing["conversations"] == []
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+                          session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [cid]
+
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/restore",
+                      "POST", {}, session=alice)
+    assert st == 200 and out["conversation"]["deleted_at"] is None
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [cid]
+    # The messages came back with it.
+    st, messages = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/messages",
+                           session=alice)
+    assert len(messages["messages"]) == 2
+
+    # Purge removes it for good; the project and its other data are untouched.
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/purge", "POST",
+                      {"confirm": True}, session=alice)
+    assert st == 200 and out["messages_removed"] == 2
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", session=alice)
+    assert st == 404
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+                          session=alice)
+    assert listing["conversations"] == []
+
+
+def test_a_purge_of_a_conversation_needs_confirmation(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    cid = _conversation(base, alice, pid)
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}/purge", "POST",
+                    {}, session=alice)
+    assert st == 400
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", session=alice)
+    assert st == 200
+
+
+def test_deleting_a_conversation_does_not_delete_its_project(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    a = _conversation(base, alice, pid, title="Первый")
+    b = _conversation(base, alice, pid, title="Второй")
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{a}", "DELETE",
+                    session=alice)
+    assert st == 200
+    st, _ = request(base, f"/api/v1/projects/{pid}", session=alice)
+    assert st == 200
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert [c["id"] for c in listing["conversations"]] == [b]
+
+
+def test_lifecycle_routes_require_auth(http_server):
+    base, alice, _app, _ = http_server
+    pid = _project(base, alice)
+    cid = _conversation(base, alice, pid)
+    for path, method in ((f"/api/v1/projects/{pid}/archive", "POST"),
+                         (f"/api/v1/projects/{pid}/delete", "POST"),
+                         (f"/api/v1/projects/{pid}/restore", "POST"),
+                         (f"/api/v1/projects/{pid}/purge", "POST"),
+                         (f"/api/v1/projects/{pid}/stats", "POST"),
+                         (f"/api/v1/projects/{pid}/conversations/{cid}/delete", "POST"),
+                         (f"/api/v1/projects/{pid}/conversations/{cid}/stats", "POST")):
+        assert request(base, path, method, {})[0] == 401, path

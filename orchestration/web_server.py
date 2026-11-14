@@ -117,7 +117,13 @@ from .nexus_workflow import (
 )
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
-from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
+from .nexus_conversations import ConversationInUse
+from .nexus_projects import (
+    IdempotencyConflict,
+    ProjectInUse,
+    ProjectService,
+    principal_for_session,
+)
 from .nexus_planning import PlanService
 from .nexus_policy import install_log_redaction, policy_report
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
@@ -1827,6 +1833,65 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return parts[3], parts[4:]
 
+    @staticmethod
+    def _project_lifecycle(path: str) -> tuple[str, str] | None:
+        """Parse ``/api/v1/projects/<uuid>/<action>`` for a lifecycle action.
+
+        Returns ``(project_id, action)`` or ``None``. The actions are
+        ``archive``/``restore``/``delete``/``purge``/``stats`` (project) and
+        ``conversations/<uuid>/{delete|restore|purge|stats}`` (conversation).
+        """
+        parts = path.strip("/").split("/")
+        if len(parts) < 5 or parts[:3] != ["api", "v1", "projects"]:
+            return None
+        if not UUID_RE.fullmatch(parts[3]):
+            return None
+        rest = parts[4:]
+        if len(rest) == 1 and rest[0] in ("archive", "restore", "delete", "purge",
+                                          "unarchive", "stats"):
+            return parts[3], rest[0]
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] in ("delete", "restore", "purge", "stats")):
+            return parts[3], f"conversation:{rest[1]}:{rest[2]}"
+        return None
+
+    def _project_lifecycle_post(self, principal: str, project_id: str, action: str,
+                                body: dict):
+        """A project or conversation lifecycle action. Writes only."""
+        projects = self.app.projects
+        conversations = self.app.conversations
+        if action.startswith("conversation:"):
+            _, conv_id, verb = action.split(":", 2)
+            if verb == "delete":
+                return self._json(200, {"conversation": conversations.delete(
+                    principal, project_id, conv_id)})
+            if verb == "restore":
+                return self._json(200, {"conversation": conversations.restore(
+                    principal, project_id, conv_id)})
+            if verb == "purge":
+                if body.get("confirm") is not True:
+                    return self._json(400, {"error": "confirm must be true to purge"})
+                return self._json(200, conversations.purge(
+                    principal, project_id, conv_id, confirm=True))
+            if verb == "stats":
+                return self._json(200, conversations.stats(principal, project_id, conv_id))
+            return self._json(404, {"error": "not found"})
+        if action == "archive":
+            return self._json(200, {"project": projects.archive(principal, project_id, True)})
+        if action == "unarchive":
+            return self._json(200, {"project": projects.archive(principal, project_id, False)})
+        if action == "restore":
+            return self._json(200, {"project": projects.restore(principal, project_id)})
+        if action == "delete":
+            return self._json(200, {"project": projects.delete(principal, project_id)})
+        if action == "purge":
+            if body.get("confirm") is not True:
+                return self._json(400, {"error": "confirm must be true to purge"})
+            return self._json(200, projects.purge(principal, project_id, confirm=True))
+        if action == "stats":
+            return self._json(200, projects.stats(principal, project_id))
+        return self._json(404, {"error": "not found"})
+
     def _get_project_resource(self, path: str, project_id: str, principal: str):
         """Dispatch the deeper project GET routes, or ``None`` if unmatched.
 
@@ -1950,9 +2015,10 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(urlparse(self.path).query)
             query = (params.get("q") or [None])[0]
             include_archived = (params.get("archived") or ["0"])[0] in ("1", "true")
+            include_deleted = (params.get("deleted") or ["0"])[0] in ("1", "true")
             return (200, {"conversations": self.app.conversations.list(
                 principal, project_id, include_archived=include_archived,
-                query=query)}, None)
+                query=query, include_deleted=include_deleted)}, None)
         # GET /api/v1/projects/{id}/conversations/{cid}
         if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
             return (200, {"conversation": self.app.conversations.get(
@@ -3670,7 +3736,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"plan": self.app.plans.get(principal, project_id, item_id)})
                 return self._json(404, {"error": "not found"})
             if path == "/api/v1/projects":
-                return self._json(200, {"projects": self.app.projects.list(self._project_principal())})
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                include_archived = query.get("archived", ["0"])[0] in ("1", "true", "yes")
+                include_deleted = query.get("deleted", ["0"])[0] in ("1", "true", "yes")
+                return self._json(200, {"projects": self.app.projects.list(
+                    self._project_principal(), include_archived=include_archived,
+                    include_deleted=include_deleted)})
             nested = self._project_nested(path)
             if nested is not None:
                 return self._project_nested_get(*nested)
@@ -3989,6 +4060,9 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/v1/projects":
                     project = self.app.projects.create(principal, body.get("name"), body.get("description", ""))
                     return self._json(201, {"project": project})
+                lifecycle = self._project_lifecycle(path)
+                if lifecycle is not None:
+                    return self._project_lifecycle_post(principal, *lifecycle, body)
                 verify = self._project_evidence_verify(path)
                 if verify is not None:
                     project_id, evidence_id = verify
@@ -4143,6 +4217,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(409, {"error": str(e)})
         except IdempotencyConflict as e:
             return self._json(409, {"error": str(e)})
+        except (ProjectInUse, ConversationInUse) as e:
+            # The project or conversation still has an active run. A conflict,
+            # not a bad request: stopping the run makes it possible.
+            return self._json(409, {"error": str(e)})
         except VisibilityError as e:
             return self._json(400, {"error": str(e)})
         except GitHubAuthError as e:
@@ -4204,12 +4282,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"deleted": rel})
                 return self._json(404, {"error": "not found"})
             # DELETE /api/v1/projects/{id}/conversations/{cid}
+            # A real, reversible delete: the conversation goes to the trash.
+            # Refused while its run is at work (409). Use PATCH archived to
+            # archive instead of deleting.
             if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
-                self.app.conversations.set_archived(principal, project_id, rest[1], True)
-                return self._json(200, {"archived": rest[1]})
+                return self._json(200, {"conversation": self.app.conversations.delete(
+                    principal, project_id, rest[1])})
+            # DELETE /api/v1/projects/{id}: move the project to the trash.
+            if not rest:
+                return self._json(200, {"project": self.app.projects.delete(
+                    principal, project_id)})
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except (ProjectInUse, ConversationInUse) as e:
+            return self._json(409, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except StoreUnavailable:

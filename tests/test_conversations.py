@@ -213,14 +213,29 @@ def test_rename_archive_and_mode_change(http_server):
     st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
                       {"mode": "plan"}, session=alice)
     assert out["conversation"]["mode"] == "plan"
-    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
-                    session=alice)
-    assert st == 200
+    # Archiving is PATCH archived, and it is reversible; DELETE is the trash.
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
+                      {"archived": True}, session=alice)
+    assert st == 200 and out["conversation"]["archived"] is True
     st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
     assert listing["conversations"] == []
     st, listing = request(base, f"/api/v1/projects/{pid}/conversations?archived=1",
                           session=alice)
     assert len(listing["conversations"]) == 1
+    st, out = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "PATCH",
+                      {"archived": False}, session=alice)
+    assert out["conversation"]["archived"] is False
+    # DELETE moves the conversation to the trash (reversible), and it leaves
+    # the active list at once.
+    st, _ = request(base, f"/api/v1/projects/{pid}/conversations/{cid}", "DELETE",
+                    session=alice)
+    assert st == 200
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations", session=alice)
+    assert listing["conversations"] == []
+    st, listing = request(base, f"/api/v1/projects/{pid}/conversations?deleted=1",
+                          session=alice)
+    assert len(listing["conversations"]) == 1
+    assert listing["conversations"][0]["deleted_at"] is not None
 
 
 def test_conversation_routes_require_auth(http_server):

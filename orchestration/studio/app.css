@@ -627,6 +627,10 @@ a:hover { text-decoration: underline; }
 .menu-item-text small { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-item-text.wrap small { white-space: normal; }
 .menu-item .icon.check { color: var(--accent-strong); opacity: 0; }
+.menu-row { display: flex; align-items: center; gap: 2px; }
+.menu-row > .menu-item { flex: 1; min-width: 0; }
+.menu-row > .icon-btn { flex: none; }
+.menu-row:hover > .icon-btn { opacity: 1; }
 .menu-item[aria-checked="true"] .icon.check { opacity: 1; }
 .menu-sep { height: 1px; margin: 6px 4px; background: var(--line); }
 .menu-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px; }
