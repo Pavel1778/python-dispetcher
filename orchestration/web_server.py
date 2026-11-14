@@ -3953,6 +3953,11 @@ class Handler(BaseHTTPRequestHandler):
                 principal = self._project_principal()
                 if not resource:
                     return self._json(200, {"project": self.app.projects.get(principal, project_id)})
+                if resource == "dependents":
+                    # What a permanent delete of this project would remove, so
+                    # the confirmation can name it before anything is destroyed.
+                    return self._json(200, {"dependents": self.app.projects.dependents(
+                        principal, project_id)})
                 if resource == "goals":
                     return self._json(200, {"goals": self.app.projects.list_goals(principal, project_id)})
                 if resource == "files":
@@ -4474,7 +4479,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"deleted": rel})
                 return self._json(404, {"error": "not found"})
             # DELETE /api/v1/projects/{id}/conversations/{cid}
+            #   Plain DELETE archives (the historical behaviour, kept). With
+            #   ``?permanent=1`` it removes the conversation for good, and only
+            #   when it is already in the trash, so one call cannot destroy a
+            #   chat that is still in the list.
             if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
+                permanent = (urllib.parse.parse_qs(urlparse(self.path).query)
+                             .get("permanent") or ["0"])[0].lower() in ("1", "true", "yes", "on")
+                if permanent:
+                    return self._json(200, self.app.conversations.delete_permanently(
+                        principal, project_id, rest[1]))
                 self.app.conversations.set_archived(principal, project_id, rest[1], True)
                 return self._json(200, {"archived": rest[1]})
             # DELETE /api/v1/projects/{id}/runs/{run_id}   (remove from history)
@@ -4483,6 +4497,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, self.app.lab.delete_run(
                         principal, project_id, rest[1]))
                 except InvalidTransition as e:
+                    return self._json(409, {"error": str(e)})
+            # DELETE /api/v1/projects/{id}   (remove a project for good)
+            #   Only a project already in the trash may go, so a single call
+            #   cannot destroy a live project; the census in the answer says
+            #   what was removed. Refused while a run is active.
+            if not rest:
+                try:
+                    return self._json(200, self.app.projects.delete_permanently(
+                        principal, project_id))
+                except ValueError as e:
                     return self._json(409, {"error": str(e)})
             return self._json(404, {"error": "not found"})
         except NotFound:

@@ -223,9 +223,16 @@ def test_protected_patch_and_delete_endpoints_require_auth(base):
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"pinned": True}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"deleted": True}),
         ("DELETE", f"/api/v1/projects/{UUID}/conversations/{UUID}", None),
+        ("DELETE", f"/api/v1/projects/{UUID}/conversations/{UUID}?permanent=1", None),
         ("DELETE", f"/api/v1/projects/{UUID}/runs/{UUID}", None),
+        # A permanent project delete is protected too: it removes everything.
+        ("DELETE", f"/api/v1/projects/{UUID}", None),
     ]:
         assert _status(method, base + path, body) == 401, (method, path)
+
+
+def test_the_project_dependents_route_requires_auth(base):
+    assert _status("GET", base + f"/api/v1/projects/{UUID}/dependents", None) == 401
 
 
 def test_bearer_token_is_accepted(base):

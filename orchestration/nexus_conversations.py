@@ -229,6 +229,40 @@ class ConversationService:
                 (project_id, float(older_than_hours)))
             return cur.rowcount
 
+    def delete_permanently(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """Remove a conversation for good. Only a trashed one may go.
+
+        A conversation must be in the trash first (``set_deleted``); this is the
+        second, explicit step, so a single click can never destroy a chat that
+        is still in the list. What is removed is the conversation and everything
+        that belongs to it alone - its messages, attachments and generations
+        (``ON DELETE CASCADE``). What is **not** removed:
+
+        * the project, its repository and its other conversations;
+        * any run the conversation started (``nexus_runs.conversation_id`` is
+          ``ON DELETE SET NULL``), so a run's history survives the chat that
+          asked for it;
+        * a stored specification that names the conversation (also ``SET NULL``).
+
+        Returns ``{"deleted": id}``.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT deleted_at FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            if row["deleted_at"] is None:
+                raise ValueError(
+                    "move the conversation to the trash first, then delete it for good")
+            cur.execute("DELETE FROM nexus_conversations WHERE id=%s AND project_id=%s",
+                        (conversation_id, project_id))
+            self._event(cur, project_id, principal, "conversation.deleted_permanently",
+                        conversation_id)
+            return {"deleted": conversation_id}
+
     def export(self, principal: str, project_id: str, conversation_id: str) -> dict:
         """A conversation and its messages as a self-contained JSON document.
 

@@ -604,7 +604,9 @@
             return '<div class="sb-item is-archived"><span class="sb-link" title="' + esc(title) + '">' +
               '<span>' + esc(title) + '</span></span>' +
               '<button class="icon-btn sm" type="button" data-action="restore-chat" data-id="' + esc(chat.id) + '" title="Восстановить">' +
-              icon('refresh', 'icon-sm') + '</button></div>';
+              icon('refresh', 'icon-sm') + '</button>' +
+              '<button class="icon-btn sm" type="button" data-action="purge-chat" data-id="' + esc(chat.id) + '" title="Удалить навсегда">' +
+              icon('x', 'icon-sm') + '</button></div>';
           }).join('')
         : '<p class="sb-empty">Корзина пуста.</p>';
     }
@@ -2423,7 +2425,11 @@
         return '<div class="lifecycle-group"><p class="work-section-title">' + esc(label) + '</p>' +
           items.map(function (p) {
             return '<div class="lifecycle-row"><span>' + esc(p.name) + '</span>' +
-              '<button class="btn btn-sm" type="button" data-action="project-restore" data-id="' + esc(p.id) + '" data-kind="' + esc(kind) + '">Восстановить</button></div>';
+              '<button class="btn btn-sm" type="button" data-action="project-restore" data-id="' + esc(p.id) + '" data-kind="' + esc(kind) + '">Восстановить</button>' +
+              (kind === 'deleted'
+                ? '<button class="btn btn-sm btn-danger" type="button" data-action="project-purge" data-id="' + esc(p.id) + '">Удалить навсегда</button>'
+                : '') +
+              '</div>';
           }).join('') + '</div>';
       }
       return rows(data.archived, 'archived', 'Архив') + rows(data.deleted, 'deleted', 'Корзина');
@@ -2642,6 +2648,34 @@
     'pick-mode': function (el) { closeMenu(); setMode(el.getAttribute('data-mode')); $('#prompt').focus(); },
     'new-project': function () { closeMenu(); newProjectDialog(); },
     'project-lifecycle': function () { openProjectLifecycle(); },
+    'project-purge': function (el) {
+      var id = el.getAttribute('data-id');
+      // Show what will be removed before confirming: the census is what makes
+      // "delete for good" an informed decision, not a guess.
+      api('/api/v1/projects/' + enc(id) + '/dependents').then(function (data) {
+        var d = data.dependents || {};
+        var parts = [];
+        var labels = { nexus_conversations: 'диалогов', nexus_goals: 'целей',
+                       nexus_runs: 'прогонов', nexus_files: 'файлов',
+                       nexus_specs: 'ТЗ', nexus_evidence: 'записей доказательств' };
+        Object.keys(labels).forEach(function (k) {
+          if (d[k]) parts.push(d[k] + ' ' + labels[k]);
+        });
+        confirmDialog('Удалить проект навсегда?',
+          'Это необратимо. Вместе с проектом будут удалены: ' +
+          (parts.length ? parts.join(', ') : 'только сам проект') +
+          '. Репозиторий на GitHub и аккаунты не затрагиваются. Восстановить после этого нельзя.',
+          'Удалить навсегда', function () {
+            api('/api/v1/projects/' + enc(id), { method: 'DELETE' }).then(function () {
+              toast('Проект удалён навсегда.');
+              return loadProjects().then(function () {
+                renderProject();
+                openProjectLifecycle();
+              });
+            }, function (error) { toast(explain(error.message).text, 'bad'); });
+          }, true);
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'project-archive': function (el) {
       var archived = el.getAttribute('data-archived') === '1';
       api(projectUrl(''), { method: 'PATCH', body: { archived: archived } }).then(function () {
@@ -2763,6 +2797,19 @@
                 return null;
               });
             }, function (error) { toast(error.message, 'bad'); });
+        }, true);
+    },
+    'purge-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      confirmDialog('Удалить чат навсегда?',
+        'Это необратимо: чат и все его сообщения и вложения будут удалены безвозвратно. ' +
+        'Проект, репозиторий и запущенные прогоны не затрагиваются. Восстановить после этого нельзя.',
+        'Удалить навсегда', function () {
+          api(projectUrl('/conversations/' + enc(id) + '?permanent=1'), { method: 'DELETE' })
+            .then(function () {
+              toast('Чат удалён навсегда.');
+              return loadChats().then(renderChats);
+            }, function (error) { toast(explain(error.message).text, 'bad'); });
         }, true);
     },
     'stop-generation': function () { stopGeneration(); },

@@ -116,3 +116,71 @@ def test_deleting_one_project_does_not_touch_another(studio):
     assert studio.api.post(f"/api/v1/projects/{b}/conversations",
                            {"title": "", "mode": "ask"})[0] == 201
     assert _names(studio) == ["B"]
+
+
+# ---------------------------------------------------------- permanent delete
+def test_a_conversation_can_be_deleted_for_good_only_after_the_trash(studio):
+    project = studio.project("Корзина")
+    conv = studio.api.post(f"/api/v1/projects/{project}/conversations",
+                           {"title": "Чат", "mode": "ask"})[1]["conversation"]["id"]
+    base = f"/api/v1/projects/{project}/conversations/{conv}"
+    # A live conversation cannot be removed for good in one step.
+    status, body = studio.api("DELETE", base + "?permanent=1")
+    assert status == 400 and "trash" in body["error"], body
+    # Trash it, then remove it for good.
+    assert studio.api.patch(base, {"deleted": True})[0] == 200
+    assert studio.api("DELETE", base + "?permanent=1")[0] == 200
+    assert studio.api.get(base)[0] == 404
+    # The project is untouched.
+    assert studio.api.get(f"/api/v1/projects/{project}")[0] == 200
+
+
+def test_a_project_can_be_deleted_for_good_only_after_the_trash(studio):
+    project = studio.project("Проект в корзине")
+    # A live project cannot be removed for good in one step.
+    status, body = studio.api("DELETE", f"/api/v1/projects/{project}")
+    assert status == 409 and "trash" in body["error"], body
+    # Trash it, then remove it for good.
+    assert studio.api.patch(f"/api/v1/projects/{project}", {"deleted": True})[0] == 200
+    status, body = studio.api("DELETE", f"/api/v1/projects/{project}")
+    assert status == 200, body
+    assert body["deleted"] == project and "dependents" in body
+    assert studio.api.get(f"/api/v1/projects/{project}")[0] == 404
+    assert _all_names(studio, "?deleted=1") == []
+
+
+def test_the_census_names_what_a_permanent_delete_would_remove(studio):
+    project = studio.project("С зависимостями")
+    studio.api.post(f"/api/v1/projects/{project}/conversations",
+                    {"title": "", "mode": "ask"})
+    studio.api.post(f"/api/v1/projects/{project}/conversations",
+                    {"title": "", "mode": "ask"})
+    status, body = studio.api.get(f"/api/v1/projects/{project}/dependents")
+    assert status == 200
+    deps = body["dependents"]
+    assert deps["nexus_conversations"] == 2
+    assert deps["active_runs"] == 0
+
+
+def test_a_project_with_an_active_run_cannot_be_deleted_for_good(studio):
+    project = studio.project("Занятый навсегда")
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conv = studio.api.post(f"/api/v1/projects/{project}/conversations",
+                           {"title": "", "mode": "autonomous"})[1]["conversation"]["id"]
+    studio.answers(json.dumps({"tasks": [
+        {"id": "a", "title": "Шаг", "description": "сделать", "acceptance": ["ок"],
+         "dependencies": []}]}))
+    assert studio.api.post(
+        f"/api/v1/projects/{project}/conversations/{conv}/messages",
+        {"text": "Исправь найденные ошибки"})[0] == 200
+    # Trashing itself is refused while a run is active - the guard that keeps a
+    # working agent from being cut off - so the project never reaches the trash
+    # and a permanent delete is refused for that same reason (trash first).
+    status, body = studio.api.patch(f"/api/v1/projects/{project}", {"deleted": True})
+    assert status == 400 and "active run" in body["error"], body
+    status, body = studio.api("DELETE", f"/api/v1/projects/{project}")
+    assert status == 409, body
+    # The census still reports the active run.
+    assert studio.api.get(f"/api/v1/projects/{project}/dependents")[1][
+        "dependents"]["active_runs"] == 1

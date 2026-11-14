@@ -183,6 +183,82 @@ class ProjectService:
             self._event(cur, project_id, principal, "project.restored", project_id)
             return dict(row)
 
+    #: Every project-scoped table, for the delete census. Each has a
+    #: ``project_id`` column; the ones with ``ON DELETE CASCADE`` go with the
+    #: project, the ``SET NULL`` ones (a run's ``conversation_id``, a spec's) are
+    #: not project-scoped and are not listed here.
+    _PROJECT_TABLES = (
+        "nexus_conversations", "nexus_goals", "nexus_plans", "nexus_files",
+        "nexus_workspaces", "nexus_voice_notes", "nexus_project_context",
+        "nexus_memory", "nexus_runs", "nexus_run_tasks", "nexus_evidence",
+        "nexus_specs", "nexus_notifications", "nexus_project_events",
+        "nexus_project_repositories", "nexus_project_executors",
+        "nexus_project_members",
+    )
+
+    def _census(self, cur: Any, project_id: str) -> dict:
+        """Row counts a permanent delete would remove, taken on *cur*.
+
+        Shared by :meth:`dependents` (a read) and :meth:`delete_permanently` (so
+        the count and the delete are one transaction), which is why it takes the
+        cursor rather than opening its own.
+        """
+        counts: dict[str, int] = {}
+        for table in self._PROJECT_TABLES:
+            cur.execute(f"SELECT count(*) AS n FROM {table} WHERE project_id=%s",
+                        (project_id,))
+            counts[table] = cur.fetchone()["n"]
+        cur.execute("SELECT count(*) AS n FROM nexus_runs "
+                    "WHERE project_id=%s AND state = ANY(%s)",
+                    (project_id, list(self._ACTIVE_RUN_STATES)))
+        counts["active_runs"] = cur.fetchone()["n"]
+        return counts
+
+    def dependents(self, principal: str, project_id: str) -> dict:
+        """What a permanent delete of this project would take with it.
+
+        A read-only census, so a destructive action can show what is at stake
+        before it is confirmed. ``active_runs`` is the count that blocks the
+        delete until the runs are cancelled.
+        """
+        with self.store._tx() as cur:
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
+            return self._census(cur, project_id)
+
+    def delete_permanently(self, principal: str, project_id: str) -> dict:
+        """Remove a project and everything that belongs to it, for good.
+
+        The second, explicit step after :meth:`delete` (the trash), so a single
+        click can never destroy a project. It is refused while the project has
+        an active run - cancel first. Everything project-scoped that references
+        the project with ``ON DELETE CASCADE`` goes with it: conversations and
+        their messages, goals, specs, plans, files, workspaces, runs and their
+        tasks, evidence, memory, notifications and events. Nothing outside the
+        project is touched: repositories (the GitHub side), GitHub and OpenHands
+        accounts, and the users themselves are global and stay.
+
+        Returns ``{"deleted": id, "dependents": {...}}`` where ``dependents`` is
+        the census taken in the same transaction, so the caller records exactly
+        what was removed.
+        """
+        with self.store._tx() as cur:
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
+            cur.execute("SELECT deleted_at FROM nexus_projects WHERE id=%s FOR UPDATE",
+                        (project_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project not found")
+            if row["deleted_at"] is None:
+                raise ValueError(
+                    "move the project to the trash first, then delete it for good")
+            active = self._active_runs(cur, project_id)
+            if active:
+                raise ValueError(
+                    f"project has {active} active run(s); cancel them before deleting")
+            census = self._census(cur, project_id)
+            cur.execute("DELETE FROM nexus_projects WHERE id=%s", (project_id,))
+            return {"deleted": project_id, "dependents": census}
+
     @staticmethod
     def role(cur: Any, principal: str, project_id: str) -> str:
         """The caller's role in a project, or ``NotFound`` if not a member."""
