@@ -59,17 +59,34 @@ without an artefact behind it.
 
 ## 5. Test result
 
-Final full suite on PostgreSQL 17 (disposable database):
+After the PR #38 integration, the full suite on PostgreSQL 17 (disposable
+database):
 
 ```
-1762 passed, 44 skipped in 1456.95s (0:24:16)
+1811 passed, 9 skipped in 1653.27s (0:27:33)
 ruff check .  -> All checks passed!
+Browser E2E (Chromium): 37 passed
 ```
 
 The baseline was **1734 passed, 1 failed, 44 skipped** (the single failure,
 `test_auth.py::test_expired_sessions_and_stale_attempts_are_swept`, is a
-pre-existing load-sensitive flake that passes on its own). The 28 new tests are
-the ones this work added; nothing on `main` was left failing.
+pre-existing load-sensitive flake; it passed 5/5 on its own here). The skip
+count dropped from 44 to 9 only because Chromium is now installed, so the 29
+browser journeys that used to skip now run.
+
+**Where the count difference comes from.** The number of *collected* tests on
+`main` is 1779; on this branch it is 1820 (+41), all from new files this branch
+adds or from ported tests, not from tests removed:
+
+- `tests/test_lifecycle.py`, `test_observability.py`, `test_run_binding.py`,
+  `test_lifecycle_migrations.py` — new;
+- `tests/test_concurrent_runs_policy.py`, `test_regression_p0_suite.py` — ported
+  from PR #38;
+- one renamed test (`test_a_run_in_which_nothing_was_pushed_is_not_reported_as_done`
+  → `test_a_push_that_was_refused_is_not_accepted_and_is_reworked`), on purpose.
+
+No test was deleted or its assertion weakened; the `main` collected set is a
+subset of this branch's.
 
 ## 6. Known limitations (honest)
 
