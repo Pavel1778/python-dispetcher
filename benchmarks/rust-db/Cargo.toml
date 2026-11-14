@@ -1,0 +1,14 @@
+[package]
+name = "nexus-db-bench"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "db_bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"] }
+serde_json = "1"
+uuid = "1"
