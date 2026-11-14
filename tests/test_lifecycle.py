@@ -219,6 +219,20 @@ def test_deleting_a_conversation_does_not_delete_its_project(http_server):
     assert [c["id"] for c in listing["conversations"]] == [b]
 
 
+def test_the_lifecycle_columns_are_in_the_schema_guard(http_server):
+    """Every column the lifecycle depends on is named in REQUIRED_COLUMNS, and
+    the schema the store connects to has them (a forgotten migration is the
+    usual cause of a missing column)."""
+    from orchestration.cloud_store import PostgresStore
+
+    assert "deleted_at" in PostgresStore.REQUIRED_COLUMNS["nexus_projects"]
+    assert "archived_at" in PostgresStore.REQUIRED_COLUMNS["nexus_projects"]
+    assert "deleted_at" in PostgresStore.REQUIRED_COLUMNS["nexus_conversations"]
+    assert "kind" in PostgresStore.REQUIRED_COLUMNS["nexus_run_tasks"]
+    _, _, app, _ = http_server
+    assert app.store.verify_schema() == []
+
+
 def test_lifecycle_routes_require_auth(http_server):
     base, alice, _app, _ = http_server
     pid = _project(base, alice)

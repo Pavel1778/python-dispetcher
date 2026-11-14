@@ -78,17 +78,12 @@ def test_the_summary_reports_percentiles_per_stage():
 
 # --------------------------------------------------------------- the route
 @needs_db
-def test_observability_endpoint_reports_the_queue_without_a_secret():
+def test_observability_endpoint_reports_the_queue_without_a_secret(monkeypatch):
+    # The real ``monkeypatch`` fixture: it restores the environment on teardown,
+    # so this test cannot leak a variable into the ones that run after it.
     from tests.test_studio_api import studio_stack
 
-    class _MP:
-        def setenv(self, *a, **k):
-            os.environ[a[0]] = a[1]
-
-        def delenv(self, *a, **k):
-            os.environ.pop(a[0], None)
-
-    with studio_stack(_MP()) as studio:
+    with studio_stack(monkeypatch) as studio:
         status, body = studio.api.get("/api/observability")
         assert status == 200
         assert "queue" in body and "workers" in body and "latency" in body
