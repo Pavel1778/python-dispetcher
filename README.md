@@ -28,16 +28,22 @@ Cloud transport provisions a sandbox and drives its agent-server directly
 
 Start here:
 
-- [docs/MVP_RELEASE_REPORT.md](docs/MVP_RELEASE_REPORT.md) — what is
-  implemented, tested and verified, and what still needs a live OpenHands key.
-- [docs/AUTONOMOUS-LAB.md](docs/AUTONOMOUS-LAB.md) — honest per-stage status
-  (implemented / tested / live verified / blocked / not implemented).
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the component map and how the
+  parts interact.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — run, monitor, diagnose, recover,
+  back up.
+- [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) — per-subsystem
+  readiness with the real evidence.
+- [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) — what is not done and
+  what is only proven against the stand-in servers.
+- [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md) — how to exercise
+  the live OpenHands / GitHub / LLM / PostgreSQL.
+- [docs/BRANCHES.md](docs/BRANCHES.md) — branching, merging and cleanup.
 - [AGENTS.md](AGENTS.md) — repository layout and hard-won runtime facts.
-- [docs/NEXUS-SPEC.md](docs/NEXUS-SPEC.md) — the target architecture.
-- [CLOUD-INTEGRATION-MAP.md](CLOUD-INTEGRATION-MAP.md) — the Cloud API surface.
-- [DEPLOY.md](DEPLOY.md) — deployment guide.
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable, run
   command, dependency and required permission in one place.
+- [DEPLOY.md](DEPLOY.md) — deployment guide.
+- [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.
 
 ## What is ready today
 

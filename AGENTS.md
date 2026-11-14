@@ -2511,3 +2511,73 @@ additive; no existing behaviour was removed.
   (provider, OpenHands, GitHub), so a rewrite would not move the numbers and
   would split the invariants documented here. `tests/test_benchmark_tool.py`
   covers the comparison and that the script imports.
+
+## Master completion, synchronization and release (2026-11-14)
+
+The repository was synchronized and released. What a future change must know:
+
+### Branch topology at release
+
+- `main` carries every increment; the branches that were already merged into it
+  (`arena/2161f211`, `arena/44b9ec6d`, `arena/4f942c7f`, `arena/5ee71838`,
+  `arena/78a1a036`, `arena/8b83d99f`, `arena/a54ad8b6`, `arena/c56cbbf3`,
+  `arena/dcb992a2`, `audit/pr29`, `docs/intent-and-env`,
+  `nexus/chat-first-workflow`, `nexus/durable-autonomy-multiconn`) were deleted
+  after a backup tag. `docs/BRANCHES.md` is the table.
+- **`arena/ab0d7665` (PR #38) was ported, not merged.** Its base was the old
+  `main`; a merge would have reverted the command system, conversation
+  management, stop generation and run history. Only its unique work was taken:
+  `_continues_analysis` in `web_server.py`, `tests/test_regression_p0_suite.py`,
+  `tests/test_concurrent_runs_policy.py`, `docs/P0-INCIDENT-FINAL-REPORT.md`.
+- **`nexus/continue-longtask-hardening` is a stale snapshot** of an older
+  `main`: `git diff main origin/nexus/continue-longtask-hardening` mostly
+  *removes* current files. Do not merge it; its content is already in `main`.
+- **`arena/d7bb7e3c` / `nexus/mainline-hardening`** carry a migration-integrity
+  framework. Only its one real defect fix was taken (see below); the
+  manifest/effect framework was left out on purpose — the test suite runs
+  migrations by executing each `*.sql` directly, so a manifest would not be
+  exercised and would add a large, unproven surface.
+
+### The migrations runner refuses an edited, applied file
+
+`PostgresStore.apply_migrations` used `ON CONFLICT DO UPDATE` and executed a
+changed body under its recorded name — the history could claim one thing while
+the schema was another. It now raises `MigrationError`, naming the file; a
+*new* file still applies. `tests/test_schema_bootstrap.py::
+test_an_edited_migration_is_refused_not_reapplied` is the regression.
+`MigrationError` is a `StoreError` subclass, so the HTTP layer answers 503, not
+a raw 500.
+
+### Two more defects fixed in the audit
+
+- **A second answer while one is generating** was a raw 400 that left the
+  conversation `thinking`. It is now a 409 with a clear message and an idle
+  conversation; the running generation's token stays registered and stoppable.
+- **`LabStore.delete_run` left `nexus_goals.active_run_id`** (a plain uuid
+  column, no foreign key) pointing at the removed run. It is cleared in the
+  same transaction.
+
+### `_count_runs` in tests asks the active list
+
+The runs route now honours `?include_hidden=1` (added for the ported §10
+suite). Two test helpers had relied on that parameter being ignored and meant
+"active runs"; they now ask the default list. Do not reintroduce
+`include_hidden=1` into `_count_runs` — it would count history as new work
+(`tests/test_chat_workflow.py::test_a_spent_plan_does_not_start_a_second_run`).
+
+### Live verification (2026-11-14)
+
+- LLM cascade (live, read-only probe): Gemini `ok`, OpenRouter `ok`, OpenHands
+  `ok`, Groq `blocked` (no key).
+- GitHub (live): `current_user()` → `Pavel1778`, 21 repositories visible.
+- OpenHands Cloud (live): `health()` True, `ping()` 200; a real autonomous run
+  created a conversation and dispatched a task (the account has no GitHub
+  provider token, so a task that must push ends `completed_unverified`).
+
+### Documentation set added
+
+`docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `docs/PRODUCTION_READINESS.md`,
+`docs/BRANCHES.md`, `docs/INTEGRATION_TESTING.md`, `docs/KNOWN_LIMITATIONS.md`,
+`docs/GAP-ANALYSIS.md`, `docs/GROUND-TRUTH-BUILD-LINT-TEST.md`,
+`docs/P0-INCIDENT-FINAL-REPORT.md`, `tools/verify_build_lint_test.sh`. Keep
+them in step when a variable, route, command or status changes.
