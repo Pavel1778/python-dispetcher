@@ -104,6 +104,7 @@ from .nexus_commands import (
     suggest as command_suggest,
     task_text as command_task_text,
 )
+from .nexus_generation import GenerationCancelled, GenerationToken
 from .nexus_intent import (
     ANALYSIS,
     AUTONOMOUS,
@@ -526,6 +527,11 @@ class App:
         from .nexus_chat import ChatResponder
         from .nexus_conversations import ConversationService
         self.conversations = ConversationService(self.store)
+        # The running AI answers of this process, by generation id. A cancel
+        # ("stop generation") finds the token here and trips it, aborting the
+        # live provider call; it is separate from cancelling a run.
+        from .nexus_generation import GenerationRegistry
+        self.generations = GenerationRegistry()
         self.chat = ChatResponder(
             self.providers,
             dispatch_code=self._chat_dispatch_code,
@@ -1952,16 +1958,17 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/v1/projects/{id}/notifications
         if rest == ["notifications"]:
             return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
-        # GET /api/v1/projects/{id}/conversations[?q=&archived=1]
+        # GET /api/v1/projects/{id}/conversations[?q=&archived=1&deleted=1]
         if rest and rest[0] == "conversations" and len(rest) == 1:
             # The query lives on the raw request target, not the stripped path.
             from urllib.parse import parse_qs
             params = parse_qs(urlparse(self.path).query)
             query = (params.get("q") or [None])[0]
             include_archived = (params.get("archived") or ["0"])[0] in ("1", "true")
+            include_deleted = (params.get("deleted") or ["0"])[0] in ("1", "true")
             return (200, {"conversations": self.app.conversations.list(
                 principal, project_id, include_archived=include_archived,
-                query=query)}, None)
+                query=query, include_deleted=include_deleted)}, None)
         # GET /api/v1/projects/{id}/conversations/{cid}
         if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
             return (200, {"conversation": self.app.conversations.get(
@@ -1971,6 +1978,11 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "messages"):
             return (200, {"messages": self.app.conversations.list_messages(
                 principal, project_id, rest[1])}, None)
+        # GET /api/v1/projects/{id}/conversations/{cid}/export
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "export"):
+            return (200, self.app.conversations.export(
+                principal, project_id, rest[1]), None)
         # GET /api/v1/projects/{id}/agents  (agent sessions)
         if rest == ["agents"]:
             return (200, {"sessions": self.app.conversations.list_agent_sessions(
@@ -2490,6 +2502,11 @@ class Handler(BaseHTTPRequestHandler):
         if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
                 and rest[2] == "messages"):
             self._chat_turn(principal, project_id, rest[1], body)
+            return True
+        # POST /api/v1/projects/{id}/conversations/{cid}/cancel   (stop generation)
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "cancel"):
+            self._cancel_generation(principal, project_id, rest[1], body)
             return True
         # POST /api/v1/projects/{id}/repository   (connect: verify, allowlist, bind)
         #   {"full_name": "owner/name", "branch"?: "...", "account_id"?: uuid | null}
@@ -3249,29 +3266,68 @@ class Handler(BaseHTTPRequestHandler):
         # the turns that answer in words: they read files instead of guessing.
         access = (self.app.repository_access(project_id, conversation)
                   if turn_mode in ("ask", "analysis", "plan") else None)
+        # A generation is opened for an answer that asks a model (ask, analysis,
+        # plan). It is what "stop generation" acts on: the answer carries a
+        # token, and a cancel trips it, aborting the live provider call at once.
+        # The token is registered only for the answer's lifetime. A mode that
+        # dispatches (code, autonomous) does no waiting on a model, so it opens
+        # no generation - stopping it is a run/task action, not a generation one.
+        token = None
+        generation_id = None
+        if turn_mode in ("ask", "analysis", "plan"):
+            generation = self.app.conversations.start_generation(
+                principal, project_id, conversation_id, mode=turn_mode)
+            generation_id = str(generation["id"])
+            token = GenerationToken(generation_id)
+            self.app.generations.register(token)
         try:
-            produced = self.app.chat.respond(
-                mode=turn_mode,
-                goal=task.strip() if turn_mode == "code" and attached else request,
-                context=context, memory=memory,
-                repository=conversation.get("repository") or "",
-                branch=conversation.get("selected_branch") or "",
-                history=history,
-                # The work a turn starts belongs to this conversation's project
-                # and to the person who asked for it.
-                project_id=project_id, principal=principal,
-                conversation_id=conversation_id,
-                spec_id=spec["id"] if spec else None,
-                run_facts=run_facts, access=access, attached=attached,
-                # An answer says how work starts in the mode this chat is in.
-                work_starts=work_starts_by(chosen))
-        except ChatError as e:
-            self.app.conversations.set_state(principal, project_id, conversation_id, "error")
-            err = self.app.conversations.add_message(
-                principal, project_id, conversation_id, role="system",
-                content=f"Не удалось получить ответ: {e}", meta={"error": True})
-            self._json(502, {"error": str(e), "messages": appended + [err]})
-            return
+            try:
+                produced = self.app.chat.respond(
+                    mode=turn_mode,
+                    goal=task.strip() if turn_mode == "code" and attached else request,
+                    context=context, memory=memory,
+                    repository=conversation.get("repository") or "",
+                    branch=conversation.get("selected_branch") or "",
+                    history=history,
+                    # The work a turn starts belongs to this conversation's project
+                    # and to the person who asked for it.
+                    project_id=project_id, principal=principal,
+                    conversation_id=conversation_id,
+                    spec_id=spec["id"] if spec else None,
+                    run_facts=run_facts, access=access, attached=attached,
+                    # An answer says how work starts in the mode this chat is in.
+                    work_starts=work_starts_by(chosen),
+                    token=token)
+            except GenerationCancelled as e:
+                # The answer was stopped. If this call wins the race to mark
+                # the generation cancelled it records the stop with whatever
+                # was produced; if the cancel request already did, this writes
+                # nothing, so the stop appears exactly once. Either way the
+                # conversation is left idle and immediately usable.
+                stopped = None
+                if self._finish_generation(generation_id, "cancelled"):
+                    stopped = self._record_stopped(principal, project_id,
+                                                   conversation_id, generation_id,
+                                                   turn_mode, e.partial)
+                else:
+                    self.app.conversations.set_state(principal, project_id,
+                                                     conversation_id, "idle")
+                self._json(200, {"messages": appended + ([stopped] if stopped else []),
+                                 "cancelled": True, "generation_id": generation_id})
+                return
+            except ChatError as e:
+                self._finish_generation(generation_id, "failed")
+                self.app.conversations.set_state(principal, project_id,
+                                                 conversation_id, "error")
+                err = self.app.conversations.add_message(
+                    principal, project_id, conversation_id, role="system",
+                    content=f"Не удалось получить ответ: {e}", meta={"error": True})
+                self._json(502, {"error": str(e), "messages": appended + [err]})
+                return
+        finally:
+            if generation_id is not None:
+                self.app.generations.unregister(generation_id)
+        self._finish_generation(generation_id, "finished")
         # Persist each produced message, attaching any run/task ids to the
         # conversation so the agent panel can follow it.
         for msg in produced:
@@ -3288,6 +3344,71 @@ class Handler(BaseHTTPRequestHandler):
                     principal, project_id, conversation_id, str(meta["run_id"]))
         self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
         self._json(200, {"messages": appended})
+
+    def _finish_generation(self, generation_id: str | None, state: str) -> bool:
+        """Close a generation row; ``True`` if this call owned the outcome.
+
+        Best effort: the answer's outcome is already decided, and a bookkeeping
+        failure must never turn it into an error. ``False`` (no id, or the row
+        was already moved by someone else) means this caller must not record
+        the outcome a second time.
+        """
+        if not generation_id:
+            return False
+        try:
+            return self.app.conversations.finish_generation(generation_id, state)
+        except Exception:  # noqa: BLE001 - the row is a side record
+            log.warning("could not mark generation %s %s", generation_id, state,
+                        exc_info=True)
+            return False
+
+    def _record_stopped(self, principal: str, project_id: str, conversation_id: str,
+                        generation_id: str, mode: str, partial: str) -> dict:
+        """Save what a stopped answer produced, marked as stopped."""
+        self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+        return self.app.conversations.add_message(
+            principal, project_id, conversation_id, role="assistant",
+            content=partial or "Генерация остановлена.",
+            meta={"mode": mode, "cancelled": True, "generation_id": generation_id,
+                  "partial": bool(partial)})
+
+    def _cancel_generation(self, principal: str, project_id: str,
+                           conversation_id: str, body: dict) -> None:
+        """``POST …/conversations/{id}/cancel``: stop the AI answer in flight.
+
+        This is *only* the text generation - it is not a run cancel and does
+        not touch any autonomous run of the project. It trips the in-process
+        token (aborting the live provider call at once) and, if the answer is
+        still running, marks the generation cancelled and records the stop with
+        the partial text produced so far. A conversation with no running answer
+        is a 409, so the caller knows nothing was stopped rather than believing
+        it was.
+        """
+        self.app.conversations.get(principal, project_id, conversation_id)
+        named = body.get("generation_id")
+        running = self.app.conversations.running_generation(conversation_id)
+        if running is None:
+            self._json(409, {"error": "no generation is running for this conversation"})
+            return
+        if named is not None and str(named) != str(running["id"]):
+            # The caller named a different (older) generation: refuse rather
+            # than stop the wrong one.
+            self._json(409, {"error": "that generation is not the one running"})
+            return
+        generation_id = str(running["id"])
+        token = self.app.generations.get(generation_id)
+        partial = token.partial if token is not None else ""
+        self.app.generations.cancel(generation_id)
+        # Whoever marks the row cancelled first owns the outcome. If the answer
+        # itself wins the race it records the stop; only if it has not (yet)
+        # does this request record it, so the stop is written exactly once.
+        if self.app.conversations.finish_generation(generation_id, "cancelled"):
+            self._record_stopped(principal, project_id, conversation_id,
+                                 generation_id, running.get("mode") or "", partial)
+        else:
+            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+        self._json(200, {"cancelled": True, "generation_id": generation_id,
+                         "stopped": token is not None})
 
     def _record_agent_session(self, principal: str, project_id: str,
                               conversation_id: str, meta: dict, msg: dict) -> None:
@@ -4329,6 +4450,21 @@ class Handler(BaseHTTPRequestHandler):
                             return self._json(400, {"error": "archived must be a boolean"})
                         conversation = self.app.conversations.set_archived(
                             principal, project_id, rest[1], body["archived"])
+                    if "pinned" in body:
+                        # A durable pin, so the pinned section survives a
+                        # restart and is the same on every device.
+                        if not isinstance(body["pinned"], bool):
+                            return self._json(400, {"error": "pinned must be a boolean"})
+                        conversation = self.app.conversations.set_pinned(
+                            principal, project_id, rest[1], body["pinned"])
+                    if "deleted" in body:
+                        # A soft delete (or a restore). Real - the conversation
+                        # leaves every list - and reversible within the
+                        # retention window. Nothing else is removed.
+                        if not isinstance(body["deleted"], bool):
+                            return self._json(400, {"error": "deleted must be a boolean"})
+                        conversation = self.app.conversations.set_deleted(
+                            principal, project_id, rest[1], body["deleted"])
                     return self._json(200, {"conversation": conversation})
                 # Any other sub-resource falls through to the project PATCH below.
             parsed = self._project_path(path)

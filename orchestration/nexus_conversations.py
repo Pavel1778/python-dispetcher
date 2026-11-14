@@ -35,8 +35,8 @@ _MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "manual")
 #: project's bound repository and branch. Kept in one place so every read and
 #: every write returns the same shape.
 _CONVERSATION = (
-    "id, project_id, title, mode, state, archived, run_id, "
-    "workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
+    "id, project_id, title, mode, state, archived, pinned, pinned_at, deleted_at, "
+    "run_id, workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
     "workflow_plan, plan_approved_hash, plan_approved_at, plan_approved_by, "
     "created_at, updated_at")
 
@@ -64,19 +64,45 @@ class ConversationService:
             return dict(row)
 
     def list(self, principal: str, project_id: str, *,
-             include_archived: bool = False, query: str | None = None) -> list[dict]:
+             include_archived: bool = False, query: str | None = None,
+             include_deleted: bool = False,
+             include_content: bool = True) -> list[dict]:
+        """The project's conversations, pinned first, newest activity next.
+
+        A pinned conversation is at the top of its own section, ordered by when
+        it was pinned (newest pin first), which is the manual order a person
+        controls. A deleted conversation is left out unless *include_deleted*
+        asks for the trash; an archived one is left out unless *include_archived*
+        asks for it. *query* searches the title (case-insensitively) and, when
+        *include_content* is true, the text of the messages - so "search in the
+        content of messages" finds a chat by what was said in it, not only by
+        its title.
+        """
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            sql = ("SELECT id, project_id, title, mode, state, archived, run_id, "
-                   "workflow_state, created_at, updated_at FROM nexus_conversations "
-                   "WHERE project_id=%s")
+            sql = ("SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
+                   "c.pinned, c.pinned_at, c.deleted_at, c.run_id, c.workflow_state, "
+                   "c.created_at, c.updated_at FROM nexus_conversations c "
+                   "WHERE c.project_id=%s")
             params: list[Any] = [project_id]
+            # ``deleted=1`` asks for the trash, so it lists *only* deleted
+            # conversations; the normal list shows only live ones.
+            sql += (" AND c.deleted_at IS NOT NULL" if include_deleted
+                    else " AND c.deleted_at IS NULL")
             if not include_archived:
-                sql += " AND archived=false"
+                sql += " AND c.archived=false"
             if query:
-                sql += " AND lower(title) LIKE %s"
-                params.append("%" + query.strip().lower() + "%")
-            sql += " ORDER BY updated_at DESC, id LIMIT 200"
+                needle = "%" + query.strip().lower() + "%"
+                if include_content:
+                    sql += (" AND (lower(c.title) LIKE %s OR EXISTS ("
+                            "SELECT 1 FROM nexus_conversation_messages m "
+                            "WHERE m.conversation_id=c.id AND lower(m.content) LIKE %s))")
+                    params.extend([needle, needle])
+                else:
+                    sql += " AND lower(c.title) LIKE %s"
+                    params.append(needle)
+            sql += (" ORDER BY c.pinned DESC, c.pinned_at DESC NULLS LAST, "
+                    "c.updated_at DESC, c.id LIMIT 200")
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
 
@@ -85,6 +111,7 @@ class ConversationService:
             self._project(cur, principal, project_id)
             cur.execute(
                 "SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
+                "  c.pinned, c.pinned_at, c.deleted_at, "
                 "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
                 "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
                 "  c.plan_approved_at, c.plan_approved_by, c.created_at, c.updated_at, "
@@ -127,6 +154,165 @@ class ConversationService:
             if row is None:
                 raise NotFound("conversation not found")
             return dict(row)
+
+    def set_pinned(self, principal: str, project_id: str, conversation_id: str,
+                   pinned: bool) -> dict:
+        """Pin a conversation to the top of the list, or unpin it.
+
+        The pin is durable (a column), so it survives a restart and is the same
+        on every device - it is not a client preference. Pinning stamps the
+        time, which is the manual order of the pinned section; unpinning clears
+        both.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            # ``updated_at`` is activity and is not touched: pinning is not
+            # activity, and unpinning must restore the order the conversation
+            # had, not push it to the top.
+            cur.execute(
+                "UPDATE nexus_conversations SET pinned=%s, "
+                "  pinned_at=CASE WHEN %s THEN COALESCE(pinned_at, now()) ELSE NULL END "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (bool(pinned), bool(pinned), conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            self._event(cur, project_id, principal,
+                        "conversation.pinned" if pinned else "conversation.unpinned",
+                        conversation_id)
+            return dict(row)
+
+    def set_deleted(self, principal: str, project_id: str, conversation_id: str,
+                    deleted: bool) -> dict:
+        """Delete a conversation, or restore it from the trash.
+
+        The delete is a stamp (``deleted_at``), so it is real - the conversation
+        leaves every list - and reversible. Nothing is removed from the
+        database here: the messages, attachments and audit rows stay, and the
+        project and its repository are untouched. Purging the row after the
+        retention window is housekeeping's job (``purge_deleted``), not this
+        one's.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            # Deleting or restoring is not activity: ``updated_at`` is left
+            # alone so a restored conversation returns to its place.
+            cur.execute(
+                "UPDATE nexus_conversations SET deleted_at="
+                "  CASE WHEN %s THEN COALESCE(deleted_at, now()) ELSE NULL END "
+                "WHERE id=%s AND project_id=%s "
+                f"RETURNING {_CONVERSATION}",
+                (bool(deleted), conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            self._event(cur, project_id, principal,
+                        "conversation.deleted" if deleted else "conversation.restored",
+                        conversation_id)
+            return dict(row)
+
+    def purge_deleted(self, project_id: str, *, older_than_hours: float) -> int:
+        """Permanently remove conversations deleted longer ago than the window.
+
+        Called by housekeeping, not by a request. Returns how many rows were
+        removed. Messages, attachments and generations go with them (their
+        foreign keys cascade); nothing outside the conversation is touched, so
+        a run, a workflow and the repository keep their history.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "DELETE FROM nexus_conversations WHERE project_id=%s AND deleted_at "
+                "IS NOT NULL AND deleted_at < now() - %s * interval '1 hour'",
+                (project_id, float(older_than_hours)))
+            return cur.rowcount
+
+    def export(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """A conversation and its messages as a self-contained JSON document.
+
+        The whole transcript, every message's role, text, metadata and
+        timestamp, and the conversation's own metadata. No secret is included:
+        a message never stores a key (the API key is read from the environment),
+        and the fields exported are exactly the ones the chat surface reads.
+        """
+        conversation = self.get(principal, project_id, conversation_id)
+        messages = self.list_messages(principal, project_id, conversation_id)
+        return {
+            "exported_from": "NEXUS",
+            "conversation": {
+                "id": conversation["id"], "title": conversation["title"],
+                "mode": conversation["mode"], "state": conversation["state"],
+                "archived": conversation["archived"], "pinned": conversation["pinned"],
+                "created_at": conversation["created_at"],
+                "updated_at": conversation["updated_at"],
+            },
+            "messages": [
+                {"id": m["id"], "role": m["role"], "content": m["content"],
+                 "meta": m.get("meta") or {}, "created_at": m["created_at"],
+                 "attachments": m.get("attachments") or []}
+                for m in messages
+            ],
+        }
+
+    # ------------------------------------------------------------ generations
+    def start_generation(self, principal: str, project_id: str, conversation_id: str,
+                         *, mode: str) -> dict:
+        """Open a generation for this conversation; refuse a second running one.
+
+        The unique partial index (``uq_nexus_generations_running``) is what
+        makes this atomic: two requests arriving together cannot both believe
+        they are the one answer. A conversation that already has a running
+        generation raises ``ValueError`` - the caller answers 409 - so a "stop"
+        always has exactly one generation to act on.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT 1 FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            if cur.fetchone() is None:
+                raise NotFound("conversation not found")
+            try:
+                cur.execute(
+                    "INSERT INTO nexus_generations(conversation_id, project_id, mode, "
+                    "  created_by) VALUES (%s,%s,%s,%s) "
+                    "RETURNING id, conversation_id, project_id, state, mode, created_at",
+                    (conversation_id, project_id, mode, principal))
+            except Exception as e:  # UniqueViolation: a generation is already running
+                if "uq_nexus_generations_running" in str(e):
+                    raise ValueError("a generation is already running") from None
+                raise
+            return dict(cur.fetchone())
+
+    def finish_generation(self, generation_id: str, state: str) -> bool:
+        """Mark a generation terminal; ``True`` if this call moved it.
+
+        Only a running row moves, so the call is idempotent and *exclusive*: the
+        first caller to move the row owns the outcome. That is what stops a
+        cancel request and the answer it stopped from both writing a "stopped"
+        message: whichever marks the row cancelled first records the stop, and
+        the other sees ``False`` and writes nothing.
+        """
+        if state not in ("cancelled", "finished", "failed"):
+            raise ValueError("state must be cancelled, finished or failed")
+        with self.store._tx() as cur:
+            cur.execute("UPDATE nexus_generations SET state=%s, ended_at=now() "
+                        "WHERE id=%s AND state='running'", (state, generation_id))
+            return cur.rowcount == 1
+
+    def running_generation(self, conversation_id: str) -> dict | None:
+        with self.store._tx() as cur:
+            cur.execute("SELECT id, conversation_id, project_id, state, mode, created_at "
+                        "FROM nexus_generations WHERE conversation_id=%s AND state='running' "
+                        "ORDER BY created_at DESC, id LIMIT 1", (conversation_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def generation(self, generation_id: str) -> dict | None:
+        with self.store._tx() as cur:
+            cur.execute("SELECT id, conversation_id, project_id, state, mode, created_at, "
+                        "ended_at FROM nexus_generations WHERE id=%s", (generation_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
     def set_mode(self, principal: str, project_id: str, conversation_id: str,
                  mode: str) -> dict:
