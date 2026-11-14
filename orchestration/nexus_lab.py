@@ -1020,11 +1020,9 @@ class GitVerifier:
                 "completed_unverified",
                 "the branch did not move: the reported commit is the one the attempt started from",
                 evidence, retry="followup")
-        if changed is None and expects_change and base is not None and sha == base:
-            # ``base`` was recorded and the head is it, so ``changed`` would be
-            # False; this branch is unreachable. Kept for clarity of the cases.
-            return Verification("completed_unverified",
-                                "the branch did not move", evidence, retry="followup")
+        # ``changed`` is True (the branch moved) or None (the start is unknown,
+        # so whether it moved cannot be said): the report refers to the real,
+        # current head, and that is what "verified" claims.
         return Verification("completed_verified",
                             "remote branch is at the reported commit", evidence)
 
