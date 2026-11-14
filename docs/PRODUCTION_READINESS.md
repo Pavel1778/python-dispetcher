@@ -34,7 +34,7 @@ stand-in servers on loopback unless stated).
 | OpenHands live conversation (create, message, events, finish) | VERIFIED (live) | `openhands diagnostics --live` in `docs/FINAL_ACCEPTANCE_REPORT.md`; this session's live run reached a real conversation |
 | GitHub read (live) | VERIFIED (live) | `current_user()` → `Pavel1778`; 21 repositories visible |
 | GitHub write (create repo / visibility) | UNVERIFIED (live) | Guarded by confirmation + `acknowledge_public`; exercised against `tests/fake_github.py` only |
-| Live autonomous run end to end | VERIFIED (live, partial) | This session: a real run dispatched a task to real OpenHands; the account has **no GitHub provider token**, so a task that must push ends `completed_unverified` |
+| Live autonomous run end to end | VERIFIED (live) | This session: a real run reached `completed`; both tasks `completed_verified` (the **real** `GitVerifier` read the live GitHub branch: "remote branch is at the reported commit"), and the report `no_changes` was written to the chat. The account has **no GitHub provider token**, so the agent reported "the push is refused" — correct, and reported as such |
 | MCP server (stdio + Streamable HTTP) | VERIFIED | `tests/test_cli_mcp.py` |
 | MCP client (connect to external MCP servers) | NOT IMPLEMENTED | `docs/MCP_ARCHITECTURE.md` (design) |
 | Self-QA engine | NOT IMPLEMENTED | `docs/SELF_QA_ARCHITECTURE.md` (design) |
@@ -49,7 +49,8 @@ stand-in servers on loopback unless stated).
   infrastructure (PostgreSQL) or real local socket servers that speak the exact
   service surface.
 - Live LLM providers, live OpenHands Cloud and live GitHub reads are
-  **VERIFIED**. The live autonomous run dispatched to real OpenHands.
+  **VERIFIED**. The live autonomous run completed end to end: real dispatch,
+  real Git verification against the live branch, real completion report.
 - The one thing that cannot be completed live here is a task that **pushes** to
   GitHub, because the OpenHands account has no GitHub provider token; that path
   is **BLOCKED** on the account, not on NEXUS, and is exercised against the
