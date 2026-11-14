@@ -1860,8 +1860,10 @@ def test_the_composer_stops_a_generation_and_the_chat_stays_usable(stack, chromi
     aborts the answer at once, and a new message can be sent immediately."""
     ctx, page, watch = _open(chromium)
     # A cancel can race the answer's own completion; a 409 then means nothing
-    # was left to stop, which is the honest answer and not a failure.
+    # was left to stop, which is the honest answer and not a failure. The
+    # browser also logs the 409 as a console error.
     watch.allow(r"HTTP 409 POST .*/cancel")
+    watch.allow(r"Failed to load resource.*409")
     try:
         _login(page, stack.base)
         # A slow answer, so the stop button is on screen while it generates.
@@ -1926,7 +1928,7 @@ def test_pin_export_and_delete_a_chat_from_its_menu(stack, chromium):
         page.click("#confirm-ok")
         expect(page.locator(".hero h1")).to_be_visible()
         # The trash holds it, and restore brings it back.
-        page.click(".sb-more:has-text('Корзина')")
+        page.click(".sb-trash")
         page.wait_for_selector("[data-action='restore-chat']")
         page.click("[data-action='restore-chat']")
         expect(page.locator(".sb-item:not(.is-archived)")).to_have_count(2)

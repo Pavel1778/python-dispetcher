@@ -595,7 +595,7 @@
         icon('archive', 'icon-sm') + '<span>Архив · ' + archived.length + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
       if (S.showArchived) html += archived.map(chatItemHtml).join('');
     }
-    html += '<button class="sb-more" type="button" data-action="toggle-trash" aria-expanded="' + S.showTrash + '">' +
+    html += '<button class="sb-trash" type="button" data-action="toggle-trash" aria-expanded="' + S.showTrash + '">' +
       icon('x', 'icon-sm') + '<span>Корзина' + (S.trash.length ? ' · ' + S.trash.length : '') + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
     if (S.showTrash) {
       html += S.trash.length
