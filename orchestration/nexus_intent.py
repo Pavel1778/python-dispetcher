@@ -29,6 +29,7 @@ router marks ambiguous does not start a run.
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 
@@ -98,19 +99,38 @@ _ANALYSIS_LEAD = re.compile(
 
 #: Imperative engineering verbs - an order to *do* work. Chosen as stems so a
 #: word ending does not matter; deliberately does not include read-only verbs.
+#:
+#: Each Cyrillic stem that is itself a prefix of its own verb's passive
+#: participle - the adjective form that describes work already done -
+#: carries a negative lookahead ruling that participle out. Without it, the
+#: stem matches both the imperative and the participle, because Russian
+#: forms the participle by appending a suffix straight onto the same root:
+#: "заверши" (an order: "finish it!") is also the first six letters of
+#: "завершившегося" (an adjective: "...that has finished"). That exact
+#: collision was the reported defect: "дай отчёт последнего успешно
+#: завершившегося прогона" asks for a fact about a run that is already over
+#: and names no work, but was read as an order and started a new run instead
+#: of answering from history. The same collision was then found live in
+#: production a few messages later in the same incident: "...отчитайся о
+#: выполненной работе" ("...report on the work that was done") matched the
+#: "выполн" stem through "выполненной", the participle of the very verb the
+#: stem exists to recognise as an order ("выполни" - "do it!"). Each guard
+#: below blocks only the participle's suffix, not the imperative's: for
+#: example "выполн(?!е)" keeps matching "выполни"/"выполняй"/"выполните" (none
+#: continue with "е") while no longer matching "выполнен-"/"выполнени-".
 _ORDER = re.compile(
     r"(?:^|[\s,;:(\-—–])(?:"
-    r"реализу|реализова|"
-    r"исправ|почин|поправь|"
+    r"реализу|реализова(?!н)|"
+    r"исправ(?!лен)|почин(?!енн)|поправь|"
     r"добавь|добави|внедри|"
-    r"сделай|сделать|создай|созда|напиши|написа|"
-    r"удали|убери|убра|замени|замен|перепиши|переписа|"
+    r"сделай|сделать|создай|созда(?!нн|н\b)|напиши|написа(?!нн|н\b)|"
+    r"удали|убери|убра(?!нн|н\b)|замени|замен(?!енн|ённ)|перепиши|переписа(?!нн|н\b)|"
     r"отрефактори|рефакторинг|рефакторь|переработай|"
-    r"обнови|обнов|улучши|улучш|оптимизиру|оптимизир|доработа|"
+    r"обнови|обнов(?!лен|лён)|улучши|улучш(?!енн)|оптимизиру|оптимизир(?!ован)|доработа(?!нн|н\b)|"
     r"запусти|запуска|перезапусти|"
-    r"выполни|выполн|собери|собра|разверни|задеплой|"
-    r"покрой|покры|протестируй|настрой|настро|подключи|подключ|"
-    r"продолж|доведи|заверши|закончи|"
+    r"выполни|выполн(?!е)|собери|собра(?!нн|н\b)|разверни|задеплой|"
+    r"покрой|покры(?!т[аоыеё])|протестируй|настрой|настро(?!енн|ённ)|подключи|подключ(?!енн|ённ)|"
+    r"продолж(?!енн|ённ)|доведи|заверши(?!вш)|закончи(?!вш)|"
     r"implement|fix|add|create|write|remove|delete|refactor|rewrite|"
     r"update|improve|optimiz|upgrade|migrate|deploy|build|run|rerun|"
     r"continue|finish|complete|carry\s+out"
@@ -215,18 +235,31 @@ class Intent:
     when the message is not clearly a question and not clearly an order, so the
     caller should ask one clarifying question rather than start work.
     ``continue_run`` is True when the message asks to carry on work already
-    started. ``reason`` is a short human-readable note for the caller/logs.
+    started. ``forbids_run`` is True when the message (or, set by the caller,
+    the conversation's own unlifted history) explicitly forbids starting or
+    launching work; :func:`effective_mode` then never returns a mode that
+    would start one, in any conversation mode. ``history_request`` is True
+    when the message specifically asks to read past runs or their reports
+    ("Дай отчёт последнего прогона"): unlike the general read-only heuristic
+    (which a long specification can also trigger, by mentioning a verb like
+    "проверь" among its points, and which an explicit "Автономно" conversation
+    is still allowed to run as work - that mode is itself the instruction to
+    do it), a history request names no work in *any* mode, because reading
+    history is never something there is a point in "launching" to do.
+    ``reason`` is a short human-readable note for the caller/logs.
     """
 
     intent: str
     ambiguous: bool = False
     continue_run: bool = False
     question: bool = False
+    forbids_run: bool = False
+    history_request: bool = False
     reason: str = ""
 
     @property
     def starts_work(self) -> bool:
-        return self.intent == AUTONOMOUS and not self.ambiguous
+        return self.intent == AUTONOMOUS and not self.ambiguous and not self.forbids_run
 
 
 #: The reason of a go-ahead that has nothing to go ahead with.
@@ -283,6 +316,85 @@ def _asks_for_a_run(text: str) -> bool:
     return False
 
 
+def _has_order(text: str) -> bool:
+    """Whether *text* contains an order verb that is not itself negated.
+
+    The defect this fixes: "Не запускай ничего, просто ответь" contains the
+    stem "запуска" (inside "запускай"), and a bare ``_ORDER.search`` found it
+    regardless of the "Не" right before it - the one word that says the
+    opposite. Each match is checked the same way :func:`_asks_for_a_run`
+    checks the run-request phrase: only a match with no negation in the two
+    words before it counts as an order.
+
+    ``_ORDER`` itself opens with ``(?:^|[\\s,;:(-—–])``, so a match that is not
+    at the very start of *text* swallows the separator before the verb (a
+    space, a comma, ...) into ``match.group()``. Left uncorrected,
+    ``text[:match.start()]`` then ends one character short of that separator,
+    and the negation regex - which requires a space right after "не" - never
+    matches. The stem's real start is recovered here before the check.
+    """
+    for match in _ORDER.finditer(text):
+        stem_start = match.start()
+        if stem_start < len(text) and not text[stem_start].isalpha():
+            stem_start += 1   # skip the separator character the match consumed
+        if not _NEGATION.search(text[:stem_start]):
+            return True
+    return False
+
+
+#: An explicit prohibition on starting or launching work, in general - not
+#: only the launch-command prohibition of ``nexus_workflow`` (which only
+#: matters once a plan is on offer). A message built entirely or partly of
+#: this is never read as a work order, in any mode: "Не запускай ничего,
+#: просто ответь" must not start a run even in a conversation set to
+#: "Автономно", where other unclear statements are run as the person's own
+#: choice of mode (:func:`effective_mode`).
+_PROHIBITS_RUN = re.compile(
+    r"(?:"
+    r"не\s+запуска\w*|не\s+начина\w*\s+(?:работ|прогон)\w*|не\s+выполня\w*\s+(?:работ|прогон)\w*|"
+    r"не\s+над(?:о|а)\s+запуска\w*|не\s+нужн\w*\s+запуска\w*|"
+    r"запрещ\w*\s+запуск\w*|запрет\w*\s+(?:на\s+)?запуск\w*|"
+    r"без\s+запуска\w*|никаких\s+(?:новых\s+)?прогон\w*|никаких\s+запуск\w*|"
+    r"прекрати\s+запуска\w*|\bне\s+трогай\s+прогон\w*|"
+    r"do\s*n[o']?t\s+(?:start|run|launch)\s+anything|no\s+new\s+runs?|"
+    r"never\s+start\s+a\s+run|don'?t\s+launch\s+(?:openhands|anything)"
+    r")", re.IGNORECASE)
+
+
+def is_prohibition(text: str) -> bool:
+    """Whether *text* explicitly forbids starting or launching work.
+
+    Used both for the message itself (:func:`classify`) and to check the
+    conversation's own history for a prohibition that was never lifted
+    (``web_server._run_forbidden``).
+    """
+    return bool(_PROHIBITS_RUN.search((text or "").strip()))
+
+
+#: A request to read what autonomous runs have already done: the last run,
+#: its report, whether it succeeded, what remains. Read-only by nature - it
+#: must never be confused with an order, however it is phrased ("Дай отчёт
+#: последнего успешно завершившегося прогона" names no work to do; it asks
+#: for a fact). Folded into the ``analysis`` signal in :func:`classify`, so it
+#: goes through the same, already-tested rules as "Почему прогон остановился?".
+_HISTORY_OR_REPORT = re.compile(
+    r"(?:"
+    r"отчёт|отчет|"
+    # "Отчитайся" on its own - section 4's own example - names no work; it
+    # asks the same question as "дай отчёт", just with a different verb.
+    r"отчита[йи]\w*|"
+    r"истори[яию]\w*|"
+    r"последн\w*\s+(?:прогон|отчёт|отчет|успешн\w*|неудачн\w*|остановленн\w*|failed|run)|"
+    r"результат\w*\s+(?:тест|прогон|выполнени)\w*|"
+    r"(?:покажи|дай|предостав\w*|пришли|отчитайся|отчитывайся|"
+    r"хочу\s+(?:увидеть|посмотреть|узнать|получить)|"
+    r"мне\s+нуж(?:ен|на|но)|нуж(?:ен|на|но)|получить)\s+[^.?!\n]{0,40}?"
+    r"(?:отчёт|отчет|прогон\w*|истори\w*|результат\w*|задач\w*)|"
+    r"what\s+(?:is|was)\s+done|show\s+(?:me\s+)?(?:the\s+)?(?:last\s+)?(?:report|run|history)|"
+    r"give\s+(?:me\s+)?(?:the\s+)?(?:last\s+)?report"
+    r")", re.IGNORECASE)
+
+
 def clarification_choice(text: str) -> str | None:
     """What a reply to :func:`clarifying_question` chooses: ``"work"``,
     ``"chat"``, or ``None`` when it names neither or both.
@@ -319,6 +431,22 @@ def _residual_after_continue(text: str) -> str:
 
 def classify(text: str, *, mode: str | None = None, has_active_run: bool = False,
              has_context: bool = False) -> Intent:
+    """Classify one chat message. See :func:`_classify` for the rules.
+
+    A thin wrapper around :func:`_classify`: an explicit prohibition
+    (:func:`is_prohibition`) is folded into ``forbids_run`` here, once, rather
+    than in every one of ``_classify``'s return statements - so it applies
+    whichever rule decided the rest of the intent.
+    """
+    intent = _classify(text, mode=mode, has_active_run=has_active_run,
+                       has_context=has_context)
+    if is_prohibition(text):
+        intent = dataclasses.replace(intent, forbids_run=True)
+    return intent
+
+
+def _classify(text: str, *, mode: str | None = None, has_active_run: bool = False,
+              has_context: bool = False) -> Intent:
     """Classify one chat message.
 
     *mode* is the conversation's chosen mode, used only as a *hint* for the
@@ -344,7 +472,18 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     question = _looks_like_question(raw)
     greeting = bool(_GREETING.match(raw))
     discuss = bool(_DISCUSS.search(raw))
-    analysis = bool(_ANALYSIS.search(raw))
+    # A request to read past runs or their reports is read-only, whatever verb
+    # introduces it ("дай отчёт", "покажи последний прогон"): folded into the
+    # same ``analysis`` signal the read-only verbs set, so it goes through the
+    # same, already-tested rules (a question about it, a read-only order, ...).
+    # Tracked separately as ``history`` too: a history request never starts
+    # work in *any* mode (:func:`effective_mode`'s ``autonomous`` branch),
+    # unlike the general read-only heuristic below it, which a long pasted
+    # specification can also trigger just by mentioning a verb like "проверь"
+    # among its points - and an explicit "Автономно" conversation is still
+    # meant to run that as work, exactly as before this change.
+    history = bool(_HISTORY_OR_REPORT.search(raw))
+    analysis = bool(_ANALYSIS.search(raw)) or history
     order = bool(_ORDER.search(raw))
     continue_run = bool(_CONTINUE.search(raw))
     why = bool(_WHY.search(raw))
@@ -360,7 +499,7 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     #    ("analysis" mode still reads; the others answer.)
     if mode in _QUIET_MODES:
         if mode == "analysis" or (analysis and not explicit_order):
-            return Intent(ANALYSIS, reason=f"mode {mode}, read-only request")
+            return Intent(ANALYSIS, history_request=history, reason=f"mode {mode}, read-only request")
         return Intent(CHAT, reason=f"mode {mode}")
 
     # 3. A discussion request is a conversation, even when it names an order
@@ -369,7 +508,7 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     #    read-only verb ("посмотри логи и объясни проблему" is analysis).
     if discuss and not explicit_order:
         if analysis_lead:
-            return Intent(ANALYSIS, reason="read-only request")
+            return Intent(ANALYSIS, history_request=history, reason="read-only request")
         return Intent(CHAT, reason="discussion")
 
     # 4. "Продолжи..." is about work already under way.
@@ -404,7 +543,7 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
     #    is ambiguous: ask, do not act.
     if question and not explicit_order:
         if analysis or (why and state):
-            return Intent(ANALYSIS, question=True, reason="question about real state")
+            return Intent(ANALYSIS, question=True, history_request=history, reason="question about real state")
         if order and not discuss and _short(raw):
             return Intent(CHAT, ambiguous=True, question=True, reason="question with a buried order")
         return Intent(CHAT, question=True, reason="question")
@@ -422,15 +561,21 @@ def classify(text: str, *, mode: str | None = None, has_active_run: bool = False
 
     # 7. A read-only request ("проанализируй", "найди причину") is analysis.
     if analysis and not order:
-        return Intent(ANALYSIS, reason="read-only request")
+        return Intent(ANALYSIS, history_request=history, reason="read-only request")
     if analysis and order and not explicit_order and _short(raw):
         # "проверь и исправь?" - an order hidden in a read-only phrase: ask.
         # A *long* text that mixes read-only and order verbs is a specification,
         # not an ambiguous remark: it is read (analysis), never intercepted.
-        return Intent(ANALYSIS, ambiguous=True, reason="mixed read-only and order")
+        return Intent(ANALYSIS, ambiguous=True, history_request=history, reason="mixed read-only and order")
 
-    # 8. An order to do work.
-    if order:
+    # 8. An order to do work - but not when the order itself is negated
+    #    ("Не запускай ничего, просто ответь"). Rule 6 above already lets a
+    #    *question* that merely contains an order verb through as ambiguous
+    #    rather than as an order ("а не лучше ли переписать?" - a suggestion,
+    #    not a prohibition, so it stays ambiguous there and is not rechecked
+    #    here); this rule only ever sees a bare statement, where "не" right
+    #    before the verb always means exactly what it says.
+    if order and _has_order(raw):
         return Intent(AUTONOMOUS, reason="order to perform work")
 
     # 9. Nothing matched: a statement, an opinion, a remark, a greeting that was
@@ -453,6 +598,12 @@ def effective_mode(mode: str | None, intent: Intent) -> str:
     answered instead of starting a run.
     """
     mode = (mode or "auto").lower()
+    if intent.forbids_run and mode not in ("ask", "plan"):
+        # An explicit prohibition ("Не запускай ничего, просто ответь") holds
+        # in every mode, including "Автономно" and "Вручную" - both of which
+        # otherwise read an unclear statement as the work the person chose
+        # that mode for. Nothing here ever starts, plans or launches work.
+        return "analysis" if intent.intent == ANALYSIS else "ask"
     if mode in ("ask", "plan"):
         return mode
     if mode == "analysis":
@@ -477,15 +628,30 @@ def effective_mode(mode: str | None, intent: Intent) -> str:
         return "analysis" if intent.intent == ANALYSIS else "ask"
     if mode == "autonomous":
         # The person chose "Автономно": they are asking for work. A question is
-        # still answered and an explicit discussion is still a discussion, but
-        # anything else - including a stated goal with no order verb ("Цель: 25
-        # задач") - is honoured as work: they selected the mode, so an unclear
-        # goal runs rather than being turned into a chat reply.
-        if intent.question:
+        # still answered, an explicit discussion is still a discussion, and a
+        # request to read what was already done - a history or report request,
+        # whether or not it is phrased as a question ("Дай отчёт последнего
+        # прогона" names no work) - is still read-only: reading history is
+        # never something there is a point in "launching" to do, in any mode.
+        # A long specification pasted into the chat can *also* end up with the
+        # ``analysis`` intent, simply by mentioning a read-only-sounding verb
+        # like "проверь" among its points ("1. ...\n2. Проверь, что...\n");
+        # unlike an actual history request it does name work, and an explicit
+        # "Автономно" conversation is still meant to run it - exactly as
+        # before this fix - so only a genuine history/report request
+        # (``history_request``) is forced to read here, not analysis in
+        # general. A stated goal with no order verb ("Цель: 25 задач") is the
+        # one further shape of chat that *is* honoured as work: they selected
+        # the mode, so an unclear goal runs rather than being turned into a
+        # chat reply. Every other shape of chat - a plan request, a bare
+        # "продолжим" with nothing to continue, a bare go-ahead with nothing
+        # before it, a greeting, a discussion - names no goal at all, and
+        # stays exactly what it is in every other mode: only
+        # :func:`classify`'s final, unclassified fallback ("statement") is a
+        # goal in disguise.
+        if intent.question or intent.history_request:
             return "analysis" if intent.intent == ANALYSIS else "ask"
-        if intent.intent == CHAT and intent.reason in ("discussion", "greeting", _NO_CONTEXT):
-            # "Привет" is not a goal, and "делай" with nothing said before it
-            # names none: a run planned from either is planned from nothing.
+        if intent.intent == CHAT and intent.reason != "statement":
             return "ask"
         return "autonomous"
     # auto: the message alone decides.
