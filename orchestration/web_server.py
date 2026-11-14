@@ -3921,7 +3921,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"plan": self.app.plans.get(principal, project_id, item_id)})
                 return self._json(404, {"error": "not found"})
             if path == "/api/v1/projects":
-                return self._json(200, {"projects": self.app.projects.list(self._project_principal())})
+                # ``archived=1`` / ``deleted=1`` bring back projects that the
+                # default list leaves out (an archive / trash view).
+                params = urllib.parse.parse_qs(urlparse(self.path).query)
+                truthy = ("1", "true", "yes", "on")
+                include_archived = (params.get("archived") or ["0"])[0].lower() in truthy
+                include_deleted = (params.get("deleted") or ["0"])[0].lower() in truthy
+                return self._json(200, {"projects": self.app.projects.list(
+                    self._project_principal(), include_archived=include_archived,
+                    include_deleted=include_deleted)})
             nested = self._project_nested(path)
             if nested is not None:
                 return self._project_nested_get(*nested)
@@ -4541,7 +4549,26 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body(max_bytes=4 * 1024 * 1024)
             if not isinstance(body, dict):
                 return self._json(400, {"error": "body must be a JSON object"})
-            project = self.app.projects.update(self._project_principal(), parsed[0], body)
+            principal = self._project_principal()
+            # ``archived`` and ``deleted`` are the lifecycle states; ``name`` /
+            # ``description`` change what the project *is*. They may be combined,
+            # but each is validated so a wrong type is a 400, not a 500.
+            project = None
+            if "archived" in body:
+                if not isinstance(body["archived"], bool):
+                    return self._json(400, {"error": "archived must be a boolean"})
+                project = self.app.projects.set_archived(
+                    principal, parsed[0], body["archived"])
+            if "deleted" in body:
+                if not isinstance(body["deleted"], bool):
+                    return self._json(400, {"error": "deleted must be a boolean"})
+                project = (self.app.projects.restore(principal, parsed[0])
+                           if not body["deleted"]
+                           else self.app.projects.delete(principal, parsed[0]))
+            if set(body) & {"name", "description"}:
+                project = self.app.projects.update(principal, parsed[0], body)
+            if project is None:
+                raise ValueError("provide name, description, archived and/or deleted")
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})

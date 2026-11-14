@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from .cloud_store import NotFound, PostgresStore
-from .nexus_projects import _text
+from .nexus_projects import ProjectService, _text
 from .nexus_specs import MESSAGE_CHARS
 from .nexus_workflow import (
     AWAITING_APPROVAL,
@@ -54,6 +54,8 @@ class ConversationService:
         title = _text(title, "title", maximum=200, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
+            # A project in the trash is inert: it cannot grow a new conversation.
+            ProjectService._refuse_if_deleted(cur, project_id)
             cur.execute(
                 "INSERT INTO nexus_conversations(project_id, title, mode, created_by) "
                 "VALUES (%s,%s,%s,%s) "

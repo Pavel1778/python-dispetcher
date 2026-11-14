@@ -2283,7 +2283,17 @@
         : '<p class="section-note">Контекст ещё не собран.</p>') +
       '<button class="btn" type="button" data-action="refresh-context"' + (repoName() ? '' : ' disabled') + '>' + icon('refresh', 'icon-sm') +
       (context ? 'Изучить заново' : 'Изучить репозиторий') + '</button></div>' +
-      projectExecutorsHtml(data.executors);
+      projectExecutorsHtml(data.executors) +
+      // The project's own lifecycle. Archive is reversible and touches nothing;
+      // delete (trash) is refused while a run is active and is reversible too.
+      '<div class="section"><h3 class="section-title">' + icon('archive', 'icon-sm') + 'Архив и удаление</h3>' +
+      '<p class="section-note">Архив убирает проект из списка, ничего не меняя. Удаление переносит проект в корзину: ' +
+      'новые диалоги и цели не создаются, пока проект не восстановлен. Данные не удаляются безвозвратно.</p>' +
+      '<div class="row">' +
+      '<button class="btn" type="button" data-action="project-archive" data-archived="1">' + icon('archive', 'icon-sm') + 'В архив</button>' +
+      '<button class="btn" type="button" data-action="project-archive" data-archived="0">Вернуть из архива</button>' +
+      '<button class="btn btn-danger" type="button" data-action="project-delete">В корзину</button>' +
+      '</div></div>';
   }
 
   // What the last access check of a repository found, in a line.
@@ -2388,8 +2398,43 @@
     if (!S.projects.length) html += '<p class="sb-empty">Проектов пока нет.</p>';
     html += '<div class="menu-sep"></div>' +
       '<button class="menu-item" type="button" role="menuitem" data-action="new-project">' + icon('plus', 'icon-sm') + '<span>Новый проект</span></button>' +
-      (S.projectId ? '<button class="menu-item" type="button" role="menuitem" data-action="open-settings" data-tab="project">' + icon('settings', 'icon-sm') + '<span>Настройки проекта</span></button>' : '');
+      (S.projectId ? '<button class="menu-item" type="button" role="menuitem" data-action="open-settings" data-tab="project">' + icon('settings', 'icon-sm') + '<span>Настройки проекта</span></button>' : '') +
+      // Archived and deleted projects drop out of the list above; this opens a
+      // dialog that lists them and offers a restore, so a project put aside is
+      // never lost.
+      '<button class="menu-item" type="button" role="menuitem" data-action="project-lifecycle">' + icon('archive', 'icon-sm') + '<span>Архив и корзина</span></button>';
     openMenu(anchor, html);
+  }
+
+  // The archive/trash view for projects. The server is the one that decides
+  // what is archived or deleted; this only asks and shows it.
+  function openProjectLifecycle() {
+    closeMenu();
+    function load() {
+      return Promise.all([
+        api('/api/v1/projects?archived=1'),
+        api('/api/v1/projects?deleted=1')]).then(function (out) {
+        return { archived: out[0].projects || [], deleted: out[1].projects || [] };
+      });
+    }
+    function render(data) {
+      function rows(items, kind, label) {
+        if (!items.length) return '<p class="sb-empty">' + esc(label) + ': пусто.</p>';
+        return '<div class="lifecycle-group"><p class="work-section-title">' + esc(label) + '</p>' +
+          items.map(function (p) {
+            return '<div class="lifecycle-row"><span>' + esc(p.name) + '</span>' +
+              '<button class="btn btn-sm" type="button" data-action="project-restore" data-id="' + esc(p.id) + '" data-kind="' + esc(kind) + '">Восстановить</button></div>';
+          }).join('') + '</div>';
+      }
+      return rows(data.archived, 'archived', 'Архив') + rows(data.deleted, 'deleted', 'Корзина');
+    }
+    load().then(function (data) {
+      openDialog({
+        title: 'Архив и корзина проектов',
+        body: render(data),
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>'
+      });
+    }, function (error) { toast(explain(error.message).text, 'bad'); });
   }
 
   function modeMenu(anchor) {
@@ -2596,6 +2641,39 @@
     'pick-project': function (el) { closeMenu(); go(el.getAttribute('data-id'), null); },
     'pick-mode': function (el) { closeMenu(); setMode(el.getAttribute('data-mode')); $('#prompt').focus(); },
     'new-project': function () { closeMenu(); newProjectDialog(); },
+    'project-lifecycle': function () { openProjectLifecycle(); },
+    'project-archive': function (el) {
+      var archived = el.getAttribute('data-archived') === '1';
+      api(projectUrl(''), { method: 'PATCH', body: { archived: archived } }).then(function () {
+        toast(archived ? 'Проект в архиве.' : 'Проект возвращён из архива.');
+        return loadProjects().then(function () { closeDialog(); renderProject(); });
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'project-delete': function () {
+      confirmDialog('Удалить проект в корзину?',
+        'Проект исчезнет из списка, и в нём нельзя будет создавать диалоги и цели, пока вы его не восстановите. ' +
+        'Данные не удаляются безвозвратно: проект и вся его история остаются и восстанавливаются из «Архив и корзина».',
+        'В корзину', function () {
+          api(projectUrl(''), { method: 'PATCH', body: { deleted: true } }).then(function () {
+            toast('Проект в корзине. Восстановить можно из «Архив и корзина».');
+            return loadProjects().then(function () {
+              closeDialog();
+              go(S.projects[0] ? S.projects[0].id : null, null);
+            });
+          }, function (error) { toast(explain(error.message).text, 'bad'); });
+        }, true);
+    },
+    'project-restore': function (el) {
+      var id = el.getAttribute('data-id'), kind = el.getAttribute('data-kind');
+      var body = kind === 'deleted' ? { deleted: false } : { archived: false };
+      api('/api/v1/projects/' + enc(id), { method: 'PATCH', body: body }).then(function () {
+        toast('Проект восстановлен.');
+        return loadProjects().then(function () {
+          renderProject();
+          openProjectLifecycle();
+        });
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'open-settings': function (el) {
       var tab = el.getAttribute('data-tab');
       closeMenu();
