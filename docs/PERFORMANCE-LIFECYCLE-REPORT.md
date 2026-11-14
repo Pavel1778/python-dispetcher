@@ -97,35 +97,50 @@ subset of this branch's.
   `tools/benchmark.py`.
 - The stage-latency table is empty until `NEXUS_TRACE=1`; that is by design
   (collection is opt-in) and stated in the UI.
-- The studio's new context menus and dialogs are now covered by real Chromium
-  journeys as well (`tests/test_browser_e2e.py`: a chat pinned/trashed/restored/
-  purged and a project deleted/restored, driven through the menus) plus the
-  structure tests (`tests/test_studio_ui.py`) and the HTTP tests.
+- The studio's new context menus and dialogs are covered by real Chromium
+  journeys (`tests/test_browser_e2e.py`, 37 passed) plus the structure tests
+  (`tests/test_studio_ui.py`) and the HTTP tests.
 
 ## 7. PR #39 finalization: history reconciliation
 
-The previous stage's report named a line of work that **does not exist in this
-repository** — `5c4f08c`, `orchestration/nexus_commands.py`,
-`orchestration/nexus_generation.py`, `LabStore.retry_failed`,
-`LabStore.delete_run`, `tools/benchmark_compare.py`, and a prior `0037` for
-command/dialog management. Every one was searched for across every ref
-(`git rev-list --all`, `git grep` on all branches, `git log --all -- <path>`)
-and none is present; the only `0037` files are this branch's
-`0037_task_kind.sql` and `arena/ab0d7665`'s
-`0037_project_conversation_lifecycle.sql`.
+This was the hard part, and the premise in the task text turned out to be
+partly wrong — which is exactly why the git history was checked rather than
+trusted.
 
-What *is* real is a parallel line, **PR #38** (`arena/ab0d7665`, 4 commits from
-`42609a4`), which implemented the same project/conversation lifecycle
-independently. The two lines collided on migration number `0037`. This branch
-keeps its lifecycle as the superset and ports PR #38's two unique pieces
-(conversation pin; analysis-turn continuity) plus its concurrent-runs contract
-test, under a fresh migration number `0039`. See [../CHANGELOG.md](../CHANGELOG.md)
-and [DATABASE.md](DATABASE.md), "Two `0037`s in the repository's history".
+**What the history actually holds.** At the start of this session `origin/main`
+was `42609a4` and had no `5c4f08c`, no `orchestration/nexus_commands.py`, no
+`nexus_generation.py`, no `LabStore.retry_failed`/`delete_run`, no
+`benchmark_compare.py` (checked with `git rev-list --all`, `git grep` over every
+ref, and `git log --all -- <path>`). The only parallel line was **PR #38**
+(`arena/ab0d7665`), which implemented the same lifecycle independently with a
+colliding `0037`. This branch ported PR #38's two unique pieces (conversation
+pin; analysis-turn continuity) under a fresh migration number `0039`.
 
-Bugs found while verifying the new menus over Chromium (all fixed):
+**Then `main` moved.** During the session `origin/main` advanced to `a6bb451`
+and now **contains** the "previous eight commits" the task named —
+`5c4f08c fix(ui): the trash button has its own class` and the whole
+commands / generation-cancel / run-history / benchmark increment
+(`bcd854b`…`5c4f08c`, plus `002c875 feat(projects): archive and soft delete`).
+So the reconciliation the task asked for was a real **merge**, not a port.
 
-- `ProjectService.stats` passed one parameter to a two-placeholder query (the
-  active-runs count) — a `500` on the delete confirmation, previously untested.
-- `GET …/stats` was `POST`-only, so the studio's confirmation never opened.
-- `loadChats` did not fetch the trash by default, so the trash fold showed no
-  count.
+**The merge** (`Merge origin/main into PR #39`) keeps both lines:
+
+- main's conversation/project lifecycle (`set_deleted`, `set_pinned`+`pinned_at`,
+  content search, `export`, generations, run history, the command system,
+  `tools/benchmark.py` + `benchmark_compare.py`) as the base;
+- this branch's additions on top: `purge`, `stats`, `active_run`, the `409`
+  `ProjectInUse`/`ConversationInUse` refusal, `/api/observability`, the tracing,
+  `_continues_analysis`, `tools/benchmark.py`'s `_queue_claim_ms`, and the
+  migration collision test;
+- five migration files, distinct names, all idempotent (see
+  [DATABASE.md](DATABASE.md), "Two `0037`s and two `0038`s").
+
+**A real bug in `main`'s migration** was found and fixed while merging:
+`0037_conversation_management.sql` declared `r record` and passed it to
+`format('%I', r)`, which renders `"(authenticated)"` and fails on a plain
+PostgreSQL (`role "(authenticated)" does not exist`). It is now `r text`, like
+every other migration. This would have failed CI on the very first run.
+
+Bugs found earlier while verifying the menus over Chromium (also fixed):
+`ProjectService.stats` passed one parameter to a two-placeholder query;
+`GET …/stats` was `POST`-only; `loadChats` did not fetch the trash by default.

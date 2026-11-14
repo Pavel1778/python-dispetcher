@@ -24,21 +24,29 @@ All three are safe to apply to a live database and to a fresh one; none rewrites
 an existing row. Rolling back is dropping the columns and indexes; no data is
 lost by applying them.
 
-### Two `0037`s in the repository's history
+### Two `0037`s and two `0038`s in the repository's history
 
-Two independent lines of work both wrote a `0037` migration. This branch's is
-`0037_task_kind.sql`; the other line (`arena/ab0d7665`, PR #38) wrote
-`0037_project_conversation_lifecycle.sql` with the same `deleted_at`/`archived_at`
-columns this branch has in `0038`. The runner keys on the **filename**, not the
-number, and applies `*.sql` in lexical order, so:
-- the two files cannot both be in the tree (this branch keeps only its own);
-- the column the other line had and this one lacked (`pinned`) was added under a
-  fresh number, `0039`;
-- an already-migrated database re-runs nothing (`schema_migrations` is keyed on
-  the filename).
+Two lines of work implemented the project/conversation lifecycle independently
+and collided on the number. After the merge both are in the tree, under
+**distinct filenames**:
+
+| number | this branch | the other line (now on `main`) |
+|---|---|---|
+| 0037 | `0037_task_kind.sql` | `0037_conversation_management.sql` |
+| 0038 | `0038_lifecycle.sql` | `0038_project_lifecycle.sql` |
+| 0039 | `0039_conversation_pin.sql` | — |
+
+The runner keys on the **filename**, not the number, and applies `*.sql` in
+lexical order, so all five coexist; the columns they add overlap
+(`deleted_at`, `archived_at`, `pinned`) but every statement is
+`ADD COLUMN IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so applying both is
+idempotent. The column the other line had and this one lacked (`pinned_at`, a
+stable pin order) is now in `0037_conversation_management.sql`; this branch's
+`0039_conversation_pin.sql` adds `pinned` alone and is a no-op where it already
+exists. An already-migrated database re-runs nothing.
 
 `tests/test_lifecycle_migrations.py` proves a clean install, an upgrade from a
-schema without the three files, and a re-apply that changes nothing.
+schema without these files, and a re-apply that changes nothing.
 
 ## Tables and their relationships
 

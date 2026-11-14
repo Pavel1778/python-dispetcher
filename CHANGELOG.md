@@ -55,29 +55,44 @@
 
 ## PR #39 finalization — history reconciliation and integration
 
-The previous stage's report named a line of work (`5c4f08c`, `nexus_commands.py`,
-`nexus_generation.py`, `LabStore.retry_failed`/`delete_run`,
-`benchmark_compare.py`) that **does not exist in this repository** (checked
-across every ref). The real parallel line is **PR #38** (`arena/ab0d7665`),
-which implemented the same project/conversation lifecycle independently and
-both lines claimed migration `0037`. This branch keeps its lifecycle as the
-superset and ports the two things PR #38 had that it lacked:
+At the start of this work the report named a line of work (`5c4f08c`,
+`nexus_commands.py`, `nexus_generation.py`, `LabStore.retry_failed`/`delete_run`,
+`benchmark_compare.py`) that was **not yet in this repository** (checked across
+every ref). The only parallel line was **PR #38** (`arena/ab0d7665`), which
+implemented the same lifecycle independently with a colliding `0037`; this
+branch ported its two unique pieces (conversation pin under a fresh
+`0039_conversation_pin.sql`; `web_server._continues_analysis`) plus its
+concurrent-runs contract test.
 
-- **Conversation pin** (`0039_conversation_pin.sql`, `set_pinned`, `PATCH
-  pinned`, the studio menu + `i-pin` icon). A fresh number keeps both `0037`s
-  distinct (the runner keys on the filename).
-- **Analysis-turn continuity** (`web_server._continues_analysis`): a bare
-  follow-up question after an analysis turn stays on the run it found.
-- Ported `tests/test_concurrent_runs_policy.py` and an analysis-continuity
-  regression; new `tests/test_lifecycle_migrations.py`.
+`origin/main` then advanced to `a6bb451` and **now contains** that named work
+(`5c4f08c` and the whole commands / generation-cancel / run-history / benchmark
+increment, `bcd854b`…`5c4f08c`, plus `002c875 feat(projects): archive and soft
+delete`). The finalization is therefore a **merge** of `origin/main` into
+PR #39, keeping both lines:
 
-Bugs found and fixed while verifying the new menus over Chromium:
+- main's lifecycle (`set_deleted`, `set_pinned`+`pinned_at`, content search,
+  `export`, generations, run history, commands, `benchmark.py`/`benchmark_compare.py`);
+- this branch's `purge`, `stats`, `active_run`, the `409` active-run refusal,
+  `/api/observability`, tracing, `_queue_claim_ms`, and the migration-collision
+  test.
 
+### Fixed during the merge
+
+- **`main`'s `0037_conversation_management.sql` failed on a plain PostgreSQL.**
+  It declared `r record` and passed it to `format('%I', r)`, which renders
+  `"(authenticated)"` (`role "(authenticated)" does not exist`). Now `r text`.
 - `ProjectService.stats` passed one parameter to a two-placeholder query (the
-  active-runs count) — a 500 on the delete confirmation.
-- `GET …/stats` was POST-only, so the studio's confirmation never opened; a
-  read is now served on GET too.
-- `loadChats` now always fetches the trash so the fold shows a real count.
+  active-runs count) — a `500` on the delete confirmation.
+- `GET …/stats` was `POST`-only, so the studio's confirmation never opened.
+- `loadChats` did not fetch the trash by default, so the trash fold showed no
+  count.
+
+### Migrations
+
+Five files, distinct names, all idempotent: this branch's `0037_task_kind.sql`,
+`0038_lifecycle.sql`, `0039_conversation_pin.sql` and main's
+`0037_conversation_management.sql`, `0038_project_lifecycle.sql`. See
+[docs/DATABASE.md](docs/DATABASE.md).
 
 All notable changes to NEXUS. The format follows Keep a Changelog; the project
 is versioned in `pyproject.toml`.
