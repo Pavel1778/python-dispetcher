@@ -71,6 +71,33 @@ they are already a fraction of a second, and against a real provider they are
 the provider's latency. There is no NEXUS-side hotspot to optimise on these
 paths; the numbers above are the evidence for that, not an assertion.
 
+### Re-measured (2026-11-14, this session)
+
+`--repeat 10 --projects 3 --conversations 10 --messages 40` (a larger dataset
+than the baseline, so slightly higher on the list paths that scan more rows):
+
+| Path | p50 (ms) | p90 (ms) |
+| --- | ---: | ---: |
+| studio_status | 1.16 | 1.43 |
+| list_projects | 1.34 | 2.04 |
+| open_project | 3.32 | 4.66 |
+| list_conversations | 2.61 | 3.50 |
+| open_conversation | 1.71 | 2.29 |
+| fetch_history (40 msgs) | 2.31 | 2.77 |
+| commands_registry | 0.83 | 0.95 |
+| search_by_content | 1.85 | 2.05 |
+| export_conversation | 3.58 | 5.37 |
+| chat_turn | 27.35 | 36.99 |
+| start_run | 65.07 | 79.66 |
+| store_dashboard_counts | 0.55 | 0.64 |
+| file_upload (4 KiB) | 3.78 | 8.20 |
+
+Every path stays in the same band as the baseline: the read paths are a few
+milliseconds, the provider-bound paths are dominated by the stand-in LLM, and
+the store's own aggregate query is sub-millisecond. **No regression, and no
+speedup is claimed** — the comparison table (`tools/benchmark_compare.py`) is
+the instrument for any such claim.
+
 ## Optimisations applied
 
 - **Indexes for the list order.** The conversation list orders by

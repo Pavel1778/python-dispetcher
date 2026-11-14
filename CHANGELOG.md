@@ -3,6 +3,36 @@
 All notable changes to NEXUS. The format follows Keep a Changelog; the project
 is versioned in `pyproject.toml`.
 
+## Unreleased — master completion, synchronization and release (2026-11-14)
+
+### Fixed
+
+- **Migrations: an edited, already-applied file is refused, not re-run.**
+  `PostgresStore.apply_migrations` used `ON CONFLICT DO UPDATE` and executed a
+  changed body under its recorded name, so the history could claim one thing
+  while the schema was another. It now raises `MigrationError`, naming the file.
+- **A second chat answer is refused cleanly.** `_chat_turn` let the
+  one-generation-per-conversation `ValueError` surface as a raw 400 and left the
+  conversation in `thinking`; it is now a 409 with a clear message and an idle
+  conversation (the running answer stays stoppable).
+- **Deleting a run clears the goal's `active_run_id`.** The column has no
+  foreign key, so removing the run left the goal pointing at a gone row.
+- **A bare follow-up question keeps reading the run state** (ported from PR #38):
+  a pronoun follow-up after an `analysis` turn stays `analysis` instead of being
+  answered with no facts.
+
+### Added
+
+- The §10 regression suite (`tests/test_regression_p0_suite.py`) and the
+  concurrent-runs architectural contract
+  (`tests/test_concurrent_runs_policy.py`); the runs list route accepts
+  `?include_hidden=1` as an alias of `?archived=1`.
+- Documentation: `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`,
+  `docs/PRODUCTION_READINESS.md`, `docs/BRANCHES.md`,
+  `docs/INTEGRATION_TESTING.md`, `docs/KNOWN_LIMITATIONS.md`,
+  `docs/GAP-ANALYSIS.md`, `docs/GROUND-TRUTH-BUILD-LINT-TEST.md`,
+  `docs/P0-INCIDENT-FINAL-REPORT.md`, and `tools/verify_build_lint_test.sh`.
+
 ## Unreleased — NEXUS Ultimate increment
 
 The four phases below are independent, each with its own migration and tests.

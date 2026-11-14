@@ -42,7 +42,10 @@ def studio(monkeypatch):
 
 
 def _count_runs(stack, project) -> int:
-    return len(stack.api.get(f"/api/v1/projects/{project}/runs?include_hidden=1")[1]["runs"])
+    # The *active* runs: what the run list shows by default. A completed
+    # run leaves it, so "did a second run start?" is asked of the active
+    # list (a hidden run is history, not new work).
+    return len(stack.api.get(f"/api/v1/projects/{project}/runs")[1]["runs"])
 
 
 def _start_conversation(stack, project, mode="auto"):
