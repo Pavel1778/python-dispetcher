@@ -97,6 +97,40 @@ Five files, distinct names, all idempotent: this branch's `0037_task_kind.sql`,
 All notable changes to NEXUS. The format follows Keep a Changelog; the project
 is versioned in `pyproject.toml`.
 
+## Unreleased — production release verification + complete CRUD (2026-11-14)
+
+### Fixed
+
+- **`0037` failed on any server with the Supabase roles (production-blocking).**
+  Its revoke loop variable was `record`, not `text`, so the statement became
+  `REVOKE ... FROM "(authenticated)"` and the migration failed with
+  `role "(authenticated)" does not exist`. Production has that role, so `0037`
+  never applied there and every deploy that included it crashed at startup —
+  which is why the live service stayed on the old build. Fixed; a regression
+  test applies every migration on a database that has the roles.
+
+### Added — complete CRUD
+
+- **Permanent delete** for conversations (`DELETE …/conversations/{id}?permanent=1`)
+  and projects (`DELETE /api/v1/projects/{id}`), both two-step (trash first),
+  the project delete refused while a run is active.
+- **Dependents census** (`GET /api/v1/projects/{id}/dependents`) so a project
+  delete names what it removes.
+- **Notification lifecycle**: list with an unread filter, mark read/unread,
+  bulk mark-all-read, delete.
+- **Session management**: `GET /api/sessions`, `DELETE /api/sessions/{id}`,
+  `DELETE /api/sessions` (revoke all others) — never the token.
+- Studio: notification centre, sessions dialog, trash "delete for good", project
+  archive/trash/purge with the census.
+- Docs: `docs/CRUD-MATRIX.md`, `docs/ENTITY-LIFECYCLE.md`,
+  `docs/DEPENDENCY-GRAPH.md`, `docs/SECURITY-AUDIT-2026-11-14.md`,
+  `docs/MASTER_COMPLETION_REPORT.md`.
+
+### Changed
+
+- The production service now serves the new build (verified: served assets and
+  `ASSET_VERSION` match the local build; `/healthz` and `/readyz` pass).
+
 ## Unreleased — master completion, synchronization and release (2026-11-14)
 
 ### Fixed
