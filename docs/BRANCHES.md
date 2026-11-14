@@ -48,3 +48,16 @@ merged.
 Branches whose work is already in `main` and whose purpose is served are
 deleted to keep the list honest. A branch with unique, unfinished work is never
 deleted for tidiness; it is kept, with a backup ref, until a decision is made.
+
+## Still open after this session
+
+| Branch / PR | State | Why it is kept |
+| --- | --- | --- |
+| `arena/ab0d7665` (PR #38) | Closed | Its unique work was ported into `main` (`_continues_analysis`, the §10 suite, the concurrent-runs contract, the P0 report, and the project lifecycle as migration `0038`). The branch is left in place (not deleted) until the operator confirms; its commits are preserved by `backup/pre-master/arena_ab0d7665-python-dispetcher`. |
+| `nexus/perf-reliability-lifecycle` (PR #39) | Open | A large, coherent parallel contribution (44 files: tracing/observability, an evidence-based acceptance change in `GitVerifier`, project/conversation lifecycle, `tools/benchmark.py`, several docs). It is based on `42609a4` and its migrations `0037_task_kind.sql` / `0038_lifecycle.sql` collide with `main`'s `0037_conversation_management.sql` / `0038_project_lifecycle.sql`. **Not merged**: merging it as-is would revert the command system, conversation management, stop generation and run history that landed since its base, and its lifecycle work overlaps `main`'s. It needs its own rebase and review. |
+| `arena/d7bb7e3c`, `nexus/mainline-hardening` | Kept | The migration-integrity framework. Its one real defect fix (refuse an edited, applied migration) is in `main`; the manifest/effect framework was deliberately not taken (the suite runs `*.sql` directly, so a manifest would not be exercised). `backup/pre-master/*` preserves the tips. |
+| `nexus/continue-longtask-hardening` | Kept (superseded) | A stale snapshot of an older `main`; its content is already in `main`. |
+| `nexus/gap-analysis`, `nexus/ground-truth-verify` | Kept (content ported) | Their unique docs are in `main`; the branches can be deleted once the operator confirms. |
+
+Deleting the remaining branches is an operator decision; each has a
+`backup/pre-master/*` tag, so nothing is lost if they are removed.
