@@ -2418,3 +2418,96 @@ where they meet, in `web_server._manual_turn` and `_manual_plan`:
 - The chat does not search file contents: it reads what it is shown and what
   it asks for by path. A question that needs "where is X used" over a large
   repository is answered from the list and a few files, and says what it read.
+
+## NEXUS Ultimate increment: commands, conversation management, stop generation, run history (this session)
+
+Four independent phases, each with its own migration and tests. Every change is
+additive; no existing behaviour was removed.
+
+### The chat command system (`orchestration/nexus_commands.py`)
+
+- **One pure parser and registry.** `parse(text, mode=)` reads a message into a
+  `Parsed` decision (commands, tags, params, the request with tokens removed,
+  the mode the turn runs in, warnings, errors). Nothing here touches a database
+  or a provider; that is what makes it testable and keeps the vocabulary in one
+  place. `registry()`/`suggest()`/`help_text()` serve the interface.
+- **Restrictions have priority.** `#read-only` beside an execute command
+  (`/autorun`, `/fix`) downgrades the turn to a read-only analysis and reports
+  the downgrade (`warnings`); it is not an error. A restriction no downgrade can
+  satisfy is an error: `/deploy #no-deploy` is refused. Do not "simplify" this
+  to a keyword check.
+- **Only real tokens are stripped.** `_remove_tokens` removes a token only when
+  it is a recognised command/tag/parameter standing alone, and takes at most one
+  neighbouring whitespace character with it. **When nothing is recognised it
+  returns the text byte for byte** - the long-task tests assert a specification
+  reaches the planner and the agents unchanged. Never collapse runs of spaces or
+  trim lines in this function; that was the regression it exists to avoid.
+- **`_chat_turn` parses the raw message (`typed`), not the trimmed `text`.** A
+  specification must keep its leading and trailing whitespace; parsing the
+  trimmed copy silently dropped it. The parser runs *before* the Intent Router;
+  an explicit mode command overrides the conversation's mode for the turn only,
+  and an execute command is never turned into a clarifying question.
+- **Buttons and slash commands are one mechanism.** A UI control posts
+  `{"action": "/plan"}`; `_chat_turn` prepends the action token and parses it
+  exactly as if typed. The transcript shows what was written (`typed`), never
+  the injected token. The command decision is stored on the user turn
+  (`meta.command`) and carried into the task text (`command_task_text`).
+- `GET /api/commands[?q=]` is the vocabulary and completions. `docs/COMMANDS.md`
+  is the reference. Tests: `tests/test_commands.py`.
+
+### Conversation management and stop generation (migration `0037`)
+
+- **A pin is durable** (`nexus_conversations.pinned`, `pinned_at`); the pinned
+  section is ordered by `pinned_at DESC`. **Pinning is not activity**: it does
+  not touch `updated_at`, so unpinning restores the old order. The list orders
+  by `(pinned, pinned_at, updated_at)`; migration 0037 adds the two indexes that
+  serve it.
+- **A delete is a stamp** (`deleted_at`), real (the conversation leaves every
+  list) and reversible. It does not touch `updated_at`, so a restored
+  conversation returns to its place. Nothing else is removed: the project, the
+  repository, the messages and the attachments stay. `purge_deleted` is
+  housekeeping for the retention window, not a request. `?deleted=1` is the
+  trash (it lists *only* deleted conversations).
+- **Search** covers the title and the text of messages (`EXISTS` over
+  `nexus_conversation_messages`), so a chat is found by what was said in it.
+- **Export** is a self-contained JSON document with no secret in it.
+- **Stop generation is a token, not a flag** (`orchestration/nexus_generation.py`).
+  `GenerationToken.cancel()` trips the signal *and closes the live provider
+  response*, so a blocked read raises at once - the stop is immediate, not
+  "after the model finishes". A database flag alone would only be seen when the
+  call is already over.
+- **One running generation per conversation** (`uq_nexus_generations_running`,
+  a partial unique index): a second answer is refused, so a stop is
+  unambiguous. `finish_generation` moves only a running row and returns whether
+  it did - the first caller to move it owns the outcome, so a cancel and the
+  answer it stopped do not both write a "stopped" message.
+- **Stop generation and cancel run are different actions.** Stopping a text
+  answer never touches an autonomous run, and cancelling a run never stops an
+  unrelated answer. The studio's send button becomes a stop button only for the
+  modes that open a generation (`ask`/`analysis`/`plan`).
+- Tests: `tests/test_conversation_management.py`, `tests/test_generation_cancel.py`
+  (the cancel is proven with a slow provider: the cancel arrives while the
+  answer generates), and two Chromium journeys in `tests/test_browser_e2e.py`.
+
+### Run history management (`LabStore.retry_failed`, `LabStore.delete_run`)
+
+- **Retry failed requeues only the unsuccessful tasks** (`completed_unverified`,
+  `partial`, `failed`, `blocked`) and puts the finished run back to `running` in
+  one transaction. A `completed_verified` task is never requeued. A run with
+  nothing to retry is refused (409), not silently moved to `running`.
+- **Remove from history deletes the run's own record and nothing else.** The
+  goal, the specification, the chat (the link is `ON DELETE SET NULL`), the
+  evidence (`nexus_evidence`, kept for audit) and the repository are all
+  untouched. Only a terminal run can be removed; an active run is refused.
+- Routes: `POST …/runs/{id}/show|retry-failed`, `DELETE …/runs/{id}`.
+- Tests: `tests/test_run_history.py`.
+
+### Performance (Phase 2)
+
+- `tools/benchmark.py` measures the real request paths against a real server and
+  PostgreSQL; `tools/benchmark_compare.py` prints the deltas. `docs/PERFORMANCE.md`
+  records the method and a baseline. **No language migration** was done: the
+  read paths are single-digit milliseconds and the slow paths are network-bound
+  (provider, OpenHands, GitHub), so a rewrite would not move the numbers and
+  would split the invariants documented here. `tests/test_benchmark_tool.py`
+  covers the comparison and that the script imports.
