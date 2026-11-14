@@ -149,3 +149,85 @@ starts exactly one run, a prohibition and a condition do not, a replan needs a
 new confirmation, Auto still runs, a completed run moves to the archive, and a
 cancelled/failed/blocked run is reported honestly. `tests/test_run_reports.py`
 covers the terminal-run reports.
+
+`tests/test_intent_router.py` covers the classifier table, the shape rules and
+a report/history request reading the database instead of launching anything.
+`tests/test_regression_p0_suite.py` covers every scenario of the chat-safety
+regression suite below (A–N), including double-submit, an empty provider
+response, a provider outage, a clarifying follow-up that stays on the run
+being discussed, and a report surviving a backend restart.
+
+## The 2026-11 conversational-intelligence fix
+
+A production incident (reproduced in `tests/test_intent_router.py` and
+`tests/test_regression_p0_suite.py`) showed three real defects in the router
+above, all in `orchestration/nexus_intent.py`:
+
+1. **A report/history request started a new run.** «Дай отчёт последнего
+   успешно **завершившегося** прогона» was read as an order to "finish"
+   something, because the Russian passive participle of an order verb
+   («завершившегося», «выполненной», «исправленной», …) shares the verb's own
+   stem with its imperative («заверши», «выполни», «исправь», …), and the
+   order regex matched the stem as a raw substring with no word-boundary or
+   grammatical-form check. Each affected stem now carries a negative lookahead
+   that blocks only the participle's suffix, not the imperative.
+2. **An explicit prohibition was read as the order it forbids.** «Не
+   **запускай** ничего, просто ответь» was read as an order to launch, because
+   the general order check had no negation guard (unlike the narrower
+   "asks for a run as a run" check, which already had one). The same guard is
+   now applied to every order match.
+3. **A history/report request could still default to work in an explicit
+   "Автономно" conversation**, because that conversation mode treated *any*
+   unclassified chat reply as a stated goal. A request to read the past
+   (`Intent.history_request`) and an explicit prohibition (`Intent.forbids_run`)
+   now hold in *every* conversation mode, including "Автономно": reading
+   history, or refusing to launch, is never "the work" that mode is for.
+
+A fourth, narrower gap was found and fixed while writing the section-8
+("remembers which report was requested") regression test: a plain follow-up
+question with no run named in it («А что в нём исправлено?») right after a
+turn that read the run state fell back to `ask` (no database facts in the
+prompt) because the Intent Router, by itself, has no memory of what "в нём"
+refers to — each message is still classified on its own. `Handler._chat_turn`
+now checks whether the conversation's last assistant turn was itself an
+`analysis` turn before it accepts a bare `ask` for a plain question with no
+topic of its own; if so, the follow-up stays in `analysis` and is given the
+same run facts. An actual topic change (a greeting, a discussion, an order, a
+plan request) is a different classification and is not affected.
+
+### The no-unsolicited-launch guarantee, restated
+
+- `classify()`'s intents (`chat`/`analysis`/`autonomous`) and the
+  `Intent.starts_work`/`forbids_run`/`history_request` flags are the single
+  place that decides whether a message is an order; `effective_mode()` is the
+  single place that turns that decision into a turn mode, for every
+  conversation mode including "Авто" and "Автономно".
+- A request to read the past never reaches `autonomous`, `plan` or `code`,
+  regardless of conversation mode (`Intent.history_request`).
+- An explicit prohibition never reaches `autonomous`, `plan` or `code` for the
+  rest of that turn, regardless of conversation mode (`Intent.forbids_run`).
+- `_chat_turn` calls `self.app.chat.respond(mode=turn_mode, ...)` exactly once
+  per message; `respond()` only ever starts a run when `mode` is `code` or
+  `autonomous`, and only `effective_mode()` produces those two values.
+- Reading history (`Handler._run_facts`) only ever calls `lab.list_runs`,
+  `lab.count_tasks` and `reports.for_run` — all read-only queries; it never
+  calls `LabStore.start_run`, the planner or OpenHands.
+
+### Section 10 regression scenarios (A–N)
+
+| # | Message / scenario | Expectation | Test |
+| --- | --- | --- | --- |
+| A | «Привет» | reply, 0 runs | `test_intent_router.py::test_the_requirement_table` |
+| B | «Что уже готово?» | text reply, 0 runs | `test_intent_router.py::test_the_requirement_table` |
+| C | «Дай отчёт последнего успешно завершившегося прогона» | historical report, 0 runs | `test_intent_router.py::test_report_request_with_a_completed_run_reads_history_not_a_new_run` |
+| D | «Не запускай ничего, просто ответь» | no launch | `test_intent_router.py::test_an_explicit_prohibition_is_honoured_end_to_end_even_in_autonomous_mode` |
+| E | «Почему прогон остановился?» | analysis of stored data, 0 runs | `test_intent_router.py::test_an_analysis_turn_reads_the_real_state_and_changes_nothing` |
+| F | «Составь план исправлений» | plan shown in chat, 0 runs | `test_regression_p0_suite.py::test_f_*` |
+| G | «Давай продолжим» | clarification/dialogue | `test_regression_p0_suite.py::test_g_*` |
+| H | «Запусти автономный прогон» | exactly 1 run | `test_intent_router.py::test_an_order_in_auto_mode_starts_a_run` |
+| I | double-submit of one message | second run NOT created | `test_regression_p0_suite.py::test_i_*` |
+| J | empty model response | clear error, no empty state | `test_regression_p0_suite.py::test_j_*` |
+| K | provider outage mid-turn | graceful, recorded failure | `test_regression_p0_suite.py::test_k_*` |
+| L | report request → clarifying follow-up | stays on the same run, 0 new runs | `test_regression_p0_suite.py::test_l_*` |
+| M | forbade launch, then an informational question | no launch | `test_regression_p0_suite.py::test_m_*` |
+| N | backend restart | prior reports still accessible | `test_regression_p0_suite.py::test_n_*` |

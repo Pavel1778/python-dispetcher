@@ -168,6 +168,28 @@ def _names_work(history: list[dict]) -> bool:
                for m in history)
 
 
+def _continues_analysis(history: list[dict]) -> bool:
+    """Whether the conversation's last assistant turn read the project's run
+    state (``analysis`` mode), so a plain follow-up question continues on it.
+
+    Section 8's own example: "Покажи последний успешный прогон" -> "Нашёл
+    прогон ABC" -> "А что в нём исправлено?" must stay on ABC, not fall back
+    to a contextless answer that never asked the database at all. The second
+    question names no run itself ("в нём" is a pronoun), so the Intent Router
+    alone reads it as a bare ``chat`` question and :func:`effective_mode`
+    would send it to ``ask`` - a turn with no run facts in its prompt. This
+    only widens *that* one case: an actual topic change (a greeting, a
+    discussion, an order, a plan request) is a different ``reason`` and is
+    not affected; see the call site in :meth:`Handler._chat_turn`.
+    """
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        return meta.get("mode") == "analysis"
+    return False
+
+
 def _asked_about(history: list[dict]) -> str | None:
     """The message the router's clarifying question was about, when that
     question is the last thing said in the conversation; else ``None``."""
@@ -3068,6 +3090,13 @@ class Handler(BaseHTTPRequestHandler):
                                 question=True, reason="chose the chat when asked")
                 request = asked_about
         turn_mode = effective_mode(chosen, intent)
+        if (turn_mode == "ask" and intent.intent == CHAT and intent.reason == "question"
+                and _continues_analysis(history)):
+            # A plain follow-up question ("А что в нём исправлено?") that
+            # names no new topic, right after a turn that read the run state,
+            # is still about that run: stay on it rather than answering with
+            # no facts at all (section 8).
+            turn_mode = "analysis"
         if (turn_mode == "autonomous" and chosen != "autonomous"
                 and not (conversation.get("repository")
                          or self.app.project_repos.primary_repository(project_id))):
