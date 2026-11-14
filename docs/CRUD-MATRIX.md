@@ -20,7 +20,7 @@ entity supports. `Project-scoped` means every route is under
 | Create a user | N/A | Single-owner model: `AUTH_USERNAME` + `AUTH_PASSWORD_HASH` from the environment. There is no user table to create rows in. |
 | Read the current user | DONE | `GET /api/session` (`username`, `csrf_token`) |
 | Update the password | N/A (by design) | `python -m orchestration.web_auth hash` writes a new `AUTH_PASSWORD_HASH`; a change ends every open session. Not an API operation, deliberately. |
-| List sessions / revoke one | GAP | `sessions` rows exist and expire; there is no `GET/DELETE /api/sessions`. Logout ends the caller's own session. |
+| List sessions / revoke one | DONE | `GET /api/sessions`, `DELETE /api/sessions/{id}`, `DELETE /api/sessions` (revoke all others). The id is a prefix of the stored HMAC, never the token. |
 | Project membership | DONE (read) | `nexus_project_members`; role read through `require_scope`. |
 | Add/remove a member | GAP | The owner is the only member; a multi-user surface does not exist. |
 | API credentials (tokens) | N/A | No token table; the machine bearer is `WEB_AUTH_TOKEN` from the environment. |
@@ -153,10 +153,10 @@ entity supports. `Project-scoped` means every route is under
 
 | Operation | Status | Where |
 | --- | --- | --- |
-| Read (list) | DONE | `GET .../notifications` |
-| Mark read / unread | GAP | `nexus_notifications.read_at` exists; there is no route to set it |
-| Archive / delete | GAP | No route |
-| Bulk mark-as-read | GAP | No route |
+| Read (list, unread filter) | DONE | `GET .../notifications[?unread=1]` |
+| Mark read / unread | DONE | `PATCH .../notifications/{id}` `{"read": bool}` |
+| Bulk mark-as-read | DONE | `POST .../notifications/read` |
+| Delete | DONE | `DELETE .../notifications/{id}` |
 | Preferences | GAP | No per-category settings |
 
 ## 12. Memory & context
@@ -181,14 +181,21 @@ entity supports. `Project-scoped` means every route is under
 
 ## Summary of gaps (with priority)
 
-1. **Notifications: mark read / unread / delete / bulk** — a real, low-risk gap;
-   the `read_at` column already exists.
-2. **Sessions: list / revoke** — useful for security; `sessions` rows exist.
-3. **Pagination and bulk actions** on the large lists (projects, conversations,
-   runs) — a scale gap, not a correctness gap; every list is already bounded.
-4. **File trash/restore** — a retention policy is needed first.
-5. **Message edit/delete, memory delete** — deliberately not offered (they would
+1. ~~Notifications: mark read / unread / delete / bulk~~ — **DONE** this
+   increment (`docs/CRUD-MATRIX.md` §11).
+2. ~~Sessions: list / revoke~~ — **DONE** this increment (§1).
+3. ~~Permanent delete for conversations and projects~~ — **DONE** this
+   increment (§2, §3).
+4. **Pagination and bulk actions** on the large lists (projects, conversations,
+   runs) — a scale gap, not a correctness gap; every list is already bounded
+   (200 rows). Plan: cursor pagination + a multi-select on the list views.
+5. **File trash/restore** — a retention policy is needed first.
+6. **Message edit/delete, memory delete** — deliberately not offered (they would
    falsify a context an agent acted on); the safe path is a new message.
+7. **Multi-user membership** — the model is single-owner; adding a member is a
+   larger change than a route.
+8. **A central audit log** — each entity has its own trail; a single "who changed
+   what" endpoint is not implemented.
 
-Items 1 and 2 are implemented in this increment; the rest are recorded here and
-in `docs/KNOWN_LIMITATIONS.md` with the reason.
+Items 1–3 are implemented and tested in this increment; the rest are recorded
+here and in `docs/KNOWN_LIMITATIONS.md` with the reason.

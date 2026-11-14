@@ -2488,7 +2488,35 @@
         icon(option[1], 'icon-sm') + '<span>' + option[2] + '</span></button>';
     }).join('') + '</div><div class="menu-sep"></div>' +
       '<button class="menu-item" type="button" role="menuitem" data-action="open-settings">' + icon('settings', 'icon-sm') + '<span>Настройки</span></button>' +
+      '<button class="menu-item" type="button" role="menuitem" data-action="open-sessions">' + icon('eye', 'icon-sm') + '<span>Активные сессии</span></button>' +
       '<button class="menu-item is-danger" type="button" role="menuitem" id="logout" data-action="logout">' + icon('logout', 'icon-sm') + '<span>Выйти</span></button>');
+  }
+
+  // The caller's own live sessions. The id is a prefix of the stored HMAC, not
+  // the token, so nothing secret is shown.
+  function openSessions() {
+    closeMenu();
+    api('/api/sessions').then(function (data) {
+      var items = data.sessions || [];
+      var body = items.length
+        ? items.map(function (s) {
+            return '<div class="lifecycle-row">' +
+              '<span>' + esc(s.id) + (s.current ? ' <small>(это устройство)</small>' : '') +
+              '<br><small>вход ' + esc(fullTime(s.created_at)) + ' · активна ' + esc(fullTime(s.last_seen)) + '</small></span>' +
+              (s.current ? '' :
+                '<button class="btn btn-sm btn-danger" type="button" data-action="session-revoke" data-id="' + esc(s.id) + '">Завершить</button>') +
+              '</div>';
+          }).join('')
+        : '<p class="sb-empty">Активных сессий нет.</p>';
+      openDialog({
+        title: 'Активные сессии',
+        body: body,
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>' +
+          (items.some(function (s) { return !s.current; })
+            ? '<button class="btn btn-danger" type="button" data-action="session-revoke-others">Завершить все другие</button>'
+            : '')
+      });
+    }, function (error) { toast(explain(error.message).text, 'bad'); });
   }
 
   function findChat(id) {
@@ -2678,6 +2706,20 @@
     'new-project': function () { closeMenu(); newProjectDialog(); },
     'project-lifecycle': function () { openProjectLifecycle(); },
     'open-notifications': function () { openNotifications(); },
+    'open-sessions': function () { openSessions(); },
+    'session-revoke': function (el) {
+      var id = el.getAttribute('data-id');
+      api('/api/sessions/' + enc(id), { method: 'DELETE' })
+        .then(function () { toast('Сессия завершена.'); return openSessions(); },
+              function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'session-revoke-others': function () {
+      api('/api/sessions', { method: 'DELETE' })
+        .then(function (data) {
+          toast('Завершено сессий: ' + (data.revoked || 0) + '.');
+          return openSessions();
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'notif-read': function (el) {
       var id = el.getAttribute('data-id'), read = el.getAttribute('data-read') === '1';
       api(projectUrl('/notifications/' + enc(id)), { method: 'PATCH', body: { read: read } })
