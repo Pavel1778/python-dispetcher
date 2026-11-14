@@ -88,6 +88,9 @@
   var TOOLS = { start_workflow: 'Запуск задачи OpenHands', start_run: 'Запуск автономного прогона' };
   // States that change on their own, so they are worth polling.
   var MOVING = { queued: 1, assigned: 1, running: 1, verifying: 1, recovering: 1, pending: 1, dispatched: 1, waiting: 1 };
+  // A task of a finished run that did not verify, and so can be retried
+  // (``LabStore.retry_failed``). A task that verified is never in this set.
+  var FAILED_TASK_STATES = { completed_unverified: 1, partial: 1, failed: 1, blocked: 1 };
 
   function stateLabel(state) { return (STATES[state] || [state || 'неизвестно'])[0]; }
   function stateTone(state) { return (STATES[state] || ['', 'idle'])[1]; }
@@ -99,7 +102,7 @@
   var S = {
     csrf: '', user: '', status: null,
     projects: [], projectId: null, binding: null,
-    chats: [], chatQuery: '', showArchived: false,
+    chats: [], chatQuery: '', showArchived: false, showTrash: false, trash: [],
     convId: null, conv: null, messages: [],
     mode: 'auto', sending: false, pending: null,
     ws: { open: false, tab: 'files', treeKey: '', tree: null, treeError: null, treeLoading: false,
@@ -536,14 +539,21 @@
 
   /* ----------------------------------------------------------------- chats */
   function loadChats() {
-    if (!S.projectId) { S.chats = []; return Promise.resolve(); }
+    if (!S.projectId) { S.chats = []; S.trash = []; return Promise.resolve(); }
     // Archived conversations come in the same answer. They stay folded under
     // one line, and that line exists only when there is something behind it.
+    // The trash is a separate, small read, and only when it has been opened.
     var query = ['archived=1'];
     if (S.chatQuery) query.push('q=' + enc(S.chatQuery));
-    return api(projectUrl('/conversations?' + query.join('&')))
+    var reads = [api(projectUrl('/conversations?' + query.join('&')))
       .then(function (data) { S.chats = data.conversations || []; },
-            function () { S.chats = []; });
+            function () { S.chats = []; })];
+    if (S.showTrash) {
+      reads.push(api(projectUrl('/conversations?deleted=1&archived=1'))
+        .then(function (data) { S.trash = data.conversations || []; },
+              function () { S.trash = []; }));
+    }
+    return Promise.all(reads);
   }
 
   function chatItemHtml(chat) {
@@ -551,9 +561,10 @@
     var current = chat.id === S.convId;
     var stateDot = chat.state === 'thinking' ? '<span class="sb-state is-thinking" title="Ассистент отвечает"></span>'
       : chat.state === 'error' ? '<span class="sb-state is-error" title="Последний ответ не получен"></span>' : '';
-    return '<div class="sb-item' + (current ? ' is-active' : '') + (chat.archived ? ' is-archived' : '') + '">' +
+    var pin = chat.pinned ? icon('arrow-up', 'icon-xs') : '';
+    return '<div class="sb-item' + (current ? ' is-active' : '') + (chat.archived ? ' is-archived' : '') + (chat.pinned ? ' is-pinned' : '') + '">' +
       '<a class="sb-link" href="#/p/' + esc(S.projectId) + '/c/' + esc(chat.id) + '" title="' + esc(title) + '"' +
-      (current ? ' aria-current="page"' : '') + '>' + stateDot + '<span>' + esc(title) + '</span></a>' +
+      (current ? ' aria-current="page"' : '') + '>' + stateDot + pin + '<span>' + esc(title) + '</span></a>' +
       '<button class="icon-btn sm" type="button" data-action="chat-menu" data-id="' + esc(chat.id) + '" aria-haspopup="menu" aria-expanded="false" aria-label="Действия с чатом «' + esc(title) + '»">' + icon('more', 'icon-sm') + '</button>' +
       '</div>';
   }
@@ -561,8 +572,15 @@
   function renderChats() {
     var active = S.chats.filter(function (chat) { return !chat.archived; });
     var archived = S.chats.filter(function (chat) { return chat.archived; });
+    var pinned = active.filter(function (chat) { return chat.pinned; });
+    var rest = active.filter(function (chat) { return !chat.pinned; });
     var html = '', group = '';
-    active.forEach(function (chat) {
+    // Pinned conversations are their own section, at the top, in pin order
+    // (newest pin first) - the order the person controls.
+    if (pinned.length) {
+      html += '<div class="sb-group">Закреплённые</div>' + pinned.map(chatItemHtml).join('');
+    }
+    rest.forEach(function (chat) {
       var label = dayGroup(chat.updated_at);
       if (label !== group) { group = label; html += '<div class="sb-group">' + esc(label) + '</div>'; }
       html += chatItemHtml(chat);
@@ -576,6 +594,19 @@
       html += '<button class="sb-more" type="button" data-action="toggle-archived" aria-expanded="' + S.showArchived + '">' +
         icon('archive', 'icon-sm') + '<span>Архив · ' + archived.length + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
       if (S.showArchived) html += archived.map(chatItemHtml).join('');
+    }
+    html += '<button class="sb-more" type="button" data-action="toggle-trash" aria-expanded="' + S.showTrash + '">' +
+      icon('x', 'icon-sm') + '<span>Корзина' + (S.trash.length ? ' · ' + S.trash.length : '') + '</span>' + icon('chevron-right', 'icon-xs') + '</button>';
+    if (S.showTrash) {
+      html += S.trash.length
+        ? S.trash.map(function (chat) {
+            var title = chat.title || 'Новый чат';
+            return '<div class="sb-item is-archived"><span class="sb-link" title="' + esc(title) + '">' +
+              '<span>' + esc(title) + '</span></span>' +
+              '<button class="icon-btn sm" type="button" data-action="restore-chat" data-id="' + esc(chat.id) + '" title="Восстановить">' +
+              icon('refresh', 'icon-sm') + '</button></div>';
+          }).join('')
+        : '<p class="sb-empty">Корзина пуста.</p>';
     }
     $('#chat-list').innerHTML = html;
   }
@@ -837,10 +868,39 @@
     syncSend();
   }
 
+  // Modes whose turn asks a model for prose and so opens a stoppable
+  // generation (``nexus_generation``). ``code``/``autonomous`` dispatch work
+  // and ``manual`` proposes a plan through its own path: none of them is a
+  // generation, so the stop button stays hidden for them.
+  var TEXT_MODES = { ask: 1, analysis: 1, plan: 1, auto: 1 };
+
   function syncSend() {
     var button = $('#send');
+    // While a text answer is being generated the send button becomes a stop
+    // button, in the same place, so the person can stop with one tap. It is
+    // shown only while a generation is running that the server can stop.
+    var stop = $('#stop');
+    var generating = !!(S.sending && S.pending && TEXT_MODES[S.pending.mode]);
+    button.hidden = generating;
+    stop.hidden = !generating;
     button.disabled = S.sending || routing > 0 || !$('#prompt').value.trim();
     button.classList.toggle('is-busy', S.sending);
+  }
+
+  // Stop the answer in flight: send the cancel for the running generation and
+  // let the in-flight request finish (it returns with the partial text). The
+  // composer is left usable at once; a new message may be typed while the
+  // cancel travels.
+  function stopGeneration() {
+    if (!S.convId || !S.sending) return;
+    var url = projectUrl('/conversations/' + enc(S.convId) + '/cancel');
+    api(url, { method: 'POST', body: {} }).then(function () {
+      toast('Генерация остановлена.');
+    }, function (error) {
+      // 409 means nothing was running (it may have just finished); say so and
+      // let the normal flow settle the message list.
+      if (error.status !== 409) toast(explain(error.message).text, 'bad');
+    });
   }
 
   function growPrompt() {
@@ -1338,6 +1398,15 @@
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
     if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
     if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    // A finished run's own actions: retry only the tasks that failed, take it
+    // out of the lists, or remove it from history. None of them touches the
+    // repository; the confirmation says so for the one that is irreversible.
+    if (!live) {
+      var failed = tasks.filter(function (task) { return FAILED_TASK_STATES[task.state]; }).length;
+      if (failed) actions += '<button class="btn btn-sm" type="button" data-action="retry-failed" data-id="' + esc(entry.id) + '">' + icon('refresh', 'icon-sm') + 'Повторить неудачные (' + failed + ')</button>';
+      actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="hide" data-id="' + esc(entry.id) + '">' + icon('archive', 'icon-sm') + 'Скрыть</button>';
+      actions += '<button class="btn btn-sm btn-danger" type="button" data-action="delete-run" data-id="' + esc(entry.id) + '">' + icon('x', 'icon-sm') + 'Удалить из истории</button>';
+    }
     // The report is the run's own record: the same text delivered to the chat.
     // It is copied in full, never the truncated view.
     var reportSection = report && report.body
@@ -2350,12 +2419,18 @@
     var id = anchor.getAttribute('data-id');
     var chat = findChat(id);
     if (!chat) return;
-    openMenu(anchor,
+    var items =
       '<button class="menu-item" type="button" role="menuitem" data-action="rename-chat" data-id="' + esc(id) + '">' + icon('pencil', 'icon-sm') + '<span>Переименовать</span></button>' +
+      (chat.pinned
+        ? '<button class="menu-item" type="button" role="menuitem" data-action="pin-chat" data-id="' + esc(id) + '" data-pinned="0">' + icon('x', 'icon-sm') + '<span>Открепить</span></button>'
+        : '<button class="menu-item" type="button" role="menuitem" data-action="pin-chat" data-id="' + esc(id) + '" data-pinned="1">' + icon('arrow-up', 'icon-sm') + '<span>Закрепить</span></button>') +
+      '<button class="menu-item" type="button" role="menuitem" data-action="export-chat" data-id="' + esc(id) + '">' + icon('external', 'icon-sm') + '<span>Экспорт</span></button>' +
       (chat.archived
         ? '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="0">' + icon('refresh', 'icon-sm') + '<span>Вернуть из архива</span></button>'
-        : '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="1">' + icon('archive', 'icon-sm') + '<span>В архив</span></button>'),
-      { alignRight: true });
+        : '<button class="menu-item" type="button" role="menuitem" data-action="archive-chat" data-id="' + esc(id) + '" data-archived="1">' + icon('archive', 'icon-sm') + '<span>В архив</span></button>') +
+      '<div class="menu-sep"></div>' +
+      '<button class="menu-item is-danger" type="button" role="menuitem" data-action="delete-chat" data-id="' + esc(id) + '">' + icon('x', 'icon-sm') + '<span>Удалить</span></button>';
+    openMenu(anchor, items, { alignRight: true });
   }
 
   // A dialog with several fields: edit a connection, describe a repository.
@@ -2482,6 +2557,21 @@
     });
   }
 
+  // Offer a JSON document as a download. The data is built locally from a
+  // server answer; no script or foreign origin is involved.
+  function downloadJson(filename, data) {
+    var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    toast('Экспорт сохранён.');
+  }
+
   var ACTIONS = {
     'toggle-sidebar': function () { setSidebar(!sidebarOpen(), true); },
     'close-overlays': function () {
@@ -2532,6 +2622,19 @@
       api('/logout', { method: 'POST' }).then(leave, leave);
     },
     'toggle-archived': function () { S.showArchived = !S.showArchived; renderChats(); },
+    'toggle-trash': function () {
+      S.showTrash = !S.showTrash;
+      // The trash is read when it is first opened (and whenever it is opened).
+      loadChats().then(renderChats);
+    },
+    'restore-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { deleted: false } })
+        .then(function () {
+          toast('Чат восстановлен.');
+          return loadChats().then(renderChats);
+        }, function (error) { toast(error.message, 'bad'); });
+    },
     'rename-chat': function (el) { closeMenu(); renameChat(el.getAttribute('data-id') || S.convId); },
     'archive-chat': function (el) {
       var id = el.getAttribute('data-id'), archived = el.getAttribute('data-archived') === '1';
@@ -2547,6 +2650,44 @@
         });
       }, function (error) { toast(error.message, 'bad'); });
     },
+    'pin-chat': function (el) {
+      var id = el.getAttribute('data-id'), pinned = el.getAttribute('data-pinned') === '1';
+      closeMenu();
+      api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { pinned: pinned } })
+        .then(function () {
+          toast(pinned ? 'Чат закреплён.' : 'Чат откреплён.');
+          return loadChats().then(renderChats);
+        }, function (error) { toast(error.message, 'bad'); });
+    },
+    'export-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      closeMenu();
+      // The export is a self-contained JSON document from the server; it is
+      // offered as a download so the whole transcript can be kept.
+      api(projectUrl('/conversations/' + enc(id) + '/export')).then(function (data) {
+        var title = (data.conversation && data.conversation.title) || 'conversation';
+        downloadJson(title.replace(/[^\w\u0400-\u04ff.-]+/g, '_') + '.json', data);
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'delete-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      closeMenu();
+      confirmDialog('Удалить чат?',
+        'Чат уйдёт из списка; его можно восстановить в течение срока хранения. ' +
+        'История сообщений сохранится. Проект и репозиторий не затрагиваются.',
+        'Удалить', function () {
+          api(projectUrl('/conversations/' + enc(id)), { method: 'PATCH', body: { deleted: true } })
+            .then(function () {
+              toast('Чат удалён. Восстановить можно из корзины.');
+              return loadChats().then(function () {
+                if (id === S.convId) return go(S.projectId, null);
+                renderChats();
+                return null;
+              });
+            }, function (error) { toast(error.message, 'bad'); });
+        }, true);
+    },
+    'stop-generation': function () { stopGeneration(); },
     'start': function (el) {
       var start = ($('#home-extras').starts || [])[Number(el.getAttribute('data-index'))];
       if (!start) return;
@@ -2628,9 +2769,30 @@
     'retry-task': function (el) {
       workAction(el, api('/api/tasks/' + enc(el.getAttribute('data-id')) + '/retry', { method: 'POST', body: {} }), 'Задача снова в очереди.');
     },
+    'retry-failed': function (el) {
+      var id = el.getAttribute('data-id');
+      workAction(el, api(projectUrl('/runs/' + enc(id) + '/retry-failed'),
+                         { method: 'POST', body: {} }),
+                 'Неудачные задачи снова в работе.');
+    },
+    'delete-run': function (el) {
+      var id = el.getAttribute('data-id');
+      confirmDialog('Удалить прогон из истории?',
+        'Уйдёт только запись об этом прогоне. Коммиты в репозитории, цель, ' +
+        'переписка чата и доказательства проверки останутся. Действие необратимо.',
+        'Удалить из истории', function () {
+          api(projectUrl('/runs/' + enc(id)), { method: 'DELETE' }).then(function () {
+            dropWork('run:' + id);
+            toast('Прогон удалён из истории.');
+            return refreshWork();
+          }, function (error) { toast(explain(error.message).text, 'bad'); });
+        }, true);
+    },
     'run-state': function (el) {
       var id = el.getAttribute('data-id'), op = el.getAttribute('data-op');
-      var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.', cancel: 'Прогон отменён.' }[op];
+      var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.',
+                   cancel: 'Прогон отменён.', hide: 'Прогон скрыт.',
+                   show: 'Прогон возвращён в список.' }[op];
       if (!done) return;
       if (op !== 'cancel') {
         workAction(el, api(projectUrl('/runs/' + enc(id) + '/' + op), { method: 'POST', body: {} }), done);

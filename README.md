@@ -80,6 +80,26 @@ are manual and need a live LLM):
   needs attention. A run that ended without completing (cancelled, failed)
   writes an honest report to its own chat at once — never as a success. A
   blocked run tells its chat why, immediately.
+- **Chat command system**: slash commands (`/chat /plan /autorun /audit /fix
+  /test /review /deploy /research /status /help`), four hashtag groups
+  (technology, quality, execution, restriction) and typed parameters
+  (`--repo`, `--branch`). Restrictions have priority — `#read-only` downgrades
+  an execute command to a read-only analysis, and `/deploy #no-deploy` is
+  refused. One parser serves both typed commands and interface buttons, so they
+  cannot drift apart. See `docs/COMMANDS.md`; `GET /api/commands` is the
+  vocabulary.
+- **Conversation management**: pin/unpin (durable, a pinned section at the top),
+  archive/restore, soft delete/restore (a real, reversible delete that leaves
+  the project, the repository and the transcript alone), search by title and by
+  the text of messages, and a self-contained JSON export. The studio sidebar has
+  a pinned section, an archive and a trash.
+- **Stop generation**: the answer in flight can be stopped at once — the cancel
+  aborts the live provider call, keeps whatever was produced with a "stopped"
+  mark, and leaves the chat immediately usable. It is a separate action from
+  cancelling a run: stopping a text answer never touches an autonomous run.
+- **Run history**: hide/show a finished run, remove it from history (its own
+  record only — the goal, the chat, the evidence and the repository stay), and
+  retry *only* the tasks that failed.
 - **Authentication**: browser session (PBKDF2 + server-side sessions + CSRF)
   and a machine bearer token, plus login rate limiting and proxy-aware client
   IP handling.
