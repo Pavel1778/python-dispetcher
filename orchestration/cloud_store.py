@@ -1951,6 +1951,38 @@ class PostgresStore:
             )
             return cur.fetchone()
 
+    def list_sessions(self, username: str) -> list[dict[str, Any]]:
+        """The live sessions of *username*, newest first. Never the token.
+
+        The ``token_hash`` is a key, not a value to show; the caller identifies a
+        session by its position or by a short prefix it can match itself. Only
+        the non-secret columns are returned.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT substr(token_hash, 1, 12) AS id, username, created_at, "
+                "  last_seen, expires_at "
+                "FROM sessions WHERE username=%s AND expires_at > now() "
+                "ORDER BY last_seen DESC",
+                (username,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def revoke_session_prefix(self, username: str, prefix: str) -> int:
+        """Revoke the session(s) of *username* whose stored id starts with
+        *prefix*. The prefix is a fragment of the HMAC, not the token, so
+        revoking never requires holding the secret. Returns how many went."""
+        with self._tx() as cur:
+            cur.execute("DELETE FROM sessions WHERE username=%s AND token_hash LIKE %s",
+                        (username, prefix + "%"))
+            return cur.rowcount
+
+    def revoke_other_sessions(self, username: str, keep_token_hash: str) -> int:
+        """Revoke every session of *username* except the caller's own."""
+        with self._tx() as cur:
+            cur.execute("DELETE FROM sessions WHERE username=%s AND token_hash <> %s",
+                        (username, keep_token_hash))
+            return cur.rowcount
+
     def delete_session(self, token_hash: str) -> None:
         with self._tx() as cur:
             cur.execute("DELETE FROM sessions WHERE token_hash=%s", (token_hash,))

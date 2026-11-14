@@ -68,7 +68,10 @@ was not measured.
 
 ## D. Testing
 
-- **pytest (full suite, PostgreSQL 17):** `1854 passed, 9 skipped, 0 failed`.
+- **pytest (full suite, PostgreSQL 17):** `1854 passed, 9 skipped, 0 failed`
+  locally; **`1857 passed, 6 skipped, 0 failed` on CI** (GitHub Actions run for
+  `8fba2b6`; Chromium is present there, so the browser E2E runs and there are
+  fewer skips).
 - **ruff:** `All checks passed!`
 - **Browser E2E (Chromium):** `37 passed`.
 - **Migrations:** fresh install, re-apply (no-op), refuse-edited — all green

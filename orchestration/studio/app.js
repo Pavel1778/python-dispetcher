@@ -604,7 +604,9 @@
             return '<div class="sb-item is-archived"><span class="sb-link" title="' + esc(title) + '">' +
               '<span>' + esc(title) + '</span></span>' +
               '<button class="icon-btn sm" type="button" data-action="restore-chat" data-id="' + esc(chat.id) + '" title="Восстановить">' +
-              icon('refresh', 'icon-sm') + '</button></div>';
+              icon('refresh', 'icon-sm') + '</button>' +
+              '<button class="icon-btn sm" type="button" data-action="purge-chat" data-id="' + esc(chat.id) + '" title="Удалить навсегда">' +
+              icon('x', 'icon-sm') + '</button></div>';
           }).join('')
         : '<p class="sb-empty">Корзина пуста.</p>';
     }
@@ -2423,7 +2425,11 @@
         return '<div class="lifecycle-group"><p class="work-section-title">' + esc(label) + '</p>' +
           items.map(function (p) {
             return '<div class="lifecycle-row"><span>' + esc(p.name) + '</span>' +
-              '<button class="btn btn-sm" type="button" data-action="project-restore" data-id="' + esc(p.id) + '" data-kind="' + esc(kind) + '">Восстановить</button></div>';
+              '<button class="btn btn-sm" type="button" data-action="project-restore" data-id="' + esc(p.id) + '" data-kind="' + esc(kind) + '">Восстановить</button>' +
+              (kind === 'deleted'
+                ? '<button class="btn btn-sm btn-danger" type="button" data-action="project-purge" data-id="' + esc(p.id) + '">Удалить навсегда</button>'
+                : '') +
+              '</div>';
           }).join('') + '</div>';
       }
       return rows(data.archived, 'archived', 'Архив') + rows(data.deleted, 'deleted', 'Корзина');
@@ -2433,6 +2439,35 @@
         title: 'Архив и корзина проектов',
         body: render(data),
         foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>'
+      });
+    }, function (error) { toast(explain(error.message).text, 'bad'); });
+  }
+
+  // The notification centre: list, mark read/unread, delete, bulk mark-all-read.
+  // The server owns the state; this only asks and shows it.
+  function openNotifications() {
+    if (!S.projectId) { toast('Сначала создайте проект.', 'bad'); return; }
+    api(projectUrl('/notifications')).then(function (data) {
+      var items = data.notifications || [];
+      var unread = items.filter(function (n) { return !n.read_at; }).length;
+      var body;
+      if (!items.length) {
+        body = '<p class="sb-empty">Уведомлений пока нет.</p>';
+      } else {
+        body = items.map(function (n) {
+          return '<div class="lifecycle-row' + (n.read_at ? '' : ' is-unread') + '">' +
+            '<span><strong>' + esc(n.title) + '</strong><br><small>' + esc(n.kind) + ' · ' + esc(fullTime(n.created_at)) + '</small></span>' +
+            '<button class="btn btn-sm" type="button" data-action="notif-read" data-id="' + esc(n.id) + '" data-read="' + (n.read_at ? '0' : '1') + '">' +
+            (n.read_at ? 'Непрочитано' : 'Прочитано') + '</button>' +
+            '<button class="btn btn-sm btn-danger" type="button" data-action="notif-delete" data-id="' + esc(n.id) + '">Удалить</button>' +
+            '</div>';
+        }).join('');
+      }
+      openDialog({
+        title: 'Уведомления' + (unread ? ' · ' + unread + ' новых' : ''),
+        body: body,
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>' +
+          (unread ? '<button class="btn btn-primary" type="button" data-action="notif-read-all">Отметить все прочитанными</button>' : '')
       });
     }, function (error) { toast(explain(error.message).text, 'bad'); });
   }
@@ -2453,7 +2488,35 @@
         icon(option[1], 'icon-sm') + '<span>' + option[2] + '</span></button>';
     }).join('') + '</div><div class="menu-sep"></div>' +
       '<button class="menu-item" type="button" role="menuitem" data-action="open-settings">' + icon('settings', 'icon-sm') + '<span>Настройки</span></button>' +
+      '<button class="menu-item" type="button" role="menuitem" data-action="open-sessions">' + icon('eye', 'icon-sm') + '<span>Активные сессии</span></button>' +
       '<button class="menu-item is-danger" type="button" role="menuitem" id="logout" data-action="logout">' + icon('logout', 'icon-sm') + '<span>Выйти</span></button>');
+  }
+
+  // The caller's own live sessions. The id is a prefix of the stored HMAC, not
+  // the token, so nothing secret is shown.
+  function openSessions() {
+    closeMenu();
+    api('/api/sessions').then(function (data) {
+      var items = data.sessions || [];
+      var body = items.length
+        ? items.map(function (s) {
+            return '<div class="lifecycle-row">' +
+              '<span>' + esc(s.id) + (s.current ? ' <small>(это устройство)</small>' : '') +
+              '<br><small>вход ' + esc(fullTime(s.created_at)) + ' · активна ' + esc(fullTime(s.last_seen)) + '</small></span>' +
+              (s.current ? '' :
+                '<button class="btn btn-sm btn-danger" type="button" data-action="session-revoke" data-id="' + esc(s.id) + '">Завершить</button>') +
+              '</div>';
+          }).join('')
+        : '<p class="sb-empty">Активных сессий нет.</p>';
+      openDialog({
+        title: 'Активные сессии',
+        body: body,
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>' +
+          (items.some(function (s) { return !s.current; })
+            ? '<button class="btn btn-danger" type="button" data-action="session-revoke-others">Завершить все другие</button>'
+            : '')
+      });
+    }, function (error) { toast(explain(error.message).text, 'bad'); });
   }
 
   function findChat(id) {
@@ -2642,6 +2705,66 @@
     'pick-mode': function (el) { closeMenu(); setMode(el.getAttribute('data-mode')); $('#prompt').focus(); },
     'new-project': function () { closeMenu(); newProjectDialog(); },
     'project-lifecycle': function () { openProjectLifecycle(); },
+    'open-notifications': function () { openNotifications(); },
+    'open-sessions': function () { openSessions(); },
+    'session-revoke': function (el) {
+      var id = el.getAttribute('data-id');
+      api('/api/sessions/' + enc(id), { method: 'DELETE' })
+        .then(function () { toast('Сессия завершена.'); return openSessions(); },
+              function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'session-revoke-others': function () {
+      api('/api/sessions', { method: 'DELETE' })
+        .then(function (data) {
+          toast('Завершено сессий: ' + (data.revoked || 0) + '.');
+          return openSessions();
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'notif-read': function (el) {
+      var id = el.getAttribute('data-id'), read = el.getAttribute('data-read') === '1';
+      api(projectUrl('/notifications/' + enc(id)), { method: 'PATCH', body: { read: read } })
+        .then(openNotifications, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'notif-delete': function (el) {
+      var id = el.getAttribute('data-id');
+      api(projectUrl('/notifications/' + enc(id)), { method: 'DELETE' })
+        .then(openNotifications, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'notif-read-all': function () {
+      api(projectUrl('/notifications/read'), { method: 'POST', body: {} })
+        .then(function (data) {
+          toast('Отмечено прочитанными: ' + (data.marked || 0) + '.');
+          return openNotifications();
+        }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'project-purge': function (el) {
+      var id = el.getAttribute('data-id');
+      // Show what will be removed before confirming: the census is what makes
+      // "delete for good" an informed decision, not a guess.
+      api('/api/v1/projects/' + enc(id) + '/dependents').then(function (data) {
+        var d = data.dependents || {};
+        var parts = [];
+        var labels = { nexus_conversations: 'диалогов', nexus_goals: 'целей',
+                       nexus_runs: 'прогонов', nexus_files: 'файлов',
+                       nexus_specs: 'ТЗ', nexus_evidence: 'записей доказательств' };
+        Object.keys(labels).forEach(function (k) {
+          if (d[k]) parts.push(d[k] + ' ' + labels[k]);
+        });
+        confirmDialog('Удалить проект навсегда?',
+          'Это необратимо. Вместе с проектом будут удалены: ' +
+          (parts.length ? parts.join(', ') : 'только сам проект') +
+          '. Репозиторий на GitHub и аккаунты не затрагиваются. Восстановить после этого нельзя.',
+          'Удалить навсегда', function () {
+            api('/api/v1/projects/' + enc(id), { method: 'DELETE' }).then(function () {
+              toast('Проект удалён навсегда.');
+              return loadProjects().then(function () {
+                renderProject();
+                openProjectLifecycle();
+              });
+            }, function (error) { toast(explain(error.message).text, 'bad'); });
+          }, true);
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
     'project-archive': function (el) {
       var archived = el.getAttribute('data-archived') === '1';
       api(projectUrl(''), { method: 'PATCH', body: { archived: archived } }).then(function () {
@@ -2763,6 +2886,19 @@
                 return null;
               });
             }, function (error) { toast(error.message, 'bad'); });
+        }, true);
+    },
+    'purge-chat': function (el) {
+      var id = el.getAttribute('data-id');
+      confirmDialog('Удалить чат навсегда?',
+        'Это необратимо: чат и все его сообщения и вложения будут удалены безвозвратно. ' +
+        'Проект, репозиторий и запущенные прогоны не затрагиваются. Восстановить после этого нельзя.',
+        'Удалить навсегда', function () {
+          api(projectUrl('/conversations/' + enc(id) + '?permanent=1'), { method: 'DELETE' })
+            .then(function () {
+              toast('Чат удалён навсегда.');
+              return loadChats().then(renderChats);
+            }, function (error) { toast(explain(error.message).text, 'bad'); });
         }, true);
     },
     'stop-generation': function () { stopGeneration(); },

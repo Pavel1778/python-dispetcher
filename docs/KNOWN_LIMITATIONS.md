@@ -91,3 +91,34 @@ does **not** prove:
   edited, already-applied migration, but a full manifest with per-file effect
   verification (the `arena/d7bb7e3c` design) was **not** integrated: it is a
   larger framework that the suite would not exercise. See `docs/BRANCHES.md`.
+
+## Full CRUD (this increment)
+
+The entity-by-entity audit is `docs/CRUD-MATRIX.md`. What is implemented and
+tested this increment: permanent (hard) delete for conversations and projects
+(two-step: trash first), a dependents census before a project delete, the full
+notification lifecycle (read/unread, bulk, delete) and session list/revoke.
+
+Still open, with the reason (not defects, decisions):
+
+- **Pagination and bulk actions** on the large lists. Every list is already
+  bounded (200 rows), so this is a scale gap, not a correctness gap.
+- **File trash/restore.** A file delete is final; a retention policy is needed
+  before a trash state means anything.
+- **Message edit/delete and memory delete.** Deliberately not offered: they
+  would falsify a context an agent already acted on. The safe path is a new
+  message; permanent delete removes the whole conversation.
+- **Multi-user project membership.** The auth model is single-owner; adding a
+  member is a larger change than a route.
+- **A central audit log.** Each entity has its own trail
+  (`nexus_project_events`, evidence, run executions); there is no single "who
+  changed what" endpoint.
+
+## Production smoke tests
+
+The authenticated smoke tests (sign in, create a project/conversation, send a
+message, start a run) could not be run against production: this environment
+holds no production credentials (`WEB_AUTH_TOKEN`/`AUTH_*` are not available),
+and creating an account is out of scope. The unauthenticated checks
+(`/healthz`, `/readyz`, the served assets) were run and pass; the authenticated
+flows are covered against the real server locally and by the browser E2E.

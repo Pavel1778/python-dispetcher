@@ -55,14 +55,42 @@ The live service `https://python-dispetcher-1.onrender.com` was checked
 | Headers | `server: cloudflare`, `x-render-origin-server: SrJrDispatcher/2.0 Python/3.12.6` |
 | Deployed front end | `static/app.js` md5 `0003a2ec…` — **identical to `main` at `42609a4`** (the pre-increment build) |
 
-**The deployment is up and healthy but has not picked up this increment.**
-`render.yaml` declares `autoDeploy: true` for both services, yet the served
-assets are still the `42609a4` build, so the deploy either has not run or the
-running service was created by hand in the dashboard (the header shows Python
-3.12.6, matching `render.yaml`, so it is this repository's code). No
-`RENDER_API_KEY` or deploy hook exists in this environment, so a deploy cannot
-be triggered from here; rebuilding by hand in the Render dashboard is the
-reliable path. Status: **RELEASE READY — DEPLOYMENT PENDING**.
+**Update 2026-11-14 22:14 UTC — the increment is deployed.** The reason
+production was stuck on `42609a4` was a real, production-blocking defect that
+this session found and fixed: `migrations/0037_conversation_management.sql`
+declared its revoke loop variable as `record` instead of `text`, so the
+statement became `REVOKE ... FROM "(authenticated)"` and the migration failed
+with `role "(authenticated)" does not exist` on any server that has the Supabase
+`authenticated` role — i.e. on production. `PostgresStore.__init__` calls
+`apply_migrations`, so every deploy that included `0037` crashed at startup and
+the service kept running the last good build. The defect was invisible locally
+because a plain PostgreSQL has neither `anon` nor `authenticated`, so the loop
+body never ran.
+
+After the fix was pushed (`383a234`), the auto-deploy succeeded within the
+minute. Verified against the live service:
+
+| Check | Result |
+| --- | --- |
+| `GET /healthz` | `200 {"status": "ok"}` |
+| `GET /readyz` | `200 {"status": "ready", "database": true}` |
+| `static/app.js` md5 | matches the local file byte for byte |
+| `static/app.css` md5 | matches the local file byte for byte |
+| Rendered `ASSET_VERSION` | `eeb20fb6fe9e`, identical to the local build |
+| New features in the served bundle | `project-lifecycle`, `project-delete`, `stop-generation`, `delete-chat`, `Архив и корзина` |
+
+`nexus_generations` is a `REQUIRED_COLUMNS` table, and `web_server.main` calls
+`verify_schema()` before binding; the service is up, so `0037` and `0038` applied
+on production and the schema guard passed.
+
+**Render MCP / deploy hook.** This environment has no Render MCP tool and no
+`RENDER_API_KEY` (checked: no such tool is exposed, no such variable is set, and
+`https://api.render.com/v1/services` answers `401`). The deploy was therefore
+performed by the service's own `autoDeploy: true` on the `main` push, which is
+the configured, safe path; nothing about the Render service was changed by hand.
+Status: **PRODUCTION READY** for the code and deployment; the only unverified
+items are the authenticated smoke tests (no production credentials exist here —
+see `docs/MASTER_COMPLETION_REPORT.md`).
 
 ## Summary
 

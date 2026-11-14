@@ -475,6 +475,12 @@ class AuthService:
                               _without_whitespace(self.password_hash or "")))
         return hmac.new(self.session_secret.encode(), bound.encode(), hashlib.sha256).digest()
 
+    def token_id(self, token: str) -> str:
+        """The stored id (HMAC) of *token* - the key a session row is filed
+        under. Public so a caller that must keep its own session while revoking
+        the others can name it without reaching into a private method."""
+        return self._token_hash(token)
+
     def _token_hash(self, token: str) -> str:
         return hmac.new(self._session_key(), token.encode(), hashlib.sha256).hexdigest()
 

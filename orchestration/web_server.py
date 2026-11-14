@@ -2099,9 +2099,12 @@ class Handler(BaseHTTPRequestHandler):
                 from urllib.parse import parse_qs
                 query = (parse_qs(path.split("?", 1)[1]).get("q") or [None])[0]
             return (200, {"memory": self.app.memory.retrieve(principal, project_id, query=query)}, None)
-        # GET /api/v1/projects/{id}/notifications
+        # GET /api/v1/projects/{id}/notifications[?unread=1]
         if rest == ["notifications"]:
-            return (200, {"notifications": self.app.lab.notifications(principal, project_id)}, None)
+            params = urllib.parse.parse_qs(urlparse(self.path).query)
+            unread_only = (params.get("unread") or ["0"])[0].lower() in ("1", "true", "yes", "on")
+            return (200, {"notifications": self.app.lab.notifications(
+                principal, project_id, unread_only=unread_only)}, None)
         # GET /api/v1/projects/{id}/conversations[?q=&archived=1&deleted=1]
         if rest and rest[0] == "conversations" and len(rest) == 1:
             # The query lives on the raw request target, not the stripped path.
@@ -2587,6 +2590,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
                 return True
             self._json(200, {"repository": link})
+            return True
+        # POST /api/v1/projects/{id}/notifications/read  (mark every unread read)
+        if rest == ["notifications", "read"]:
+            marked = self.app.lab.mark_all_notifications_read(principal, project_id)
+            self._json(200, {"marked": marked})
             return True
         # POST /api/v1/projects/{id}/context/refresh  (analyze the repository)
         if rest == ["context", "refresh"]:
@@ -4069,6 +4077,11 @@ class Handler(BaseHTTPRequestHandler):
                 principal = self._project_principal()
                 if not resource:
                     return self._json(200, {"project": self.app.projects.get(principal, project_id)})
+                if resource == "dependents":
+                    # What a permanent delete of this project would remove, so
+                    # the confirmation can name it before anything is destroyed.
+                    return self._json(200, {"dependents": self.app.projects.dependents(
+                        principal, project_id)})
                 if resource == "goals":
                     return self._json(200, {"goals": self.app.projects.list_goals(principal, project_id)})
                 if resource == "files":
@@ -4091,6 +4104,21 @@ class Handler(BaseHTTPRequestHandler):
                     "username": s.username if s else "api",
                     "csrf_token": s.csrf_token if s else "",
                 })
+            if path == "/api/sessions":
+                # The caller's own live sessions, never the token: the id is a
+                # prefix of the stored HMAC, which is enough to revoke one and
+                # useless to an attacker. A bearer client sees none (it holds no
+                # browser session).
+                s = self._session()
+                if s is None:
+                    return self._json(200, {"sessions": []})
+                current = self.app.auth.token_id(s.token)[:12]
+                sessions = self.app.store.list_sessions(s.username)
+                for row in sessions:
+                    # Mark the caller's own session so the interface can say
+                    # "this device" and never offer to revoke it by mistake.
+                    row["current"] = row["id"] == current
+                return self._json(200, {"sessions": sessions})
             if path == "/api/studio":
                 return self._json(200, self.app.studio_status())
             if path == "/api/commands":
@@ -4577,6 +4605,27 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._require_write():
                 return
+            # DELETE /api/sessions/{id}   (revoke one of the caller's sessions)
+            #   ``{id}`` is a prefix of the stored HMAC; the token itself is
+            #   never known to the server. Only the caller's own sessions can be
+            #   revoked, so a prefix cannot reach another user's.
+            if path.startswith("/api/sessions/"):
+                prefix = path.rsplit("/", 1)[-1]
+                s = self._session()
+                if s is None:
+                    return self._json(404, {"error": "not found"})
+                if not prefix or len(prefix) < 8:
+                    return self._json(400, {"error": "session id is too short"})
+                gone = self.app.store.revoke_session_prefix(s.username, prefix)
+                return self._json(200, {"revoked": gone})
+            # DELETE /api/sessions   (revoke every other session of the caller)
+            if path == "/api/sessions":
+                s = self._session()
+                if s is None:
+                    return self._json(404, {"error": "not found"})
+                gone = self.app.store.revoke_other_sessions(
+                    s.username, self.app.auth.token_id(s.token))
+                return self._json(200, {"revoked": gone})
             parsed = self._project_subpath(path)
             if parsed is None:
                 return self._json(404, {"error": "not found"})
@@ -4601,18 +4650,39 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"deleted": rel})
                 return self._json(404, {"error": "not found"})
             # DELETE /api/v1/projects/{id}/conversations/{cid}
-            # A real, reversible delete: the conversation goes to the trash.
-            # Refused while its run is at work (409). Use PATCH archived to
-            # archive instead of deleting.
+            #   Plain DELETE archives (the historical behaviour, kept). With
+            #   ``?permanent=1`` it removes the conversation for good, and only
+            #   when it is already in the trash, so one call cannot destroy a
+            #   chat that is still in the list.
             if len(rest) == 2 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1]):
+                permanent = (urllib.parse.parse_qs(urlparse(self.path).query)
+                             .get("permanent") or ["0"])[0].lower() in ("1", "true", "yes", "on")
+                if permanent:
+                    return self._json(200, self.app.conversations.delete_permanently(
+                        principal, project_id, rest[1]))
                 self.app.conversations.set_archived(principal, project_id, rest[1], True)
                 return self._json(200, {"archived": rest[1]})
+            # DELETE /api/v1/projects/{id}/notifications/{nid}
+            if len(rest) == 2 and rest[0] == "notifications" and UUID_RE.fullmatch(rest[1]):
+                if self.app.lab.delete_notification(principal, project_id, rest[1]):
+                    return self._json(200, {"deleted": rest[1]})
+                return self._json(404, {"error": "not found"})
             # DELETE /api/v1/projects/{id}/runs/{run_id}   (remove from history)
             if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
                 try:
                     return self._json(200, self.app.lab.delete_run(
                         principal, project_id, rest[1]))
                 except InvalidTransition as e:
+                    return self._json(409, {"error": str(e)})
+            # DELETE /api/v1/projects/{id}   (remove a project for good)
+            #   Only a project already in the trash may go, so a single call
+            #   cannot destroy a live project; the census in the answer says
+            #   what was removed. Refused while a run is active.
+            if not rest:
+                try:
+                    return self._json(200, self.app.projects.delete_permanently(
+                        principal, project_id))
+                except ValueError as e:
                     return self._json(409, {"error": str(e)})
             return self._json(404, {"error": "not found"})
         except NotFound:
@@ -4638,6 +4708,17 @@ class Handler(BaseHTTPRequestHandler):
             sub = self._project_subpath(path)
             if sub is not None:
                 project_id, rest = sub
+                # PATCH /api/v1/projects/{id}/notifications/{nid}  (read/unread)
+                if (len(rest) == 2 and rest[0] == "notifications"
+                        and UUID_RE.fullmatch(rest[1])):
+                    body = self._body(max_bytes=64 * 1024)
+                    if not isinstance(body, dict) or "read" not in body:
+                        return self._json(400, {"error": "body must be {\"read\": true|false}"})
+                    if not isinstance(body["read"], bool):
+                        return self._json(400, {"error": "read must be a boolean"})
+                    notification = self.app.lab.set_notification_read(
+                        self._project_principal(), project_id, rest[1], body["read"])
+                    return self._json(200, {"notification": notification})
                 if (len(rest) == 2 and rest[0] == "conversations"
                         and UUID_RE.fullmatch(rest[1])):
                     body = self._body(max_bytes=64 * 1024)
