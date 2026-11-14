@@ -12,8 +12,21 @@ from .cloud_store import NotFound, PostgresStore
 from .nexus_policy import SCOPE_PROJECT_ADMIN, PermissionDenied, require
 
 
+def _active_run_states() -> list[str]:
+    """The run states that count as "still at work". Imported lazily:
+    ``nexus_lab_store`` imports this module, so a top-level import here would be
+    circular."""
+    from .nexus_lab_store import ACTIVE_RUN_STATES
+
+    return list(ACTIVE_RUN_STATES)
+
+
 class IdempotencyConflict(ValueError):
     """The same project's request key was reused with a different goal."""
+
+
+class ProjectInUse(RuntimeError):
+    """A project cannot be deleted or purged while it has an active run."""
 
 
 def _text(value: Any, field: str, *, maximum: int, required: bool = True) -> str:
@@ -82,6 +95,8 @@ class ProjectService:
 
     @staticmethod
     def _project(cur: Any, principal: str, project_id: str) -> dict:
+        # A deleted project is still *readable* by a member, so it can be
+        # restored; it is ``_refuse_if_deleted`` that stops new work in it.
         cur.execute("SELECT p.id, p.name, p.description, p.archived_at, p.deleted_at, "
                     "  p.created_at, p.updated_at "
                     "FROM nexus_projects p JOIN nexus_project_members m ON m.project_id=p.id "
@@ -90,6 +105,83 @@ class ProjectService:
         if row is None:
             raise NotFound("project not found")
         return dict(row)
+
+    # ------------------------------------------------------- lifecycle
+    def stats(self, principal: str, project_id: str) -> dict:
+        """What is inside a project, for the deletion confirmation.
+
+        Names only what the operator needs to decide: how many conversations,
+        runs, tasks and goals, whether any run is still active, and which
+        repositories are bound. Reading it changes nothing. A project in the
+        trash is still readable by a member (``include_deleted``), so the trash
+        can show what it holds.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT id, name, archived_at, deleted_at FROM nexus_projects p "
+                        "JOIN nexus_project_members m ON m.project_id=p.id "
+                        "WHERE p.id=%s AND m.principal=%s", (project_id, principal))
+            if cur.fetchone() is None:
+                raise NotFound("project not found")
+
+            def count(sql: str, params: tuple = ()) -> int:
+                cur.execute(sql, (project_id, *params))
+                return int(cur.fetchone()["n"])
+
+            active_runs = count(
+                "SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s "
+                "AND state = ANY(%s)", (_active_run_states(),))
+            repositories = []
+            cur.execute("SELECT r.full_name, pr.branch, pr.enabled "
+                        "FROM nexus_project_repositories pr "
+                        "JOIN repositories r ON r.id = pr.repository_id "
+                        "WHERE pr.project_id=%s ORDER BY r.full_name", (project_id,))
+            repositories = [{"full_name": r["full_name"], "branch": r["branch"],
+                             "enabled": r["enabled"]} for r in cur.fetchall()]
+            return {
+                "conversations": count("SELECT count(*) AS n FROM nexus_conversations "
+                                       "WHERE project_id=%s"),
+                "runs": count("SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s"),
+                "active_runs": active_runs,
+                "tasks": count("SELECT count(*) AS n FROM nexus_run_tasks WHERE project_id=%s"),
+                "goals": count("SELECT count(*) AS n FROM nexus_goals WHERE project_id=%s"),
+                "members": count("SELECT count(*) AS n FROM nexus_project_members "
+                                 "WHERE project_id=%s"),
+                "repositories": repositories,
+                "has_active_runs": active_runs > 0,
+            }
+
+    def purge(self, principal: str, project_id: str, *, confirm: bool) -> dict:
+        """Remove a project and everything inside it for good. Irreversible.
+
+        Refused without ``confirm`` and refused (409) while a run is active.
+        Only rows inside this project are removed; the external GitHub
+        repositories it was bound to are never touched (the links go, the
+        repositories do not). The rows that reference the project ``ON DELETE
+        SET NULL`` (evidence, legacy tasks) keep their content and lose the
+        link, so no other project is affected.
+        """
+        if not confirm:
+            raise ValueError("purging a project requires explicit confirmation")
+        with self.store._tx() as cur:
+            self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
+            cur.execute("SELECT name FROM nexus_projects WHERE id=%s", (project_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project not found")
+            name = row["name"]
+            active = self._active_runs(cur, project_id)
+            if active:
+                raise ProjectInUse(
+                    f"the project has {active} active run(s); stop them before purging")
+            # Counted before the delete, for the report: after it they are gone.
+            counts = {}
+            for table in ("nexus_conversations", "nexus_runs", "nexus_run_tasks",
+                          "nexus_goals", "nexus_specs"):
+                cur.execute(f"SELECT count(*) AS n FROM {table} WHERE project_id=%s",
+                            (project_id,))
+                counts[table] = int(cur.fetchone()["n"])
+            cur.execute("DELETE FROM nexus_projects WHERE id=%s", (project_id,))
+            return {"purged": True, "name": name, "removed": counts}
 
     @staticmethod
     def _refuse_if_deleted(cur: Any, project_id: str) -> None:
@@ -140,22 +232,27 @@ class ProjectService:
                         "project.archived" if archived else "project.unarchived", project_id)
             return dict(row)
 
+    #: ``archive`` is the name the lifecycle routes use; ``set_archived`` is the
+    #: one the PATCH handler uses. One implementation, two names.
+    def archive(self, principal: str, project_id: str, archived: bool = True) -> dict:
+        return self.set_archived(principal, project_id, archived)
+
     def delete(self, principal: str, project_id: str) -> dict:
         """Soft-delete a project: move it to the trash, nothing is destroyed.
 
-        Refused while the project has an active run - the agent working on it
-        would otherwise be cut off mid-step with nothing to report. The caller
-        cancels those runs first (a separate, explicit action), so a delete can
-        never silently stop work the user did not ask to stop. Nothing
-        cascades: the project row and all its data stay, ``deleted_at`` is a
-        marker, and no other project or external repository is touched. A
-        repeat delete is idempotent.
+        Refused (409, ``ProjectInUse``) while the project has an active run -
+        the agent working on it would otherwise be cut off mid-step with
+        nothing to report. The caller cancels those runs first (a separate,
+        explicit action), so a delete can never silently stop work the user did
+        not ask to stop. Nothing cascades: the project row and all its data
+        stay, ``deleted_at`` is a marker, and no other project or external
+        repository is touched. A repeat delete is idempotent.
         """
         with self.store._tx() as cur:
             self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
             active = self._active_runs(cur, project_id)
             if active:
-                raise ValueError(
+                raise ProjectInUse(
                     f"project has {active} active run(s); cancel them before deleting")
             cur.execute(
                 "UPDATE nexus_projects SET deleted_at=now() WHERE id=%s AND deleted_at IS NULL "

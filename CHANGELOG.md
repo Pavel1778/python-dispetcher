@@ -1,5 +1,99 @@
 # Changelog
 
+## Unreleased — performance, execution reliability, project/conversation lifecycle
+
+### Fixed
+
+- **A task could be accepted with no new change** (evidence-based acceptance).
+  `GitVerifier` accepted a task whose report named the head of the branch, which
+  is true of an agent whose push was refused and that named the head it found.
+  The head SHA alone does not prove a new change appeared. A change-requiring
+  task (`implementation`, `bugfix`, `documentation`) whose branch did not move
+  is now `completed_unverified` and is reworked; it is never reported as
+  verified. A task whose kind does not change the code (`verification_only`,
+  `research_audit`) is accepted as `completed_no_changes` - an honest no-change
+  result, not a claim of a change. (`orchestration/nexus_lab.py`,
+  `migrations/0037_task_kind.sql`.)
+- **A project or conversation could not be deleted.** Only rename and archive
+  existed, and `DELETE …/conversations/{id}` merely archived. Projects and
+  conversations can now be archived, moved to the trash, restored and purged,
+  with an active-run guard. (See [docs/PROJECT-LIFECYCLE.md](docs/PROJECT-LIFECYCLE.md),
+  `migrations/0038_lifecycle.sql`.)
+
+### Added
+
+- **Stage tracing** (`orchestration/tracing.py`): one secret-free span shape for
+  the dispatch, poll and verify stages, with the ids of the attempt. Off unless
+  `NEXUS_TRACE=1`.
+- **`GET /api/observability`**: queue depth, stuck tasks, worker heartbeat and
+  per-stage latency. The studio shows it under **Настройки → Диагностика**.
+  (`LabStore.queue_snapshot`, `LabStore.stuck_tasks`.) See
+  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
+- **`tools/benchmark.py`**: measures the queue/claim path over real PostgreSQL
+  and is honest about what it cannot measure here.
+- **Project and conversation context menus** in the studio: archive, delete,
+  restore, purge, with a confirmation that names what is inside and states that
+  the external GitHub repository is not touched.
+- Tests: `tests/test_run_binding.py` (the ForgeCRM incident regression),
+  `tests/test_lifecycle.py` (project/conversation lifecycle and isolation),
+  `tests/test_observability.py` (tracing and the observability endpoint).
+
+### Documentation
+
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — where the time goes and how to
+  measure it.
+- [docs/PROJECT-LIFECYCLE.md](docs/PROJECT-LIFECYCLE.md) — the lifecycle
+  contract.
+- [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) — the diagnostics surface.
+
+### Migrations
+
+- `0037_task_kind.sql` — `nexus_run_tasks.kind` and the `completed_no_changes`
+  state. Additive.
+- `0038_lifecycle.sql` — `archived_at`/`deleted_at`. Additive.
+- `0039_conversation_pin.sql` — `nexus_conversations.pinned`. Additive.
+
+## PR #39 finalization — history reconciliation and integration
+
+At the start of this work the report named a line of work (`5c4f08c`,
+`nexus_commands.py`, `nexus_generation.py`, `LabStore.retry_failed`/`delete_run`,
+`benchmark_compare.py`) that was **not yet in this repository** (checked across
+every ref). The only parallel line was **PR #38** (`arena/ab0d7665`), which
+implemented the same lifecycle independently with a colliding `0037`; this
+branch ported its two unique pieces (conversation pin under a fresh
+`0039_conversation_pin.sql`; `web_server._continues_analysis`) plus its
+concurrent-runs contract test.
+
+`origin/main` then advanced to `a6bb451` and **now contains** that named work
+(`5c4f08c` and the whole commands / generation-cancel / run-history / benchmark
+increment, `bcd854b`…`5c4f08c`, plus `002c875 feat(projects): archive and soft
+delete`). The finalization is therefore a **merge** of `origin/main` into
+PR #39, keeping both lines:
+
+- main's lifecycle (`set_deleted`, `set_pinned`+`pinned_at`, content search,
+  `export`, generations, run history, commands, `benchmark.py`/`benchmark_compare.py`);
+- this branch's `purge`, `stats`, `active_run`, the `409` active-run refusal,
+  `/api/observability`, tracing, `_queue_claim_ms`, and the migration-collision
+  test.
+
+### Fixed during the merge
+
+- **`main`'s `0037_conversation_management.sql` failed on a plain PostgreSQL.**
+  It declared `r record` and passed it to `format('%I', r)`, which renders
+  `"(authenticated)"` (`role "(authenticated)" does not exist`). Now `r text`.
+- `ProjectService.stats` passed one parameter to a two-placeholder query (the
+  active-runs count) — a `500` on the delete confirmation.
+- `GET …/stats` was `POST`-only, so the studio's confirmation never opened.
+- `loadChats` did not fetch the trash by default, so the trash fold showed no
+  count.
+
+### Migrations
+
+Five files, distinct names, all idempotent: this branch's `0037_task_kind.sql`,
+`0038_lifecycle.sql`, `0039_conversation_pin.sql` and main's
+`0037_conversation_management.sql`, `0038_project_lifecycle.sql`. See
+[docs/DATABASE.md](docs/DATABASE.md).
+
 All notable changes to NEXUS. The format follows Keep a Changelog; the project
 is versioned in `pyproject.toml`.
 

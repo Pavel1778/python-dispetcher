@@ -52,6 +52,7 @@ from tests.test_studio_api import DSN, studio_stack  # noqa: E402
 pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run lab tests")
 
 DONE = f"Готово. Коммит {HEAD}."
+DONE2 = "Готово. Коммит a1b2c3d4e5f60718293a4b5c6d7e8f9012345678."
 
 
 class Server:
@@ -149,7 +150,7 @@ def _run_ends(studio, project, run, first: str) -> None:
     _finish(studio, first, DONE)
     second = _until(lambda: _task_conversation(studio, "change"),
                     what="the next task to be started")
-    _finish(studio, second, DONE)
+    _finish(studio, second, DONE2)
     done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
         _detail(studio, project, run)), what="the run to finish")
     assert done["run"]["state"] == "completed", done["run"]

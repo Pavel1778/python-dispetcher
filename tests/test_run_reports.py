@@ -195,8 +195,14 @@ def test_the_report_says_what_was_asked_done_and_checked(env):
 
 
 def test_a_report_never_claims_more_than_was_seen(env):
-    """Failed checks, retries and a task accepted without a change are said."""
-    run_id = start(env, TWO)
+    """Failed checks, retries and a verification task accepted without a change
+    are said. The second task is a *verification* task (``verification_only``):
+    it is not expected to move the branch, so its accepted outcome is
+    ``completed_no_changes`` and the report says so honestly."""
+    tasks = [{"task_key": "api", "title": "Эндпоинт /health", "repository": APP},
+             {"task_key": "site", "title": "Проверить статус на сайте", "repository": SITE,
+              "dependencies": ["api"], "kind": "verification_only"}]
+    run_id = start(env, tasks)
     executor = Conversations()
     sched = scheduler(env, executor)
     # The first attempt of "api" names no commit: reworked, then accepted.
@@ -208,9 +214,10 @@ def test_a_report_never_claims_more_than_was_seen(env):
     env["gh"].push(APP, sha(0xA1), "feat: api")
     executor.finish(conversation, f"Отправил. Коммит {sha(0xA1)}.")
     sched.tick(run_id)
-    # "site" needed no change: its agent names the head as it stands.
+    # "site" is a verification task: it names the head as it stands and is
+    # accepted without a change, because that is what its kind expects.
     sched.tick(run_id)
-    executor.finish(executor.of("site")[-1], f"Менять нечего. Вершина ветки {BASE}.")
+    executor.finish(executor.of("site")[-1], f"Проверено. Вершина ветки {BASE}.")
     env["gh"].check_runs[sha(0xA1)] = [
         {"name": "tests", "status": "completed", "conclusion": "failure"}]
     sched.run_until_done(run_id)
@@ -227,12 +234,16 @@ def test_a_report_never_claims_more_than_was_seen(env):
     assert reports_in_chat(env)[0]["meta"]["outcome"] == "success_with_notes"
 
 
-def test_a_run_in_which_nothing_was_pushed_is_not_reported_as_done(env):
-    """What the live service did on the day this was deployed. The agent's push
-    was refused; it said so, and named the head of the branch as it had found
-    it. The rule of acceptance - the agent named the head of the branch - holds
-    for that, so the task verified and the run completed. The report must not
-    call it done: NEXUS saw no new commit."""
+def test_a_push_that_was_refused_is_not_accepted_and_is_reworked(env):
+    """The defect this fixes. An agent whose push was refused names the head of
+    the branch as it found it. The old rule of acceptance - "the report names
+    the head of the branch" - held for that, so the task was recorded as
+    verified and the run as completed although nothing had changed: the SHA of
+    the current head does not, by itself, prove a new change appeared.
+
+    Now the branch has to have moved. The refused push is `completed_unverified`
+    and the task is reworked, not accepted. Once the agent really pushes, the
+    task verifies and the run completes."""
     run_id = start(env, [TWO[0]])
     executor = Conversations()
     sched = scheduler(env, executor)
@@ -241,22 +252,57 @@ def test_a_run_in_which_nothing_was_pushed_is_not_reported_as_done(env):
                f"`{APP}@main` is still **`{BASE}`** — unchanged.\n\n"
                f"remote: Permission to {APP}.git denied. The requested URL returned error: 403")
     executor.finish(executor.of("api")[-1], refused)
+    sched.tick(run_id)
+
+    # Not accepted: the branch did not move, so the task is put back to work -
+    # reworked in the same tick, in a fresh conversation (attempt 2).
+    run = env["lab"].get_run(ALICE, env["project"], run_id)
+    assert run["state"] == "running", run["state"]
+    task = env["lab"].list_tasks(ALICE, env["project"], run_id)[0]
+    assert task["state"] == "running" and task["attempt"] == 2
+    assert "did not move" in (task["verification"] or {}).get("reason", "")
+    assert len(executor.of("api")) == 2, "the refused result was not reworked"
+    assert reports_in_chat(env) == [], "a run that is not done reports nothing"
+
+    # The agent pushes for real and names the new commit: now it verifies.
+    env["gh"].push(APP, sha(0xA1), "feat: api")
+    executor.finish(executor.of("api")[-1], f"Отправил. Коммит {sha(0xA1)}.")
     assert sched.run_until_done(run_id).finished
-    # The rule of acceptance itself is as it was.
     assert env["lab"].get_run(ALICE, env["project"], run_id)["state"] == "completed"
 
     report = env["reports"].get(ALICE, env["project"], run_id)
-    assert report["outcome"] == "no_changes"
-    assert report["summary"]["changes"] == {"changed": [], "unchanged": [APP], "unknown": []}
+    assert report["outcome"] == "success"
+    assert report["summary"]["changes"] == {"changed": [APP], "unchanged": [], "unknown": []}
     text = report["body"]
-    assert "**Статус:** изменений в репозитории нет — результат не подтверждён." in text
-    assert "выполнено" not in text and "Блокеров не осталось" not in text
-    assert "ни одного нового коммита" in text and "она не доставлена" in text
-    assert "Вершина ветки не изменилась" in text
-    assert "Новых коммитов нет: подтверждать в репозитории нечего." in text
-    assert "Blocker: the push was refused." in text, "the agent's own words are there to read"
+    assert "**Статус:** выполнено, все задачи проверены и подтверждены в репозиториях." in text
+    # The report quotes the attempt that was accepted, not the refused one.
+    assert "Отправил. Коммит" in text
+    assert "1 из 1 задачи потребовали повторных запусков" in text
     message = reports_in_chat(env)[0]
-    assert message["meta"]["outcome"] == "no_changes" and message["content"] == text
+    assert message["meta"]["outcome"] == "success" and message["content"] == text
+
+
+def test_a_verification_task_accepted_without_a_change_is_not_called_a_change(env):
+    """A task whose kind does not change the code (verification / research) is
+    accepted without the branch moving - and the report says so, instead of
+    claiming a change that never happened."""
+    tasks = [{"task_key": "check", "title": "Проверить эндпоинт", "repository": APP,
+              "kind": "verification_only"}]
+    run_id = start(env, tasks)
+    executor = Conversations()
+    sched = scheduler(env, executor)
+    sched.tick(run_id)
+    executor.finish(executor.of("check")[-1], f"Проверил. Вершина ветки {BASE}, всё цело.")
+    assert sched.run_until_done(run_id).finished
+
+    task = env["lab"].list_tasks(ALICE, env["project"], run_id)[0]
+    assert task["state"] == "completed_no_changes"
+    report = env["reports"].get(ALICE, env["project"], run_id)
+    assert report["outcome"] == "no_changes"
+    text = report["body"]
+    assert "**Статус:** выполнено — задачи этого прогона не меняют код." in text
+    assert "задачи проверки или анализа" in text
+    assert "без изменения кода принято 1" in text
 
 
 def test_a_run_whose_starting_commit_is_not_known_claims_no_change(env):

@@ -88,7 +88,7 @@ def test_a_project_with_an_active_run_cannot_be_deleted(studio):
         {"text": "Исправь найденные ошибки"})[0] == 200
 
     status, body = studio.api.patch(f"/api/v1/projects/{project}", {"deleted": True})
-    assert status == 400 and "active run" in body["error"], body
+    assert status == 409 and "active run" in body["error"], body
 
     # Cancel the run; now it can be deleted.
     run_id = studio.api.get(f"/api/v1/projects/{project}/runs")[1]["runs"][0]["id"]
@@ -178,7 +178,7 @@ def test_a_project_with_an_active_run_cannot_be_deleted_for_good(studio):
     # working agent from being cut off - so the project never reaches the trash
     # and a permanent delete is refused for that same reason (trash first).
     status, body = studio.api.patch(f"/api/v1/projects/{project}", {"deleted": True})
-    assert status == 400 and "active run" in body["error"], body
+    assert status == 409 and "active run" in body["error"], body
     status, body = studio.api("DELETE", f"/api/v1/projects/{project}")
     assert status == 409, body
     # The census still reports the active run.

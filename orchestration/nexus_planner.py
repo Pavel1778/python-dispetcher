@@ -23,6 +23,61 @@ from .providers import ProviderCascade
 
 _TASK_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
+#: What a task is for. The model may say; when it does not, the kind is read
+#: from the task's own words. ``verification_only`` and ``research_audit`` are
+#: the kinds that do not have to move the branch, so an accepted result of one
+#: is ``completed_no_changes`` rather than a claim of a change (migration 0037).
+_TASK_KINDS = ("implementation", "bugfix", "documentation",
+               "verification_only", "research_audit")
+_KIND_ALIASES = {
+    "implementation": "implementation", "feature": "implementation",
+    "bugfix": "bugfix", "bug": "bugfix", "fix": "bugfix",
+    "documentation": "documentation", "docs": "documentation", "doc": "documentation",
+    "verification_only": "verification_only", "verification": "verification_only",
+    "verify": "verification_only", "test": "verification_only",
+    "research_audit": "research_audit", "research": "research_audit",
+    "audit": "research_audit", "analysis": "research_audit", "investigate": "research_audit",
+}
+#: Words that mark a task which does not itself change the code. The chat and
+#: the plans are Russian, so both languages are read.
+_NO_CHANGE_WORDS = re.compile(
+    r"\b(verify|verification|research|audit|analys|analyz|investigat|review|inspect|"
+    r"assess|evaluate|check|document the findings|report on)\b"
+    r"|(изучи|изучен|прочита|прочти|исследу|анализ|аудит|ревиз|обзор|оцени|провер|"
+    r"убед|удостовер)",
+    re.IGNORECASE)
+#: Words that mark a task whose point is to *change* the code. A task that says
+#: "проверь и исправь" is a change task: the verb to change wins over the verb
+#: to check, so a real change is never accepted without moving the branch.
+_CHANGE_WORDS = re.compile(
+    r"\b(implement|add|create|change|update|fix|refactor|write|build|remove|"
+    r"delete|migrate|rename|bump|wire)\b"
+    r"|(исправ|добав|реализ|измени|внедр|напиши|созда|обнови|почини|удали|"
+    r"переимену|перенес|сделай|сделать|внеси|внести|реализуй|дополни)",
+    re.IGNORECASE)
+
+
+def task_kind(task: dict[str, Any]) -> str:
+    """The kind of one planned task: what the model said, else read from its
+    words. An unknown value falls back to the words, then to implementation."""
+    declared = task.get("kind")
+    if isinstance(declared, str):
+        resolved = _KIND_ALIASES.get(declared.strip().lower())
+        if resolved:
+            return resolved
+    text = " ".join(str(task.get(f) or "") for f in ("title", "description"))
+    if _CHANGE_WORDS.search(text):
+        # The task is about changing something; a "check" beside it is part of
+        # the change ("проверь и исправь"), not the whole task.
+        return "implementation"
+    match = _NO_CHANGE_WORDS.search(text)
+    if match:
+        low = match.group(0).lower()
+        if low.startswith(("verify", "verification", "провер", "убед", "удостовер")):
+            return "verification_only"
+        return "research_audit"
+    return "implementation"
+
 
 def validate_tasks(payload: Any, *, max_tasks: int = 50,
                    keep: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -65,6 +120,10 @@ def validate_tasks(payload: Any, *, max_tasks: int = 50,
             if isinstance(task.get("description"), str) else "",
             "acceptance": [a[:1000] for a in acceptance][:20],
             "dependencies": deps[:20],
+            # What the task is for: from the model, else read from its words.
+            # The kind decides whether an accepted result has to have moved the
+            # branch (migration 0037).
+            "kind": task_kind({**task, "title": title, "acceptance": acceptance}),
             **{name: task[name] for name in keep if name in task},
         })
     # Cycle + unknown-dependency check.
@@ -93,8 +152,12 @@ def validate_tasks(payload: Any, *, max_tasks: int = 50,
 PLANNER_SYSTEM = (
     "You are a planning component. Return ONLY a JSON object of the form "
     '{"tasks": [{"id": "t1", "title": "...", "description": "...", '
-    '"acceptance": ["..."], "dependencies": ["t1"]}]}. '
+    '"acceptance": ["..."], "dependencies": ["t1"], "kind": "implementation"}]}. '
     "Use short stable ids. Dependencies must reference ids in the same plan. "
+    '"kind" is one of implementation, bugfix, documentation, verification_only, '
+    "research_audit: use verification_only or research_audit for a task that "
+    "inspects, verifies or analyses without changing the code, and the others "
+    "for a task that must change it. "
     "Do not include any prose outside the JSON."
 )
 
@@ -156,5 +219,6 @@ def store_plan(lab_store: Any, principal: str, project_id: str, run_id: str, *,
             task_key=task["id"], title=task["title"], description=task["description"],
             acceptance=task["acceptance"], dependencies=task["dependencies"],
             repository=repository, branch=branch, executor=executor,
-            timeout_seconds=timeout_seconds, max_attempts=max_attempts))
+            timeout_seconds=timeout_seconds, max_attempts=max_attempts,
+            kind=task.get("kind") or task_kind(task)))
     return stored

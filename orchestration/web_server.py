@@ -127,7 +127,13 @@ from .nexus_workflow import (
 )
 from .nexus_files import FileService, MAX_FILE_SIZE
 from .voice import VoiceNoteService
-from .nexus_projects import IdempotencyConflict, ProjectService, principal_for_session
+from .nexus_conversations import ConversationInUse
+from .nexus_projects import (
+    IdempotencyConflict,
+    ProjectInUse,
+    ProjectService,
+    principal_for_session,
+)
 from .nexus_planning import PlanService
 from .nexus_policy import install_log_redaction, policy_report
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
@@ -155,7 +161,7 @@ from .web_auth import (
     parse_cookie,
     session_cookie_header,
 )
-from . import web_ui
+from . import tracing, web_ui
 from .workflow_verifier import WorkflowVerifier
 
 log = logging.getLogger("web_server")
@@ -1454,6 +1460,46 @@ class App:
                 for r in self.providers.probe_all()]
         return out
 
+    def observability(self) -> dict[str, Any]:
+        """What the execution path is doing now, and how slow each stage is.
+
+        Booleans, counts and durations only; never a secret and never a
+        project's content. Everything that can fail is answered as an error
+        field, so the endpoint never 500s (it is read during an outage).
+        """
+        out: dict[str, Any] = {}
+        try:
+            out["queue"] = self.lab.queue_snapshot()
+        except Exception as e:  # noqa: BLE001 - diagnostics must not raise
+            out["queue"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            out["stuck_tasks"] = self.lab.stuck_tasks()
+        except Exception as e:  # noqa: BLE001
+            out["stuck_tasks"] = [{"error": f"{type(e).__name__}: {e}"}]
+        try:
+            workers = self.lab.live_workers(max_age_seconds=120)
+            out["workers"] = {
+                "live": [{"worker_id": w["worker_id"], "kind": w["kind"],
+                          "age_seconds": w["age_seconds"], "last_error": w["last_error"]}
+                         for w in workers],
+                "count": len(workers),
+            }
+        except Exception as e:  # noqa: BLE001
+            out["workers"] = {"error": f"{type(e).__name__}: {e}"}
+        last = self.last_lab_tick or {}
+        out["last_tick"] = {"at": last.get("at"), "advanced": last.get("advanced"),
+                            "errors": last.get("errors")}
+        # Per-stage latency from the tracer: queue wait is dispatch latency;
+        # poll is how long a look at OpenHands took; verify is the GitHub read.
+        out["latency"] = tracing.tracer.summary()
+        # Connectivity, by presence and a bounded error, never a value.
+        try:
+            out["openhands_reachable"] = bool(self.client.health())
+        except Exception as e:  # noqa: BLE001
+            out["openhands_reachable"] = False
+            out["openhands_error"] = type(e).__name__
+        return out
+
     def system_info(self) -> dict[str, Any]:
         """Safe diagnostics: presence of settings, never their values."""
         store_ok, store_err = True, None
@@ -1863,6 +1909,76 @@ class Handler(BaseHTTPRequestHandler):
         if not UUID_RE.fullmatch(parts[3]):
             return None
         return parts[3], parts[4:]
+
+    @staticmethod
+    def _project_lifecycle(path: str) -> tuple[str, str] | None:
+        """Parse ``/api/v1/projects/<uuid>/<action>`` for a lifecycle action.
+
+        Returns ``(project_id, action)`` or ``None``. The actions are
+        ``archive``/``restore``/``delete``/``purge``/``stats`` (project) and
+        ``conversations/<uuid>/{delete|restore|purge|stats}`` (conversation).
+        """
+        parts = path.strip("/").split("/")
+        if len(parts) < 5 or parts[:3] != ["api", "v1", "projects"]:
+            return None
+        if not UUID_RE.fullmatch(parts[3]):
+            return None
+        rest = parts[4:]
+        if len(rest) == 1 and rest[0] in ("archive", "restore", "delete", "purge",
+                                          "unarchive", "stats"):
+            return parts[3], rest[0]
+        if (len(rest) == 3 and rest[0] == "conversations" and UUID_RE.fullmatch(rest[1])
+                and rest[2] in ("delete", "restore", "purge", "stats")):
+            return parts[3], f"conversation:{rest[1]}:{rest[2]}"
+        return None
+
+    def _project_lifecycle_get(self, principal: str, project_id: str, action: str):
+        """The read half of a lifecycle route: ``stats`` only."""
+        if action == "stats":
+            return self._json(200, self.app.projects.stats(principal, project_id))
+        if action.startswith("conversation:"):
+            _, conv_id, verb = action.split(":", 2)
+            if verb == "stats":
+                return self._json(200, self.app.conversations.stats(
+                    principal, project_id, conv_id))
+        return self._json(404, {"error": "not found"})
+
+    def _project_lifecycle_post(self, principal: str, project_id: str, action: str,
+                                body: dict):
+        """A project or conversation lifecycle action. Writes only."""
+        projects = self.app.projects
+        conversations = self.app.conversations
+        if action.startswith("conversation:"):
+            _, conv_id, verb = action.split(":", 2)
+            if verb == "delete":
+                return self._json(200, {"conversation": conversations.delete(
+                    principal, project_id, conv_id)})
+            if verb == "restore":
+                return self._json(200, {"conversation": conversations.restore(
+                    principal, project_id, conv_id)})
+            if verb == "purge":
+                if body.get("confirm") is not True:
+                    return self._json(400, {"error": "confirm must be true to purge"})
+                return self._json(200, conversations.purge(
+                    principal, project_id, conv_id, confirm=True))
+            if verb == "stats":
+                return self._json(200, conversations.stats(principal, project_id, conv_id))
+            return self._json(404, {"error": "not found"})
+        if action == "archive":
+            return self._json(200, {"project": projects.archive(principal, project_id, True)})
+        if action == "unarchive":
+            return self._json(200, {"project": projects.archive(principal, project_id, False)})
+        if action == "restore":
+            return self._json(200, {"project": projects.restore(principal, project_id)})
+        if action == "delete":
+            return self._json(200, {"project": projects.delete(principal, project_id)})
+        if action == "purge":
+            if body.get("confirm") is not True:
+                return self._json(400, {"error": "confirm must be true to purge"})
+            return self._json(200, projects.purge(principal, project_id, confirm=True))
+        if action == "stats":
+            return self._json(200, projects.stats(principal, project_id))
+        return self._json(404, {"error": "not found"})
 
     def _get_project_resource(self, path: str, project_id: str, principal: str):
         """Dispatch the deeper project GET routes, or ``None`` if unmatched.
@@ -4020,6 +4136,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
                 return self._json(200, self.app.system_info())
+            if path == "/api/observability":
+                # Queue depth, stuck tasks, worker heartbeat, per-stage latency.
+                # Booleans, counts and durations only; never a secret.
+                return self._json(200, self.app.observability())
             if path == "/api/security/policy":
                 # The NEXUS permission policy: roles and their scopes, the scope
                 # every MCP tool needs, and the SSRF/redaction configuration.
@@ -4287,6 +4407,9 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/v1/projects":
                     project = self.app.projects.create(principal, body.get("name"), body.get("description", ""))
                     return self._json(201, {"project": project})
+                lifecycle = self._project_lifecycle(path)
+                if lifecycle is not None:
+                    return self._project_lifecycle_post(principal, *lifecycle, body)
                 verify = self._project_evidence_verify(path)
                 if verify is not None:
                     project_id, evidence_id = verify
@@ -4441,6 +4564,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(409, {"error": str(e)})
         except IdempotencyConflict as e:
             return self._json(409, {"error": str(e)})
+        except (ProjectInUse, ConversationInUse) as e:
+            # The project or conversation still has an active run. A conflict,
+            # not a bad request: stopping the run makes it possible.
+            return self._json(409, {"error": str(e)})
         except VisibilityError as e:
             return self._json(400, {"error": str(e)})
         except GitHubAuthError as e:
@@ -4560,6 +4687,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except (ProjectInUse, ConversationInUse) as e:
+            return self._json(409, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except StoreUnavailable:
@@ -4596,7 +4725,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(body, dict):
                         return self._json(400, {"error": "body must be a JSON object"})
                     principal = self._project_principal()
-                    conversation = self.app.conversations.get(principal, project_id, rest[1])
+                    # ``include_deleted`` so a trashed conversation can be
+                    # patched - notably to restore it (``deleted: false``).
+                    conversation = self.app.conversations.get(
+                        principal, project_id, rest[1], include_deleted=True)
                     if "title" in body:
                         conversation = self.app.conversations.rename(
                             principal, project_id, rest[1], body["title"])
@@ -4604,8 +4736,9 @@ class Handler(BaseHTTPRequestHandler):
                         conversation = self.app.conversations.set_mode(
                             principal, project_id, rest[1], body["mode"])
                     if "archived" in body:
-                        # DELETE archives; this is the way back. Without it an
-                        # archived conversation could never be restored.
+                        # This is the way back from the archive (the trash uses
+                        # ``deleted`` below). Without it an archived
+                        # conversation could never be restored.
                         if not isinstance(body["archived"], bool):
                             return self._json(400, {"error": "archived must be a boolean"})
                         conversation = self.app.conversations.set_archived(
@@ -4656,6 +4789,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})
+        except (ProjectInUse, ConversationInUse) as e:
+            # The project or conversation still has an active run. A conflict,
+            # not a bad request: stopping the run makes it possible.
+            return self._json(409, {"error": str(e)})
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         except StoreUnavailable:

@@ -68,13 +68,35 @@ from .nexus_projects import ProjectService
 
 log = logging.getLogger("nexus_lab_store")
 
-#: Task states that count as "done well enough to unblock a child".
-VERIFIED_STATES = frozenset({"completed_verified"})
+#: Task states that count as "done well enough to unblock a child". A task that
+#: legitimately produced no change (``completed_no_changes``) is accepted too:
+#: it did what its kind asked. Only these two unblock dependents.
+VERIFIED_STATES = frozenset({"completed_verified", "completed_no_changes"})
 
 #: Task states that are terminal (no further work without a new attempt).
 TERMINAL_TASK_STATES = frozenset({
-    "completed_verified", "completed_unverified", "partial", "failed", "blocked",
+    "completed_verified", "completed_no_changes", "completed_unverified",
+    "partial", "failed", "blocked",
 })
+
+#: Task states a person's "resume" may send back to the queue.
+_RETRYABLE_TASK_STATES = ("completed_unverified", "partial", "failed", "blocked")
+
+#: What a task is *for*. A task whose kind is one of the first three is expected
+#: to move its branch: an accepted result must show a new commit. The last two
+#: are not - a verification or a research task may legitimately change nothing,
+#: and its accepted outcome is ``completed_no_changes`` rather than a claim of a
+#: change that never happened (see migration 0037).
+CHANGE_TASK_KINDS = frozenset({"implementation", "bugfix", "documentation"})
+NO_CHANGE_TASK_KINDS = frozenset({"verification_only", "research_audit"})
+TASK_KINDS = CHANGE_TASK_KINDS | NO_CHANGE_TASK_KINDS
+
+
+def expects_change(kind: str | None) -> bool:
+    """Whether a task of this kind is expected to move its branch. An unknown
+    or absent kind is treated as change-requiring, the safe default."""
+    return (kind or "implementation") not in NO_CHANGE_TASK_KINDS
+
 
 #: Run states that are still active (the loop should keep servicing them).
 ACTIVE_RUN_STATES = frozenset({"running", "paused", "waiting_for_approval", "blocked"})
@@ -182,10 +204,7 @@ _DEPS_VERIFIED = (
     "  WHERE NOT EXISTS ("
     "    SELECT 1 FROM nexus_run_tasks dep "
     "    WHERE dep.run_id = t.run_id AND dep.task_key = d.dep "
-    "      AND dep.state = 'completed_verified')) ")
-
-#: Task states a person's "resume" may send back to the queue.
-_RETRYABLE_TASK_STATES = ("completed_unverified", "partial", "failed", "blocked")
+    "      AND dep.state = ANY(ARRAY['completed_verified','completed_no_changes']))) ")
 
 #: How long one task's conversation may run before the task is given up, in
 #: seconds, unless ``NEXUS_TASK_TIMEOUT_SECONDS`` says otherwise. It was thirty
@@ -335,7 +354,8 @@ class LabStore:
                     repository=named if elsewhere else repository,
                     branch=(repositories or {})[named] if elsewhere else branch,
                     max_attempts=max_attempts_per_task, position=position,
-                    spec_ref=task.get("spec_ref"))
+                    spec_ref=task.get("spec_ref"),
+                    kind=task.get("kind") or "implementation")
             ProjectService._event(cur, project_id, principal, "run.started", run["id"])
             self._notify(cur, project_id, "goal_started", "Цель запущена", run["id"])
             if also is not None:
@@ -750,7 +770,8 @@ class LabStore:
                  acceptance: list[str] | None = None, dependencies: list[str] | None = None,
                  repository: str = "", branch: str = "",
                  timeout_seconds: int | None = None,
-                 max_attempts: int = 3, executor: str = "openhands") -> dict:
+                 max_attempts: int = 3, executor: str = "openhands",
+                 kind: str = "implementation") -> dict:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)
             cur.execute("SELECT id FROM nexus_runs WHERE id=%s AND project_id=%s",
@@ -761,14 +782,17 @@ class LabStore:
                 cur, run_id, project_id, task_key=task_key, title=title,
                 description=description, acceptance=acceptance or [],
                 dependencies=dependencies or [], repository=repository, branch=branch,
-                timeout_seconds=timeout_seconds, max_attempts=max_attempts, executor=executor)
+                timeout_seconds=timeout_seconds, max_attempts=max_attempts, executor=executor,
+                kind=kind)
 
     def _insert_task(self, cur: Any, run_id: Any, project_id: str, *, task_key: str,
                      title: str, description: str = "", acceptance: list[str],
                      dependencies: list[str], repository: str = "", branch: str = "",
                      timeout_seconds: int | None = None, max_attempts: int = 3,
                      executor: str = "openhands", position: int = 0,
-                     spec_ref: dict | None = None) -> dict:
+                     spec_ref: dict | None = None, kind: str = "implementation") -> dict:
+        if kind not in TASK_KINDS:
+            raise ValueError("invalid task kind")
         if timeout_seconds is None:
             timeout_seconds = task_timeout_seconds()
         # Tasks are listed and claimed in ``created_at`` order, and ``now()`` is
@@ -781,12 +805,12 @@ class LabStore:
         cur.execute(
             "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title, description, "
             "acceptance, dependencies, repository, branch, timeout_seconds, max_attempts, "
-            "executor, spec_ref, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
+            "executor, spec_ref, kind, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
             "        now() + %s * interval '1 microsecond') RETURNING *",
             (run_id, project_id, task_key, title, description, _jsonb(acceptance),
              _jsonb(dependencies), repository, branch, timeout_seconds,
-             max_attempts, executor, _jsonb(spec_ref) if spec_ref else None, position))
+             max_attempts, executor, _jsonb(spec_ref) if spec_ref else None, kind, position))
         return self._task_row(cur.fetchone())
 
     def tasks_internal(self, run_id: str) -> list[dict]:
@@ -862,6 +886,11 @@ class LabStore:
         # worker still has to stop for real; while the list is non-empty the
         # task's branch is held so no second writer starts there.
         out["abandoned"] = _loads(out.get("abandoned")) or []
+        # What the task is for, and whether that expects the branch to move. A
+        # row written before migration 0037 has no kind; it is read as an
+        # implementation task (change-requiring), the safe default.
+        out["kind"] = out.get("kind") or "implementation"
+        out["expects_change"] = expects_change(out["kind"])
         return out
 
     @staticmethod
@@ -1161,8 +1190,8 @@ class LabStore:
                             lease_token: int | None = None) -> dict:
         """Set the terminal task state from a verifier verdict.
 
-        ``verdict`` is one of the five task outcomes. Only
-        ``completed_verified`` unblocks children.
+        ``verdict`` is one of the terminal task outcomes. Only
+        ``completed_verified`` and ``completed_no_changes`` unblock children.
 
         The verdict is recorded only while the task is still in flight. A task
         that was settled in the meantime (its run was cancelled while the
@@ -1174,8 +1203,8 @@ class LabStore:
         expired cannot settle a task that has since been taken up by another
         worker (or requeued for a new attempt).
         """
-        if verdict not in ("completed_verified", "completed_unverified",
-                           "partial", "failed", "blocked"):
+        if verdict not in ("completed_verified", "completed_no_changes",
+                           "completed_unverified", "partial", "failed", "blocked"):
             raise ValueError("invalid verdict")
         fence = "AND lease_token=%s" if lease_token is not None else ""
         params: list[Any] = [verdict, _jsonb(detail or {}), _jsonb([evidence])]
@@ -1359,9 +1388,9 @@ class LabStore:
                 "conversation_id=NULL, lease_expires=NULL, "
                 "lease_owner=NULL, lease_token=lease_token+1, "
                 "verification = jsonb_build_object('verdict', 'reopened', 'reason', %s::text), "
-                "updated_at=now() WHERE id=%s AND state='completed_verified' RETURNING *",
+                "updated_at=now() WHERE id=%s AND state = ANY(%s) RETURNING *",
                 (float(seconds), float(seconds), float(seconds), reason[:1000], reason[:2000],
-                 reason[:1000], reason[:1000], task_id))
+                 reason[:1000], reason[:1000], task_id, list(VERIFIED_STATES)))
             row = cur.fetchone()
             if row is None:
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
@@ -1900,7 +1929,7 @@ class LabStore:
     def all_verified(self, run_id: str) -> bool:
         with self.store._tx() as cur:
             cur.execute("SELECT count(*) AS n FROM nexus_run_tasks WHERE run_id=%s "
-                        "AND state <> 'completed_verified'", (run_id,))
+                        "AND state <> ALL(%s)", (run_id, list(VERIFIED_STATES)))
             return cur.fetchone()["n"] == 0
 
     def has_pending(self, run_id: str) -> bool:
@@ -1947,6 +1976,74 @@ class LabStore:
                 "  JOIN nexus_run_tasks dep ON dep.run_id = t.run_id AND dep.task_key = d.dep "
                 "  WHERE dep.state = ANY(%s))", (run_id, list(_RETRYABLE_TASK_STATES)))
             return cur.fetchone()["n"] > 0
+
+    def queue_snapshot(self) -> dict[str, Any]:
+        """What the lab queue holds right now, across every project.
+
+        Counts only; no project or task content. ``stuck`` is a task that is
+        ``pending`` or ``waiting`` with no live lease and no wait left - it is
+        claimable in principle, so if it stays that way it means nobody is
+        claiming it (the symptom "running + pending" the request names). The
+        oldest such task's age is what tells a slow worker from a dead one.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT state, count(*) AS n FROM nexus_run_tasks GROUP BY state")
+            by_state = {r["state"]: int(r["n"]) for r in cur.fetchall()}
+            cur.execute(
+                "SELECT count(*) AS n, "
+                "  COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)::int AS oldest "
+                "FROM nexus_run_tasks "
+                "WHERE state IN ('pending','waiting') "
+                "  AND (lease_expires IS NULL OR lease_expires < now()) "
+                "  AND (retry_at IS NULL OR retry_at <= now())")
+            row = cur.fetchone()
+            claimable, oldest = int(row["n"]), int(row["oldest"] or 0)
+            cur.execute(
+                "SELECT count(*) AS n FROM nexus_runs WHERE state = ANY(%s)",
+                (list(ACTIVE_RUN_STATES),))
+            active_runs = int(cur.fetchone()["n"])
+        return {
+            "tasks_by_state": by_state,
+            "pending": by_state.get("pending", 0) + by_state.get("waiting", 0),
+            "running": sum(by_state.get(s, 0) for s in IN_FLIGHT_TASK_STATES),
+            "failed": by_state.get("failed", 0) + by_state.get("blocked", 0),
+            "retrying": by_state.get("waiting", 0),
+            "claimable_now": claimable,
+            "oldest_claimable_seconds": oldest,
+            "active_runs": active_runs,
+        }
+
+    def stuck_tasks(self, *, min_age_seconds: int = 300, limit: int = 20) -> list[dict]:
+        """Claimable tasks that have waited longer than *min_age_seconds*.
+
+        A task that is due (no live lease, its wait is over) and still not
+        claimed after this long is the "running run, pending task, attempt 0"
+        state the request names. Each entry says why it is not moving: the run's
+        state, the task's reason, and how long it has waited. No secrets - the
+        ids and the reason only.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT t.id, t.run_id, t.project_id, t.task_key, t.state, t.attempt, "
+                "  t.max_attempts, t.wait_reason, t.last_error, t.created_at, "
+                "  EXTRACT(EPOCH FROM (now() - t.created_at))::int AS age_seconds, "
+                "  r.state AS run_state "
+                "FROM nexus_run_tasks t JOIN nexus_runs r ON r.id = t.run_id "
+                "WHERE t.state IN ('pending','waiting') "
+                "  AND (t.lease_expires IS NULL OR t.lease_expires < now()) "
+                "  AND (t.retry_at IS NULL OR t.retry_at <= now()) "
+                "  AND t.created_at < now() - (%s || ' seconds')::interval "
+                "  AND r.state = ANY(%s) "
+                "ORDER BY t.created_at LIMIT %s",
+                (max(0, int(min_age_seconds)), list(ACTIVE_RUN_STATES), max(1, int(limit))))
+            return [{
+                "task_id": str(r["id"]), "run_id": str(r["run_id"]),
+                "project_id": str(r["project_id"]), "task_key": r["task_key"],
+                "state": r["state"], "run_state": r["run_state"],
+                "attempt": int(r["attempt"]), "max_attempts": int(r["max_attempts"]),
+                "age_seconds": int(r["age_seconds"] or 0),
+                "reason": (r["wait_reason"] or r["last_error"] or "")[:300],
+            } for r in cur.fetchall()]
 
     def next_wake(self, run_id: str) -> dict | None:
         """What a run that has nothing in flight is waiting for: the earliest

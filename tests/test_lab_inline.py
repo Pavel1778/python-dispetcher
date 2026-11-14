@@ -29,6 +29,12 @@ from tests.test_studio_api import (  # noqa: E402
 pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run lab tests")
 
 HEAD = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+#: The commit the branch is at before any task runs: what "the branch moved" is
+#: measured against. An agent that pushes nothing names this and is not accepted
+#: (a change-requiring task whose branch did not move is reworked).
+BASE = "0123456789abcdef0123456789abcdef01234567"
+#: A second commit, for a run whose two tasks each move the branch.
+HEAD2 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 PLAN = {"tasks": [
     {"id": "audit", "title": "Изучить код", "description": "Прочитать модуль.",
      "acceptance": ["сводка"], "dependencies": []},
@@ -49,13 +55,18 @@ def _until(read, *, timeout=20.0, what="the condition"):
 
 
 def _start_run(studio, *, account=False):
-    """Connect the repository and send one autonomous message. Returns ids."""
+    """Connect the repository and send one autonomous message. Returns ids.
+
+    The branch starts at ``BASE`` so that a task which pushes a new commit is
+    accepted and one that pushes nothing is reworked (a change-requiring task
+    must move the branch to verify).
+    """
     project = studio.project()
     body = {"full_name": REPO}
     if account:
         body["account_id"] = studio.account()
     assert studio.api.post(f"/api/v1/projects/{project}/repository", body)[0] == 200
-    studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+    studio.github.commits = [{"sha": BASE, "commit": {"message": "start"}}]
     conversation = studio.conversation(project, mode="autonomous")
     studio.answers(json.dumps(PLAN))
     status, reply = studio.api.post(
@@ -80,8 +91,29 @@ def _task_conversation(studio, key):
 
 
 def _finish(studio, cid, text):
+    """The agent ends its conversation, and the commit its report names is the
+    head of the branch.
+
+    A task verifies only when the branch actually moved (``GitVerifier``), so a
+    test that has the agent name a commit must also have it pushed - exactly as
+    a real agent does. The commit is taken from the report text and pushed only
+    when it is not already the head, so a caller that pushed it first is not
+    double-counted.
+    """
+    import re
+
+    match = re.search(r"\b[0-9a-f]{7,40}\b", text or "")
+    if match:
+        commit = match.group(0)
+        if studio.github.head(REPO) != commit:
+            studio.github.push(REPO, commit, "work")
     studio.cloud.cloud.add_assistant_message(cid, text)
     studio.cloud.cloud.conversations[cid]["execution_status"] = "finished"
+
+
+def _push(studio, commit, *, message="work"):
+    """What an agent's ``git push`` leaves: a new head of the branch."""
+    studio.github.push(REPO, commit, message)
 
 
 def _starts(studio):
@@ -109,11 +141,14 @@ def test_the_server_alone_takes_a_run_from_the_chat_to_completed(monkeypatch):
         assert _task_conversation(studio, "change") is None, "a task ran before its dependency"
         assert len(_starts(studio)) == 1
 
-        # The agent finishes and names the commit; only then does the next start.
+        # The agent finishes, pushes, and names the new commit; only then does
+        # the next start (the branch must have moved for the task to verify).
+        _push(studio, HEAD)
         _finish(studio, first, f"Готово. Коммит {HEAD[:10]}, тесты прошли.")
         second = _until(lambda: _task_conversation(studio, "change"),
                         what="the second task to start")
-        _finish(studio, second, f"Готово. Коммит {HEAD}.")
+        _push(studio, HEAD2)
+        _finish(studio, second, f"Готово. Коммит {HEAD2}.")
 
         done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
             _detail(studio, project, run)), what="the run to finish")
@@ -175,10 +210,12 @@ def test_a_report_that_names_no_commit_is_put_right_and_the_run_goes_on(monkeypa
         assert len(_starts(studio)) == 1, "no second conversation: the first still has the work"
         assert detail["report"] is None
 
+        _push(studio, HEAD)
         _finish(studio, first, f"Отправил. Коммит {HEAD}")
         second = _until(lambda: _task_conversation(studio, "change"),
                         what="the second task to start")
-        _finish(studio, second, f"Коммит {HEAD}. Тесты: 14 passed.")
+        _push(studio, HEAD2)
+        _finish(studio, second, f"Коммит {HEAD2}. Тесты: 14 passed.")
         done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
             _detail(studio, project, run)), what="the run to finish")
         assert done["run"]["state"] == "completed"
@@ -210,7 +247,7 @@ def test_a_run_given_a_budget_stops_when_it_is_spent_and_resume_tries_again(monk
         project = studio.project()
         assert studio.api.post(f"/api/v1/projects/{project}/repository",
                                {"full_name": REPO})[0] == 200
-        studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+        studio.github.commits = [{"sha": BASE, "commit": {"message": "start"}}]
         studio.answers(json.dumps(PLAN))
         status, goal = studio.api.post(f"/api/v1/projects/{project}/goals",
                                        {"text": "Цель: покрыть модуль тестами"})
@@ -241,10 +278,12 @@ def test_a_run_given_a_budget_stops_when_it_is_spent_and_resume_tries_again(monk
             (cid for cid, c in list(studio.cloud.cloud.conversations.items())
              if (c.get("tags") or {}).get("nexustask") == "audit" and cid != first), None),
             what="the retry to start")
+        _push(studio, HEAD)
         _finish(studio, again, f"Коммит {HEAD}")
         second = _until(lambda: _task_conversation(studio, "change"),
                         what="the second task to start")
-        _finish(studio, second, f"Коммит {HEAD}")
+        _push(studio, HEAD2)
+        _finish(studio, second, f"Коммит {HEAD2}")
         done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
             _detail(studio, project, run)), what="the run to finish")
         assert done["run"]["state"] == "completed"
@@ -333,10 +372,12 @@ def test_left_alone_the_server_advances_runs_itself(monkeypatch):
         project, run = _start_run(studio)
         first = _until(lambda: _task_conversation(studio, "audit"),
                        what="the first task to start with nothing configured")
+        _push(studio, HEAD)
         _finish(studio, first, f"Коммит {HEAD}")
         second = _until(lambda: _task_conversation(studio, "change"),
                         what="the second task to start")
-        _finish(studio, second, f"Коммит {HEAD}")
+        _push(studio, HEAD2)
+        _finish(studio, second, f"Коммит {HEAD2}")
         done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
             _detail(studio, project, run)), what="the run to finish")
         assert done["run"]["state"] == "completed"
@@ -416,6 +457,7 @@ def test_an_answer_given_through_the_finish_tool_is_the_report(monkeypatch):
         project, run = _start_run(studio)
         first = _until(lambda: _task_conversation(studio, "audit"), what="the first task to start")
         cloud = studio.cloud.cloud
+        _push(studio, HEAD)
         cloud.add_assistant_message(first, "Смотрю репозиторий.")     # earlier, not the report
         cloud.add_finish(first, f"Готово. Коммит {HEAD}.")
         cloud.conversations[first]["execution_status"] = "finished"
@@ -425,4 +467,5 @@ def test_an_answer_given_through_the_finish_tool_is_the_report(monkeypatch):
         assert (tasks["audit"]["state"], tasks["audit"]["attempt"]) == ("completed_verified", 1)
         assert tasks["audit"]["evidence"][-1]["final_text"] == f"Готово. Коммит {HEAD}."
         assert len(_starts(studio)) == 2, "the first task was started again"
-        _finish(studio, second, f"Коммит {HEAD}")
+        _push(studio, HEAD2)
+        _finish(studio, second, f"Коммит {HEAD2}")
