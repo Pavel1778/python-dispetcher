@@ -114,3 +114,22 @@ The terminal-outputs list path is NOT yet benchmarked.
 - No raw terminal-output recovery (impossible on this agent-server version).
 - No live-cloud verification this session.
 - No performance win; no "production-ready" stamp beyond the evidence above.
+
+## Static mobile/Android pass (2026-11-15, static only — NOT a render)
+
+Playwright is installed but its Chromium build is absent and the browser
+download call failed (`--only-shell`, sandbox network), so **no page was
+rendered**. Static review only:
+
+- `index.html` / `login.html`: `<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">` ✓
+- Outputs panel renders through the shared dialog; the output view is
+  `.log-view` — `overflow: auto`, `max-height: min(62vh, 560px)`, `white-space:
+  pre`, `-webkit-overflow-scrolling: touch`; at `max-width: 700px` it drops to
+  `56vh`/11px and `.output-actions .btn` wraps full-width. No horizontal
+  page overflow is expected from this rule set.
+- Copy-fallback (`textarea.copy-area`) and download are native controls;
+  no canvas/iframe tricks.
+- 7 `@media` blocks cover hover/pointer/motion/1180/860/700/420 px.
+
+Verdict: statically plausible at Android widths; **NOT verified in a real
+browser or device.** Needs CI with Playwright or a phone to close.
