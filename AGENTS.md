@@ -2680,3 +2680,57 @@ facts a future change must keep (all measured live on v1.60.1):
   retrieval, below/at/above the cap, a missing artifact, a non-matching preview,
   a traversal-shaped archive name, the app transport's honest refusal, and the
   two routes over real HTTP), plus the route-auth entries.
+
+## Phase 3 + Phase 4 consolidation (2026-11-15, this session)
+
+The Phase 3 performance work and the Phase 4 work were merged onto `main` and
+reconciled. What a future change has to know:
+
+- **Two Phase 4 terminal-output implementations coexist, on different routes.**
+  `main` (PR #42) added `orchestration/terminal_output.py` with run-level routes
+  `GET …/runs/{run}/terminal-outputs[/{cid}/{event_id}[/download]]` (it rebuilds
+  the SDK's `terminal_output_<sha8>.txt` name from the event and reads it with
+  `download_file`). The Phase 4 work added `orchestration/nexus_outputs.py` with
+  task-level routes `GET …/runs/{run}/tasks/{task}/outputs[/{event_id}]` (it
+  matches the event's preview prefix inside the conversation's trajectory ZIP).
+  Both are honest and both are tested; they were **kept**, not collapsed. The
+  task-level design is the one with end-to-end tests (`tests/test_artifacts.py`)
+  and the one the studio, CLI (`nexus run outputs|output`) and MCP
+  (`list_run_task_outputs`/`get_run_task_output`) drive.
+- **The run-level routes were missing from `tests/test_route_auth.py`.** They are
+  behind the same auth as every other `/api/v1/projects/` route (`do_GET` calls
+  `_require_read` first), but the allowlist did not name them; it does now.
+- **The `i-terminal` icon symbol was declared twice** in `studio/index.html`
+  (once by each Phase 4); the duplicate was removed - a duplicate id is invalid
+  HTML and `test_element_ids_are_unique_in_the_page` fails on it.
+- **Two test-database isolation mechanisms compose.** `conftest._isolate_database`
+  copies a local disposable database to `<base>_p<suffix>`; `tests/_test_db.py`
+  (main) creates `nexus_test_<token>` or serialises. `_isolate_database` runs
+  first; `_test_db.setup` defers when `NEXUS_TEST_BASE_DB_URL` is set (the copy
+  was made) and both honour `NEXUS_TEST_ISOLATE_DB` as the shared escape hatch.
+  Without the defer, a process created a database twice.
+- **The cluster-global advisory lock in `test_schema_bootstrap.py` was a no-op.**
+  `pg_advisory_lock` is keyed by *database oid*, and per-process isolation puts
+  each pytest on its own database, so the same constant taken on two databases
+  does not collide. Two processes raced `CREATE ROLE "anon"` and one failed with
+  `UniqueViolation` on `pg_authid_rolname_index`. The lock is now taken on the
+  shared `postgres` maintenance database (`_maintenance_dsn`). Reproduce with two
+  `pytest tests/test_schema_bootstrap.py` processes on one base DSN.
+- **`test_a_repository_that_cannot_be_read_is_said_so_under_the_answer` was a
+  pre-existing flake** (reproduced 1/25 on clean `origin/main`). `_connect_repository`
+  left the connect dialog's default-on `POST /context/refresh` in flight; a test
+  that then forces GitHub to 401 raced it and the resulting 400 landed in
+  `watch.problems`. The helper now waits for that response before returning, so
+  the page is quiescent before a test mutates what GitHub answers (0/25 after).
+- **Verified on the frozen candidate `242742c`:** `ruff check .` clean;
+  `node tests/studio_render_test.js` passed; `pytest tests/` (PostgreSQL 17,
+  per-process isolated DB) **1942 passed, 10 skipped, 0 failed**; browser E2E 37
+  passed (0 Chromium skips). Skips are environmental only (4 Android SDK, 3
+  mingw-w64, 1 pooler DSN, 1 live-OpenHands section F, 1 CREATEDB-privilege).
+- **Performance re-measured** with the repo's own instruments on the candidate:
+  `benchmarks/db_concurrency_bench.py` p99 @100 concurrent **551 ms (single
+  connection) → 28 ms (pool)**; `tools/benchmark.py` `static_asset_ms` p50
+  **0.68 ms** (precomputed gzip). Both match the committed reports.
+- **Not implemented, on purpose** (backlog, not defects): run *restart*, run
+  *duplicate*, and aggregated *per-run latency metrics* (raw per-attempt
+  `started_at`/`ended_at` are exposed by `LabStore.run_events`).
