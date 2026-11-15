@@ -79,7 +79,10 @@ def _isolate_database() -> None:
 
 _isolate_database()
 
-from tests import _test_db  # noqa: F401 - the import does the setup
+# Imported *after* ``_isolate_database`` on purpose: the module runs its own
+# per-process isolation at import, and it must see what ``_isolate_database``
+# decided (it defers when a copy was already made) rather than act first.
+from tests import _test_db  # noqa: E402,F401 - the import does the setup
 
 # A server advances autonomous runs itself unless NEXUS_LAB_INLINE says no
 # (``orchestration.web_server.lab_inline_default``). Most tests here start a
