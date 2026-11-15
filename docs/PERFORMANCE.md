@@ -137,3 +137,33 @@ the instrument for any such claim.
 Add one entry to `tools/benchmark.py`'s `results["measurements"]` and it appears
 in both the JSON and the comparison table. Keep the method: a real server, a
 real database, a real round trip — never a simulated one.
+### Re-measured (2026-11-15, this branch, `nexus_bench` database)
+
+`--repeat 10 --projects 3 --conversations 10 --messages 40`, Python 3.11.2,
+local PostgreSQL 16.2 (note: the 2026-11-14 run used Python 3.13.15 on the
+same sandbox, so the two are not a controlled A/B — treat bands, not deltas):
+
+| Path | p50 (ms) | p90 (ms) |
+| --- | ---: | ---: |
+| studio_status | 0.97 | 1.11 |
+| list_projects | 1.24 | 1.38 |
+| open_project | 1.48 | 1.56 |
+| list_conversations | 1.47 | 1.62 |
+| open_conversation | 1.44 | 1.55 |
+| fetch_history (40 msgs) | 2.20 | 6.20 |
+| commands_registry | 1.04 | 1.19 |
+| search_by_content | 1.95 | 2.31 |
+| export_conversation | 2.45 | 2.82 |
+| chat_turn | 18.53 | 20.53 |
+| start_run | 33.40 | 39.09 |
+| store_dashboard_counts | 0.28 | 0.35 |
+| file_upload (4 KiB) | 2.32 | 3.27 |
+| queue_claim | 2.15 | 2.32 |
+
+Same conclusion as before: the read paths are single-digit milliseconds and
+the provider-bound paths are dominated by the (stand-in) provider, not by
+NEXUS. **No regression vs 2026-11-14 is claimed or implied; if one is to be
+shown, it must come from `benchmark_compare.py` on identical Python.** The
+terminal-outputs list path (new in PR #42, up to 25 conversations × 3 event
+pages + probes) is not yet benchmarked — queued as follow-up rather than
+estimated.
