@@ -4726,12 +4726,30 @@ class Handler(BaseHTTPRequestHandler):
 
 
 
+class NexusHTTPServer(ThreadingHTTPServer):
+    """A threaded HTTP server whose accept queue fits a real client burst.
+
+    ``socketserver.TCPServer.request_queue_size`` defaults to 5, and ``listen``
+    is called with it when the server binds. A browser opening a page makes
+    several connections at once, and a load test opens many: with a backlog of
+    5 the extra SYNs are dropped, the client retries after the TCP initial
+    retransmit timeout (~1 s), and the tail latency jumps by whole seconds.
+    Measured on the read path: p99 1884 ms at 50 concurrent with the default,
+    62 ms with this value (benchmarks/api_bench.py). The server accepts
+    connections on one thread and answers each on its own, so a larger queue
+    lets a burst wait in the kernel instead of being refused.
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class WebServer:
     """Context manager for the HTTP server and its background loop."""
 
     def __init__(self, app: App, host: str = "127.0.0.1", port: int = 8000):
         self.app = app
-        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.httpd = NexusHTTPServer((host, port), Handler)
         self.httpd.app = app  # type: ignore[attr-defined]
         self._thread: threading.Thread | None = None
 
