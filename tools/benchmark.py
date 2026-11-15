@@ -101,6 +101,41 @@ def _time(fn, *, repeat: int = 1) -> list[float]:
     return out
 
 
+def _queue_claim_ms(dsn: str, *, repeat: int = 15) -> list[float]:
+    """How long a due lab task waits before a worker claims it (one run's worth).
+
+    Real PostgreSQL and the real ``LabStore``: a durable run is started, a task
+    is added, and the time from "the task is due" to "the claim took it" is
+    measured. This is the queue latency; a task that stays due is the
+    "running + pending" symptom the diagnostics surface.
+    """
+    from orchestration.cloud_store import PostgresStore
+    from orchestration.nexus_lab_store import LabStore
+    from orchestration.nexus_projects import ProjectService
+
+    store = PostgresStore(dsn)
+    try:
+        projects = ProjectService(store)
+        project = str(projects.create("machine:bench", "Bench")["id"])
+        lab = LabStore(store)
+        timings: list[float] = []
+        for i in range(repeat):
+            goal = str(projects.create_goal("machine:bench", project, f"g{i}")[0]["id"])
+            run = lab.start_run("machine:bench", project, goal, policy="durable")
+            lab.add_task("machine:bench", project, run["id"], task_key="t", title="bench",
+                         repository="", branch="")
+            start = time.perf_counter()
+            claimed = lab.claim_task(str(run["id"]), f"bench-{i}")
+            timings.append((time.perf_counter() - start) * 1000.0)
+            if claimed is not None:
+                lab.release_task(claimed["id"], error="bench", requeue=False,
+                                 lease_token=claimed["lease_token"])
+            lab.set_run_state_internal(str(run["id"]), "cancelled")
+        return timings
+    finally:
+        store.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="")
@@ -243,6 +278,12 @@ def main() -> int:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 resp.read()
         m["file_upload_ms"] = _percentiles(_time(upload_and_read, repeat=max(3, args.repeat // 3)))
+
+        # --- the lab queue: how long a due task waits to be claimed, and how
+        #     long the claim itself takes. This is the "queue latency" the
+        #     reliability work is about: a task that is due and unclaimed is the
+        #     "running + pending" symptom.
+        m["queue_claim_ms"] = _percentiles(_queue_claim_ms(dsn, repeat=max(5, args.repeat)))
 
         server.stop()
         llm.shutdown()

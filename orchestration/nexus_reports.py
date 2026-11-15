@@ -205,6 +205,9 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
             "starts": len(history), "cycle": int(task.get("cycle") or 0),
             "executor": executor,
             "executors": [e.get("executor_label") or "" for e in history],
+            "kind": task.get("kind") or "implementation",
+            "state": task.get("state"),
+            "expects_change": task.get("expects_change"),
             "verification": (task.get("verification") or {}).get("reason")})
 
     # ------------------------------------------------------ the repositories
@@ -321,20 +324,35 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
     # new commit is not reported as done, whatever its tasks were accepted for.
     beside = list(dict.fromkeys(notes))
     seen = list(dict.fromkeys(notes + change_notes))
+    # Every task was accepted without changing the code and every one of them
+    # was a task that legitimately changes nothing (verification / research).
+    # The rule now enforces this (``GitVerifier``), so it is a true "no
+    # changes" and not an agent that failed to push.
+    all_no_change = (bool(tasks)
+                     and all(t.get("state") == "completed_no_changes" for t in tasks)
+                     and not any(t.get("expects_change") for t in tasks))
     if repositories and not moved:
         outcome = "unconfirmed" if unknown else "no_changes"
-        if outcome == "no_changes":
+        if outcome == "no_changes" and all_no_change:
+            status = (
+                "**Статус:** выполнено — задачи этого прогона не меняют код.\n\n"
+                "Все задачи приняты, и ни одна из них не должна была изменить репозиторий: "
+                "это задачи проверки или анализа. Новых коммитов нет, и это ожидаемо. "
+                "Результат работы — в отчётах агентов ниже.")
+            limits.insert(0, (
+                "Прогон состоял из задач проверки/анализа: изменения в репозитории не "
+                "предполагались. NEXUS подтвердил, что вершина ветки не двигалась."))
+        elif outcome == "no_changes":
             status = (
                 "**Статус:** изменений в репозитории нет — результат не подтверждён.\n\n"
-                "Задачи приняты по отчётам агентов, но ни одного нового коммита за время "
-                "прогона NEXUS не увидел: вершина ветки та же, что до начала работы. Если "
-                "работа должна была изменить код, она не доставлена. Что произошло, сказано "
-                "в отчёте агента ниже.")
+                "Ни одного нового коммита за время прогона NEXUS не увидел: вершина ветки "
+                "та же, что до начала работы. Задача, которая должна была изменить код, "
+                "принята не была бы — она перезапускается. Что произошло, сказано в отчёте "
+                "агента ниже.")
             limits.insert(0, (
-                "Новых коммитов в репозитории нет. Задачи приняты, потому что вершина ветки "
-                "названа в отчёте агента, — это правило выполняется и тогда, когда агент "
-                "ничего не отправил и назвал прежнюю вершину. Прогон из-за этого задачи не "
-                "перезапускал."))
+                "Новых коммитов в репозитории нет. Ни одна задача этого прогона не была "
+                "принята как изменившая код: правило требует, чтобы вершина ветки сдвинулась. "
+                "Если изменения ожидались, значит их доставить не удалось."))
         else:
             status = (
                 "**Статус:** завершено, но изменения в репозитории не подтверждены.\n\n"
@@ -385,9 +403,12 @@ def build_report(*, run: dict, task_text: str, task_meta: dict | None,
         quoted = _quote(text) if text.strip() else "_Текст задания не сохранён._"
 
     verified = sum(1 for t in tasks if t.get("state") == "completed_verified")
+    no_changes = sum(1 for t in tasks if t.get("state") == "completed_no_changes")
     checks_note = (
         "- По каждой задаче: вершина её ветки на GitHub — коммит, названный в отчёте "
-        f"агента. Принято {verified} из {len(tasks)}.\n"
+        f"агента. Принято {verified} из {len(tasks)}"
+        + (f"; без изменения кода принято {no_changes} (задачи проверки/анализа).\n"
+           if no_changes else ".\n")
         + ("- Итоговая сверка после последней задачи: коммиты, по которым приняты задачи, "
            "по-прежнему содержатся в ветках. Список коммитов и файлов — из GitHub.\n"
            if repositories else "")
@@ -534,7 +555,8 @@ class ReportService:
         counts: dict[str, int] = {}
         for task in tasks:
             counts[task["state"]] = counts.get(task["state"], 0) + 1
-        done = counts.get("completed_verified", 0) + counts.get("completed_unverified", 0)
+        done = (counts.get("completed_verified", 0) + counts.get("completed_no_changes", 0)
+                + counts.get("completed_unverified", 0))
         lines = [
             "## Отчёт автономного прогона", status,
             f"Прогон `{run_id[:8]}` · итог: {headline} · задач: {len(tasks)} · "

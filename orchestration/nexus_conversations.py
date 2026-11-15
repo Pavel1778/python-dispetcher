@@ -26,6 +26,19 @@ from .nexus_workflow import (
     plan_hash_of,
 )
 
+
+def _active_run_states() -> list[str]:
+    """Run states that count as "still at work". Imported lazily to avoid a
+    circular import (``nexus_lab_store`` imports the project service)."""
+    from .nexus_lab_store import ACTIVE_RUN_STATES
+
+    return list(ACTIVE_RUN_STATES)
+
+
+class ConversationInUse(RuntimeError):
+    """A conversation cannot be deleted or purged while its run is at work."""
+
+
 #: The modes a conversation may be set to. ``auto`` is the default: the Intent
 #: Router decides per message (see ``orchestration/nexus_intent.py``), so a
 #: question in an ``auto`` conversation is answered instead of starting a run.
@@ -35,10 +48,10 @@ _MODES = ("ask", "analysis", "plan", "code", "autonomous", "auto", "manual")
 #: project's bound repository and branch. Kept in one place so every read and
 #: every write returns the same shape.
 _CONVERSATION = (
-    "id, project_id, title, mode, state, archived, pinned, pinned_at, deleted_at, "
+    "id, project_id, title, mode, state, archived, pinned, pinned_at, "
     "run_id, workflow_state, workflow_goal_id, workflow_spec_id, plan_hash, "
     "workflow_plan, plan_approved_hash, plan_approved_at, plan_approved_by, "
-    "created_at, updated_at")
+    "deleted_at, created_at, updated_at")
 
 
 class ConversationService:
@@ -108,7 +121,8 @@ class ConversationService:
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
 
-    def get(self, principal: str, project_id: str, conversation_id: str) -> dict:
+    def get(self, principal: str, project_id: str, conversation_id: str, *,
+            include_deleted: bool = False) -> dict:
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
             cur.execute(
@@ -116,12 +130,14 @@ class ConversationService:
                 "  c.pinned, c.pinned_at, c.deleted_at, "
                 "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
                 "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
-                "  c.plan_approved_at, c.plan_approved_by, c.created_at, c.updated_at, "
+                "  c.plan_approved_at, c.plan_approved_by, "
+                "  c.created_at, c.updated_at, "
                 "  p.repository_id, p.selected_branch, r.full_name AS repository "
                 "FROM nexus_conversations c "
                 "JOIN nexus_projects p ON p.id = c.project_id "
                 "LEFT JOIN repositories r ON r.id = p.repository_id "
-                "WHERE c.id=%s AND c.project_id=%s",
+                "WHERE c.id=%s AND c.project_id=%s"
+                + ("" if include_deleted else " AND c.deleted_at IS NULL"),
                 (conversation_id, project_id))
             row = cur.fetchone()
             if row is None:
@@ -365,6 +381,136 @@ class ConversationService:
                 raise NotFound("conversation not found")
             return dict(row)
 
+    # ------------------------------------------------------- lifecycle
+    def active_run(self, principal: str, project_id: str, conversation_id: str) -> dict | None:
+        """The run this conversation started that is still at work, if any.
+
+        "At work" is ``ACTIVE_RUN_STATES`` - running, paused, waiting for an
+        approval or blocked. A blocked run still holds conversations, so
+        deleting the chat it was asked for in would strand it; the caller must
+        stop the run first. ``None`` when there is no such run.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute(
+                "SELECT r.id, r.state FROM nexus_conversations c "
+                "JOIN nexus_runs r ON r.id = c.run_id "
+                "WHERE c.id=%s AND c.project_id=%s AND r.state = ANY(%s)",
+                (conversation_id, project_id, _active_run_states()))
+            row = cur.fetchone()
+        return {"id": str(row["id"]), "state": row["state"]} if row else None
+
+    def stats(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """What a conversation holds, for the deletion confirmation."""
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT id, title, run_id, deleted_at, archived FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+
+            def count(sql: str, params: tuple) -> int:
+                cur.execute(sql, params)
+                return int(cur.fetchone()["n"])
+
+            run = None
+            if row["run_id"] is not None:
+                cur.execute("SELECT state FROM nexus_runs WHERE id=%s", (row["run_id"],))
+                run_row = cur.fetchone()
+                run = {"id": str(row["run_id"]), "state": run_row["state"]} if run_row else None
+            active = bool(run and run["state"] in _active_run_states())
+            return {
+                "title": row["title"],
+                "messages": count("SELECT count(*) AS n FROM nexus_conversation_messages "
+                                  "WHERE conversation_id=%s", (conversation_id,)),
+                "attachments": count("SELECT count(*) AS n FROM nexus_conversation_attachments "
+                                     "WHERE conversation_id=%s", (conversation_id,)),
+                "agent_sessions": count("SELECT count(*) AS n FROM nexus_agent_sessions "
+                                        "WHERE conversation_id=%s", (conversation_id,)),
+                "run": run,
+                "has_active_run": active,
+            }
+
+    def delete(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """Move a conversation to the trash (soft delete). Reversible.
+
+        Refused while a run the conversation started is still at work: the
+        active execution would be stranded with no chat to report to. Stop the
+        run first (``POST .../runs/{id}/cancel``). Messages, attachments and
+        agent sessions are kept; ``restore`` brings the conversation back with
+        all of them, and ``purge`` is the separate, irreversible step.
+        """
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT id FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s AND deleted_at IS NULL",
+                        (conversation_id, project_id))
+            if cur.fetchone() is None:
+                raise NotFound("conversation not found")
+            cur.execute(
+                "SELECT count(*) AS n FROM nexus_conversations c "
+                "JOIN nexus_runs r ON r.id = c.run_id "
+                "WHERE c.id=%s AND r.state = ANY(%s)",
+                (conversation_id, _active_run_states()))
+            active = int(cur.fetchone()["n"])
+            if active:
+                raise ConversationInUse(
+                    "the conversation has an active run; stop it before deleting")
+            cur.execute("UPDATE nexus_conversations SET deleted_at=now(), archived=false, "
+                        "updated_at=now() WHERE id=%s AND project_id=%s "
+                        f"RETURNING {_CONVERSATION}", (conversation_id, project_id))
+            row = cur.fetchone()
+            self._event(cur, project_id, principal, "conversation.deleted", conversation_id)
+            return dict(row)
+
+    def restore(self, principal: str, project_id: str, conversation_id: str) -> dict:
+        """Bring a conversation back from the trash."""
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("UPDATE nexus_conversations SET deleted_at=NULL, updated_at=now() "
+                        "WHERE id=%s AND project_id=%s AND deleted_at IS NOT NULL "
+                        f"RETURNING {_CONVERSATION}", (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found in the trash")
+            self._event(cur, project_id, principal, "conversation.restored", conversation_id)
+            return dict(row)
+
+    def purge(self, principal: str, project_id: str, conversation_id: str, *,
+              confirm: bool) -> dict:
+        """Remove a conversation and its messages for good. Irreversible.
+
+        Refused without ``confirm`` and refused while its run is at work. The
+        run the conversation started is *not* removed - a run is a record of
+        work, and removing a chat must not remove it. ``nexus_runs.conversation_id``
+        is set to NULL by the foreign key, so the run survives without its chat.
+        """
+        if not confirm:
+            raise ValueError("purging a conversation requires explicit confirmation")
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT title FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("conversation not found")
+            title = row["title"]
+            cur.execute(
+                "SELECT count(*) AS n FROM nexus_conversations c "
+                "JOIN nexus_runs r ON r.id = c.run_id "
+                "WHERE c.id=%s AND r.state = ANY(%s)",
+                (conversation_id, _active_run_states()))
+            if int(cur.fetchone()["n"]):
+                raise ConversationInUse(
+                    "the conversation has an active run; stop it before purging")
+            cur.execute("SELECT count(*) AS n FROM nexus_conversation_messages "
+                        "WHERE conversation_id=%s", (conversation_id,))
+            messages = int(cur.fetchone()["n"])
+            cur.execute("DELETE FROM nexus_conversations WHERE id=%s AND project_id=%s",
+                        (conversation_id, project_id))
+            return {"purged": True, "title": title, "messages_removed": messages}
+
     def linked_run(self, principal: str, project_id: str, conversation_id: str) -> dict | None:
         """The run this conversation started, if any, or ``None``.
 
@@ -537,10 +683,15 @@ class ConversationService:
         content = _text(content, "content", maximum=MESSAGE_CHARS, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            cur.execute("SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s",
-                        (conversation_id, project_id))
-            if cur.fetchone() is None:
+            cur.execute("SELECT id, deleted_at FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            found = cur.fetchone()
+            if found is None:
                 raise NotFound("conversation not found")
+            if found["deleted_at"] is not None:
+                # A trashed conversation is read-only until it is restored; a
+                # message appended behind the scenes would be invisible work.
+                raise ValueError("conversation is deleted; restore it before adding messages")
             return self.append_internal(cur, conversation_id, role=role, content=content,
                                         meta=meta)
 

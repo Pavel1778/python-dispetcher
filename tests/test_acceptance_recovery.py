@@ -43,6 +43,7 @@ from tests.test_studio_api import DSN, studio_stack  # noqa: E402
 pytestmark = pytest.mark.skipif(not DSN, reason="set TEST_SUPABASE_DB_URL to run lab tests")
 
 HEAD = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+HEAD2 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
 
 def _detail(studio, project, run):
@@ -80,7 +81,7 @@ def test_a_sigkilled_worker_is_recovered_by_a_new_process(monkeypatch):
             _finish(studio, first, f"Готово. Коммит {HEAD}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the second worker to continue")
-            _finish(studio, second, f"Готово. Коммит {HEAD}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2}.")
             done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
                 _detail(studio, project, run)), what="the run to finish")
             assert done["run"]["state"] == "completed"
@@ -103,7 +104,7 @@ def test_a_restart_after_graceful_stop_resumes_the_run(monkeypatch):
             _finish(studio, first, f"Готово. Коммит {HEAD}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the replacement worker to continue")
-            _finish(studio, second, f"Готово. Коммит {HEAD}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2}.")
             done = _until(lambda: (lambda d: d if d["run"]["state"] != "running" else None)(
                 _detail(studio, project, run)), what="the run to finish")
             assert done["run"]["state"] == "completed"

@@ -59,6 +59,9 @@ PRINCIPAL = "user:owner"
 #: read its branch head for real.
 REPO = "Pavel1778/python-dispetcher"
 HEAD = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+HEAD2 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+#: The commit the branch is at before any task runs.
+BASE = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _reset() -> None:
@@ -94,6 +97,12 @@ class AccountClient:
         self.started: list[dict] = []
         self.deleted: list[str] = []
         self._conversations: dict[str, dict] = {}
+        #: When set, the conversation's report is pushed to this fake GitHub as
+        #: a real agent's ``git push`` when the report is read - so a task that
+        #: names a new commit really moves the branch (which the verifier now
+        #: requires). ``None`` (the default) pushes nothing.
+        self.github = None
+        self.repository = REPO
 
     def start_conversation(self, *, initial_message, title=None, tags=None,
                            selected_repository=None, selected_branch=None, **kw):
@@ -120,7 +129,17 @@ class AccountClient:
                 "provider_tokens_set": {}}
 
     def final_response(self, conversation_id):
-        return self._conversations[conversation_id]["text"]
+        text = self._conversations[conversation_id]["text"]
+        # An agent that names a new commit has pushed it: leave that on the fake
+        # GitHub, so the real verifier sees the branch move (which it now
+        # requires) rather than only the commit it found.
+        if self.github is not None:
+            import re
+
+            match = re.search(r"\b[0-9a-f]{7,40}\b", text or "")
+            if match and self.github.head(self.repository) != match.group(0):
+                self.github.push(self.repository, match.group(0), "work")
+        return text
 
     def delete_conversation(self, conversation_id):
         self.deleted.append(conversation_id)
@@ -381,12 +400,16 @@ def test_handoff_does_not_repeat_a_completed_stage(store, service, clouds):
     client_a = AccountClient("A")
     client_a.report = f"done, commit {HEAD}"
     client_b = AccountClient("B")
-    client_b.report = f"done, commit {HEAD}"
+    client_b.report = f"done, commit {HEAD2}"
     clients = {va["id"]: client_a, vb["id"]: client_b}
 
     github = FakeGitHub()
-    github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+    github.commits = [{"sha": BASE, "commit": {"message": "start"}}]
     with FakeGitHubServer(github) as gh:
+        # An agent that names a new commit has pushed it; the real verifier now
+        # requires the branch to move, so the fake does the push on read.
+        client_a.github = github
+        client_b.github = github
         verifier = _real_verifier(GitHubClient(base_url=gh.base_url, token="t"))
         sched, lab, _pool = _scheduler(store, service, clients, verifier=verifier,
                                        priority={vb["id"]: 1})
@@ -482,7 +505,7 @@ def test_the_worker_continues_and_the_result_is_read_after_reconnecting(monkeypa
             _finish(studio, first, f"Готово. Коммит {HEAD}.")
             second = _until(lambda: _task_conversation(studio, "change"),
                             what="the worker to continue without a client")
-            _finish(studio, second, f"Готово. Коммит {HEAD}.")
+            _finish(studio, second, f"Готово. Коммит {HEAD2}.")
 
             # Reconnect: a fresh HTTP client reads the finished run.
             from tests.test_studio_api import Api
@@ -590,14 +613,16 @@ def test_end_to_end_failover_with_independent_verification(store, service, cloud
     vb = _add(service, b, "B")
 
     github = FakeGitHub()
-    github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+    github.commits = [{"sha": BASE, "commit": {"message": "start"}}]
     with FakeGitHubServer(github) as gh:
         verifier = _real_verifier(GitHubClient(base_url=gh.base_url, token="t"))
 
         client_a = AccountClient("A")
         client_a.report = f"Готово. Коммит {HEAD}."
         client_b = AccountClient("B")
-        client_b.report = f"Готово. Коммит {HEAD}."
+        client_b.report = f"Готово. Коммит {HEAD2}."
+        client_a.github = github
+        client_b.github = github
         clients = {va["id"]: client_a, vb["id"]: client_b}
         sched, lab, _pool = _scheduler(store, service, clients, verifier=verifier,
                                        priority={vb["id"]: 1})
@@ -644,7 +669,9 @@ def test_end_to_end_failover_with_independent_verification(store, service, cloud
         assert final["state"] == "completed"
         assert len(client_a.started) == 1 and len(client_b.started) == 1
         task = lab.list_tasks(PRINCIPAL, str(project["id"]), str(run["id"]))[0]
-        assert any(isinstance(e, dict) and e.get("remote_sha") == HEAD
+        # The record binds the commit the verifier observed - HEAD2, the commit
+        # the second account's agent pushed and named.
+        assert any(isinstance(e, dict) and e.get("remote_sha") == HEAD2
                    for e in task["evidence"])
 
 

@@ -403,3 +403,49 @@ def test_the_section_4_non_launch_list_never_starts_work(text):
         intent = classify(text, mode=mode)
         assert not intent.starts_work, (text, mode, intent)
         assert effective_mode(mode, intent) not in ("autonomous", "plan", "code"), (text, mode, intent)
+
+
+def test_a_bare_follow_up_about_a_named_report_stays_on_it(studio):
+    """A pronoun-only follow-up ("А что в нём исправлено?") that names no run
+    itself must be answered from the run the previous analysis turn found, not
+    fall back to a context-free question - and must start nothing.
+
+    This is the fix ported from PR #38: the Intent Router classifies a message
+    in isolation, so a bare question after an analysis turn read as ``ask`` and
+    lost the run facts. ``web_server._continues_analysis`` upgrades that one
+    case back to ``analysis``.
+    """
+    project = studio.project()
+    assert studio.api.post(f"/api/v1/projects/{project}/repository",
+                           {"full_name": REPO})[0] == 200
+    conversation = _start_conversation(studio, project, mode="auto")
+    studio.answers(json.dumps(PLAN))
+    status, body = _send(studio, project, conversation, "Реализуй функцию")
+    assert status == 200, body
+    run_id = next(m["meta"]["run_id"] for m in body["messages"] if m["meta"].get("run_id"))
+
+    with studio.app.store._tx() as cur:
+        cur.execute("UPDATE nexus_runs SET state='completed' WHERE id=%s", (run_id,))
+        cur.execute(
+            "INSERT INTO nexus_run_reports(run_id, project_id, conversation_id, body, outcome) "
+            "VALUES (%s, %s, %s, %s, 'changes_made')",
+            (run_id, project, conversation,
+             "## Отчёт автономного прогона\n\n**Исправлено:** валидация email."))
+
+    # The analysis turn: the router answers from the run's real state.
+    studio.answers(f"Нашёл прогон {run_id}: задача выполнена.")
+    status, body = _send(studio, project, conversation, "Покажи последний успешный прогон")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["mode"] == "analysis"
+    assert _count_runs(studio, project) == 1
+
+    # The bare follow-up: same run's facts in the prompt, still no new run.
+    studio.answers("Исправлена валидация email.")
+    status, body = _send(studio, project, conversation, "А что в нём исправлено?")
+    assert status == 200, body
+    assert body["messages"][-1]["meta"]["mode"] == "analysis"
+    prompt = studio.llm.calls[-1]["body"]["messages"][-1]["content"]
+    assert run_id in prompt, "the follow-up lost which run was being discussed"
+    assert "валидация email" in prompt
+    assert _count_runs(studio, project) == 1, "the follow-up started another run"
+

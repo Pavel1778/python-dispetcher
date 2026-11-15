@@ -43,7 +43,7 @@ from typing import Any
 
 from .cloud_store import PostgresStore
 from .nexus_executors import ProjectExecutorService
-from .nexus_lab_store import LabStore
+from .nexus_lab_store import VERIFIED_STATES, LabStore
 from .openhands_pool import AccountPool, PoolError
 
 
@@ -287,9 +287,9 @@ class AccountRouter:
             memories = [dict(r) for r in cur.fetchall()]
         plan = [{"task_key": s["task_key"], "title": s["title"], "state": s["state"]}
                 for s in siblings]
-        done = [s["task_key"] for s in siblings if s["state"] == "completed_verified"]
+        done = [s["task_key"] for s in siblings if s["state"] in VERIFIED_STATES]
         remaining = [s["task_key"] for s in siblings
-                     if s["state"] not in ("completed_verified", "failed")]
+                     if s["state"] not in (*VERIFIED_STATES, "failed")]
         decisions = [{"content": m["content"], "provenance": m["provenance"]}
                      for m in memories if m["kind"] == "decision"]
         constraints = [{"content": m["content"], "provenance": m["provenance"]}
@@ -308,8 +308,8 @@ class AccountRouter:
         # verdict and in the last evidence entry for an attempt that was not
         # accepted; read either, and fall back to the task's own state, so a
         # task that settled without a detail is still reported.
-        settled = {"completed_verified", "completed_unverified", "partial",
-                   "failed", "blocked"}
+        settled = {"completed_verified", "completed_no_changes",
+                   "completed_unverified", "partial", "failed", "blocked"}
         test_results = []
         for s in siblings:
             verification = _as_dict(s.get("verification"))

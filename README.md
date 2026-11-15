@@ -219,6 +219,49 @@ the project exists, the task and workflow share it, the repository is linked,
 enabled and on an allowed branch, and the caller is a member. The same gate
 protects the web API, the CLI, MCP and the background dispatcher.
 
+The autonomous lab goes through the same rule: `authorize_run_task` is called
+when a run is started and **again immediately before each conversation is
+created**, so a link removed in between still stops the work and the task is
+blocked with the reason - never silently redirected to a default repository. A
+run for one project can never reach another project's repository
+(`tests/test_run_binding.py`, the regression for run `2ae6adc3`).
+
+## Evidence-based acceptance
+
+A task is `completed_verified` only when the conversation finished, the head of
+the task's branch (read from GitHub now) is a commit the agent named, **and the
+branch actually moved** during the attempt. The head SHA alone does not prove a
+new change appeared: an agent whose push was refused names the head it found, so
+a change-requiring task (`implementation`, `bugfix`, `documentation`) whose
+branch did not move is `completed_unverified` and is reworked. A task whose kind
+does not change the code (`verification_only`, `research_audit`) is accepted as
+`completed_no_changes` - an honest no-change result, not a claim of a change.
+This separates the nine things that used to be conflated: the agent reported
+success, the runtime completed, the workspace verified, a change was produced,
+committed, pushed, tests passed, independent verification passed, and the task
+was accepted.
+
+## Project and conversation lifecycle
+
+Projects and conversations can be created, renamed, archived, moved to the
+trash, restored and purged. A delete is a **soft delete**: the row and its data
+stay, and a restore brings it back. A **purge** is the separate, explicit,
+irreversible step, refused while a run is active, and it never touches the
+external GitHub repository or any other project. The studio has context menus
+for both, with a confirmation that names what is inside. See
+[docs/PROJECT-LIFECYCLE.md](docs/PROJECT-LIFECYCLE.md).
+
+## Performance and observability
+
+`orchestration/tracing.py` times each stage NEXUS controls (dispatch, poll,
+verify) with one secret-free span shape; `GET /api/observability` reports queue
+depth, stuck tasks, worker heartbeat and per-stage latency, and the studio shows
+it under **Настройки → Диагностика**. `tools/benchmark.py` measures the queue
+path over real PostgreSQL. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and
+[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md). The "run running, task pending,
+attempt 0" symptom is answered by `queue.claimable_now` and `stuck_tasks` - a
+due task nobody claims is a missing or dead worker, and it is now visible.
+
 ## Evidence Trust Engine
 
 Evidence is signed with Ed25519 over a canonical byte encoding. A verdict is

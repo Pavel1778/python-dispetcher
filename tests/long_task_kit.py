@@ -16,6 +16,9 @@ import urllib.error
 import urllib.request
 
 HEAD = "9a8b7c6d5e4f30211203f4e5d6c7b8a901234567"
+#: The commit the branch is at before any task runs. An agent that pushes HEAD
+#: moves the branch, which the verifier requires for a task to be accepted.
+BASE = "0123456789abcdef0123456789abcdef01234567"
 
 _PART = re.compile(r"<<<PART\n(.*)\nPART>>>", re.S)
 _PIECE = re.compile(r"\[(R-\d+)\] ")
@@ -248,8 +251,15 @@ class Lab:
         status, body = studio.api.post(f"/api/v1/projects/{self.project}/repository",
                                        {"full_name": repo})
         assert status == 200, body
-        studio.github.commits = [{"sha": HEAD, "commit": {"message": "work"}}]
+        self.repo = repo
+        studio.github.commits = [{"sha": BASE, "commit": {"message": "start"}}]
         self.conversation = studio.conversation(self.project, mode=mode)
+
+    def push(self, commit: str = HEAD) -> None:
+        """What an agent's ``git push`` leaves: a new head of the branch. A test
+        that has the agent name *commit* pushes it, because the verifier now
+        requires the branch to have moved for a task to be accepted."""
+        self.studio.github.push(self.repo, commit, "work")
 
     # ------------------------------------------------------------- sending
     def send(self, text: str, *, mode: str = "autonomous", conversation: str | None = None,

@@ -4,6 +4,52 @@ Symptom-first. Every entry names the cause and the fix. The variables each fix
 names, with their defaults and the module that reads them, are in
 [ENVIRONMENT.md](ENVIRONMENT.md).
 
+## A run is "running" but its task is "pending" and no executor starts
+
+Symptom: run state `running`, task state `pending`, `attempt = 0`, and nothing
+ever starts. This is the "не запускается" the acceptance text names.
+
+Diagnose with `GET /api/observability` (or the studio's **Настройки →
+Диагностика**):
+
+- `queue.claimable_now > 0` and `workers.count == 0` — **nobody is ticking the
+  run.** Start the worker (`python -m orchestration.lab_worker`) or set
+  `NEXUS_LAB_INLINE=1` on the web service. On a free Render plan the process is
+  stopped after ~15 minutes without a request, so an unattended run needs a paid
+  instance or an outside request to `/healthz`.
+- `workers.count > 0` but `stuck_tasks` is non-empty — the worker is alive but
+  not claiming. Read `stuck_tasks[].reason` and `workers.live[].last_error`. A
+  common cause is every OpenHands account at its `max_concurrent_tasks`
+  (the pool says so), or an account whose key was rejected.
+- `claimable_now == 0` — the task is waiting on a dependency or a retry. Read
+  `queue.tasks_by_state`: `waiting` is a retry (`wait_reason` says until when);
+  a `blocked` dependency is a deadlock the run's `last_error` explains.
+
+## A task completed but is not "completed_verified"
+
+Symptom: a task settled as `completed_unverified` with reason "the branch did
+not move".
+
+Cause: the agent named the head of the branch, but the branch is still at the
+commit the attempt started from — the push was refused, or nothing was changed.
+The head SHA alone does not prove a new change, so a change-requiring task is
+reworked rather than accepted. A task whose kind is `verification_only` or
+`research_audit` is accepted as `completed_no_changes` instead, because it was
+not asked to change the code. See
+[PERFORMANCE.md](PERFORMANCE.md) and the acceptance rules in
+[../README.md](../README.md).
+
+## A project or conversation cannot be deleted
+
+Symptom: `409` with "active run".
+
+Cause: a run the project or conversation started is still at work
+(`running`/`paused`/`waiting_for_approval`/`blocked`). Deleting it would strand
+the execution with no chat to report to. Stop the run first
+(`POST /api/v1/projects/{id}/runs/{run}/cancel`), then delete. A delete is
+reversible (the trash); a `purge` is not and needs `{"confirm": true}`. See
+[PROJECT-LIFECYCLE.md](PROJECT-LIFECYCLE.md).
+
 ## OpenHands
 
 ### A conversation fails immediately with an LLM auth error
