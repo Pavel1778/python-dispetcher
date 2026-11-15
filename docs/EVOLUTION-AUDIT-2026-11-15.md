@@ -2,10 +2,9 @@
 
 Branch `arena/b10d2a83-python-dispetcher`, base `28aa026` (PR #42 merge).
 This audit is the state of one snapshot, not a blanket certification.
-Full suite on this branch: **1915 passed / 49 skipped / 0 failed (38m34s)** at
-`fc026be`; the two later commits (`12fdf02`, `5085ace`) change only studio copy
-and docs — the suite has **not** been re-run after `12fdf02` yet (see REPORT B);
-a re-run was launched and its result is tracked outside this document.
+Full suite on this branch: **1915 passed / 49 skipped / 0 failed**, run twice —
+38m34s at `fc026be`, and **36m54s at `9cc5c4b`** (after the studio edit,
+`EXIT=0`, `/home/user/pytest_full2.log`).
 
 ## Where NEXUS stands on the EVOLUTION axis
 

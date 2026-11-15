@@ -13,7 +13,7 @@
 
 | Run | Result |
 | --- | --- |
-| **Full sequential suite `pytest tests/ -q`** (this branch, against `fc026be`+studio edit) | **1915 passed, 49 skipped, 0 failed — 38m34s (2026-11-15)** |
+| **Full sequential suite `pytest tests/ -q`** (HEAD `9cc5c4b`; second run, after the studio edit) | **1915 passed, 49 skipped, 0 failed — 36m54s, `EXIT=0` (2026-11-15)** |
 | `tests/test_terminal_output.py` (standalone) | 45 passed |
 | `tests/test_studio_ui.py` | 25 passed |
 | `ruff check` (changed files) | clean |
@@ -102,7 +102,7 @@ The terminal-outputs list path is NOT yet benchmarked.
 ## Next priorities
 
 1. Mobile/Android + real-browser pass of studio (outputs panel, pause copy).
-2. Re-run full suite after `12fdf02` (studio edit) at the next checkpoint.
+2. ~~Re-run full suite after `12fdf02`~~ — done: second run green (36m54s).
 3. Benchmark the terminal-outputs list path; add it to `tools/benchmark.py`.
 4. CI: push/PR pipeline running the suite; block merge on red.
 5. Self-QA first vertical slice: `nexus doctor` (status/severity/action).
