@@ -342,9 +342,26 @@ class PostgresStore:
         # How long a caller waits for a free connection before it is told the
         # database is unavailable. Bounds the queue instead of letting it grow.
         self.pool_timeout = float(os.environ.get("NEXUS_DB_POOL_TIMEOUT", "30") or 30)
+        self._pool: Any = None
+        self._open_pool()
+        # Render's free plan has no shell to run ``psql`` in, so the schema must
+        # be applied by the process itself. The migrations are idempotent, and
+        # ``AUTO_MIGRATE=false`` opts out for environments that apply them out of
+        # band (a release step, a DBA).
+        if auto_migrate and os.environ.get("AUTO_MIGRATE", "true").lower() not in ("0", "false", "no"):
+            self.apply_migrations()
+
+    def _open_pool(self) -> None:
+        """Open the connection pool (also used to reopen one that was closed).
+
+        A store that has been ``close()``d is usable again: the next call opens
+        a fresh pool. This keeps the behaviour the single-connection store had
+        (a closed connection was replaced on the next use), so code that closes
+        a store and later reads from it - a test, a diagnostic - still works.
+        """
         self._pool = psycopg_pool.ConnectionPool(
             self.dsn,
-            kwargs=connect_kwargs,
+            kwargs=self._connect_kwargs,
             min_size=self.pool_min,
             max_size=self.pool_max,
             open=True,
@@ -359,20 +376,20 @@ class PostgresStore:
             check=_pool_check_connection,
             # Do not hammer a database that is down: the pool backs off between
             # reconnection attempts on its own.
-            reconnect_timeout=connect_timeout,
+            reconnect_timeout=self._connect_timeout,
         )
         # Surface a bad DSN at construction (the old store connected here too),
         # so a misconfiguration is one clear error at startup, not a 500 later.
         try:
-            self._pool.wait(timeout=connect_timeout)
+            self._pool.wait(timeout=self._connect_timeout)
         except psycopg_pool.PoolTimeout as e:
             raise StoreError("database unavailable") from e
-        # Render's free plan has no shell to run ``psql`` in, so the schema must
-        # be applied by the process itself. The migrations are idempotent, and
-        # ``AUTO_MIGRATE=false`` opts out for environments that apply them out of
-        # band (a release step, a DBA).
-        if auto_migrate and os.environ.get("AUTO_MIGRATE", "true").lower() not in ("0", "false", "no"):
-            self.apply_migrations()
+
+    def _ensure_pool(self) -> Any:
+        """The live pool, reopening it if it was closed. Returns the pool."""
+        if self._pool is None or self._pool.closed:
+            self._open_pool()
+        return self._pool
 
     # ------------------------------------------------------------ migrations
     def apply_migrations(self, directory: str | None = None) -> list[str]:
@@ -574,11 +591,11 @@ class PostgresStore:
         it could not reconnect.
         """
         try:
-            conn = self._pool.getconn()
+            conn = self._ensure_pool().getconn()
         except psycopg_pool.PoolTimeout as e:
             self._reconnect_failed_at = time.monotonic()
             raise StoreUnavailable("database unavailable") from e
-        except psycopg_pool.PoolClosed as e:  # pragma: no cover - after close()
+        except psycopg_pool.PoolClosed as e:  # pragma: no cover - pool raced closed
             raise StoreUnavailable("database unavailable") from e
         except psycopg.Error as e:
             self._reconnect_failed_at = time.monotonic()
@@ -602,7 +619,10 @@ class PostgresStore:
             # Always return the connection: on success, on a handled error, and
             # on a cancel/KeyboardInterrupt. `putconn` discards a connection the
             # driver marked broken and hands a healthy one to the next caller.
-            self._pool.putconn(conn)
+            try:
+                self._pool.putconn(conn)
+            except Exception:  # noqa: BLE001 - returning must never mask the caller's error
+                pass
 
     # The single-connection accessors are kept for the tests and diagnostics
     # that read them (tests/test_store_reconnect.py, tests/test_transactions.py,
@@ -613,7 +633,7 @@ class PostgresStore:
     @contextmanager
     def _connection(self) -> Iterator[Any]:
         try:
-            conn = self._pool.getconn()
+            conn = self._ensure_pool().getconn()
         except psycopg_pool.PoolTimeout as e:
             raise StoreUnavailable("database unavailable") from e
         try:
