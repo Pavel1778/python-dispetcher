@@ -71,7 +71,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .cloud_client import CloudError
+from .cloud_client import CloudError, CloudNotFound
 from .cloud_direct import build_cloud_client
 from .cloud_dispatcher import CloudDispatcher
 from .cloud_store import (
@@ -1286,6 +1286,167 @@ class App:
                         conversation_id, type(e).__name__)
             return False
 
+    # ------------------------------------------------------- terminal output
+    #: Conversations one list call will read events for, and saved-file probes
+    #: it will make. A run with more than this lists what it can and says the
+    #: rest needs another look, rather than hammering the sandboxes.
+    MAX_OUTPUT_CONVERSATIONS = 25
+    MAX_OUTPUT_PROBES = 40
+
+    def _terminal_output_client(self, principal: str, account_id: Any):
+        """The client that may read a conversation's sandbox, or ``None``.
+
+        The account the execution ran as decides, exactly as for the worker;
+        an execution behind no stored connection is read with the process
+        client. ``None`` means "could not build one" - the caller reports the
+        conversation as unavailable rather than reading it through another
+        identity.
+        """
+        if account_id:
+            try:
+                return self.openhands_accounts.execution_client_for_account(
+                    principal, str(account_id))
+            except Exception:
+                return None
+        return self.client
+
+    def _probe_saved_output(self, client: Any, ref) -> str:
+        from .terminal_output import OutputUnavailable, download_file
+
+        try:
+            status, _ = download_file(client, ref.conversation_id, ref._path, limit=1)
+        except OutputUnavailable:
+            return "unknown"
+        if status == 200:
+            return "available"
+        if status == 404:
+            return "missing"
+        return "unknown"
+
+    def terminal_outputs_for_run(self, principal: str, project_id: str,
+                                 run_id: str) -> dict[str, Any]:
+        """Terminal outputs of the run's conversations, for the UI list.
+
+        Never fatal per conversation: one unreadable sandbox is reported in
+        ``unavailable`` and the rest are still listed. Nothing is written to
+        the database here - a probe is two bytes from the sandbox.
+        """
+        from dataclasses import replace
+
+        from . import terminal_output as to
+
+        self.lab.get_run(principal, project_id, run_id)
+        executions = self.lab.executions(run_id)
+        conversations: dict[str, dict[str, Any]] = {}
+        for execution in executions:
+            cid = execution.get("conversation_id")
+            if cid:
+                conversations.setdefault(str(cid), execution)
+        outputs: list[dict] = []
+        unavailable: list[dict[str, str]] = []
+        probes = 0
+        truncated = len(conversations) > self.MAX_OUTPUT_CONVERSATIONS
+        for cid, execution in list(conversations.items())[:self.MAX_OUTPUT_CONVERSATIONS]:
+            client = self._terminal_output_client(principal,
+                                                  execution.get("openhands_account_id"))
+            if client is None:
+                unavailable.append({"conversation_id": cid, "reason": "account_unavailable"})
+                continue
+            capable = to.capability(client) == "agent-server"
+            try:
+                events = client.list_events(cid, limit=to.EVENTS_PAGE, max_pages=3)
+            except CloudNotFound:
+                # The conversation is gone from the sandbox; its outputs cannot
+                # be probed, but the rest of the run still can.
+                unavailable.append({"conversation_id": cid, "reason": "conversation_gone"})
+                continue
+            except Exception:
+                unavailable.append({"conversation_id": cid,
+                                    "reason": "runtime_unavailable"})
+                continue
+            refs = to.extract_refs(events, cid)
+            if len(refs) == to.MAX_REFS:
+                truncated = True
+            for ref in refs:
+                if not capable:
+                    ref = replace(ref, saved_output="unsupported")
+                elif ref._path:
+                    if probes < self.MAX_OUTPUT_PROBES:
+                        probes += 1
+                        ref = replace(ref, saved_output=self._probe_saved_output(client, ref))
+                    else:
+                        truncated = True
+                outputs.append(to.ref_public(ref))
+        outputs.sort(key=lambda item: item.get("at") or "", reverse=True)
+        if len(outputs) > to.MAX_REFS:
+            outputs = outputs[:to.MAX_REFS]
+            truncated = True
+        return {"outputs": outputs, "truncated": truncated,
+                "unavailable": unavailable,
+                "max_output_bytes": to.MAX_OUTPUT_BYTES}
+
+    def terminal_output_for_run(self, principal: str, project_id: str, run_id: str,
+                                conversation_id: str, event_id: str) -> bytes:
+        """The SDK-saved rendering of one terminal output. Never a partial body.
+
+        Raises :class:`NotFound` when the run, the conversation or the event
+        is not this project's, :class:`RuntimeFetchError` when the sandbox
+        cannot answer, :class:`UnsupportedTransport` on the ``app`` transport,
+        and :class:`OutputTooLarge` when the saved file exceeds the cap.
+        """
+        from . import terminal_output as to
+
+        self.lab.get_run(principal, project_id, run_id)
+        executions = self.lab.executions(run_id)
+        execution = next(
+            (e for e in executions
+             if str(e.get("conversation_id") or "") == conversation_id),
+            None,
+        )
+        if execution is None:
+            raise NotFound("conversation not found in this run")
+        client = self._terminal_output_client(principal,
+                                              execution.get("openhands_account_id"))
+        if client is None:
+            raise to.RuntimeFetchError("the account for this conversation is unavailable")
+        if to.capability(client) != "agent-server":
+            raise to.UnsupportedTransport("the app transport cannot read sandbox files")
+        try:
+            events = client.list_events(conversation_id, limit=to.EVENTS_PAGE,
+                                        max_pages=3)
+        except CloudNotFound as e:
+            raise NotFound("the conversation is not on its sandbox any more") from e
+        except Exception as e:
+            raise to.RuntimeFetchError(f"the sandbox did not answer: {type(e).__name__}") from e
+        ref = to.find_ref(events, conversation_id, event_id)
+        if ref is None:
+            raise NotFound("terminal output not found")
+        try:
+            body = to.fetch_full_output(client, ref)
+        except to.FileTooLarge as e:
+            raise to.OutputTooLarge(str(e)) from e
+        except to.OutputRefused as e:
+            raise NotFound(str(e)) from e
+        except to.OutputUnavailable as e:
+            message = str(e)
+            if "not there any more" in message:
+                raise NotFound("the saved output is not there any more") from e
+            raise to.RuntimeFetchError(message) from e
+        self._record_terminal_output_read(project_id, principal, run_id)
+        return body
+
+    def _record_terminal_output_read(self, project_id: Any, principal: str,
+                                     run_id: str) -> None:
+        """Best-effort audit line; never fails the read."""
+        try:
+            with self.store._tx() as cur:
+                cur.execute(
+                    "INSERT INTO nexus_project_events(project_id, actor, kind, "
+                    "  resource_id) VALUES (%s,%s,%s,%s)",
+                    (project_id, principal, "terminal_output.read", run_id))
+        except Exception:
+            log.debug("could not record terminal output read", exc_info=True)
+
     def rename_sr(self, workflow_id: str, title: str) -> dict[str, Any]:
         """Rename the workflow's Sr conversation in Cloud.
 
@@ -2081,6 +2242,47 @@ class Handler(BaseHTTPRequestHandler):
                           "cleanup": self.app.lab.cleanup_summary(
                               rest[1], retention_seconds=cleanup_retention_seconds())},
                     None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/terminal-outputs
+        #   Every terminal observation of the run's conversations: what the
+        #   agent ran, what the clipped event shows, and whether the SDK's saved
+        #   rendering file is still on the sandbox.
+        if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "terminal-outputs"):
+            data = self.app.terminal_outputs_for_run(principal, project_id, rest[1])
+            return (200, data, None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/terminal-outputs/{cid}/{event_id}[/download]
+        #   The SDK's saved rendering of one terminal output, read from the
+        #   sandbox. Never truncated to fit: a file larger than the cap is a
+        #   413, not a clipped body pretending to be complete.
+        if (len(rest) in (5, 6) and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "terminal-outputs" and UUID_RE.fullmatch(rest[3])
+                and (len(rest) == 5 or rest[5] == "download")):
+            from . import terminal_output as _to
+
+            event_id = rest[4]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", event_id):
+                return (404, {"error": "not found"}, None)
+            try:
+                body = self.app.terminal_output_for_run(
+                    principal, project_id, rest[1], rest[3], event_id)
+            except NotFound:
+                return (404, {"error": "not found"}, None)
+            except _to.UnsupportedTransport:
+                return (501, {"error": "unsupported_transport",
+                              "detail": "the app transport cannot read sandbox files"},
+                        None)
+            except _to.OutputTooLarge:
+                return (413, {"error": "output_too_large",
+                              "limit_bytes": _to.MAX_OUTPUT_BYTES}, None)
+            except _to.RuntimeFetchError:
+                return (502, {"error": "runtime_unavailable"}, None)
+            if len(rest) == 6:
+                safe_event = re.sub(r"[^A-Za-z0-9._-]", "_", event_id)
+                return (200, None,
+                        (body, "text/plain; charset=utf-8",
+                         f"terminal-output-{safe_event}.txt"))
+            return (200, {"text": body.decode("utf-8", errors="replace"),
+                          "bytes": len(body)}, None)
         # GET /api/v1/projects/{id}/runs/{run_id}/report
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
                 and rest[2] == "report"):

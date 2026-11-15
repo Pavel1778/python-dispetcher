@@ -80,6 +80,18 @@ class FakeRuntime:
     create_status: int = 0
     #: When set, ConversationErrorEvent search returns this classification.
     error_classification: dict[str, Any] | None = None
+    #: Events served for a conversation id by ``/events/search``. Empty by
+    #: default, which keeps every existing test's view of the route unchanged.
+    events_by_conversation: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def set_events(self, conversation_id: str,
+                   events: list[dict[str, Any]]) -> None:
+        with self.lock:
+            self.events_by_conversation[conversation_id] = list(events)
+
+    def add_event(self, conversation_id: str, event: dict[str, Any]) -> None:
+        with self.lock:
+            self.events_by_conversation.setdefault(conversation_id, []).append(event)
     require_key: bool = True
     expected_key: str = "test-key"
     seen_keys: list[str] = field(default_factory=list)
@@ -245,7 +257,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(404, {"detail": "Conversation not found"})
                 return
             cls = self.runtime.error_classification
-            items = []
+            with self.runtime.lock:
+                items = list(self.runtime.events_by_conversation.get(parts[2], []))
             if cls is not None:
                 items.append(
                     {"kind": "ConversationErrorEvent", "classification": cls}

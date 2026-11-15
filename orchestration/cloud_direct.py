@@ -712,6 +712,19 @@ class CloudDirectClient:
         self._cache.pop(conversation_id, None)
         return outcome
 
+    def download_file(self, conversation_id: str, path: str,
+                      *, limit: int) -> tuple[int, bytes]:
+        """``GET /api/file/download?path=`` on the sandbox the conversation
+        lives on, with that sandbox's own key. ``(status, body)`` with at most
+        ``limit + 1`` bytes; every HTTP answer is returned, not raised (a 404
+        is "not there", a fact). A network failure raises
+        :class:`ApiUnavailable`. The route comes from the store, so a path is
+        only ever asked of the sandbox the conversation is actually on.
+        """
+        route = self._route_for(conversation_id)
+        return self._http._download_from(
+            route.agent_server_url, route.session_api_key, path, limit=limit)
+
     def pause(self, conversation_id: str) -> None:
         route = self._route_for(conversation_id)
         status, _ = self._send(
