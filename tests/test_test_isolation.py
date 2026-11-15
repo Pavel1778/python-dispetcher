@@ -59,19 +59,33 @@ def test_the_escape_hatch_keeps_one_named_database():
 
 
 def test_a_local_database_is_isolated_per_process():
-    """A local disposable database is copied to a process-named sibling; the
-    base URL is recorded so the copy is never copied again."""
+    """A local disposable database is isolated for this process.
+
+    Two mechanisms can do it and they compose: ``conftest._isolate_database``
+    makes a process-named copy ``<base>_p<suffix>`` of the named database;
+    ``tests/_test_db.py`` is the fallback for a base whose copy cannot be made
+    (it hands out ``nexus_test_<token>``, or serialises when it cannot create
+    one). The property under test is the same either way - the process never
+    ends up on the shared base URL - so the assertion is on the property, not
+    on one mechanism's database name.
+    """
     url = "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent"
     got = _decide({"TEST_SUPABASE_DB_URL": url})
     if got["base"] is not None:
-        # The copy was made (the role can create databases).
+        # ``conftest`` copied the named database to a process-named sibling.
         assert got["base"] == url
         assert got["dsn"].startswith(
             "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent_p")
         assert got["dsn"] != url
     else:
-        # No privilege to create a database: the base URL stands, no crash.
-        assert got["dsn"] == url
+        # ``conftest`` could not copy the named database (it does not exist, or
+        # the role cannot create one), so the ``tests/_test_db.py`` fallback ran
+        # instead. It must still have put this process on a database of its own
+        # - a ``nexus_test_<token>`` sibling - and never on the shared base URL.
+        # Only a role that can create nothing falls back to serialising on the
+        # base URL, and this role can create databases.
+        assert got["dsn"] != url, "the process is on the shared base database"
+        assert "nexus_test_" in got["dsn"] or "_p" in got["dsn"]
 
 
 def test_two_processes_get_two_databases():

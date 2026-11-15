@@ -115,6 +115,16 @@ def _serialise(base: str) -> str:
 
 
 def setup() -> str:
+    # ``conftest`` may have isolated this process already (a process-named copy
+    # of a local disposable database); see ``tests/conftest._isolate_database``.
+    # Defer to it rather than copy the copy.
+    if os.environ.get("NEXUS_TEST_BASE_DB_URL"):
+        return "deferred"
+    # The shared escape hatch: an operator who asks for one named database gets
+    # one, whichever mechanism would otherwise isolate.
+    if os.environ.get("NEXUS_TEST_ISOLATE_DB", "").strip().lower() in (
+            "0", "false", "no", "off"):
+        return "unset"
     base = _base_dsn()
     if not base:
         return "unset"
