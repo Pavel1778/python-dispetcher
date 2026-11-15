@@ -247,12 +247,27 @@ def _overflow(page) -> int:
 
 
 def _connect_repository(page):
+    """Connect the test repository and wait until the page is quiescent.
+
+    The connect dialog's "изучить репозиторий" box is checked by default, so
+    ``repo-connect`` fires a *fire-and-forget* ``POST /context/refresh`` once the
+    repository is connected. A test that then changes what GitHub answers (e.g.
+    forces a 401 to exercise "the repository cannot be read") races that request:
+    if it lands after the change it is answered 400 and the run's Watch records
+    it, so ``watch.problems`` is not empty - an intermittent failure that has
+    nothing to do with the property under test. Waiting for the request here
+    settles the page before the test mutates anything.
+    """
     page.click("#repo-chip")
     page.click(f'.picker-item[data-name="{REPO}"]')
     page.wait_for_selector("#repo-branch option:nth-of-type(2)", state="attached")
-    page.click("#repo-connect")
-    page.wait_for_selector(".dialog-wrap", state="detached")
-    expect(page.locator("#repo-chip-text")).to_have_text(f"{REPO} · main")
+    with page.expect_response(
+            lambda r: r.request.method == "POST" and "/context/refresh" in r.url
+    ) as analyze:
+        page.click("#repo-connect")
+        page.wait_for_selector(".dialog-wrap", state="detached")
+        expect(page.locator("#repo-chip-text")).to_have_text(f"{REPO} · main")
+    analyze.value  # the analyze turn has finished; nothing is left in flight
 
 
 # ------------------------------------------------------------------- journey
