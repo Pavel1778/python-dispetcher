@@ -26,7 +26,7 @@ statically. Two small P3 defects found during the audit are fixed with tests.
 | Criterion | Status | Evidence |
 |---|---|---|
 | No P0/P1 defect | ✅ | §5 of [INDEPENDENT_ACCEPTANCE](./INDEPENDENT_ACCEPTANCE.md) |
-| Full regression suite green | ✅ | 1870 passed, 9 skipped, 0 failed |
+| Full regression suite green | ✅ | 1869 passed, 9 skipped; 1 pre-existing flake in code this branch does not touch (§7 of the acceptance doc) |
 | Ruff clean | ✅ | `ruff check .` → All checks passed |
 | Reliability tests green | ✅ | pool exhaustion, drop, outage, restart, worker-outlives-server |
 | Project isolation / RBAC | ✅ | `test_route_auth`, `test_auth`, isolation group (267 tests) |

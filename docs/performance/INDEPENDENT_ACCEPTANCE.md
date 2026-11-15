@@ -137,3 +137,34 @@ pool-hygiene properties (no leak on failure; exhaustion is bounded).
 - Real OpenHands/LLM/GitHub latency — BLOCKED (no load on real services).
 - HTTP/1.1 keep-alive and minification — assessed, not implemented (§11).
 - A multi-hour soak beyond the run in [SOAK_TEST_RESULTS](./SOAK_TEST_RESULTS.md).
+
+## 7. Test suite result and one pre-existing flake (VERIFIED)
+
+Full run: **1869 passed, 9 skipped, 1 failed**. The one failure is
+`tests/test_browser_e2e.py::test_a_repository_that_cannot_be_read_is_said_so_under_the_answer`,
+and it is a **pre-existing flake, not a regression**:
+
+- The failing assertion is `watch.problems == []`, which trips on an
+  `HTTP 400 POST /api/v1/projects/{id}/context/refresh`. The UI fires that
+  request when a repository is connected (`orchestration/studio/app.js`), and
+  the test sets `github.force_status = 401` immediately after; when the request
+  and the forced 401 race, the refresh returns 400 and the browser records it.
+- **None of the files involved are changed by this branch**: `git diff
+  a744263..HEAD -- tests/test_browser_e2e.py orchestration/studio/
+  orchestration/nexus_analysis.py` is empty.
+- **It reproduces on the untouched baseline** (`a744263`, a clean worktree) with
+  the same filter: 3 of 6 subset runs failed there, 4 of 6 here — the same
+  race, in the same proportion, with no performance change involved. Run alone
+  the test passes 8 of 8 times.
+
+So the suite is green for every change this branch makes; the one flake is in
+code this branch does not touch and exists on `main`'s base.
+
+## 8. Memory-metric correction (VERIFIED)
+
+The first soak run reported RSS rising 71.9 → 162.1 MB. That was
+`resource.getrusage().ru_maxrss` — the **peak**, which only ever grows and
+therefore cannot show a leak. A probe reading **current** RSS (`VmRSS`) under
+the same workload is flat (70.9–71.0 MB for readers; 71.5–72.0 MB with periodic
+uploads), so there is no leak. The soak script is fixed to report `VmRSS`
+(`benchmarks/soak_test.py`).
