@@ -89,15 +89,23 @@ def test_a_local_database_is_isolated_per_process():
 
 
 def test_two_processes_get_two_databases():
-    """The whole point: two interpreters, one base DSN, two different databases."""
+    """The whole point: two interpreters, one base DSN, two different databases.
+
+    Either mechanism may isolate: ``conftest._isolate_database`` copies the
+    named database, or ``tests/_test_db.py`` creates ``nexus_test_<token>``.
+    The property asserted is the same either way - the two processes never end
+    up on the same database, and neither is on the shared base URL.
+    """
     url = "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent"
     first = _decide({"TEST_SUPABASE_DB_URL": url})
     second = _decide({"TEST_SUPABASE_DB_URL": url})
-    if first["base"] is None and second["base"] is None:
+    if first["dsn"] == url and second["dsn"] == url:
         import pytest
 
-        pytest.skip("this database role cannot create databases")
-    # Different pids give different suffixes, so the two never collide.
+        pytest.skip("this database role cannot create databases; "
+                    "processes serialise on the base URL instead")
+    # Different pids give different suffixes/tokens, so the two never collide,
+    # and neither process runs on the shared base database.
     assert first["dsn"] != second["dsn"]
-    assert first["base"] == second["base"] == url
+    assert first["dsn"] != url and second["dsn"] != url
 
