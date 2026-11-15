@@ -276,16 +276,35 @@ def test_a_resend_while_the_plan_is_being_built_does_not_plan_twice(lab):
 
 
 def _gone():
-    """Take the database away from a store: every later call is unavailable.
+    """Take the database away from a store, the way a dead process loses it.
 
-    Replaces the store's pool with one pointed at a port nothing listens on, so
-    the process under test cannot write anything more (the same effect the old
-    ``_reconnect`` hook produced, now expressed on the pool).
+    Swapping the pool stops every *future* call (it points at a port nothing
+    listens on), but a connection the store had already checked out - the stage
+    being planned right now - survives a pool swap and can still write once. A
+    real process death closes its sockets, so PostgreSQL rolls that transaction
+    back; the pool swap alone is therefore an incomplete simulation, and under
+    load the "dead" process raced the recovering one and the stage it was
+    planning was recorded twice (``attempts`` 1 where 2 was expected). The
+    server-side backends are closed here too, so nothing more is written on the
+    dead process's behalf - which is what the test's comment already claims.
     """
+    import psycopg
     import psycopg_pool
     from orchestration import cloud_store
 
     def detach(store):
+        dsn = store.dsn
+        # Close the store's live server sessions first, so an in-flight
+        # transaction cannot commit after the "process" is gone; then swap the
+        # pool so every later call is refused at once.
+        try:
+            with psycopg.connect(dsn, autocommit=True) as admin:
+                with admin.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid()")
+        except Exception:  # noqa: BLE001 - best effort; the swap already isolates
+            pass
         store._pool.close()
         dead = "postgresql://127.0.0.1:1/nexus-gone"
         store._pool = psycopg_pool.ConnectionPool(
