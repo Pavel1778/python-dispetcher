@@ -1531,6 +1531,30 @@ def _is_compressible(content_type: str) -> bool:
     return base.startswith(_COMPRESSIBLE_PREFIXES)
 
 
+def _accepts_gzip(header: str) -> bool:
+    """Whether the client accepts gzip, honouring an explicit ``q=0`` refusal.
+
+    A plain ``"gzip" in header`` is wrong twice over: it matches ``gzip;q=0``
+    (the client saying *no*) and it matches the substring inside another token.
+    Parsing the list is a few lines and removes both.
+    """
+    for part in header.split(","):
+        token, _, params = part.strip().partition(";")
+        if token.strip().lower() not in ("gzip", "x-gzip", "*"):
+            continue
+        q = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    q = float(value.strip())
+                except ValueError:
+                    q = 0.0
+        if q > 0:
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SrJrDispatcher/2.0"
 
@@ -1604,7 +1628,7 @@ class Handler(BaseHTTPRequestHandler):
         # available without a build step. Fonts and images are already
         # compressed and are left alone. The body is small and read once, so the
         # cost of compressing it is trivial next to sending it.
-        if _is_compressible(content_type) and "gzip" in self.headers.get("Accept-Encoding", ""):
+        if _is_compressible(content_type) and _accepts_gzip(self.headers.get("Accept-Encoding", "")):
             compressed = gzip.compress(body, compresslevel=6)
             if len(compressed) < len(body):
                 body = compressed

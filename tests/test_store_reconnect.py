@@ -303,3 +303,43 @@ def test_an_outage_is_a_503_without_the_driver_text_and_ends_by_itself(served):
         check=cloud_store._pool_check_connection)
     assert _get(base, "/api/v1/projects")[0] == 200
     assert _get(base, "/readyz", token=None)[0] == 200
+
+
+# --------------------------------------------------------------- pool hygiene
+def test_a_failed_transaction_returns_its_connection_to_the_pool(store):
+    """An exception inside a transaction must not leak the connection.
+
+    If the pool handed out a connection and never got it back, a few failed
+    calls would exhaust it and every later call would time out. The idle count
+    is the same before and after a failure, so the connection came back.
+    """
+    import psycopg
+
+    idle_before = store._pool.get_stats()["pool_available"]
+    for _ in range(5):
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            with store._tx() as cur:
+                cur.execute("SELECT 1 FROM a_table_that_does_not_exist")
+    idle_after = store._pool.get_stats()["pool_available"]
+    assert idle_after == idle_before, "a connection was lost after a failure"
+    # The pool is still usable.
+    assert isinstance(store.dashboard_counts(), dict)
+
+
+def test_pool_exhaustion_is_reported_as_unavailable_not_a_hang(store, monkeypatch):
+    """When every connection is out and the wait expires, the caller is told.
+
+    Held connections are released afterwards, so this is the *bounded* wait,
+    not a deadlock: the caller gets StoreUnavailable and the pool recovers.
+    """
+    monkeypatch.setattr(store, "pool_timeout", 0.3)
+    store._pool.close()
+    store._open_pool()
+    held = [store._pool.getconn() for _ in range(store.pool_max)]
+    try:
+        with pytest.raises(StoreUnavailable):
+            store.dashboard_counts()
+    finally:
+        for conn in held:
+            store._pool.putconn(conn)
+    assert isinstance(store.dashboard_counts(), dict)

@@ -334,7 +334,6 @@ class PostgresStore:
         # Kept so a connection is opened the same way everywhere (the pool and
         # any direct open share these).
         self._connect_kwargs = connect_kwargs
-        self._reconnect_failed_at = 0.0
         self.pool_min = _pool_size_env("NEXUS_DB_POOL_MIN", 1)
         self.pool_max = _pool_size_env("NEXUS_DB_POOL_MAX", 8)
         if self.pool_max < self.pool_min:
@@ -590,11 +589,6 @@ class PostgresStore:
         return missing
 
     # ---------------------------------------------------------------- infra
-    #: After a failed connect, how long to refuse further attempts. The pool
-    #: uses this as its own reconnect back-off, so a database outage does not
-    #: turn into a queue of requests that each spend the whole connect timeout.
-    RECONNECT_BACKOFF_SECONDS = 2.0
-
     @contextmanager
     def _tx(self) -> Iterator[Any]:
         """Yield a cursor inside a transaction, committing or rolling back.
@@ -616,12 +610,10 @@ class PostgresStore:
         try:
             conn = self._ensure_pool().getconn()
         except psycopg_pool.PoolTimeout as e:
-            self._reconnect_failed_at = time.monotonic()
             raise StoreUnavailable("database unavailable") from e
         except psycopg_pool.PoolClosed as e:  # pragma: no cover - pool raced closed
             raise StoreUnavailable("database unavailable") from e
         except psycopg.Error as e:
-            self._reconnect_failed_at = time.monotonic()
             raise StoreUnavailable("database unavailable") from e
         try:
             if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
