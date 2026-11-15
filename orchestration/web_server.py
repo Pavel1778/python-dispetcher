@@ -56,6 +56,7 @@ Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
 from __future__ import annotations
 
 import argparse
+import gzip
 import hmac
 import json
 import logging
@@ -1516,6 +1517,17 @@ class App:
         }
 
 
+#: Content types worth compressing: text formats whose gzipped form is much
+#: smaller. Fonts (already compressed) and images are excluded.
+_COMPRESSIBLE_PREFIXES = ("text/", "application/javascript", "application/json",
+                          "image/svg+xml", "application/manifest+json")
+
+
+def _is_compressible(content_type: str) -> bool:
+    base = content_type.split(";", 1)[0].strip().lower()
+    return base.startswith(_COMPRESSIBLE_PREFIXES)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SrJrDispatcher/2.0"
 
@@ -1582,9 +1594,27 @@ class Handler(BaseHTTPRequestHandler):
         cache_control: str = "public, max-age=300",
     ) -> None:
         body = text.encode() if isinstance(text, str) else text
+        encoding = None
+        # Compress text assets on the fly when the client accepts it. A studio
+        # asset is ~4x smaller gzipped (app.js 207 KB -> 52 KB), and the same
+        # page is fetched on every visit, so this is the largest first-load win
+        # available without a build step. Fonts and images are already
+        # compressed and are left alone. The body is small and read once, so the
+        # cost of compressing it is trivial next to sending it.
+        if _is_compressible(content_type) and "gzip" in self.headers.get("Accept-Encoding", ""):
+            compressed = gzip.compress(body, compresslevel=6)
+            if len(compressed) < len(body):
+                body = compressed
+                encoding = "gzip"
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            # A compressed response varies by Accept-Encoding; say so, so a
+            # shared cache does not hand gzip bytes to a client that cannot read
+            # them.
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", cache_control)
         self.end_headers()
