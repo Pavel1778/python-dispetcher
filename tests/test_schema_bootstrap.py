@@ -50,7 +50,6 @@ def _maintenance_dsn() -> str:
     *different* test databases has to be taken where they all meet. The
     maintenance database is the one every connection can reach.
     """
-    import psycopg
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
     params = conninfo_to_dict(DSN)
