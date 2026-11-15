@@ -42,9 +42,24 @@ TABLES = (
 )
 
 
+def _maintenance_dsn() -> str:
+    """The DSN of the ``postgres`` maintenance database on the same server.
+
+    Used as the rendezvous for a cluster-wide advisory lock: ``pg_advisory_lock``
+    is scoped to one database, so a lock that must serialise processes on
+    *different* test databases has to be taken where they all meet. The
+    maintenance database is the one every connection can reach.
+    """
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(DSN)
+    params["dbname"] = "postgres"
+    return make_conninfo(**params)
+
+
 def _drop_schema() -> None:
     import psycopg
-
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -251,11 +266,21 @@ def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
     _drop_schema()
     # The Supabase roles are **cluster-global**, not per database: two pytest
     # processes that both create and drop them race, and one drops a role the
-    # other is still using. A PostgreSQL advisory lock (cluster-wide, keyed by a
-    # constant) serialises this section, so the test is safe to run in parallel
-    # with any other process.
+    # other is still using. A PostgreSQL advisory lock serialises this section.
+    #
+    # It must be taken on a database both processes share. ``pg_advisory_lock``
+    # is **per database** - the lock is keyed by (database oid, key), so the
+    # same constant taken on two different databases does not collide. With
+    # per-process test databases (``tests/conftest._isolate_database``) each
+    # process runs on its own database, so a lock taken on the session's own DSN
+    # would not serialise anything: two processes raced and one failed with
+    # ``duplicate key value violates unique constraint pg_authid_rolname_index``
+    # on ``CREATE ROLE "anon"``. The lock is therefore taken on the ``postgres``
+    # maintenance database, which every process shares. The ``database`` clause
+    # of the lock key is the maintenance database's oid, so it is a real
+    # cluster-wide rendezvous.
     lock_key = 0x4E45585553  # "NEXUS" as an integer
-    with psycopg.connect(DSN, autocommit=True) as conn:
+    with psycopg.connect(_maintenance_dsn(), autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
             try:
