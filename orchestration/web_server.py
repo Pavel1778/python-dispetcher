@@ -1514,6 +1514,9 @@ class App:
                 "lab_inline": self.lab_inline,
                 "lab_last_tick_at": self.last_lab_tick.get("at"),
             },
+            # Database pool pressure: counts only, no DSN or credential. Lets an
+            # operator see whether callers are waiting for a connection.
+            "db_pool": self.store.pool_stats(),
         }
 
 

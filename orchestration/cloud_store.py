@@ -391,6 +391,29 @@ class PostgresStore:
             self._open_pool()
         return self._pool
 
+    def pool_stats(self) -> dict[str, Any]:
+        """A small, safe snapshot of the pool for diagnostics.
+
+        Counts only: no DSN, host, user or credential. ``waiting`` above zero
+        means callers are queued for a connection, which is the signal to raise
+        ``NEXUS_DB_POOL_MAX`` (if the database limit allows) or to look for a
+        slow query holding a connection.
+        """
+        try:
+            s = self._ensure_pool().get_stats()
+        except Exception:  # noqa: BLE001 - diagnostics must not raise
+            return {"available": False}
+        return {
+            "available": True,
+            "min": self.pool_min,
+            "max": self.pool_max,
+            "size": s.get("pool_size"),
+            "idle": s.get("pool_available"),
+            "waiting": s.get("requests_waiting"),
+            "requests": s.get("requests_num"),
+            "wait_ms": s.get("requests_wait_ms"),
+        }
+
     # ------------------------------------------------------------ migrations
     def apply_migrations(self, directory: str | None = None) -> list[str]:
         """Apply every ``*.sql`` migration in order, skipping applied ones.
