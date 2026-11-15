@@ -1,6 +1,12 @@
 """Defaults for the whole test session."""
 import os
 
+# The test suites drop and re-create the public schema of the database they
+# run against. Giving every pytest process a database of its own (or, when
+# that is not allowed, serialising the processes) is what stops two parallel
+# runs from corrupting each other; see tests/_test_db.py.
+from tests import _test_db  # noqa: F401 - the import does the setup
+
 # A server advances autonomous runs itself unless NEXUS_LAB_INLINE says no
 # (``orchestration.web_server.lab_inline_default``). Most tests here start a
 # server to exercise something else, and many create a run to look at it as it

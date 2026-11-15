@@ -518,6 +518,16 @@ class OpenHandsClient:
         if status not in (200, 201):
             raise ApiUnavailable(f"pause -> {status}")
 
+    def download_file(self, path: str, *, limit: int) -> tuple[int, bytes]:
+        """``GET /api/file/download?path=…`` for file-recovery callers.
+
+        ``(status, body)`` with at most ``limit + 1`` bytes; a non-200 status
+        is returned to the caller, not raised, for every HTTP answer (a 404 is
+        "the file is not there", a fact, not a transport failure). A network
+        failure raises :class:`ApiUnavailable` as everywhere else.
+        """
+        return self._download_from(self._base_url(), self._auth_key(), path, limit=limit)
+
     # ----------------------------------------------------------------- utils
     @staticmethod
     def _view(payload: dict[str, Any]) -> ConversationView:

@@ -1397,6 +1397,11 @@
             (extra.length ? ' · ' + esc(extra.join(' · ')) : '') + '</span></li>';
         }).join('') + '</ul></details>' : '';
     var actions = '';
+    var hasConversations = executions.some(function (item) { return !!item.conversation_id; });
+    // What the agents printed, in full: on every run that started a
+    // conversation, live or over - the output does not disappear when the
+    // run ends.
+    if (hasConversations) actions += '<button class="btn btn-sm" type="button" data-action="terminal-outputs" data-id="' + esc(entry.id) + '">' + icon('terminal', 'icon-sm') + 'Вывод команд</button>';
     if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
     if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
     if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
@@ -2645,6 +2650,137 @@
     });
   }
 
+  /* ------------------------------------------------ terminal outputs */
+  // What the run's agents actually did, beyond their own reports: the
+  // commands OpenHands ran and the text behind each clipped
+  // "ObservationEvent". The list endpoint resolves, per command, whether
+  // the sandbox still holds the file with the SDK's saved rendering; the
+  // text itself is fetched only when a person asks for it.
+  function fmtExit(code) {
+    if (code === null || code === undefined || code === -1) return 'код выхода неизвестен';
+    return 'код выхода ' + code;
+  }
+  function outputFullState(item) {
+    switch (item.saved_output) {
+      case 'available': return { label: 'файл сохранён', tone: 'is-ok' };
+      case 'missing': return { label: 'файла нет', tone: '' };
+      case 'unsupported': return { label: 'transport не отдаёт файлы', tone: '' };
+      default: return { label: 'состояние неизвестно', tone: '' };
+    }
+  }
+  function terminalOutputUrl(runId, item, suffix) {
+    return projectUrl('/runs/' + enc(runId) + '/terminal-outputs/'
+      + enc(item.conversation_id) + '/' + enc(item.id) + (suffix || ''));
+  }
+  function openTerminalOutputs(runId) {
+    var dialog = openDialog({
+      title: 'Вывод команд',
+      className: 'is-wide is-log',
+      body: '<div class="skeleton" aria-label="Загрузка вывода команд"><i></i><i></i><i></i></div>',
+      foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>'
+    });
+    var bodyEl = $('.dialog-body', dialog.el);
+    api(projectUrl('/runs/' + enc(runId) + '/terminal-outputs'), { timeout: 60000 })
+      .then(function (data) {
+        var outputs = (data && data.outputs) || [];
+        var unavailable = (data && data.unavailable) || [];
+        if (!outputs.length) {
+          bodyEl.innerHTML = '<div class="empty"><div class="empty-icon">' + icon('terminal') +
+            '</div><h3>Вывод команд не найден</h3><p>' +
+            (unavailable.length
+              ? 'Разговор' + (unavailable.length > 1 ? 'ы' : '') + ' этого прогона не отвечают или не поддерживают чтение файлов. Их вывод здесь не показан.'
+              : 'Агенты этого прогона ещё не выполнили команды, либо OpenHands не сохранил их вывод.') +
+            '</p></div>';
+          return;
+        }
+        var html = '<p class="lead">' + outputs.length + (outputs.length === 1 ? ' команда.' : ' команд(ы).') +
+          (data.truncated ? ' Показаны самые свежие.' : '') + '</p>' +
+          '<p class="step-sub">OpenHands сохраняет в песочнице свой рендер обрезанного вывода (до ~30 000 символов), а не сырой stdout целиком — необрезанный вывод команды не сохранён нигде.</p>';
+        if (unavailable.length) {
+          html += '<p class="form-msg is-bad">' + unavailable.length +
+            ' разговор(ов) не отвечают или недоступны — их вывод здесь не показан.</p>';
+        }
+        html += outputs.map(function (item) {
+          var state = outputFullState(item);
+          var when = item.at ? clock(item.at) : '';
+          var clippedNote = item.clipped ? ' · вывод был обрезан OpenHands' : '';
+          var btnDisabled = item.saved_output === 'missing' || item.saved_output === 'unsupported';
+          var title = item.saved_output === 'missing' ? 'OpenHands не сохранил файл этой команды'
+            : item.saved_output === 'unsupported' ? 'Этот транспорт не умеет читать файлы песочницы'
+            : 'Открыть сохранённый рендер';
+          var exitTone = item.exit_code === 0 ? 'is-ok' : (item.exit_code ? 'is-failed' : '');
+          return '<div class="log-row">' +
+            '<div class="log-cmd"><span class="dot ' + exitTone + '" title="' + esc(fmtExit(item.exit_code)) + '"></span>' + esc(item.command || '(пустая команда)') + '</div>' +
+            '<div class="output-meta"><span>' + esc(when) + '</span><span>' + esc(fmtExit(item.exit_code)) + '</span>' +
+              (item.is_error ? '<span class="is-bad">ошибка</span>' : '') +
+              '<span>' + esc(String(item.output_chars)) + ' симв.' + esc(clippedNote) + '</span>' +
+              '<span>' + esc(state.label) + '</span></div>' +
+            (item.preview ? '<pre class="log-preview">' + esc(item.preview) + '</pre>' : '') +
+            '<div class="output-actions">' +
+              '<button class="btn btn-sm" type="button" data-action="open-terminal-output" data-run="' + esc(runId) +
+                '" data-cid="' + esc(item.conversation_id) + '" data-event="' + esc(item.id) + '"' +
+                (btnDisabled ? ' disabled' : '') + ' title="' + esc(title) + '" aria-label="' + esc(title) + '">' +
+                icon('terminal', 'icon-sm') + 'Сохранённый вывод</button>' +
+              '<a class="btn btn-sm btn-ghost" href="' + esc(terminalOutputUrl(runId, item, '/download')) +
+                '" download>' + icon('download', 'icon-sm') + 'Скачать</a>' +
+            '</div></div>';
+        }).join('');
+        bodyEl.innerHTML = html;
+      }, function (error) {
+        bodyEl.innerHTML = '<div class="form-msg is-bad" role="alert">' +
+          esc(explain(error.message).text) + '</div>' +
+          '<div class="output-actions"><button class="btn btn-sm" type="button" data-action="retry-terminal-outputs" data-id="' +
+          esc(runId) + '">Повторить</button></div>';
+      });
+    return dialog;
+  }
+
+  function openTerminalOutput(runId, cid, eventId) {
+    var url = terminalOutputUrl(runId, { conversation_id: cid, id: eventId }, '');
+    var dialog = openDialog({
+      title: 'Сохранённый вывод',
+      className: 'is-wide is-log',
+      body: '<div class="skeleton" aria-label="Загрузка сохранённого вывода"><i></i><i></i><i></i><i></i></div>',
+      foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>'
+    });
+    var bodyEl = $('.dialog-body', dialog.el);
+    api(url, { timeout: 60000 }).then(function (data) {
+      var text = (data && data.text) || '';
+      var size = (data && typeof data.bytes === 'number') ? data.bytes : text.length;
+      var MAX_VIEW = 2000000;
+      var shown = text.length > MAX_VIEW ? text.slice(0, MAX_VIEW) : text;
+      dialog.el.querySelector('#dialog-title').textContent = 'Сохранённый вывод · ' + size + ' байт';
+      bodyEl.innerHTML = '';
+      var pre = document.createElement('pre');
+      pre.className = 'log-view';
+      pre.id = 'terminal-output-view';
+      pre.textContent = shown;
+      bodyEl.appendChild(pre);
+      if (shown.length < text.length) {
+        var note = document.createElement('p');
+        note.className = 'step-sub';
+        note.textContent = 'Показаны первые 2 000 000 символов. Скачайте файл, чтобы получить полный текст.';
+        bodyEl.appendChild(note);
+      }
+      var foot = $('.dialog-foot', dialog.el);
+      foot.innerHTML =
+        '<button class="btn btn-sm" type="button" id="copy-terminal-output">' + icon('copy', 'icon-sm') + 'Копировать</button>' +
+        '<a class="btn btn-sm btn-primary" href="' + esc(terminalOutputUrl(runId, { conversation_id: cid, id: eventId }, '/download')) + '" download>' + icon('download', 'icon-sm') + 'Скачать файл</a>' +
+        '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>';
+      foot.querySelector('#copy-terminal-output').addEventListener('click', function () {
+        copyOut(text, 'Вывод скопирован.');
+      });
+    }, function (error) {
+      var message = error.status === 404 ? 'Сохранённый файл недоступен: OpenHands не сохранил его или он уже удалён.'
+        : error.status === 413 ? 'Файл больше 8 МБ — скачайте его в OpenHands.'
+        : error.status === 501 ? 'Этот транспорт не умеет отдавать файлы песочницы.'
+        : error.status === 502 ? 'OpenHands не ответил. Повторите попытку.'
+        : explain(error.message).text;
+      bodyEl.innerHTML = '<div class="form-msg is-bad" role="alert">' + esc(message) + '</div>';
+    });
+    return dialog;
+  }
+
   /* --------------------------------------------------------------- actions */
   // What a copy button does with its text: copy it and say so, or - when the
   // browser lets nothing be copied for it - put the whole text in front of the
@@ -2937,6 +3073,17 @@
         ? record.detail.report.body : '';
       if (!content) { toast('Отчёт ещё не готов.', 'bad'); return; }
       copyOut(content, 'Отчёт скопирован.');
+    },
+    'terminal-outputs': function (el) {
+      openTerminalOutputs(el.getAttribute('data-id'));
+    },
+    'retry-terminal-outputs': function (el) {
+      closeDialog();
+      openTerminalOutputs(el.getAttribute('data-id'));
+    },
+    'open-terminal-output': function (el) {
+      openTerminalOutput(el.getAttribute('data-run'), el.getAttribute('data-cid'),
+                         el.getAttribute('data-event'));
     },
     'copy-code': function (el) {
       var code = $('code', el.closest('.code'));
