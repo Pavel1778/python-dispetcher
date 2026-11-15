@@ -249,6 +249,27 @@ def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
     import psycopg
 
     _drop_schema()
+    # The Supabase roles are **cluster-global**, not per database: two pytest
+    # processes that both create and drop them race, and one drops a role the
+    # other is still using. A PostgreSQL advisory lock (cluster-wide, keyed by a
+    # constant) serialises this section, so the test is safe to run in parallel
+    # with any other process.
+    lock_key = 0x4E45585553  # "NEXUS" as an integer
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+            try:
+                _run_supabase_role_case(psycopg)
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+
+def _run_supabase_role_case(psycopg) -> None:
+    """Create the two roles, apply every migration, drop them again.
+
+    Runs under the advisory lock taken by the caller, so the cluster-global
+    roles are not created or dropped while another process needs them.
+    """
     # Create the roles only if they do not already exist, and only for the
     # duration of this test. A database user without CREATEROLE cannot do it;
     # that is not the code under test, so the case is skipped, not failed.
@@ -275,9 +296,25 @@ def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
         # migrations attached to them first (a policy or grant makes the role
         # own objects, and DROP ROLE refuses while they exist). A role that was
         # already there is left untouched.
+        #
+        # The roles are **cluster-global**: another database (a sibling test
+        # database) that ran the same migrations holds policies bound to
+        # ``authenticated``, and ``DROP OWNED BY`` only releases objects in the
+        # *current* database - so the drop can fail with
+        # ``DependentObjectsStillExist`` while a peer database still references
+        # the role. That is housekeeping, not the property under test (which is
+        # that the migrations apply), so a role that cannot be dropped is left in
+        # place rather than failing the test. A leftover NOLOGIN role is
+        # harmless, and the next run reuses it.
         if created:
+            import psycopg.errors
+
             with psycopg.connect(DSN, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     for role in created:
-                        cur.execute(f'DROP OWNED BY "{role}"')
-                        cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                        try:
+                            cur.execute(f'DROP OWNED BY "{role}"')
+                            cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                        except psycopg.errors.DependentObjectsStillExist:
+                            # A peer database still uses the role; leave it.
+                            conn.rollback()

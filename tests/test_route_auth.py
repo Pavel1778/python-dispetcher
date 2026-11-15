@@ -78,6 +78,8 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/context",
     f"/api/v1/projects/{UUID}/executors",
     f"/api/v1/projects/{UUID}/runs", f"/api/v1/projects/{UUID}/runs/{UUID}/report",
+    f"/api/v1/projects/{UUID}/runs/{UUID}/tasks/{UUID}/outputs",
+    f"/api/v1/projects/{UUID}/runs/{UUID}/tasks/{UUID}/outputs/{UUID}",
     f"/api/v1/projects/{UUID}/repositories",
     f"/api/openhands/accounts/{UUID}/dependencies",
     f"/api/openhands/accounts/{UUID}/executions",

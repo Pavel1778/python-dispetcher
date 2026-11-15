@@ -1213,6 +1213,61 @@ class App:
         task = self.store.retry_task(task_id)
         return {"task_id": task.id, "state": task.state.value}
 
+    def _execution_client_for_task(self, principal: str, task: dict[str, Any]) -> Any:
+        """The client that can read a task's conversation.
+
+        A task bound to an account is read with that account's execution client;
+        an unbound one with the process client. Reading through the wrong account
+        would ask a different sandbox for a conversation it never had, so the
+        binding is honoured here exactly as the executor honours it.
+        """
+        account_id = task.get("openhands_account_id")
+        if account_id:
+            return self.openhands_accounts.execution_client_for_account(
+                principal, str(account_id))
+        return self.client
+
+    def run_task_outputs(self, principal: str, project_id: str, run_id: str,
+                         task_id: str) -> dict[str, Any]:
+        """Which terminal outputs of a task's conversation were cut off.
+
+        Returns one entry per truncated ``ObservationEvent`` with the event id
+        and how many characters the event showed - never the full text, which is
+        read on demand. The list is empty when the task has no conversation yet,
+        when the transport cannot reach output files, or when nothing was cut.
+        """
+        from .nexus_outputs import run_task_outputs
+
+        return run_task_outputs(self.store, principal, project_id, run_id, task_id,
+                                self._execution_client_for_task)
+
+    def run_task_output(self, principal: str, project_id: str, run_id: str,
+                        task_id: str, event_id: str) -> dict[str, Any]:
+        """The complete terminal output of one truncated event.
+
+        The event is read first (its truncated text is the key the archive is
+        searched with), so the result is the exact file whose preview the event
+        showed - not a file guessed by name. The full text is returned for the
+        interface to display or download; nothing is written to the database.
+        """
+        from .nexus_outputs import run_task_output
+
+        return run_task_output(self.store, principal, project_id, run_id, task_id,
+                               event_id, self._execution_client_for_task)
+
+    def _execution_client_for_task(self, principal: str, account_id: str | None) -> Any:
+        """The client that can read a task's conversation.
+
+        A task bound to an account is read with that account's execution client;
+        an unbound one with the process client. Reading through the wrong account
+        would ask a different sandbox for a conversation it never had, so the
+        binding is honoured here exactly as the executor honours it.
+        """
+        if account_id:
+            return self.openhands_accounts.execution_client_for_account(
+                principal, str(account_id))
+        return self.client
+
     def switch_task_executor(self, principal: str, project_id: str, run_id: str,
                              task_id: str, account_id: str) -> dict[str, Any]:
         """Hand a running task to another OpenHands account (manual switch).
@@ -1826,17 +1881,20 @@ class Handler(BaseHTTPRequestHandler):
     def _static(
         self, code: int, text: str | bytes, content_type: str, *,
         cache_control: str = "public, max-age=300",
+        precompressed: bytes | None = None,
     ) -> None:
         body = text.encode() if isinstance(text, str) else text
         encoding = None
-        # Compress text assets on the fly when the client accepts it. A studio
-        # asset is ~4x smaller gzipped (app.js 207 KB -> 52 KB), and the same
-        # page is fetched on every visit, so this is the largest first-load win
-        # available without a build step. Fonts and images are already
-        # compressed and are left alone. The body is small and read once, so the
-        # cost of compressing it is trivial next to sending it.
-        if _is_compressible(content_type) and _accepts_gzip(self.headers.get("Accept-Encoding", "")):
-            compressed = gzip.compress(body, compresslevel=6)
+        # Text assets are served gzipped when the client accepts it - a studio
+        # asset is ~4x smaller (app.js 214 KB -> 54 KB). A caller that passes a
+        # body it already compressed (*precompressed*) avoids recompressing it
+        # on every request; only a body with no prepared form is compressed
+        # here. Fonts and images are already compressed and are left alone.
+        if _is_compressible(content_type) and _accepts_gzip(
+                self.headers.get("Accept-Encoding", "")):
+            compressed = precompressed
+            if compressed is None:
+                compressed = gzip.compress(body, compresslevel=6)
             if len(compressed) < len(body):
                 body = compressed
                 encoding = "gzip"
@@ -2345,6 +2403,22 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "report"):
             return (200, {"report": self.app.reports.get(principal, project_id, rest[1])},
                     None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/tasks/{task_id}/outputs
+        #   Which terminal outputs of the task's conversation were cut off. An
+        #   empty list, never an error, when nothing was cut or the transport
+        #   cannot reach output files (the Cloud app transport); a flag says so.
+        if (len(rest) == 5 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "tasks" and rest[4] == "outputs"):
+            return (200, self.app.run_task_outputs(
+                principal, project_id, rest[1], rest[3]), None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/tasks/{task_id}/outputs/{event_id}
+        #   The complete terminal output whose preview one event showed. The
+        #   text is returned for the interface; it is never written to the
+        #   database, so a huge output is not duplicated in PostgreSQL.
+        if (len(rest) == 6 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "tasks" and rest[4] == "outputs"):
+            return (200, self.app.run_task_output(
+                principal, project_id, rest[1], rest[3], rest[5]), None)
         # GET /api/v1/projects/{id}/specs/{spec_id}[/content|sections|requirements|stages]
         if rest and rest[0] == "specs" and len(rest) in (2, 3) and UUID_RE.fullmatch(rest[1]):
             return self._get_spec(principal, project_id, rest[1], rest[2] if len(rest) == 3 else "")
@@ -4267,9 +4341,13 @@ class Handler(BaseHTTPRequestHandler):
                                     cache_control=cache_control)
             if path in web_ui.STATIC:
                 # A closed mapping, not a directory lookup: a path that is not a
-                # key here is never read from disk (see web_ui.STATIC).
+                # key here is never read from disk (see web_ui.STATIC). The
+                # gzipped body is prepared once (web_ui.STATIC_GZIP), so a
+                # repeat request does not spend CPU recompressing an asset that
+                # never changes.
                 body, content_type, cache_control = web_ui.STATIC[path]
-                return self._static(200, body, content_type, cache_control=cache_control)
+                return self._static(200, body, content_type, cache_control=cache_control,
+                                    precompressed=web_ui.STATIC_GZIP.get(path))
 
             # --- everything below requires authentication ---
             if path == "/":

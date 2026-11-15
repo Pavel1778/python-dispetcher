@@ -47,6 +47,10 @@ def _actions_in_markup() -> set[str]:
         used |= set(re.findall(r'data-action="([\w-]+)"', read(name)))
     # explain() names an action for the button under an error message.
     used |= set(re.findall(r"action: '([\w-]+)'", read("app.js")))
+    # iconAction('icon', 'action', 'label', …) is the compact icon-only control:
+    # it builds the ``data-action`` attribute at runtime, so the literal is not
+    # in the source. The action it wires is the second argument.
+    used |= set(re.findall(r"iconAction\(\s*'[\w-]+',\s*'([\w-]+)'", read("app.js")))
     return used
 
 
@@ -88,6 +92,27 @@ def test_every_icon_referenced_is_in_the_sprite():
 def test_element_ids_are_unique_in_the_page():
     ids = re.findall(r'\bid="([\w-]+)"', read("index.html"))
     assert sorted(ids) == sorted(set(ids))
+
+
+def test_the_prepared_gzip_bodies_match_the_assets():
+    """Every text asset is served gzipped from a body prepared once at import.
+
+    The prepared body must decompress to exactly the file: a stale or wrong copy
+    would ship a broken asset while every test that only checks the file on disk
+    still passed. Fonts are left alone (already compressed).
+    """
+    import gzip
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from orchestration import web_ui
+
+    assert web_ui.STATIC_GZIP, "no text asset was prepared for gzip"
+    for url, body in web_ui.STATIC_GZIP.items():
+        original = web_ui.STATIC[url][0]
+        assert gzip.decompress(body) == original, url
+        assert len(body) < len(original), url
+    # A binary asset (a font) is not prepared.
+    assert "/static/fonts/inter-latin.woff2" not in web_ui.STATIC_GZIP
 
 
 # ------------------------------------------------- what the policy forbids
@@ -163,9 +188,19 @@ def test_every_file_in_the_studio_directory_is_accounted_for():
 
 
 def test_served_assets_are_what_is_on_disk():
+    """What the server serves equals the file on disk.
+
+    ``web_ui.STATIC`` is read once at import, so this compares that snapshot
+    with the file *now*. A mismatch therefore also means a studio file was
+    edited after this process imported ``web_ui`` (a concurrent edit during a
+    run) - finish every edit before starting the suite.
+    """
     for url, (name, content_type, _cache) in web_ui._FILES.items():
         body, served_type, cache = web_ui.STATIC[url]
-        assert body == (STUDIO / name).read_bytes(), url
+        on_disk = (STUDIO / name).read_bytes()
+        assert body == on_disk, (
+            f"{url}: the served bytes differ from {name} on disk "
+            "(a studio file edited after web_ui was imported?)")
         assert served_type == content_type
         assert cache.startswith("public, max-age=")
     assert "__ASSET_VERSION__" not in web_ui.APP_HTML

@@ -14,8 +14,10 @@ import json
 import posixpath
 import threading
 import urllib.parse
+import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from typing import Any, Callable
 
 
@@ -40,6 +42,20 @@ class FakeConversation:
     #: The sandbox's files at the moment this conversation was created. A file
     #: that arrives later was not there when the agent started.
     files_at_start: dict[str, bytes] = field(default_factory=dict)
+    #: The full-output files the agent-server wrote for this conversation:
+    #: ``terminal_output_<sha256[:8]>.txt`` -> the full text. A truncated event
+    #: (content of ``TERMINAL_OUTPUT_CAP_CHARS``) is answered by
+    #: ``download-trajectory`` with a ZIP that carries these.
+    output_files: dict[str, str] = field(default_factory=dict)
+    #: Observation events the conversation should report from
+    #: ``events/search``; each is a ready event dict.
+    observation_events: list[dict[str, Any]] = field(default_factory=list)
+    #: ``True`` -> ``download-trajectory`` answers 404 (the file is gone, or the
+    #: retention window passed).
+    trajectory_missing: bool = False
+    #: When set, ``download-trajectory`` answers these exact bytes (a corrupted
+    #: or oversized archive), ignoring ``output_files``.
+    trajectory_raw: bytes | None = None
 
 
 def parse_upload(body: bytes, content_type: str) -> tuple[str, bytes] | None:
@@ -152,6 +168,18 @@ class FakeRuntime:
             c.status = "finished"
             c.final_response = response
 
+    def make_conversation(self, conversation_id: str | None = None,
+                          working_dir: str = "/workspace/project") -> str:
+        """Register a conversation and return its id.
+
+        A test that needs a conversation without going through the create
+        request (which provisions a sandbox and an account) uses this.
+        """
+        cid = conversation_id or f"conv-{self.created_count + 1}"
+        self.created_count += 1
+        self.conversations[cid] = FakeConversation(id=cid, working_dir=working_dir)
+        return cid
+
     def set_status(self, conversation_id: str, status: str) -> None:
         with self.lock:
             self.conversations[conversation_id].status = status
@@ -263,7 +291,35 @@ class _Handler(BaseHTTPRequestHandler):
                 items.append(
                     {"kind": "ConversationErrorEvent", "classification": cls}
                 )
+            items.extend(json.loads(json.dumps(c.observation_events)))
             self._json(200, {"items": items})
+            return
+
+        # /api/conversations/{id}/file/download-trajectory/{id}
+        #   A ZIP of the conversation's own directory. The agent-server packs
+        #   the conversation's events and its observations/ - the full terminal
+        #   outputs a truncated event points at - and refuses any path outside
+        #   the conversation. The fake carries the full-output files the test
+        #   seeded and answers 404 when told the file is gone.
+        if (len(parts) == 6 and parts[3] == "file"
+                and parts[4] == "download-trajectory"):
+            c = self.runtime.conversations.get(parts[2])
+            if c is None or c.trajectory_missing:
+                self._json(404, {"detail": "Conversation not found"})
+                return
+            if c.trajectory_raw is not None:
+                data = c.trajectory_raw
+            else:
+                buf = BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                    for name, text in c.output_files.items():
+                        z.writestr(f"{parts[2]}/observations/{name}", text)
+                data = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
 
         # /api/conversations/{id}/agent_final_response

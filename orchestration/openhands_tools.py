@@ -40,6 +40,16 @@ class ToolCatalogUnsupported(RuntimeError):
     """
 
 
+class ArtifactsUnsupported(RuntimeError):
+    """This transport cannot reach a conversation's full-output files.
+
+    The agent-server writes a truncated terminal output to a file beside the
+    conversation; only a transport that addresses a sandbox's filesystem can
+    read it. The Cloud V1 *app* transport cannot, so it raises this rather than
+    returning an empty result a caller might read as "the output is complete".
+    """
+
+
 #: The capability groups the request names, each proved by a set of tools the
 #: agent-server reports. Git and testing have no dedicated built-in — the agent
 #: runs ``git`` and ``pytest`` through the terminal — so both are proved by

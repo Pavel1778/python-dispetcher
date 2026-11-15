@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — full terminal output, run controls, test isolation, asset latency
+
+### Added
+
+- **Full terminal output recovery.** The agent-server cuts a terminal
+  `ObservationEvent` at 30 000 characters and writes the whole output to a file
+  beside the conversation; NEXUS can now read it. The truncated event's text is
+  an exact prefix of the file, so the file is found by matching that prefix in
+  the conversation's own trajectory archive (the only conversation-scoped way to
+  reach it). Routes: `GET …/runs/{run}/tasks/{task}/outputs` (which events were
+  cut) and `GET …/runs/{run}/tasks/{task}/outputs/{event_id}` (the full text).
+  The studio shows a terminal icon on a task that ran and reads the text on
+  demand; the CLI has `nexus run outputs|output`; MCP has
+  `list_run_task_outputs` and `get_run_task_output`. The Cloud *app* transport
+  cannot reach a sandbox filesystem and says so (`unsupported`), never an empty
+  result. See `AGENTS.md`, "Full terminal output recovery".
+  (`orchestration/nexus_outputs.py`, `cloud_direct.py`, `local_runtime.py`,
+  `openhands_client.py`, `web_server.py`, `cli.py`, `mcp_server.py`; tests
+  `tests/test_artifacts.py`.)
+
+### Changed
+
+- **The run card's controls are compact icon-only buttons** with a real
+  accessible name (a tooltip and an `aria-label`), a busy state and a danger
+  tone, offered only for the states the server accepts. A paused run says
+  honestly what the pause means: it stops new tasks, not a conversation already
+  running in OpenHands.
+- **A studio asset's gzipped body is computed once, not per request.** Measured
+  `static_asset_ms` p50: 7.23 ms → 0.59 ms (`tools/benchmark.py`). The served
+  bytes are unchanged.
+
+### Fixed
+
+- **Two pytest processes no longer share one test database.** Each process makes
+  its own copy of a local disposable database, and the one test that creates and
+  drops the cluster-global Supabase roles takes a cluster-wide advisory lock.
+  Before this, running two suites on one database failed in
+  `test_schema_bootstrap` and a browser test while each passed alone
+  (`tests/test_test_isolation.py`).
+
 ## Unreleased — performance, execution reliability, project/conversation lifecycle
 
 ### Fixed

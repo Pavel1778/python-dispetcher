@@ -22,6 +22,21 @@
   function icon(name, extra) {
     return '<svg class="icon' + (extra ? ' ' + extra : '') + '" aria-hidden="true"><use href="#i-' + name + '"/></svg>';
   }
+
+  // A compact, icon-only control. It carries a real accessible name (both a
+  // tooltip and an aria-label), and its action, data and optional danger tone.
+  // Used where a row of controls would otherwise be too wide for a phone.
+  function iconAction(name, action, label, opts) {
+    opts = opts || {};
+    var attrs = ' class="icon-btn' + (opts.danger ? ' is-danger' : '') + '" type="button"' +
+      ' data-action="' + esc(action) + '"' +
+      ' title="' + esc(label) + '" aria-label="' + esc(label) + '"';
+    if (opts.disabled) attrs += ' disabled';
+    for (var key in (opts.data || {})) {
+      if (opts.data[key] != null) attrs += ' data-' + key + '="' + esc(opts.data[key]) + '"';
+    }
+    return '<button' + attrs + '>' + icon(name) + '</button>';
+  }
   function enc(value) { return encodeURIComponent(value); }
 
   /* ------------------------------------------------------------ vocabulary */
@@ -1268,6 +1283,33 @@
     return 'через ' + hours + ' ' + plural(hours, 'час', 'часа', 'часов');
   }
 
+  // How long ago something happened, in words (a run's start, its last change).
+  function agoText(value) {
+    var then = parseTime(value);
+    if (!then) return '';
+    var seconds = Math.max(0, Math.round((Date.now() - then.getTime()) / 1000));
+    if (seconds < 60) return 'только что';
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + ' ' + plural(minutes, 'минуту', 'минуты', 'минут') + ' назад';
+    var hours = Math.round(minutes / 60);
+    if (hours < 36) return hours + ' ' + plural(hours, 'час', 'часа', 'часов') + ' назад';
+    return fullTime(value);
+  }
+
+  // How long a run has been going, from its start to now (or to its last change
+  // when it has ended).
+  function durationText(from, to) {
+    var start = parseTime(from);
+    if (!start) return '';
+    var end = parseTime(to) || new Date();
+    var seconds = Math.max(0, Math.round((end.getTime() - start.getTime()) / 1000));
+    if (seconds < 60) return seconds + ' с';
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + ' мин';
+    var hours = Math.floor(minutes / 60);
+    return hours + ' ч ' + (minutes % 60) + ' мин';
+  }
+
   // Which OpenHands a task is (or was last) run by: the newest line of its
   // history. An empty label is the server's own key.
   function taskExecutor(executions, taskId) {
@@ -1326,6 +1368,14 @@
     // A durable run that is between two tries says so, and when it goes on.
     var pause = run.state === 'running' && run.resume_at && run.wait_reason
       ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
+    // What "на паузе" honestly means here: the server stops starting new tasks,
+    // but a conversation already running in OpenHands is not suspended - it
+    // goes on until it stops on its own. Saying so is the difference between a
+    // real control and a status toggle dressed as one.
+    var pauseNote = run.state === 'paused'
+      ? '<p class="work-note">Пауза останавливает запуск новых задач. Уже начатый разговор в OpenHands ' +
+        'не приостанавливается — он идёт, пока агент не закончит. «Продолжить» вернёт задачи в работу.</p>'
+      : '';
     // The executor at work right now: the newest execution that has not ended,
     // else the newest one at all. It names the connection, its conversation id
     // and what it is doing - the "текущий OpenHands / используемый аккаунт /
@@ -1366,12 +1416,19 @@
         ? '<button class="btn btn-sm" type="button" data-action="switch-executor" data-id="' + esc(task.id) +
           '" data-run="' + esc(entry.id) + '">' + icon('refresh', 'icon-sm') + 'Сменить исполнителя</button>'
         : '<span></span>';
+      // A task that ran has a conversation whose long terminal outputs the
+      // server cut; offer the full output when there is one to read.
+      var outputBtn = task.conversation_id
+        ? '<button class="icon-btn" type="button" data-action="task-output" data-id="' + esc(task.id) +
+          '" data-run="' + esc(entry.id) + '" title="Полный вывод" aria-label="Полный вывод терминала">' +
+          icon('terminal') + '</button>'
+        : '<span></span>';
       return '<li class="step-row"><span class="dot is-' + stateTone(task.state) + '" title="' + esc(stateLabel(task.state)) + '"></span>' +
         '<div><div class="step-title">' + esc(clip(task.title || task.task_key, 260)) + '</div>' +
         '<div class="step-sub">' + esc(sub.join(' · ')) + '</div>' + wait +
         (settled && reason ? '<div class="step-sub">' + esc(clip(reason, 320)) + '</div>' : '') +
         (!wait && task.last_error ? '<div class="step-sub">' + esc(clip(task.last_error, 320)) + '</div>' : '') + '</div>' +
-        switchBtn + '</li>';
+        '<div class="step-actions">' + outputBtn + switchBtn + '</div></li>';
     }).join('') + '</ul>' : '<p class="step-sub">В плане нет задач.</p>';
     // Every manual or failover hand-off: who was left, who took over, why.
     var switchesSection = switches.length
@@ -1402,17 +1459,32 @@
     // conversation, live or over - the output does not disappear when the
     // run ends.
     if (hasConversations) actions += '<button class="btn btn-sm" type="button" data-action="terminal-outputs" data-id="' + esc(entry.id) + '">' + icon('terminal', 'icon-sm') + 'Вывод команд</button>';
-    if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
-    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
-    if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
+    // Compact, icon-only controls with a real accessible name. Each is offered
+    // only where the server would accept it, so a control that fails by design
+    // is never shown: pause only while running, resume only when paused/blocked,
+    // cancel while the run is active, the finished-run actions only when it is
+    // over. Destructive ones (cancel, delete) are confirmed in the handler.
+    if (run.state === 'running') {
+      actions += iconAction('pause', 'run-state', 'Пауза: не запускать новые задачи',
+                            { data: { op: 'pause', id: entry.id } });
+    }
+    if ({ paused: 1, blocked: 1 }[run.state]) {
+      actions += iconAction('play', 'run-state', 'Продолжить', { data: { op: 'resume', id: entry.id } });
+    }
+    if (live) {
+      actions += iconAction('stop', 'run-state', 'Отменить прогон', { danger: true, data: { op: 'cancel', id: entry.id } });
+    }
     // A finished run's own actions: retry only the tasks that failed, take it
     // out of the lists, or remove it from history. None of them touches the
     // repository; the confirmation says so for the one that is irreversible.
     if (!live) {
       var failed = tasks.filter(function (task) { return FAILED_TASK_STATES[task.state]; }).length;
-      if (failed) actions += '<button class="btn btn-sm" type="button" data-action="retry-failed" data-id="' + esc(entry.id) + '">' + icon('refresh', 'icon-sm') + 'Повторить неудачные (' + failed + ')</button>';
-      actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="hide" data-id="' + esc(entry.id) + '">' + icon('archive', 'icon-sm') + 'Скрыть</button>';
-      actions += '<button class="btn btn-sm btn-danger" type="button" data-action="delete-run" data-id="' + esc(entry.id) + '">' + icon('x', 'icon-sm') + 'Удалить из истории</button>';
+      if (failed) {
+        actions += iconAction('refresh', 'retry-failed', 'Повторить неудачные (' + failed + ')',
+                              { data: { id: entry.id } });
+      }
+      actions += iconAction('archive', 'run-state', 'Скрыть из списка', { data: { op: 'hide', id: entry.id } });
+      actions += iconAction('x', 'delete-run', 'Удалить из истории', { danger: true, data: { id: entry.id } });
     }
     // The report is the run's own record: the same text delivered to the chat.
     // It is copied in full, never the truncated view.
@@ -1434,7 +1506,13 @@
       '<span class="topbar-spacer"></span><span class="work-id" title="' +
       (durable ? 'Сколько раз прогон запускал задачи в этом цикле. Когда запуски цикла кончаются, прогон делает паузу и продолжает сам.'
                : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
-      (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
+      (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause + pauseNote +
+      // When it started, how long it has been going, and when it last changed:
+      // the "timestamps / duration" a reader needs without opening anything.
+      '<p class="work-note">' + esc(
+        (run.created_at ? 'начат ' + fullTime(run.created_at) : '') +
+        (run.created_at ? ' · ' + durationText(run.created_at, live ? null : run.updated_at) : '') +
+        (run.updated_at ? ' · последнее изменение ' + agoText(run.updated_at) : '')) + '</p>' +
       (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
       (cleanupLine ? '<p class="work-note">' + esc(cleanupLine) + '</p>' : '') +
       currentLine +
@@ -1443,7 +1521,7 @@
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
         : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
       switchesSection + eventsSection + reportSection +
-      (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
+      (actions ? '<div class="work-foot work-actions">' + actions + '</div>' : '') + '</section>';
   }
 
   // The list of runs is redrawn every few seconds while something is at work.
@@ -2816,6 +2894,21 @@
     toast('Экспорт сохранён.');
   }
 
+  // Offer a text document (a full terminal output) as a download. The bytes
+  // come from the server's answer; nothing is loaded from another origin.
+  function downloadText(filename, text) {
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    toast('Файл сохранён.');
+  }
+
   var ACTIONS = {
     'toggle-sidebar': function () { setSidebar(!sidebarOpen(), true); },
     'close-overlays': function () {
@@ -3221,6 +3314,81 @@
       else loadOpenhandsAccounts().then(open, function (error) {
         toast(explain(error.message).text, 'bad');
       });
+    },
+    // The full terminal output of a task's conversation. The list is fetched
+    // first (it is small), so an event with nothing cut says so at once and a
+    // truncated one offers the whole text; the text is only fetched when asked
+    // for, and never injected into the run list.
+    'task-output': function (el) {
+      var taskId = el.getAttribute('data-id'), runId = el.getAttribute('data-run');
+      var url = projectUrl('/runs/' + enc(runId) + '/tasks/' + enc(taskId) + '/outputs');
+      openDialog({
+        title: 'Вывод терминала',
+        body: '<p class="lead" id="output-msg" role="status">Загружаем список…</p><div id="output-list"></div>',
+        foot: '<button class="btn btn-ghost" type="button" data-action="close-dialog">Закрыть</button>'
+      });
+      api(url).then(function (data) {
+        var msg = $('#output-msg'), list = $('#output-list');
+        if (!document.contains(msg)) return;
+        if (data.unsupported) {
+          msg.textContent = 'На этом транспорте полный вывод недоступен: разговор живёт в песочнице, к которой сервер не обращается. ' +
+            'Показанная часть — всё, что можно прочитать.';
+          return;
+        }
+        var outputs = data.outputs || [];
+        if (!outputs.length) {
+          msg.textContent = 'Обрезанных выводов нет: каждый вывод терминала поместился целиком.';
+          return;
+        }
+        msg.textContent = 'Выводов, обрезанных сервером на ' + outputs[0].shown_chars.toLocaleString('ru-RU') +
+          ' символах: ' + outputs.length + '. Полный текст хранится у OpenHands.';
+        list.innerHTML = '<ul class="events">' + outputs.map(function (o) {
+          return '<li><button class="btn btn-sm" type="button" data-action="open-output" data-id="' + esc(taskId) +
+            '" data-run="' + esc(runId) + '" data-event="' + esc(o.event_id) + '">' +
+            icon('file', 'icon-sm') + 'Показать полностью (' + o.shown_chars.toLocaleString('ru-RU') + ' показано)</button></li>';
+        }).join('') + '</ul>';
+      }, function (error) {
+        var msg = $('#output-msg');
+        if (document.contains(msg)) msg.textContent = explain(error.message).text;
+      });
+    },
+    // The full text of one output: shown in the dialog (scrolled, so a huge
+    // output does not freeze the page) with copy and download.
+    'open-output': function (el) {
+      var taskId = el.getAttribute('data-id'), runId = el.getAttribute('data-run'),
+          eventId = el.getAttribute('data-event');
+      setBusy(el, true);
+      api(projectUrl('/runs/' + enc(runId) + '/tasks/' + enc(taskId) + '/outputs/' + enc(eventId)), { timeout: 120000 })
+        .then(function (data) {
+          var list = $('#output-list');
+          if (!document.contains(list)) return;
+          var size = (data.bytes || 0).toLocaleString('ru-RU');
+          list.innerHTML =
+            '<p class="work-note">Полный вывод: ' + size + ' байт · ' + esc(data.name || '') + '</p>' +
+            '<div class="code"><div class="code-head"><span class="code-lang">вывод</span>' +
+            '<button class="code-copy" type="button" data-action="copy-output" data-run="' + esc(runId) +
+            '" data-task="' + esc(taskId) + '" data-event="' + esc(eventId) + '">Копировать</button>' +
+            '<button class="code-copy" type="button" data-action="download-output" data-run="' + esc(runId) +
+            '" data-task="' + esc(taskId) + '" data-event="' + esc(eventId) + '">Скачать</button></div>' +
+            '<pre><code>' + esc(data.text || '') + '</code></pre></div>';
+        }, function (error) {
+          setBusy(el, false);
+          toast(explain(error.message).text, 'bad');
+        });
+    },
+    'copy-output': function (el) {
+      var url = projectUrl('/runs/' + enc(el.getAttribute('data-run')) + '/tasks/' +
+        enc(el.getAttribute('data-task')) + '/outputs/' + enc(el.getAttribute('data-event')));
+      api(url, { timeout: 120000 }).then(function (data) {
+        copyOut(data.text || '', 'Полный вывод скопирован.');
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
+    },
+    'download-output': function (el) {
+      var url = projectUrl('/runs/' + enc(el.getAttribute('data-run')) + '/tasks/' +
+        enc(el.getAttribute('data-task')) + '/outputs/' + enc(el.getAttribute('data-event')));
+      api(url, { timeout: 120000 }).then(function (data) {
+        downloadText(data.name || 'terminal-output.txt', data.text || '');
+      }, function (error) { toast(explain(error.message).text, 'bad'); });
     },
     'toggle-dir': function (el) {
       var path = el.getAttribute('data-path');

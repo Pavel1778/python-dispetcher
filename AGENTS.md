@@ -2581,3 +2581,102 @@ suite). Two test helpers had relied on that parameter being ignored and meant
 `docs/GAP-ANALYSIS.md`, `docs/GROUND-TRUTH-BUILD-LINT-TEST.md`,
 `docs/P0-INCIDENT-FINAL-REPORT.md`, `tools/verify_build_lint_test.sh`. Keep
 them in step when a variable, route, command or status changes.
+
+## The OpenHands output contract, verified live (2026-11-15)
+
+The request "OpenHands output recovery" was investigated by reading the live
+agent-server (`/usr/local/bin/openhands-agent-server`, **v1.60.1**, build SHA
+`e99e5c71ffe440a0b8d74b695f9307a7e34e4bbd`, a PyInstaller-frozen binary — there
+is no OpenHands *source tree* in this environment and no `/workspace/oh-platform`).
+What was found, and the rules to keep:
+
+- **There is no output-loss defect in NEXUS's OpenHands consumption.** For all
+  36 real conversations on the local agent-server, `CloudClient.final_response`
+  (and the direct/local clients' `/agent_final_response` path) returned a string
+  **byte-for-byte identical** to the platform's own
+  `GET /api/conversations/{id}/agent_final_response`, across 4–5 400 character
+  answers. The event-derived answer and the platform's own answer agree. This is
+  the check `tests/test_openhands_output.py` now pins.
+- **The verdict is the state, not the text.** A live conversation can sit in
+  `execution_status="error"` *and* return a 5 098-character
+  `/agent_final_response`. `OpenHandsExecutor.poll` maps `error`/`stuck`
+  (`_BAD`) to a `TaskReport(state="error"|"stuck")` with **no** `final_text`, so
+  such a conversation is never a success. Do not "read the answer anyway" for a
+  non-`finished` state — that is a false completion.
+- **An absent `execution_status` is "still at work".** The service leaves it
+  empty while it cannot ask the sandbox; `poll` returns `running` and asks again.
+  Never settle on an empty status.
+- **The two ways an agent ends.** A `finish` tool call
+  (`ActionEvent.tool_name=="finish"`, text in `action.message`) and a plain
+  assistant `MessageEvent` are both answers; the newest wins, and an empty
+  `finish` may be answered by the text of the same turn. This is the SDK's own
+  `get_agent_final_response` rule.
+- **`events/search` caps `limit` at 100** (a `limit=200` is `422`), so the end
+  of a long conversation is reached by paging (`sort_order=TIMESTAMP_DESC`,
+  which the live server honours) — a bounded oldest-first read never reaches it.
+  A live conversation measured 3 790 events; the answer is at the end.
+- **The one real truncation is terminal output, and it is OpenHands', not
+  NEXUS's.** A terminal `ObservationEvent` whose content exceeds 30 000
+  characters is cut to exactly 30 000 and the full text is written to a file the
+  event names (`observation.full_output_save_dir`, e.g.
+  `/var/openhands/conversations/<id>/observations/terminal_output_<hash>.txt`).
+  The event carries `metadata.exit_code`/`prefix`/`suffix`. The full output is
+  now **readable** — see "Full terminal output recovery" below.
+- **The event page order is not globally monotonic.** `sort_order=TIMESTAMP_DESC`
+  gives pages whose *first* timestamp is newer than their *last* (the heuristic
+  `recent_events` uses), but the concatenation across pages is not strictly
+  descending — events within a tick share a timestamp. Nothing in NEXUS relies
+  on strict ordering; do not add a check that does.
+- **`OpenHandsClient.Outcome`** maps the raw status conservatively:
+  `finished` → `FINISHED`, `error`/`stuck` → `FAILED`, `paused`/`idle`/`deleting`
+  → `IDLE`, `waiting_for_confirmation` → `BLOCKED`. Keep the map conservative:
+  an unknown status must not become `FINISHED`.
+
+Tests: `tests/test_openhands_output.py` (6 cases, real `tests/fake_cloud.py`;
+one is load-bearing — it fails if `_BAD` states ever carry a `final_text`).
+
+## Full terminal output recovery (2026-11-15, part 2)
+
+The output a truncated event points at is now retrievable, end to end. The
+facts a future change must keep (all measured live on v1.60.1):
+
+- **The filename is not in the event.** The event names only a *directory*
+  (`full_output_save_dir`), and that field is set on **most** observations — it
+  is a configuration value, not a truncation flag. The truncation signal is the
+  **content length**: exactly `30_000` characters (`TERMINAL_OUTPUT_CAP_CHARS`).
+  Do not go back to "has `full_output_save_dir`" as the test for truncated.
+- **The file is `terminal_output_<sha256(full_output)[:8]>.txt`**, and the
+  truncated event's text is an exact **prefix** of the full file. That prefix is
+  what maps an event to its file: it cannot be derived from the hash (the hash
+  is over the full text the event does not carry), so the file is found by
+  matching the prefix, never by computing a name.
+- **The conversation-scoped way to reach it is the trajectory archive:**
+  `GET /api/conversations/{cid}/file/download-trajectory/{cid}` returns a ZIP of
+  the conversation's own directory, `observations/` included. The conversation
+  *file* API (`/api/conversations/{cid}/file/download`) is confined to the
+  **workspace** and refuses the observations dir; the **global** `/api/file/…`
+  routes can read it but are unscoped (any absolute path) and are therefore
+  **not** used. `OpenHandsClient.download_trajectory` is the one call.
+- **`CloudDirectClient.truncated_outputs(cid)`** lists the truncated events
+  (id + shown length, no content); **`full_terminal_output(cid, prefix)`** reads
+  the archive (bounded by `TRAJECTORY_MAX_BYTES`, 64 MiB), picks the file whose
+  bytes start with `prefix`, and returns name/bytes/sha256/text. A `..` segment
+  in an archive name is skipped. `LocalCloudClient` has the same two methods.
+- **The `app` transport cannot do it** and says so: `CloudClient.truncated_outputs`
+  / `full_terminal_output` raise `ArtifactsUnsupported` (never an empty result),
+  because Cloud V1's app-conversation surface never addresses a sandbox
+  filesystem. The route then answers `{"unsupported": true, ...}`, not an error.
+- **Routes** (protected, in `tests/test_route_auth.py`):
+  `GET …/runs/{run}/tasks/{task}/outputs` and
+  `GET …/runs/{run}/tasks/{task}/outputs/{event_id}`. The task must be in the
+  run and the project (a non-member and a foreign task are both 404). The event
+  is read first, so the answer is the exact file its preview named; no
+  filesystem path is ever returned to the caller.
+- **The studio** shows a terminal icon on a task that ran (`task-output`),
+  fetches the small list first, and reads the full text only when asked
+  (`open-output`), into a scrolled `<pre>` with copy (`copy-output`) and
+  download (`download-output`). Nothing huge is loaded into the run list.
+- Tests: `tests/test_artifacts.py` (11: the detection rule, byte-for-byte
+  retrieval, below/at/above the cap, a missing artifact, a non-matching preview,
+  a traversal-shaped archive name, the app transport's honest refusal, and the
+  two routes over real HTTP), plus the route-auth entries.

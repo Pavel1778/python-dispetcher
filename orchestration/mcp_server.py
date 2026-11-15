@@ -79,6 +79,8 @@ class McpServer:
             "list_runs": self._list_runs,
             "get_run": self._get_run,
             "cancel_run": self._cancel_run,
+            "list_run_task_outputs": self._list_run_task_outputs,
+            "get_run_task_output": self._get_run_task_output,
             "list_project_executors": self._list_project_executors,
             "assign_project_executor": self._assign_project_executor,
         }
@@ -118,6 +120,16 @@ class McpServer:
             _tool("cancel_run", "Stop an autonomous run for good (terminal, idempotent).",
                   {"project_id": _s("string"), "run_id": _s("string")},
                   ["project_id", "run_id"]),
+            _tool("list_run_task_outputs",
+                  "List the terminal outputs of a run task's conversation that "
+                  "the agent-server cut off (full output is fetched per event).",
+                  {"project_id": _s("string"), "run_id": _s("string"),
+                   "task_id": _s("string")}, ["project_id", "run_id", "task_id"]),
+            _tool("get_run_task_output",
+                  "Fetch the complete terminal output whose preview one event showed.",
+                  {"project_id": _s("string"), "run_id": _s("string"),
+                   "task_id": _s("string"), "event_id": _s("string")},
+                  ["project_id", "run_id", "task_id", "event_id"]),
             _tool("list_project_executors",
                   "List the OpenHands executors assigned to a project.",
                   {"project_id": _s("string")}, ["project_id"]),
@@ -232,6 +244,36 @@ class McpServer:
         run = LabStore(self.store).set_run_state(self.principal, pid, args["run_id"],
                                                  "cancelled")
         return {"run": run}
+
+    def _list_run_task_outputs(self, args: dict) -> Any:
+        """Which terminal outputs of a task's conversation the server cut."""
+        from .nexus_outputs import run_task_outputs
+
+        pid = args["project_id"]
+        self._member(pid)
+        return run_task_outputs(self.store, self.principal, pid, args["run_id"],
+                                args["task_id"], self._execution_client)
+
+    def _get_run_task_output(self, args: dict) -> Any:
+        """The complete terminal output whose preview one event showed."""
+        from .nexus_outputs import run_task_output
+
+        pid = args["project_id"]
+        self._member(pid)
+        return run_task_output(self.store, self.principal, pid, args["run_id"],
+                               args["task_id"], args["event_id"],
+                               self._execution_client)
+
+    def _execution_client(self, principal: str, account_id: str | None):
+        """The client that can read a task's conversation (its own account's)."""
+        from .nexus_openhands_accounts import OpenHandsAccountService
+
+        if account_id:
+            return OpenHandsAccountService(self.store).execution_client_for_account(
+                principal, str(account_id))
+        from .cloud_direct import build_cloud_client
+
+        return build_cloud_client(self.store)
 
     def _list_project_executors(self, args: dict) -> Any:
         pid = args["project_id"]
