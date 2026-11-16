@@ -69,3 +69,60 @@ integration branch is `consolidate/final`, built in a dedicated worktree
 3. `consolidate(prod)`: the registered migration-correction recovery.
 4. `consolidate`: pause-honesty UI fix + perf benchmark.
 5. `consolidate(docs)`: the Phase 3/4 architecture and performance documents.
+
+## Verification (Phase E)
+
+- **Full suite**: `pytest tests/ -q` against a fresh PostgreSQL 17 on 127.0.0.1 →
+  **1973 passed, 9 skipped, 0 failed** (31 min). 1982 tests collected.
+- **ruff**: `ruff check .` clean.
+- **Studio**: `node tests/studio_render_test.js` → passed; `tests/test_studio_ui.py`
+  26 passed.
+- **Browser E2E**: `tests/test_browser_e2e.py` (33 Chromium journeys, desktop and
+  five widths) passed within the full run.
+- **Migrations**: 41 files, `0001`–`0040` (gaps `0012`/`0013` reserved), no
+  collisions; applied by `PostgresStore` on a fresh schema; the schema guard and
+  the registered-correction path covered by `test_schema_bootstrap.py`.
+- **Security**: route auth, project isolation (404 not 403), terminal-output
+  access (conversation-scoped, no global `/api/file/*`), ZIP traversal/bomb
+  rejection, size limits, MCP/CLI authorization and no-secret-leak assertions all
+  pass inside the full run (`test_route_auth`, `test_archive_safety`,
+  `test_artifacts`, `test_openhands_inventory`, `test_cli_mcp`, …).
+- **Live OpenHands (direct transport, real key)**: VERIFIED. One conversation
+  created (`READY`), ran `running → finished`, the marker `echo` appeared in its
+  final response, 12 events, then the conversation was deleted. Cloud v1.92.0,
+  `compatibility: compatible`.
+
+### The 9 skips (all environmental, none a defect)
+
+- 3 `test_windows_exe.py` — mingw-w64 not installed.
+- 4 `test_android_apk.py` — Android SDK build-tools not installed.
+- 1 `test_schema_bootstrap.py` pooler case — `TEST_POOLER_DSN` unset.
+- 1 `test_comprehensive_suite.py` section F — needs a live OpenHands key *and a
+  sandbox* for the two-account failover; BLOCKED (see AGENTS.md). The live
+  conversation probe above is the honest substitute that did run.
+
+### Live items still BLOCKED (not fabricated)
+
+- **Two-account failover** — only one OpenHands key is available here; the
+  failover is proven against the local fakes + PostgreSQL
+  (`tests/test_openhands_failover.py`), not two live accounts.
+- **Section F real development task through NEXUS** — same reason.
+
+## Performance (Phase F)
+
+Measured fresh with `tools/perf_bench.py` against a real local PostgreSQL 17
+(different host from the historical figures, so they are not directly
+comparable; recorded, not asserted):
+
+| Metric | This run | Historical (Phase 3) |
+|---|---|---|
+| DB p99 @ 100 concurrent | 69.2 ms | 28.0 ms (baseline 550.9 ms) |
+| DB throughput @ 100 concurrent | 1725 ops/s | 4467 ops/s |
+| DB p99 @ 10 concurrent | 16.5 ms | — |
+| claim throughput @ 50 workers | 1345 claims/s, 0 errors | — |
+
+The pool served 100 concurrent clients with **0 errors** and every connection
+returned (no pool exhaustion). Absolute numbers differ from the historical
+machine; no regression was introduced by the consolidation (the pool code is the
+owner-approved Phase 3 line, unchanged).
+
