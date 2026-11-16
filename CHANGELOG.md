@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased — full terminal output, run controls, test isolation, asset latency
+
+### Added
+
+- **Full terminal output recovery.** The agent-server cuts a terminal
+  `ObservationEvent` at 30 000 characters and writes the whole output to a file
+  beside the conversation; NEXUS can now read it. The truncated event's text is
+  an exact prefix of the file, so the file is found by matching that prefix in
+  the conversation's own trajectory archive (the only conversation-scoped way to
+  reach it). Routes: `GET …/runs/{run}/tasks/{task}/outputs` (which events were
+  cut) and `GET …/runs/{run}/tasks/{task}/outputs/{event_id}` (the full text).
+  The studio shows a terminal icon on a task that ran and reads the text on
+  demand; the CLI has `nexus run outputs|output`; MCP has
+  `list_run_task_outputs` and `get_run_task_output`. The Cloud *app* transport
+  cannot reach a sandbox filesystem and says so (`unsupported`), never an empty
+  result. See `AGENTS.md`, "Full terminal output recovery".
+  (`orchestration/nexus_outputs.py`, `cloud_direct.py`, `local_runtime.py`,
+  `openhands_client.py`, `web_server.py`, `cli.py`, `mcp_server.py`; tests
+  `tests/test_artifacts.py`.)
+
+### Changed
+
+- **The run card's controls are compact icon-only buttons** with a real
+  accessible name (a tooltip and an `aria-label`), a busy state and a danger
+  tone, offered only for the states the server accepts. A paused run says
+  honestly what the pause means: it stops new tasks, not a conversation already
+  running in OpenHands.
+- **A studio asset's gzipped body is computed once, not per request.** Measured
+  `static_asset_ms` p50: 7.23 ms → 0.59 ms (`tools/benchmark.py`). The served
+  bytes are unchanged.
+
+### Fixed
+
+- **Two pytest processes no longer share one test database.** Each process makes
+  its own copy of a local disposable database, and the one test that creates and
+  drops the cluster-global Supabase roles takes a cluster-wide advisory lock.
+  Before this, running two suites on one database failed in
+  `test_schema_bootstrap` and a browser test while each passed alone
+  (`tests/test_test_isolation.py`).
+- **A ZIP-bomb trajectory archive is refused, not buffered.** The full-output
+  reader bounded the *compressed* archive (64 MiB) but read each member with
+  `archive.read`, which fully decompresses it: a ~190 KB archive could expand to
+  200 MB in memory. Each member is now bounded on its own
+  (`OpenHandsClient.bounded_zip_member`, `OUTPUT_MAX_BYTES`), refusing a member
+  over the limit before it is held. `tests/test_artifacts.py::
+  test_a_zip_bomb_member_is_refused_by_the_decompressed_limit` fails if
+  `archive.read` is used again.
+- **The browser flake is fixed.** `tests/test_browser_e2e.py::
+  test_a_repository_that_cannot_be_read_is_said_so_under_the_answer` failed
+  about 2 runs in 5: connecting the repository fired a background
+  `context/refresh` (the dialog's "analyze" box was checked) that raced the
+  test's forced GitHub 401. `_connect_repository(..., analyze=False)` is used
+  for this one test, so nothing races the forced failure. 8/8 isolated runs
+  pass; the browser module is 37/37.
+- **The test-isolation cases run instead of skipping.** `tests/test_test_isolation.py`
+  hardcoded a base database name that may not exist, so two of its cases skipped
+  silently. It now derives the base from the session's own DSN (the base marker
+  `conftest` records), so all four cases exercise the real path.
+
 ## Unreleased — performance, execution reliability, project/conversation lifecycle
 
 ### Fixed

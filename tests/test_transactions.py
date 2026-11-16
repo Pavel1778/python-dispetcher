@@ -157,9 +157,11 @@ def test_aborted_transaction_is_recovered_on_entry(store):
     """A connection left aborted by an external writer is repaired by _tx()."""
     # Bypass the helper to simulate a connection already stuck in the aborted
     # state (as an interrupted transaction elsewhere would leave it).
-    with store._conn.cursor() as cur:
-        with pytest.raises(Exception):
-            cur.execute("SELECT 1 FROM table_that_does_not_exist")
+    with store._connection() as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception):
+                cur.execute("SELECT 1 FROM table_that_does_not_exist")
+        conn.rollback()
 
     # _tx() rolls the aborted transaction back on entry, so this call succeeds.
     assert store.list_workflows() == []

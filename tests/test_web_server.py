@@ -569,3 +569,42 @@ def test_wrong_token_is_rejected(server):
     bad = Client(f"http://127.0.0.1:{server.port}", token="nope")
     st, _ = bad.post("/api/repositories", {"full_name": "a/b"})
     assert st == 401
+
+
+# --------------------------------------------------------------- static gzip
+def _static_get(server, path: str, accept_encoding: str):
+    req = urllib.request.Request(f"http://127.0.0.1:{server.port}{path}")
+    req.add_header("Authorization", "Bearer test-token")
+    req.add_header("Accept-Encoding", accept_encoding)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, dict(r.headers), r.read()
+
+
+def test_static_is_gzipped_when_the_client_accepts_it(server):
+    st, headers, body = _static_get(server, "/static/app.js", "gzip")
+    assert st == 200
+    assert headers.get("Content-Encoding") == "gzip"
+    assert headers.get("Vary") == "Accept-Encoding"
+    assert int(headers["Content-Length"]) == len(body)
+    import gzip as _gzip
+    assert len(_gzip.decompress(body)) > len(body), "a smaller body was sent"
+
+
+def test_static_is_identity_without_accept_encoding(server):
+    st, headers, body = _static_get(server, "/static/app.js", "identity")
+    assert st == 200
+    assert headers.get("Content-Encoding") is None
+    assert int(headers["Content-Length"]) == len(body)
+
+
+def test_static_honours_an_explicit_gzip_refusal(server):
+    """``Accept-Encoding: gzip;q=0`` means the client does *not* want gzip."""
+    st, headers, body = _static_get(server, "/static/app.js", "gzip;q=0")
+    assert st == 200
+    assert headers.get("Content-Encoding") is None
+
+
+def test_an_already_compressed_asset_is_not_gzipped(server):
+    st, headers, _ = _static_get(server, "/static/fonts/inter-latin.woff2", "gzip")
+    assert st == 200
+    assert headers.get("Content-Encoding") is None, "a woff2 must not be re-compressed"

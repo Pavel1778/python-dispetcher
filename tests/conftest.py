@@ -31,3 +31,74 @@ os.environ.setdefault("NEXUS_ALLOW_PRIVATE_TARGETS", "1")
 # says so, without a request. A test that needs a token sets one, together
 # with the address of the stand-in (``tests/fake_github.py``).
 os.environ.pop("GITHUB_TOKEN", None)
+
+
+def _isolate_database() -> None:
+    """Give this pytest process its own database.
+
+    Several test modules drop and re-create the whole schema (``_reset_schema``)
+    or create and drop the Supabase roles. Two pytest processes sharing one
+    database therefore fight: one drops a table or a role while the other is
+    mid-test, and the failures look like real defects. That is exactly what
+    happened when two suites were run against one database in parallel
+    (``test_schema_bootstrap`` failed with ``DependentObjectsStillExist`` and a
+    browser test failed too; each passed alone).
+
+    So, for a **local, disposable** database, each process makes its own copy of
+    the base database and points the session at it. The base database is only
+    read (its name); a sibling ``<base>_p<id>`` is created, empty, and the
+    session's DSN is rewritten to it. The first connection applies the
+    migrations, exactly as a fresh database is set up in production.
+
+    It does nothing when:
+
+    * ``NEXUS_TEST_ISOLATE_DB`` is ``0``/``false``/``no``/``off`` (the escape
+      hatch for an operator who wants every run on one named database);
+    * the DSN is not local (a remote host is not ours to create databases on);
+    * the base database name already carries the process suffix (a DSN that was
+      already isolated, e.g. exported by CI);
+    * the database cannot be created (no privilege, or it already exists) - the
+      base DSN is then left in place, so the suite still runs.
+    """
+    if os.environ.get("NEXUS_TEST_ISOLATE_DB", "").strip().lower() in (
+            "0", "false", "no", "off"):
+        return
+    if os.environ.get("NEXUS_TEST_BASE_DB_URL"):
+        return  # already isolated this process; do not isolate twice
+    key = ("TEST_SUPABASE_DB_URL" if os.environ.get("TEST_SUPABASE_DB_URL")
+           else "SUPABASE_DB_URL")
+    url = os.environ.get(key)
+    if not url:
+        return
+    import hashlib
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    if (parts.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+        return  # not a local disposable database; do not touch it
+    base = (parts.path or "/").lstrip("/")
+    if not base:
+        return
+    suffix = hashlib.sha1(
+        f"{os.getpid()}-{os.getcwd()}-{url}".encode()).hexdigest()[:8]
+    if base.endswith(f"_p{suffix}"):
+        return
+    name = f"{base}_p{suffix}"
+    try:
+        import psycopg
+
+        with psycopg.connect(url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (name,))
+                if cur.fetchone() is None:
+                    cur.execute(f'CREATE DATABASE "{name}"')
+    except Exception:  # noqa: BLE001 - isolation is best effort, never fatal
+        return
+    new_url = urlunsplit((parts.scheme, parts.netloc,
+                          "/" + name, parts.query, parts.fragment))
+    os.environ["NEXUS_TEST_BASE_DB_URL"] = url
+    os.environ[key] = new_url
+    os.environ["SUPABASE_DB_URL"] = new_url
+
+
+_isolate_database()

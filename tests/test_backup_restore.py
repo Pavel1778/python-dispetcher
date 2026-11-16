@@ -15,7 +15,6 @@ import os
 import shutil
 import subprocess
 import sys
-import urllib.parse
 import uuid
 
 import pytest
@@ -35,6 +34,33 @@ pytestmark = pytest.mark.skipif(
 _MIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
 
 
+def _conninfo(dsn: str) -> dict[str, str]:
+    """The connection parameters of *dsn*, parsed by psycopg itself.
+
+    The DSN is **not** necessarily a URL: ``tests/_test_db.py`` rewrites the
+    session DSN with ``psycopg.conninfo.make_conninfo``, which produces a
+    ``key=value`` conninfo string. Parsing that with ``urllib.parse.urlsplit``
+    yields ``hostname=None, port=None``, and a fallback to port 5432 then sends
+    ``createdb``/``pg_dump`` to a *different* server than the one the suite runs
+    on - which is how this test once hung on a password prompt. psycopg's own
+    parser understands both a URL and a conninfo string, so it is the only
+    correct reader here, and there is no port fallback: the port the DSN names
+    is the port used.
+    """
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        params = conninfo_to_dict(dsn)
+    except Exception as e:  # noqa: BLE001 - a bad DSN is a clear test failure
+        raise AssertionError(f"the test DSN is not a usable PostgreSQL DSN: {e}") from e
+    if not params.get("port"):
+        raise AssertionError(
+            "the test DSN does not name a port; refusing to guess one (a wrong "
+            "port would reach another server). Set TEST_SUPABASE_DB_URL with an "
+            "explicit port.")
+    return params
+
+
 def _reset_schema() -> None:
     import psycopg
 
@@ -47,8 +73,16 @@ def _reset_schema() -> None:
 
 
 def _swap_db(dsn: str, dbname: str) -> str:
-    parts = urllib.parse.urlsplit(dsn)
-    return urllib.parse.urlunsplit(parts._replace(path="/" + dbname))
+    """The same connection as *dsn* but to *dbname*, as a conninfo string.
+
+    Built from the parsed parameters, so a URL or a conninfo DSN both come out
+    as one canonical form and the port is preserved.
+    """
+    from psycopg.conninfo import make_conninfo
+
+    params = dict(_conninfo(dsn))
+    params["dbname"] = dbname
+    return make_conninfo(**params)
 
 
 def _run(*cmd: str, env_extra: dict | None = None) -> None:
@@ -67,8 +101,13 @@ def test_dump_and_restore_into_a_fresh_database():
     source = PostgresStore(DSN)
     restore_db = "nexus_restore_" + uuid.uuid4().hex[:8]
     dump_path = f"/tmp/nexus-drill-{uuid.uuid4().hex[:8]}.dump"
-    parts = urllib.parse.urlsplit(DSN)
-    env = {"PGPASSWORD": urllib.parse.unquote(parts.password or "")}
+    # The connection parameters are read once, by psycopg, so the tools reach
+    # the same host and port the suite itself uses - never a guessed 5432.
+    params = _conninfo(DSN)
+    host = params.get("host") or "127.0.0.1"
+    port = params["port"]
+    user = params.get("user") or "postgres"
+    env = {"PGPASSWORD": params.get("password", "")}
     try:
         # Populate the source with a project, a repository link and a task, so
         # the dump has real NEXUS data to carry.
@@ -85,9 +124,8 @@ def test_dump_and_restore_into_a_fresh_database():
         _run("pg_dump", "--format=custom", "--file", dump_path,
              "--no-owner", "--no-privileges", DSN, env_extra=env)
 
-        # Create an empty database and restore into it.
-        _run("createdb", "-h", parts.hostname or "127.0.0.1",
-             "-p", str(parts.port or 5432), "-U", parts.username or "postgres",
+        # Create an empty database and restore into it, on the same server.
+        _run("createdb", "-h", host, "-p", port, "-U", user,
              restore_db, env_extra=env)
         try:
             _run("pg_restore", "--dbname", _swap_db(DSN, restore_db),
@@ -107,8 +145,7 @@ def test_dump_and_restore_into_a_fresh_database():
             finally:
                 restored.close()
         finally:
-            _run("dropdb", "--if-exists", "-h", parts.hostname or "127.0.0.1",
-                 "-p", str(parts.port or 5432), "-U", parts.username or "postgres",
+            _run("dropdb", "--if-exists", "-h", host, "-p", port, "-U", user,
                  restore_db, env_extra=env)
     finally:
         source.close()

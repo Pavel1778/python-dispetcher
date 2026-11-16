@@ -166,17 +166,22 @@ def test_prepared_statements_are_off_by_default() -> None:
     store = PostgresStore(DSN)
     try:
         # None is what psycopg uses to mean "never prepare server-side".
-        assert store._conn.prepare_threshold is None
         assert store.prepare_threshold is None
-        # Execute the same statement more than the default threshold (5); with
-        # preparation disabled the server must not hold a prepared statement,
-        # because a pooled connection may be handed to another client.
-        with store._conn.cursor() as cur:
-            for _ in range(8):
-                cur.execute("SELECT 1 AS n")
-                cur.fetchone()
-            cur.execute("SELECT count(*) AS n FROM pg_prepared_statements")
-            assert cur.fetchone()["n"] == 0
+        # Every pooled connection must be opened with that policy, because a
+        # pooled connection may be handed to another client.
+        with store._connection() as conn:
+            assert conn.prepare_threshold is None
+            # Execute the same statement more than the default threshold (5);
+            # with preparation disabled the server must not hold a prepared
+            # statement, because a pooled connection may be handed to another
+            # client.
+            with conn.cursor() as cur:
+                for _ in range(8):
+                    cur.execute("SELECT 1 AS n")
+                    cur.fetchone()
+                cur.execute("SELECT count(*) AS n FROM pg_prepared_statements")
+                assert cur.fetchone()["n"] == 0
+            conn.rollback()
     finally:
         store.close()
 
@@ -190,8 +195,9 @@ def test_prepare_can_be_opted_in_for_a_direct_connection() -> None:
     finally:
         os.environ.pop("PSYCOPG_PREPARE", None)
     try:
-        assert store._conn.prepare_threshold == 5
         assert store.prepare_threshold == 5
+        with store._connection() as conn:
+            assert conn.prepare_threshold == 5
     finally:
         store.close()
 
@@ -269,9 +275,25 @@ def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
         # migrations attached to them first (a policy or grant makes the role
         # own objects, and DROP ROLE refuses while they exist). A role that was
         # already there is left untouched.
+        #
+        # The roles are **cluster-global**: another database (a sibling test
+        # database) that ran the same migrations holds policies bound to
+        # ``authenticated``, and ``DROP OWNED BY`` only releases objects in the
+        # *current* database - so the drop can fail with
+        # ``DependentObjectsStillExist`` while a peer database still references
+        # the role. That is housekeeping, not the property under test (which is
+        # that the migrations apply), so a role that cannot be dropped is left in
+        # place rather than failing the test. A leftover NOLOGIN role is
+        # harmless, and the next run reuses it.
         if created:
+            import psycopg.errors
+
             with psycopg.connect(DSN, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     for role in created:
-                        cur.execute(f'DROP OWNED BY "{role}"')
-                        cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                        try:
+                            cur.execute(f'DROP OWNED BY "{role}"')
+                            cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                        except psycopg.errors.DependentObjectsStillExist:
+                            # A peer database still uses the role; leave it.
+                            conn.rollback()

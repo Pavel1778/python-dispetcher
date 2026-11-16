@@ -47,10 +47,12 @@ so :class:`~orchestration.cloud_dispatcher.CloudDispatcher`,
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import os
 import posixpath
 import uuid
+import zipfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -774,6 +776,117 @@ class CloudDirectClient:
             raise
         except CloudError:
             return None
+
+    # ------------------------------------------------------- full-output files
+    #: The agent-server cuts a terminal ``ObservationEvent`` at this many
+    #: characters (measured on v1.60.1) and writes the whole output to a file
+    #: beside the conversation. An observation whose content is exactly this
+    #: long was cut; the full text is in ``terminal_output_<sha256[:8]>.txt``
+    #: and the truncated content is an exact **prefix** of it. The event names
+    #: only the directory (``observation.full_output_save_dir``), which is set
+    #: on most observations - it is a configuration value, not a truncation
+    #: flag - so the length is what decides.
+    TERMINAL_OUTPUT_CAP_CHARS = 30_000
+    TERMINAL_OUTPUT_PREFIX = "terminal_output_"
+    #: The whole conversation directory as a ZIP; bounded so one request cannot
+    #: pull an unbounded archive into memory. 64 MiB holds the longest
+    #: conversation measured here (3 790 events) several times over.
+    TRAJECTORY_MAX_BYTES = 64 * 1024 * 1024
+    #: The decompressed size one output file may have. The compressed archive is
+    #: already bounded, but a small archive can expand enormously (a ZIP bomb),
+    #: so the member is bounded on its own too - a full terminal output is a
+    #: text log, and 64 MiB is far more than any real one.
+    OUTPUT_MAX_BYTES = 64 * 1024 * 1024
+
+    def truncated_outputs(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Every terminal observation of a conversation whose output was cut.
+
+        An observation is truncated when its content is exactly
+        :attr:`TERMINAL_OUTPUT_CAP_CHARS` long - the server's own cut-off - and
+        it names a save directory. Returns the event id and the number of
+        characters shown; the *content* is read on demand by
+        :meth:`full_terminal_output`.
+        """
+        out: list[dict[str, Any]] = []
+        for event in self.list_events(conversation_id):
+            if event.get("kind") != "ObservationEvent":
+                continue
+            obs = event.get("observation")
+            if not isinstance(obs, dict) or not obs.get("full_output_save_dir"):
+                continue
+            text = "".join(
+                c.get("text", "")
+                for c in (obs.get("content") or [])
+                if isinstance(c, dict)
+            )
+            if len(text) < self.TERMINAL_OUTPUT_CAP_CHARS:
+                continue
+            out.append({
+                "event_id": event.get("id"),
+                "shown_chars": len(text),
+                "truncated": True,
+            })
+        return out
+
+    def full_terminal_output(self, conversation_id: str, prefix: str) -> dict[str, Any]:
+        """The complete terminal output whose preview is *prefix*.
+
+        The full output is a file the agent-server wrote beside the
+        conversation; the only conversation-scoped way to reach it is the
+        trajectory archive (``download-trajectory``), which packs the
+        conversation's own directory - ``observations/`` included - and refuses
+        any path outside it. The archive is read whole (bounded), the output
+        file whose bytes start with *prefix* is chosen, and its bytes are
+        returned. *prefix* is the truncated text the event showed, so the match
+        is exact, not a guess.
+
+        Raises :class:`CloudNotFound` when no file starts with *prefix* (the
+        output was never written, or the retention window passed), and
+        :class:`CloudUnavailable` when the sandbox cannot be reached or the
+        archive is larger than :attr:`TRAJECTORY_MAX_BYTES`.
+        """
+        route = self._route_for(conversation_id)
+        try:
+            status, blob = self._http.download_trajectory(
+                route.agent_server_url, route.session_api_key, conversation_id,
+                limit=self.TRAJECTORY_MAX_BYTES,
+            )
+        except ApiUnavailable as e:
+            raise CloudUnavailable(str(e)) from e
+        if status in (404, 422):
+            raise CloudNotFound(f"no trajectory for conversation {conversation_id}")
+        if status != 200:
+            raise CloudError(f"download-trajectory -> {status}")
+        if len(blob) > self.TRAJECTORY_MAX_BYTES:
+            raise CloudUnavailable(
+                f"the conversation archive is larger than "
+                f"{self.TRAJECTORY_MAX_BYTES} bytes")
+        wanted = prefix.encode("utf-8", "replace")
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(blob))
+        except zipfile.BadZipFile as e:
+            raise CloudError("the trajectory archive could not be read") from e
+        with archive:
+            for name in archive.namelist():
+                if not name.endswith(".txt") or ".." in name.split("/"):
+                    continue
+                base = name.rsplit("/", 1)[-1]
+                if not base.startswith(self.TERMINAL_OUTPUT_PREFIX):
+                    continue
+                data = self._http.bounded_zip_member(
+                    archive, name, limit=self.OUTPUT_MAX_BYTES)
+                if data is None:
+                    # A member over the decompressed limit is skipped, never
+                    # buffered: a small archive must not expand into memory.
+                    continue
+                if data.startswith(wanted):
+                    return {
+                        "name": base,
+                        "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "text": data.decode("utf-8", "replace"),
+                    }
+        raise CloudNotFound("no full-output file matches the truncated event")
 
     def conversation_skills(self, conversation_id: str) -> list[str]:
         try:

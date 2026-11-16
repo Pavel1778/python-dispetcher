@@ -946,6 +946,30 @@ class CloudClient:
             "the Cloud app transport exposes no agent-server tool catalog"
         )
 
+    def truncated_outputs(self, conversation_id: str) -> list[dict[str, Any]]:
+        """No full-output files can be reached on the app transport.
+
+        The agent-server writes a truncated terminal output to a file beside the
+        conversation; the Cloud V1 app-conversation surface never addresses a
+        sandbox's filesystem, so this transport cannot read it. Raising
+        :class:`ArtifactsUnsupported` is honest — nothing was proved — and lets
+        the API answer "not available on this transport" instead of pretending
+        the output is complete.
+        """
+        from .openhands_tools import ArtifactsUnsupported
+
+        raise ArtifactsUnsupported(
+            "the Cloud app transport cannot read a conversation's output files"
+        )
+
+    def full_terminal_output(self, conversation_id: str, prefix: str) -> dict[str, Any]:
+        """See :meth:`truncated_outputs` — unsupported on the app transport."""
+        from .openhands_tools import ArtifactsUnsupported
+
+        raise ArtifactsUnsupported(
+            "the Cloud app transport cannot read a conversation's output files"
+        )
+
     def account_capabilities(self) -> dict[str, Any]:
         """A read-only snapshot of the account-level capabilities.
 

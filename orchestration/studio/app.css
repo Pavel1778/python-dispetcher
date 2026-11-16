@@ -205,6 +205,10 @@ a:hover { text-decoration: underline; }
 .btn.is-busy { position: relative; color: transparent !important; pointer-events: none; }
 .btn.is-busy::after { content: ""; position: absolute; width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--text-3); border-top-color: var(--text); animation: spin 0.7s linear infinite; }
 .btn-primary.is-busy::after { border-color: rgba(255, 255, 255, 0.4); border-top-color: #fff; }
+.icon-btn.is-busy { color: transparent !important; pointer-events: none; }
+.icon-btn.is-busy::after { content: ""; position: absolute; width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--text-3); border-top-color: var(--text); animation: spin 0.7s linear infinite; }
+.icon-btn.is-danger { color: var(--bad); }
+.icon-btn.is-danger:hover { background: var(--bad-soft); color: var(--bad); }
 
 .icon-btn {
   position: relative; display: inline-grid; place-items: center; flex: none;
@@ -397,6 +401,9 @@ a:hover { text-decoration: underline; }
 @media (hover: none), (pointer: coarse) {
   .msg-actions .icon-btn { opacity: 1; }
   .msg-actions .icon-btn, .msg-meta .icon-btn { min-width: 40px; min-height: 40px; }
+  /* Run-management icon controls are always visible on a touch screen and
+     large enough for a finger. */
+  .work-actions .icon-btn { min-width: 40px; min-height: 40px; }
 }
 .copy-area { width: 100%; min-height: 200px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; resize: vertical; }
 .bubble { max-width: min(86%, 620px); padding: 10px 14px; border-radius: 18px 18px 6px 18px; background: var(--surface-2); font-size: 15px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -586,6 +593,7 @@ a:hover { text-decoration: underline; }
 .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .step-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: start; }
 .step-row .dot { margin-top: 6px; }
+.step-actions { display: flex; align-items: center; gap: 6px; }
 .step-title { font-size: 13.5px; line-height: 1.45; overflow-wrap: anywhere; }
 .step-sub { margin-top: 2px; font-size: 12.5px; color: var(--text-3); line-height: 1.45; overflow-wrap: anywhere; }
 .events { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: 12.5px; color: var(--text-2); }

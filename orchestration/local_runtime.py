@@ -299,6 +299,83 @@ class LocalCloudClient(OpenHandsClient):
             raise CloudUnavailable(f"tool catalog -> {status}")
         return {"tools": normalize_catalog(payload), "raw": payload}
 
+    # ------------------------------------------------------- full-output files
+    supports_files = True
+    TERMINAL_OUTPUT_CAP_CHARS = 30_000
+    TERMINAL_OUTPUT_PREFIX = "terminal_output_"
+    TRAJECTORY_MAX_BYTES = 64 * 1024 * 1024
+    OUTPUT_MAX_BYTES = 64 * 1024 * 1024
+
+    def truncated_outputs(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Terminal observations of the local conversation whose output was cut.
+
+        Same rule as the direct transport: an observation is truncated when its
+        content is exactly the server's cut-off length and it names a save
+        directory.
+        """
+        out: list[dict[str, Any]] = []
+        for event in self.list_events(conversation_id):
+            if event.get("kind") != "ObservationEvent":
+                continue
+            obs = event.get("observation")
+            if not isinstance(obs, dict) or not obs.get("full_output_save_dir"):
+                continue
+            text = "".join(
+                c.get("text", "")
+                for c in (obs.get("content") or [])
+                if isinstance(c, dict)
+            )
+            if len(text) < self.TERMINAL_OUTPUT_CAP_CHARS:
+                continue
+            out.append({"event_id": event.get("id"), "shown_chars": len(text),
+                        "truncated": True})
+        return out
+
+    def full_terminal_output(self, conversation_id: str, prefix: str) -> dict[str, Any]:
+        """The complete output whose preview is *prefix*, from the local server.
+
+        Read through the conversation-scoped trajectory archive, the same route
+        the direct transport uses; the file whose bytes start with *prefix* is
+        chosen.
+        """
+        import hashlib
+        import io
+        import zipfile
+
+        try:
+            status, blob = self.download_trajectory(
+                self.base_url, self._auth_key(), conversation_id,
+                limit=self.TRAJECTORY_MAX_BYTES)
+        except ApiUnavailable as e:
+            raise CloudUnavailable(str(e)) from e
+        if status in (404, 422):
+            raise CloudNotFound(f"no trajectory for conversation {conversation_id}")
+        if status != 200:
+            raise CloudError(f"download-trajectory -> {status}")
+        if len(blob) > self.TRAJECTORY_MAX_BYTES:
+            raise CloudUnavailable("the conversation archive is too large")
+        wanted = prefix.encode("utf-8", "replace")
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(blob))
+        except zipfile.BadZipFile as e:
+            raise CloudError("the trajectory archive could not be read") from e
+        with archive:
+            for name in archive.namelist():
+                if not name.endswith(".txt") or ".." in name.split("/"):
+                    continue
+                base = name.rsplit("/", 1)[-1]
+                if not base.startswith(self.TERMINAL_OUTPUT_PREFIX):
+                    continue
+                data = self.bounded_zip_member(archive, name,
+                                               limit=self.OUTPUT_MAX_BYTES)
+                if data is None:
+                    continue
+                if data.startswith(wanted):
+                    return {"name": base, "bytes": len(data),
+                            "sha256": hashlib.sha256(data).hexdigest(),
+                            "text": data.decode("utf-8", "replace")}
+        raise CloudNotFound("no full-output file matches the truncated event")
+
     # ---------------------------------------------------- account metadata
     def get_settings(self) -> dict[str, Any]:
         return super().settings()

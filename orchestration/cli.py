@@ -612,6 +612,44 @@ def cmd_run_hide(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_run_outputs(args: argparse.Namespace) -> int:
+    """List the terminal outputs of a task's conversation that the server cut.
+
+    The agent-server cuts a terminal observation at 30 000 characters; this
+    lists which ones were cut and how much was shown, so a person can fetch the
+    whole output. An empty list means nothing was cut (or the transport cannot
+    reach output files; the payload says which).
+    """
+    client = _client(args)
+    data = client.get(
+        f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/tasks/{args.task_id}/outputs")
+    outputs = data.get("outputs", [])
+    if data.get("unsupported"):
+        human = "full output is not reachable on this transport: " + str(data.get("reason", ""))
+    elif not outputs:
+        human = "no truncated terminal output"
+    else:
+        human = "\n".join(f"{o['event_id']}  shown {o['shown_chars']}" for o in outputs)
+    _emit(args, data, human=human)
+    return EXIT["ok"]
+
+
+def cmd_run_output(args: argparse.Namespace) -> int:
+    """Fetch the complete terminal output whose preview one event showed."""
+    client = _client(args)
+    data = client.get(
+        f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/tasks/{args.task_id}"
+        f"/outputs/{args.event_id}")
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(data.get("text", ""))
+        human = f"wrote {data.get('bytes', 0)} bytes to {args.out}"
+        _emit(args, {k: v for k, v in data.items() if k != "text"}, human=human)
+    else:
+        _emit(args, data, human=data.get("text", ""))
+    return EXIT["ok"]
+
+
 def cmd_project_executors_show(args: argparse.Namespace) -> int:
     client = _client(args)
     data = client.get(f"/api/v1/projects/{args.project_id}/executors")
@@ -810,6 +848,20 @@ def build_parser() -> argparse.ArgumentParser:
     rh.add_argument("run_id")
     rh.add_argument("--project", dest="project_id", required=True)
     rh.set_defaults(func=cmd_run_hide)
+    ro = run.add_parser("outputs", parents=[common],
+                        help="list the terminal outputs a task's conversation cut")
+    ro.add_argument("run_id")
+    ro.add_argument("task_id")
+    ro.add_argument("--project", dest="project_id", required=True)
+    ro.set_defaults(func=cmd_run_outputs)
+    roo = run.add_parser("output", parents=[common],
+                         help="fetch the complete terminal output of one event")
+    roo.add_argument("run_id")
+    roo.add_argument("task_id")
+    roo.add_argument("event_id")
+    roo.add_argument("--project", dest="project_id", required=True)
+    roo.add_argument("--out", default="", help="write the text to this file")
+    roo.set_defaults(func=cmd_run_output)
 
     task = sub.add_parser("task", parents=[common], help="manage tasks").add_subparsers(dest="sub", required=True)
     tl = task.add_parser("list", parents=[common], help="list tasks")

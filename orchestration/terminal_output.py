@@ -59,7 +59,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 #: Hard cap on a recovered file. Enough for any log worth reading; small
 #: enough that a hostile or broken sandbox cannot make this server buffer an
@@ -87,6 +87,12 @@ _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: reference) is what ends up stored in the event stream; the persist notice
 #: (with the file reference) is only ever in the model-facing copy.
 _CLIP_MARKERS = ("<response clipped>",)
+
+#: The agent-server cuts a terminal observation at this many characters
+#: (``MAX_CMD_OUTPUT_SIZE``, v1.60.1). An observation whose content reaches it
+#: was cut, whether or not a marker is present, so this length is a second,
+#: independent truncation signal.
+TERMINAL_OUTPUT_CAP_CHARS = 30_000
 
 
 class OutputRefused(Exception):
@@ -132,6 +138,9 @@ class TerminalOutputRef:
     #: session layer has already discarded).
     saved_output: str = "unknown"
     preview: str = ""
+    #: The event's own (uncleaned) truncated text, used only to match the saved
+    #: file by prefix. Never serialised into an API response.
+    match_prefix: str = ""
     #: Resolved path, never serialised into an API response. Kept on the
     #: Python side so the fetch does not have to recompute it.
     _path: str | None = field(default=None, repr=False)
@@ -150,7 +159,15 @@ def _text_parts(content: Any) -> str:
 
 
 def clipped_in_stream(text: str) -> bool:
-    return any(marker in text for marker in _CLIP_MARKERS)
+    """Whether an observation's text was cut by the agent-server.
+
+    Two independent signals, either of which means "truncated": the SDK's own
+    clip marker, or a body that reaches the server's cut-off length (a body that
+    long was cut at the boundary, marker or not).
+    """
+    if any(marker in text for marker in _CLIP_MARKERS):
+        return True
+    return len(text) >= TERMINAL_OUTPUT_CAP_CHARS
 
 
 def normalize_save_dir(raw: object) -> str | None:
@@ -295,6 +312,7 @@ def extract_refs(
             clipped=clipped_in_stream(text),
             saved_output="unknown" if path else "missing",
             preview=_preview(text),
+            match_prefix=text,
             _path=path,
         ))
     refs.sort(key=lambda r: r.at or "", reverse=True)
@@ -365,24 +383,152 @@ def download_file(client: Any, conversation_id: str, path: str, *, limit: int) -
         raise OutputUnavailable(f"{type(e).__name__}") from e
 
 
-def fetch_full_output(client: Any, ref: TerminalOutputRef) -> bytes:
-    """Read the file behind ``ref``, whole, bounded by :data:`MAX_OUTPUT_BYTES`.
+#: The whole conversation directory as a ZIP; bounded so one request cannot
+#: pull an unbounded archive into memory.
+TRAJECTORY_MAX_BYTES = 64 * 1024 * 1024
+#: The decompressed size one output file may have. The compressed archive is
+#: already bounded, but a small archive can expand enormously (a ZIP bomb), so
+#: the member is bounded on its own too.
+OUTPUT_MAX_BYTES = 64 * 1024 * 1024
 
-    Raises :class:`OutputRefused` for a ref whose path is not valid (nothing to
-    fetch), :class:`OutputUnavailable` for transport failures and for a 404, and
-    :class:`FileTooLarge` when the file exceeds the cap.
+
+def download_trajectory(client: Any, conversation_id: str, *, limit: int) -> tuple[int, bytes]:
+    """The conversation's own directory as a ZIP, via the scoped route.
+
+    ``GET /api/conversations/{id}/file/download-trajectory/{id}`` on the
+    sandbox the conversation lives on. The route is **conversation scoped**:
+    the server refuses a path outside that conversation's own directory, so the
+    archive is the safe way to reach the saved output files, and it is the
+    transport this module uses - not the global ``/api/file/download?path=``
+    endpoint, which would let a caller name any path on the sandbox.
+
+    Raises :class:`OutputUnavailable` when the transport cannot read files.
     """
-    if not ref._path:
+    from .cloud_direct import CloudDirectClient
+    from .local_runtime import LocalCloudClient
+    from .openhands_client import ApiUnavailable, OpenHandsClient
+
+    try:
+        if isinstance(client, CloudDirectClient):
+            return client._http.download_trajectory(
+                client._route_for(conversation_id).agent_server_url,
+                client._route_for(conversation_id).session_api_key,
+                conversation_id, limit=limit)
+        if isinstance(client, LocalCloudClient):
+            return client.download_trajectory(
+                client.base_url, client._auth_key(), conversation_id, limit=limit)
+        if isinstance(client, OpenHandsClient):
+            return client.download_trajectory(
+                client._base_url(), client._auth_key(), conversation_id, limit=limit)
+        fn = getattr(client, "download_trajectory", None)
+        if callable(fn):
+            return fn(conversation_id, limit=limit)
+        raise OutputUnavailable("this transport cannot read sandbox files")
+    except OutputUnavailable:
+        raise
+    except ApiUnavailable as e:
+        raise OutputUnavailable(str(e)) from e
+    except Exception as e:  # noqa: BLE001 - never leak transport internals
+        raise OutputUnavailable(f"{type(e).__name__}") from e
+
+
+def _bounded_zip_member(archive: Any, name: str, *, limit: int) -> bytes | None:
+    """Read one member of *archive*, or ``None`` if it is larger than *limit*.
+
+    Mirrors ``OpenHandsClient.bounded_zip_member`` so this module does not
+    depend on which client shape the caller passed. ``ZipInfo.file_size`` is
+    read first and refused when over the limit, and the stream is read with a
+    cap as well, because a hostile archive can understate the size it declares.
+    Returns ``None`` (never a partial buffer) for a member over the limit.
+    """
+    try:
+        info = archive.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > limit:
+        return None
+    out = bytearray()
+    with archive.open(info) as handle:
+        while True:
+            chunk = handle.read(min(65536, limit - len(out) + 1))
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > limit:
+                return None
+    return bytes(out)
+
+
+def fetch_full_output(client: Any, ref: TerminalOutputRef) -> bytes:
+    """Read the file behind ``ref`` from the conversation-scoped archive.
+
+    The output file is read through the trajectory archive (a conversation's own
+    directory, never a caller-named path). Two independent checks decide which
+    member it is, so a substituted file cannot pass as the event's output:
+
+    * when the event carries enough metadata to recompute the SDK's file name
+      (``terminal_output_<sha256(rendered)[:8]>.txt``), the member must have
+      exactly that name **and** its bytes must start with the event's clipped
+      text; and
+    * otherwise (an event with no recomputable name) the member whose bytes
+      start with the event's clipped text is used - the Phase 4 rule - so a real
+      output is still recovered, but a member that does not match the event's
+      own text is never returned.
+
+    Raises :class:`OutputRefused` when the event carries no usable reference,
+    :class:`OutputUnavailable` when the transport cannot read the archive or no
+    member matches, and :class:`FileTooLarge` when the archive or a matching
+    member exceeds its cap.
+    """
+    import io
+    import zipfile
+
+    if not ref.match_prefix:
         raise OutputRefused("the event carries no usable full-output reference")
-    status, body = download_file(client, ref.conversation_id, ref._path,
-                                 limit=MAX_OUTPUT_BYTES)
-    if status == 404:
-        raise OutputUnavailable("the saved output is not there any more")
+    try:
+        status, blob = download_trajectory(client, ref.conversation_id,
+                                           limit=TRAJECTORY_MAX_BYTES)
+    except OutputUnavailable:
+        raise
+    if status in (404, 422):
+        raise OutputUnavailable("the conversation archive is not there any more")
     if status != 200:
         raise OutputUnavailable(f"the sandbox answered {status}")
-    if len(body) > MAX_OUTPUT_BYTES:
-        raise FileTooLarge(f"the saved output is larger than {MAX_OUTPUT_BYTES} bytes")
-    return body
+    if len(blob) > TRAJECTORY_MAX_BYTES:
+        raise FileTooLarge(f"the conversation archive is larger than {TRAJECTORY_MAX_BYTES} bytes")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+    except zipfile.BadZipFile as e:
+        raise OutputUnavailable("the conversation archive could not be read") from e
+
+    prefix = ref.match_prefix.encode("utf-8", "replace")
+    wanted_name = ref._path.rsplit("/", 1)[-1] if ref._path else None
+    with archive:
+        names = [n for n in archive.namelist()
+                 if n.endswith(".txt") and ".." not in n.split("/")]
+        # 1. The member whose name is exactly the one recomputed from the event
+        #    (only when the event carried enough metadata to recompute it).
+        if wanted_name:
+            for name in names:
+                if name.rsplit("/", 1)[-1] != wanted_name:
+                    continue
+                data = _bounded_zip_member(archive, name, limit=OUTPUT_MAX_BYTES)
+                if data is None:
+                    raise FileTooLarge(
+                        f"the saved output is larger than {OUTPUT_MAX_BYTES} bytes")
+                if data.startswith(prefix):
+                    return data
+        # 2. Fall back to the member whose bytes start with the event's text.
+        for name in names:
+            base = name.rsplit("/", 1)[-1]
+            if not base.startswith("terminal_output_"):
+                continue
+            data = _bounded_zip_member(archive, name, limit=OUTPUT_MAX_BYTES)
+            if data is None:
+                continue
+            if data.startswith(prefix):
+                return data
+    raise OutputUnavailable("no saved output matches the truncated event")
 
 
 def find_ref(events: Iterable[dict[str, Any]], conversation_id: str,
@@ -391,3 +537,121 @@ def find_ref(events: Iterable[dict[str, Any]], conversation_id: str,
         if ref.event_id == event_id:
             return ref
     return None
+
+
+# ---------------------------------------------------------------- task scoping
+#
+# The HTTP routes, the CLI and the MCP tools all address a *task* of a run, not
+# a conversation: a task is what a person starts and reads. These helpers resolve
+# the task (honouring project membership) and then use the primitives above, so
+# there is exactly one recovery mechanism - this module - reached three ways.
+
+#: ``client_for(principal, account_id) -> a client that can read the sandbox``.
+#: The caller supplies it because the server and the MCP process build it
+#: differently (the server has its own account service and process client).
+ClientFor = Callable[[str, "str | None"], Any]
+
+
+def run_task(store: Any, principal: str, project_id: str, run_id: str,
+             task_id: str) -> dict[str, Any]:
+    """A task of *run_id* in *project_id*, or ``NotFound``.
+
+    Membership is checked through the run, so a non-member never learns whether
+    the task exists (``NotFound``, never ``Forbidden``).
+    """
+    from .cloud_store import NotFound
+    from .nexus_lab_store import LabStore
+
+    if not _is_uuid(task_id):
+        raise NotFound("task id")
+    lab = LabStore(store)
+    lab.get_run(principal, project_id, run_id)  # membership + existence
+    task = next((t for t in lab.list_tasks(principal, project_id, run_id)
+                 if str(t["id"]) == task_id), None)
+    if task is None:
+        raise NotFound("task not found in this run")
+    return task
+
+
+def run_task_outputs(store: Any, principal: str, project_id: str, run_id: str,
+                     task_id: str, client_for: ClientFor) -> dict[str, Any]:
+    """Which terminal outputs of the task's conversation were cut off.
+
+    An empty list (never an error) when the task has no conversation yet, when
+    the transport cannot reach the archive (``unsupported`` says so), or when
+    nothing was cut. Uses the same validation as the run-level listing.
+    """
+    from .cloud_client import CloudNotFound
+    from .cloud_store import NotFound
+
+    task = run_task(store, principal, project_id, run_id, task_id)
+    conversation_id = task.get("conversation_id")
+    base = {"task_id": task_id, "conversation_id": conversation_id, "outputs": []}
+    if not conversation_id:
+        return base
+    client = client_for(principal, task.get("openhands_account_id"))
+    if capability(client) != "agent-server":
+        return {**base, "unsupported": True,
+                "reason": "this transport cannot read sandbox files"}
+    try:
+        events = client.list_events(str(conversation_id), limit=EVENTS_PAGE, max_pages=3)
+    except CloudNotFound as e:
+        raise NotFound(str(e) or "conversation not found") from None
+    refs = extract_refs(events, str(conversation_id))
+    # The task route lists the outputs that were **cut off** - the ones worth
+    # fetching. A short observation is not truncated, so it is not listed.
+    outputs = [{"event_id": r.event_id, "shown_chars": r.output_chars,
+                "truncated": True, "command": r.command,
+                "exit_code": r.exit_code, "at": r.at}
+               for r in refs if r.clipped]
+    return {**base, "outputs": outputs}
+
+
+def run_task_output(store: Any, principal: str, project_id: str, run_id: str,
+                    task_id: str, event_id: str, client_for: ClientFor) -> dict[str, Any]:
+    """The complete terminal output whose preview one event showed.
+
+    The event is read first (its own text is the key the archive is searched
+    with), so the file returned is the one its preview named - not a file
+    guessed by name. ``NotFound`` when the event is unknown or the output is
+    gone; ``ValueError`` when the transport cannot read it.
+    """
+    from .cloud_client import CloudNotFound
+    from .cloud_store import NotFound
+
+    task = run_task(store, principal, project_id, run_id, task_id)
+    conversation_id = task.get("conversation_id")
+    if not conversation_id:
+        raise NotFound("the task has no conversation yet")
+    client = client_for(principal, task.get("openhands_account_id"))
+    if capability(client) != "agent-server":
+        raise ValueError("this transport cannot read sandbox files")
+    try:
+        events = client.list_events(str(conversation_id), limit=EVENTS_PAGE, max_pages=3)
+    except CloudNotFound as e:
+        raise NotFound(str(e) or "conversation not found") from None
+    ref = find_ref(events, str(conversation_id), event_id)
+    if ref is None:
+        raise NotFound("no such event in the task's conversation")
+    try:
+        data = fetch_full_output(client, ref)
+    except OutputRefused as e:
+        raise NotFound(str(e)) from None
+    except UnsupportedTransport as e:
+        raise ValueError(str(e)) from None
+    except FileTooLarge as e:
+        raise ValueError(str(e)) from None
+    except OutputUnavailable as e:
+        raise NotFound(str(e)) from None
+    return {"task_id": task_id, "conversation_id": conversation_id,
+            "event_id": event_id, "shown_chars": len(ref.match_prefix),
+            "name": ref._path.rsplit("/", 1)[-1] if ref._path else "",
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "text": data.decode("utf-8", "replace")}
+
+
+def _is_uuid(value: str) -> bool:
+    import re
+
+    return bool(re.fullmatch(r"[0-9a-fA-F-]{36}", value or ""))
