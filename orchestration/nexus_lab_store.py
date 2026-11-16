@@ -64,9 +64,26 @@ from datetime import timedelta
 from typing import Any
 
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
+
 from .nexus_projects import ProjectService
 
 log = logging.getLogger("nexus_lab_store")
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    """Whether *exc* is a PostgreSQL deadlock report.
+
+    psycopg is optional at import time elsewhere in this package; a missing
+    driver is not a deadlock.
+    """
+    try:
+        from .cloud_store import psycopg
+        if psycopg is None:
+            return False
+        return isinstance(exc, psycopg.errors.DeadlockDetected)
+    except Exception:  # noqa: BLE001 - detection must never mask the real error
+        return False
+
 
 #: Task states that count as "done well enough to unblock a child". A task that
 #: legitimately produced no change (``completed_no_changes``) is accepted too:
@@ -487,12 +504,27 @@ class LabStore:
         run's current state does not lead there (see ``_RUN_ENTERED_FROM``)."""
         if state not in _RUN_ENTERED_FROM:
             raise ValueError("invalid run state")
-        with self.store._tx() as cur:
-            ProjectService._project(cur, principal, project_id)
-            run = self._apply_run_state(cur, project_id, run_id, state, last_error,
-                                        strict=True, actor=principal)
-            assert run is not None
-            return run
+        # A cancel settles one run against every unfinished task of it, and the
+        # worker settles single tasks the same rows at the same time; under load
+        # the two paths can be reported by PostgreSQL as a deadlock. The aborted
+        # transaction commits nothing, and every write inside is idempotent, so
+        # one attempt more is safe. It is not a loop: a second deadlock is a
+        # real defect and surfaces as the 500 it always was.
+        for attempt in (1, 2):
+            try:
+                with self.store._tx() as cur:
+                    ProjectService._project(cur, principal, project_id)
+                    run = self._apply_run_state(cur, project_id, run_id, state,
+                                                last_error, strict=True,
+                                                actor=principal)
+                    assert run is not None
+                    return run
+            except Exception as e:
+                if attempt == 1 and _is_deadlock(e):
+                    log.warning("deadlock settling run %s to %s; one retry", run_id, state)
+                    continue
+                raise
+        raise AssertionError("unreachable")
 
     def set_hidden(self, principal: str, project_id: str, run_id: str,
                    hidden: bool) -> dict:
@@ -627,16 +659,24 @@ class LabStore:
         """
         if state not in _RUN_ENTERED_FROM:
             raise ValueError("invalid run state")
-        with self.store._tx() as cur:
-            cur.execute("SELECT project_id FROM nexus_runs WHERE id=%s", (run_id,))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("run not found")
-            run = self._apply_run_state(cur, str(row["project_id"]), run_id, state,
-                                        last_error, strict=False)
-            if run is not None and also is not None and run["state"] == state:
-                also(cur, run)
-            return run
+        for attempt in (1, 2):
+            try:
+                with self.store._tx() as cur:
+                    cur.execute("SELECT project_id FROM nexus_runs WHERE id=%s", (run_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        raise NotFound("run not found")
+                    run = self._apply_run_state(cur, str(row["project_id"]), run_id,
+                                                state, last_error, strict=False)
+                    if run is not None and also is not None and run["state"] == state:
+                        also(cur, run)
+                    return run
+            except Exception as e:
+                if attempt == 1 and _is_deadlock(e):
+                    log.warning("deadlock settling run %s to %s; one retry", run_id, state)
+                    continue
+                raise
+        raise AssertionError("unreachable")
 
     def _apply_run_state(self, cur: Any, project_id: str, run_id: str, state: str,
                          last_error: str | None, *, strict: bool,

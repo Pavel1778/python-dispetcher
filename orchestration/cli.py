@@ -53,6 +53,20 @@ class Client:
     """Minimal bearer-authenticated JSON client for the NEXUS API."""
 
     def __init__(self, base_url: str, token: str | None, *, timeout: float = 30.0):
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            # Same trap the server-side Cloud client guards against: urlopen
+            # honours any scheme it is handed, including ``file://`` (reads a
+            # local file into the CLI's output) and ``ftp://``. The NEXUS_URL
+            # value is operator-supplied, so a typo or a hostile value must
+            # fail loudly at construction instead of silently doing I/O the
+            # operator never asked for. Loopback and private addresses are
+            # not refused here: a local NEXUS server is a supported setup.
+            raise CliError(
+                f"nexus server URL must be an http(s) URL, got "
+                f"{parsed.scheme or '(none)'}",
+                EXIT["config"],
+            )
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
