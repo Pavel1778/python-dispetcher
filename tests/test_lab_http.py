@@ -214,6 +214,11 @@ def test_full_autonomous_loop_completes_over_http(harness):
                        session=harness["alice"])
     kinds = {n["kind"] for n in notes["notifications"]}
     assert "goal_started" in kinds and "goal_completed" in kinds
+    # The task itself is notified when it starts and when it settles: a person
+    # watching the project learns that work began and that it verified, not only
+    # that the goal was requested and finished.
+    assert "task_started" in kinds
+    assert "task_completed_verified" in kinds
 
 
 def test_the_run_detail_carries_a_time_profile(harness):

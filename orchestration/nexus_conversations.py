@@ -603,7 +603,17 @@ class ConversationService:
                 f"RETURNING {_CONVERSATION}",
                 (_json(plan), digest, goal_id, spec_id, digest, digest, digest,
                  state, conversation_id, project_id))
-            return dict(cur.fetchone())
+            row = cur.fetchone()
+            if state == AWAITING_APPROVAL:
+                # A plan is on offer and only an explicit confirmation starts it,
+                # so the owner needs to be told a decision is waiting. Written in
+                # the same transaction that stores the plan, so the notification
+                # and the state cannot disagree.
+                cur.execute(
+                    "INSERT INTO nexus_notifications(project_id, kind, title, resource_id) "
+                    "VALUES (%s, 'approval_required', %s, %s)",
+                    (project_id, "Требуется подтверждение плана", conversation_id))
+            return dict(row)
 
     def record_approval(self, principal: str, project_id: str, conversation_id: str,
                         *, plan_hash: str) -> dict:

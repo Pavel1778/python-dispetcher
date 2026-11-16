@@ -195,6 +195,28 @@ def test_a_manual_order_proposes_a_plan_and_starts_nothing(studio):
     assert wf["plan_hash"]
 
 
+def test_a_manual_order_raises_an_approval_notification(studio):
+    """A plan on offer tells the owner a decision is waiting.
+
+    The manual gate is only useful if the person knows a plan is waiting for a
+    confirmation; the notification is written in the same transaction that
+    stores the plan, so the state and the notification cannot disagree.
+    """
+    project = studio.project()
+    _connect(studio, project)
+    conversation = _conversation(studio, project)
+    studio.answers(json.dumps(PLAN))
+
+    status, body = _send(studio, project, conversation, "Исправь найденные ошибки")
+    assert status == 200, body
+    status, listed = studio.api.get(f"/api/v1/projects/{project}/notifications")
+    assert status == 200, listed
+    kinds = {n["kind"] for n in listed["notifications"]}
+    assert "approval_required" in kinds
+    waiting = next(n for n in listed["notifications"] if n["kind"] == "approval_required")
+    assert waiting["resource_id"] == conversation
+
+
 def test_a_manual_question_is_answered_and_starts_nothing(studio):
     project = studio.project()
     _connect(studio, project)

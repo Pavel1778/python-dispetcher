@@ -741,10 +741,12 @@ class LabStore:
                 log.exception("could not write the %s report of run %s", state, run_id)
         # A run that is *blocked* cannot go on without a person, so its chat is
         # told why at once. It is not terminal (a resume may restart it), so this
-        # is a message, not a report.
+        # is a message, not a report - and the owner is also notified, because a
+        # blocked run needs attention that a chat note alone does not raise.
         if state == "blocked":
             self._tell_chat(cur, run, "Прогон заблокирован.",
                             (last_error or "").strip())
+            self._notify(cur, project_id, "run_blocked", "Прогон заблокирован", run_id)
         # Mirror terminal states onto the goal so the goal is not left
         # "running" after its only run finished.
         if state in TERMINAL_RUN_STATES:
@@ -1215,6 +1217,13 @@ class LabStore:
                      task.get("openhands_account_id"), task.get("openhands_account_id"),
                      str(conversation_id), task.get("repository") or "",
                      task.get("branch") or "", task.get("base_sha")))
+                if kind in ("start", "adopted") and task["state"] == "running":
+                    # The task's first real attempt has an executor and is at work.
+                    # Notified once per attempt cycle - a retry notifies its own
+                    # attempt - so the owner is told work actually started, which
+                    # is a different fact from the run having been requested.
+                    self._notify(cur, task["project_id"], "task_started",
+                                 task["title"], task_id)
                 if task["state"] != "running":
                     # The run was cancelled while the start was on its way.
                     # Nobody will follow this conversation; it is told to stop.

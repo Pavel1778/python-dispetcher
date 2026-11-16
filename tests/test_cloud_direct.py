@@ -365,6 +365,41 @@ def test_repository_task_default_mode_injects_a_clone_instruction(monkeypatch):
         store.close()
 
 
+def test_secrets_reach_the_sandbox_create_body(monkeypatch):
+    """A credential given to ``start_conversation`` is not dropped.
+
+    The agent-server's ``StartConversationRequest`` carries ``secrets``, so a
+    task that must authenticate (a private clone, a push) can be given one. The
+    direct transport used to accept the argument and drop it silently, leaving
+    the caller believing the agent had the credential. Asserted through the real
+    call path: the body the agent-server receives carries the mapping.
+    """
+    store = PostgresStore(DSN)
+    try:
+        account = FakeCloudAccount()
+        client, _ = _client(store, account)
+        captured: dict = {}
+        inner = client._send
+
+        def recording(route, method, path, body=None):
+            if method == "POST" and path == "/api/conversations":
+                captured["body"] = body
+            return inner(route, method, path, body)
+
+        client._send = recording  # type: ignore[method-assign]
+        client.start_conversation(
+            initial_message="clone and push",
+            secrets={"GITHUB_TOKEN": "ghp_secret_value"},
+        )
+        assert captured["body"]["secrets"] == {"GITHUB_TOKEN": "ghp_secret_value"}
+        # And a call with no secrets does not invent one.
+        captured.clear()
+        client.start_conversation(initial_message="no credential here")
+        assert "secrets" not in captured["body"]
+    finally:
+        store.close()
+
+
 def test_repository_task_refuse_mode_raises(monkeypatch):
     from orchestration.cloud_client import CloudError
 
