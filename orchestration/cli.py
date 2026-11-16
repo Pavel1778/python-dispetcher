@@ -714,6 +714,44 @@ def cmd_qa_verify(args: argparse.Namespace) -> int:
     return EXIT["ok"] if ok else EXIT["conflict"]
 
 
+def cmd_qa_run(args: argparse.Namespace) -> int:
+    """Run a project's own checks (tests, lint) in an isolated checkout.
+
+    Real commands, real exit codes: the verdict is ``passed``/``failed``/
+    ``skipped``/``blocked`` and is never a false pass. ``--repo`` is a local
+    path or a git URL; ``--commit`` pins the revision. Without ``--repo`` it
+    uses the project's bound repository (read through the API).
+    """
+    from .nexus_selfqa import SelfQa
+
+    repository = args.repo
+    commit = args.commit or ""
+    if not repository and args.project_id:
+        client = _client(args)
+        detail = client.get(f"/api/v1/projects/{args.project_id}")
+        binding = (detail.get("binding") or {})
+        repository = binding.get("full_name") or ""
+        commit = commit or binding.get("selected_branch") or ""
+        if not repository:
+            raise CliError("the project has no bound repository", EXIT["not_found"])
+    if not repository:
+        raise CliError("--repo or --project is required", EXIT["usage"])
+    report = SelfQa(check_timeout=args.check_timeout or 900.0).run(
+        repository=repository, commit=commit)
+    human = "\n".join(
+        f"[{c.status}] {c.name}"
+        + (f" (exit {c.exit_code})" if c.exit_code is not None else "")
+        + (f" — {c.detail}" if c.detail else "")
+        for c in report.checks) or "(no checks ran)"
+    human = f"verdict: {report.verdict} — {report.reason}\n" + human
+    _emit(args, report.as_dict(), human=human)
+    if report.verdict == "passed":
+        return EXIT["ok"]
+    if report.verdict in ("skipped", "blocked"):
+        return EXIT["unavailable"]
+    return EXIT["error"]
+
+
 def cmd_restore_point_create(args: argparse.Namespace) -> int:
     """Create a restore point (git bundle) for the repository. Local, no API."""
     from .restore_point import create_restore_point
@@ -1011,6 +1049,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     qa = sub.add_parser("qa", parents=[common], help="QA and evidence reports").add_subparsers(dest="sub", required=True)
     qa.add_parser("report", parents=[common], help="real system report").set_defaults(func=cmd_qa_report)
+    qr = qa.add_parser("run", parents=[common],
+                       help="run the project's own checks in an isolated checkout")
+    qr.add_argument("--repo", default=None,
+                    help="a local repository path or a git URL (default: the project's binding)")
+    qr.add_argument("--project", dest="project_id", default=None,
+                    help="use this project's bound repository when --repo is not given")
+    qr.add_argument("--commit", default=None, help="a commit or branch to check out")
+    qr.add_argument("--check-timeout", dest="check_timeout", type=float, default=None,
+                    help="seconds per check (default 900)")
+    qr.set_defaults(func=cmd_qa_run)
     qv = qa.add_parser("verify", parents=[common], help="verify project evidence chain")
     qv.add_argument("--project", dest="project_id", required=True)
     qv.set_defaults(func=cmd_qa_verify)
