@@ -2971,15 +2971,17 @@ class Handler(BaseHTTPRequestHandler):
             self._lab_start_run(principal, project_id, rest[1], body)
             return True
         # POST /api/v1/projects/{id}/runs/{run_id}/
-        #      {pause|resume|cancel|hide|show|retry-failed}
+        #      {pause|resume|cancel|hide|show|retry-failed|restart|duplicate}
         #   cancel is durable and idempotent: the run is settled and hidden from
         #   the active lists at once, and the loop signals the executor. A
         #   second cancel is a no-op, never an error. hide/show take a finished
         #   run out of the lists or put it back; retry-failed puts a finished
-        #   run back to work with only its unsuccessful tasks.
+        #   run back to work with only its unsuccessful tasks. restart re-runs
+        #   the whole plan as a new run under the same goal; duplicate copies it
+        #   into a new goal and run. Both refuse a run that is not over.
         if (len(rest) == 3 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
                 and rest[2] in ("pause", "resume", "cancel", "hide", "show",
-                                "retry-failed")):
+                                "retry-failed", "restart", "duplicate")):
             if rest[2] in ("hide", "show"):
                 self._json(200, {"run": self.app.lab.set_hidden(
                     principal, project_id, rest[1], rest[2] == "hide")})
@@ -2989,6 +2991,23 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(200, {"run": self.app.lab.retry_failed(
                         principal, project_id, rest[1])})
                 except InvalidTransition as e:
+                    self._json(409, {"error": str(e)})
+                return True
+            if rest[2] == "restart":
+                try:
+                    self._json(200, {"run": self.app.lab.restart_run(
+                        principal, project_id, rest[1])})
+                except InvalidTransition as e:
+                    self._json(409, {"error": str(e)})
+                return True
+            if rest[2] == "duplicate":
+                key = body.get("idempotency_key") or self.headers.get("Idempotency-Key")
+                try:
+                    self._json(200, {"run": self.app.lab.duplicate_run(
+                        principal, project_id, rest[1], key=key)})
+                except InvalidTransition as e:
+                    self._json(409, {"error": str(e)})
+                except IdempotencyConflict as e:
                     self._json(409, {"error": str(e)})
                 return True
             # ``cancelled`` settles the run, takes it out of the lists and

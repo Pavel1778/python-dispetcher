@@ -154,7 +154,7 @@ def test_mcp_initialize_and_tool_list(app):
         "list_projects", "get_project", "list_repositories", "list_tasks",
         "get_task", "create_task", "dispatch_task", "get_execution_status",
         "list_evidence", "verify_evidence",
-        "list_runs", "get_run", "cancel_run",
+        "list_runs", "get_run", "cancel_run", "restart_run", "duplicate_run",
         "list_run_task_outputs", "get_run_task_output",
         "list_project_executors", "assign_project_executor",
     }
@@ -233,7 +233,7 @@ def test_mcp_stdio_round_trip(app):
     serve(server, stdin=stdin, stdout=stdout)
     lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nexus"
-    assert len(lines[1]["result"]["tools"]) == 17
+    assert len(lines[1]["result"]["tools"]) == 19
 
 
 def test_mcp_parse_error_is_reported(app):
@@ -271,7 +271,7 @@ def test_mcp_http_initialize_and_tools(base):
     assert status == 200
     assert body["result"]["serverInfo"]["name"] == "nexus"
     status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert len(body["result"]["tools"]) == 17
+    assert len(body["result"]["tools"]) == 19
 
 
 def test_mcp_http_project_isolation(base, app):
@@ -304,3 +304,25 @@ def test_mcp_http_notification_is_202(base):
     req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=10) as r:
         assert r.status == 202
+
+
+def test_cli_registers_run_restart_and_duplicate():
+    """The CLI exposes `run restart` and `run duplicate` (the new run actions)."""
+    parser = cli.build_parser()
+    # Find the `run` subparser's choices.
+    subs = next(a for a in parser._subparsers._group_actions if a.dest == "command")
+    run_parser = subs.choices["run"]
+    run_subs = next(a for a in run_parser._subparsers._group_actions if a.dest == "sub")
+    assert "restart" in run_subs.choices
+    assert "duplicate" in run_subs.choices
+
+
+def test_mcp_registers_restart_and_duplicate(app):
+    """The MCP server exposes restart_run and duplicate_run, scoped for control."""
+    server = McpServer(app.store, "user:owner")
+    names = {t["name"] for t in server.handle("tools/list", {})["tools"]}
+    assert "restart_run" in names
+    assert "duplicate_run" in names
+    from orchestration.nexus_policy import MCP_TOOL_SCOPES, SCOPE_RUN_CONTROL
+    assert MCP_TOOL_SCOPES["restart_run"] == SCOPE_RUN_CONTROL
+    assert MCP_TOOL_SCOPES["duplicate_run"] == SCOPE_RUN_CONTROL
