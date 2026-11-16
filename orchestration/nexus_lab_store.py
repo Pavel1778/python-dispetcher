@@ -1215,6 +1215,13 @@ class LabStore:
                      task.get("openhands_account_id"), task.get("openhands_account_id"),
                      str(conversation_id), task.get("repository") or "",
                      task.get("branch") or "", task.get("base_sha")))
+                if kind in ("start", "adopted") and task["state"] == "running":
+                    # The task's first real attempt has an executor and is at work.
+                    # Notified once per attempt cycle - a retry notifies its own
+                    # attempt - so the owner is told work actually started, which
+                    # is a different fact from the run having been requested.
+                    self._notify(cur, task["project_id"], "task_started",
+                                 task["title"], task_id)
                 if task["state"] != "running":
                     # The run was cancelled while the start was on its way.
                     # Nobody will follow this conversation; it is told to stop.
