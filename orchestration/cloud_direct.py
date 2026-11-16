@@ -413,6 +413,14 @@ class CloudDirectClient:
             body["title"] = title
         if tags:
             body["tags"] = tags
+        if secrets:
+            # The agent-server's StartConversationRequest carries ``secrets``
+            # (a name -> value mapping the agent's environment gets), so a task
+            # that must authenticate - a private clone, a push - can be given a
+            # credential. The app transport forwards this; the direct transport
+            # used to accept it and drop it silently, which is worse than
+            # refusing: the caller believed the agent had the credential.
+            body["secrets"] = secrets
         if client_tools is not None:
             body["client_tools"] = client_tools
         if initial_message:
