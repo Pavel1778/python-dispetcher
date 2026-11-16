@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — run-time profile (Phase 5), canonical consolidation
+
+### Added
+
+- **A durable run-time profile.** `nexus_runs` gains stage milestones
+  (`queued_at`, `claimed_at`, `dispatch_started_at`, `conversation_ready_at`,
+  `prompt_sent_at`, `first_agent_event_at`, `verification_started_at`,
+  `verification_completed_at`, `completed_at`) written once at each lifecycle
+  point (migration `0040_run_profiler.sql`). `orchestration/nexus_profiler.py`
+  turns them into per-stage durations, idle time and the dominant bottleneck;
+  the run-detail route returns a `profile`, and the studio shows it. A stage
+  that was not measured is `None`, never a fabricated zero.
+  (`nexus_profiler.py`, `nexus_lab_store.py`, `nexus_lab.py`, `web_server.py`,
+  `cloud_store.py`; tests `tests/test_run_profiler.py`, the run-detail case in
+  `tests/test_lab_http.py`; doc `docs/RUN-PROFILER.md`.)
+
+### Changed
+
+- **Canonical consolidation.** The three consolidation candidates (the
+  owner-approved Phase 3+4 base, the engineering/performance-evolution branch,
+  and the Phase 5 profiler) are reconciled into one branch: one
+  `terminal_output.py` (the conversation-scoped trajectory transport with the
+  ZIP-bomb bound, the `..`-skip and PR #42's recomputed-name source verification),
+  the kept connection pool, the engineering docs and the `file_lab` batch insert,
+  and a cluster-wide advisory lock around the cluster-global Supabase-role test
+  case. See `AGENTS.md`, "Canonical consolidation".
+
 ## Unreleased — full terminal output, run controls, test isolation, asset latency
 
 ### Added
@@ -16,7 +43,7 @@
   `list_run_task_outputs` and `get_run_task_output`. The Cloud *app* transport
   cannot reach a sandbox filesystem and says so (`unsupported`), never an empty
   result. See `AGENTS.md`, "Full terminal output recovery".
-  (`orchestration/nexus_outputs.py`, `cloud_direct.py`, `local_runtime.py`,
+  (`orchestration/terminal_output.py`, `cloud_direct.py`, `local_runtime.py`,
   `openhands_client.py`, `web_server.py`, `cli.py`, `mcp_server.py`; tests
   `tests/test_artifacts.py`.)
 
