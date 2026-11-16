@@ -9,17 +9,44 @@ is the per-subsystem matrix with the evidence.
 
 - **The MCP *client*** (NEXUS connecting *to* external MCP servers) is a design
   only (`docs/MCP_ARCHITECTURE.md`). The MCP *server* (stdio + Streamable HTTP)
-  is implemented.
-- **The Self-QA engine** (`docs/SELF_QA_ARCHITECTURE.md`) is design only.
+  is implemented. **No current NEXUS user flow needs an MCP client**: NEXUS is
+  the MCP server the operator/agent connects *to*; a conversation's own MCP
+  servers are configured on the OpenHands account and the agent-server connects
+  to them, not NEXUS. A client would be a new capability, not a completion of an
+  existing one, so it is left as design until a scenario needs it.
+- **Self-QA** is implemented as a **deterministic** engine
+  (`orchestration/nexus_selfqa.py`, `nexus qa run`): it runs a project's own
+  checks (`.nexus-qa.json`, or lint + tests) in an isolated checkout and returns
+  passed/failed/skipped/blocked. What it does **not** do: judge whether the
+  result matches the task's *intent* (that needs a model and is a separate,
+  optional layer, deliberately not part of the verdict), and it is not yet
+  wired into the run loop as an automatic gate - it is an operator/CLI check.
 - **Preview of PDF / DOCX / XLSX / PPTX**: the File Lab renders text and images
   inline; any other type is offered as a download. The UI does not claim to
   render a format the code cannot (`orchestration/file_lab.py`, `TEXT_EXTS` /
-  `IMAGE_EXTS`).
+  `IMAGE_EXTS`). An office-document text extractor is P2 and not in the MVP.
 - **Features that have routes but no screen** in the studio: lab file uploads,
-  workspaces and voice notes; evidence; plan approval; GitHub create-repository
-  and visibility confirmations; the legacy task form and queue; the system
-  diagnostics page; the allowlist editor; OpenHands account management. They are
-  reachable through the API, the CLI and MCP.
+  workspaces and voice notes; evidence records; GitHub create-repository and
+  visibility confirmations; the legacy task form and queue; the system
+  diagnostics page; the allowlist editor. They are reachable through the API,
+  the CLI and MCP. Plan approval and OpenHands account management **are** on
+  screen (the chat-first «Вручную» mode and Settings → Подключения).
+
+## Live verification achieved (2026-11-16)
+
+Contrary to the earlier note that live execution was unproven, a **full
+autonomous run was driven through NEXUS against the live OpenHands Cloud** in
+this environment:
+
+- project bound to a real GitHub branch, a goal submitted, the run **planned**
+  into a two-task DAG, dispatched to live OpenHands conversations, the agent
+  **cloned, committed and pushed** to the bound branch, and NEXUS **verified**
+  both tasks (`completed_verified`); the run reached `completed` with a report.
+- The account still has **no GitHub provider token**, but NEXUS now hands the
+  sandbox a Git credential itself (from `GITHUB_TOKEN` or the bound account), so
+  a push succeeds. The `secrets` channel is verified: the agent-server injects
+  the value and masks it in the agent's output.
+
 
 ## Verified only against the local stand-in servers
 
