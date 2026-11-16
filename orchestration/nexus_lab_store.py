@@ -741,10 +741,12 @@ class LabStore:
                 log.exception("could not write the %s report of run %s", state, run_id)
         # A run that is *blocked* cannot go on without a person, so its chat is
         # told why at once. It is not terminal (a resume may restart it), so this
-        # is a message, not a report.
+        # is a message, not a report - and the owner is also notified, because a
+        # blocked run needs attention that a chat note alone does not raise.
         if state == "blocked":
             self._tell_chat(cur, run, "Прогон заблокирован.",
                             (last_error or "").strip())
+            self._notify(cur, project_id, "run_blocked", "Прогон заблокирован", run_id)
         # Mirror terminal states onto the goal so the goal is not left
         # "running" after its only run finished.
         if state in TERMINAL_RUN_STATES:

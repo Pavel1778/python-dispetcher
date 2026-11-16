@@ -976,6 +976,19 @@ def test_a_cancel_between_the_claim_and_the_start_still_stops_the_conversation(e
     assert executor.states[conversation] == "paused"
 
 
+def test_a_blocked_run_raises_a_notification(env):
+    """A blocked run needs a person, so the owner is notified, not only the chat.
+
+    The run's conversation also gets a note (``_tell_chat``), but a notification
+    is what a person watching the project sees; the two are written in the same
+    transaction that sets the state, so they cannot disagree.
+    """
+    run_id = start(env, [{"task_key": "build", "title": "Build"}])
+    env["lab"].set_run_state_internal(run_id, "blocked", last_error="needs a decision")
+    notes = env["lab"].notifications(ALICE, env["project"])
+    assert any(n["kind"] == "run_blocked" for n in notes), notes
+
+
 def test_only_a_run_that_is_over_can_be_hidden_and_it_can_be_shown_again(env):
     run_id = start(env, [{"task_key": "build", "title": "Build"}], policy="bounded")
     with pytest.raises(InvalidTransition):
