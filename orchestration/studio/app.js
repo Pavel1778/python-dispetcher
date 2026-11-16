@@ -1268,6 +1268,31 @@
     return 'через ' + hours + ' ' + plural(hours, 'час', 'часа', 'часов');
   }
 
+  // A stage duration in the run profile, from a number of seconds.
+  function secondsText(value) {
+    var seconds = Math.max(0, Math.round(Number(value) || 0));
+    if (seconds < 60) return seconds + ' с';
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + ' мин ' + (seconds % 60) + ' с';
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + ' ч ' + (minutes % 60) + ' мин';
+    return Math.floor(hours / 24) + ' д ' + (hours % 24) + ' ч';
+  }
+
+  // The profiler's bottleneck token, said in words.
+  function profBottleneckLabel(token) {
+    return ({
+      queue_wait: 'ожидание в очереди',
+      dispatch: 'запуск разговора',
+      openhands_start: 'старт OpenHands',
+      agent_first_event: 'первый ответ агента',
+      agent_execution: 'работа агента',
+      verification: 'проверка результата',
+      finish: 'завершение',
+      idle: 'простой (время без измеренных этапов)'
+    })[token] || token;
+  }
+
   // Which OpenHands a task is (or was last) run by: the newest line of its
   // history. An empty label is the server's own key.
   function taskExecutor(executions, taskId) {
@@ -1326,6 +1351,28 @@
     // A durable run that is between two tries says so, and when it goes on.
     var pause = run.state === 'running' && run.resume_at && run.wait_reason
       ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
+    // The run-time profile: where the wall-clock time went. Read-only; the
+    // server computes it. Only the stages that were measured are shown, so a
+    // missing milestone reads as "не измерено", never as zero.
+    var prof = detail.profile;
+    var profileSection = '';
+    if (prof && prof.stages) {
+      var order = [['queue_wait', 'ожидание в очереди'], ['dispatch', 'запуск'],
+                   ['openhands_start', 'старт OpenHands'], ['prompt', 'отправка задачи'],
+                   ['first_event', 'первый ответ агента'], ['execution', 'работа агента'],
+                   ['verification', 'проверка'], ['finish', 'завершение'],
+                   ['idle', 'простой']];
+      var rows = order.map(function (pair) {
+        var v = pair[0] === 'idle' ? prof.idle_seconds : prof.stages[pair[0]];
+        if (v == null) return '';
+        return '<li><span>' + esc(pair[1]) + '</span><span class="mono">' + esc(secondsText(v)) + '</span></li>';
+      }).join('');
+      var ratio = prof.idle_ratio == null ? '' : ' · простой ' + Math.round(prof.idle_ratio * 100) + '%';
+      profileSection = '<details class="work-section"><summary>Профиль времени' + esc(ratio) + '</summary>' +
+        '<ul class="events profile-rows">' + rows + '</ul>' +
+        (prof.bottleneck ? '<p class="step-sub">Основная доля времени: ' + esc(profBottleneckLabel(prof.bottleneck)) + '</p>' : '') +
+        '</details>';
+    }
     // The executor at work right now: the newest execution that has not ended,
     // else the newest one at all. It names the connection, its conversation id
     // and what it is doing - the "текущий OpenHands / используемый аккаунт /
@@ -1442,7 +1489,7 @@
       (waiting ? '<p class="step-sub">' + (inline
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
         : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
-      switchesSection + eventsSection + reportSection +
+      switchesSection + eventsSection + profileSection + reportSection +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
   }
 

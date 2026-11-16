@@ -2357,12 +2357,17 @@ class Handler(BaseHTTPRequestHandler):
             # OpenHands conversations: when they are deleted, how many have
             # been, and why one that is owed a deletion still exists.
             from .nexus_lab import cleanup_retention_seconds
+            from .nexus_profiler import idle_ratio, profile_run
+            profile = profile_run(run)
             return (200, {"run": run, "tasks": tasks,
                           "report": self.app.reports.for_run(rest[1]),
                           "executions": self.app.lab.executions(rest[1]),
                           "switches": self.app.lab.run_handoffs(rest[1]),
                           "events": self.app.lab.run_events(rest[1]),
                           "stops": self.app.lab.stops(rest[1]),
+                          # The run-time profile: where the wall-clock time went,
+                          # and the dominant stage. Read-only and secret-free.
+                          "profile": {**profile, "idle_ratio": idle_ratio(profile)},
                           "cleanup": self.app.lab.cleanup_summary(
                               rest[1], retention_seconds=cleanup_retention_seconds())},
                     None)
