@@ -1351,6 +1351,13 @@
     // A durable run that is between two tries says so, and when it goes on.
     var pause = run.state === 'running' && run.resume_at && run.wait_reason
       ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
+    // A paused run that still has conversations in flight: say on the card
+    // itself what the pause did and did not stop - never leave it implied.
+    var inflight = executions.filter(function (item) { return !item.ended_at; }).length;
+    var pausedNote = run.state === 'paused' && inflight
+      ? '<p class="work-reason">Пауза остановила выдачу новых задач. ' + inflight + ' ' +
+        plural(inflight, 'разговор', 'разговора', 'разговоров') +
+        ' OpenHands продолжают работу; для их остановки отмените прогон.</p>' : '';
     // The run-time profile: where the wall-clock time went. Read-only; the
     // server computes it. Only the stages that were measured are shown, so a
     // missing milestone reads as "не измерено", never as zero.
@@ -1449,8 +1456,8 @@
     // conversation, live or over - the output does not disappear when the
     // run ends.
     if (hasConversations) actions += '<button class="btn btn-sm" type="button" data-action="terminal-outputs" data-id="' + esc(entry.id) + '">' + icon('terminal', 'icon-sm') + 'Вывод команд</button>';
-    if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
-    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
+    if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '" title="Планировщик перестанет выдавать новые задачи; выполняющиеся разговоры OpenHands продолжат работу" aria-label="Пауза: остановить выдачу новых задач, не останавливая текущие разговоры OpenHands">' + icon('pause', 'icon-sm') + 'Пауза</button>';
+    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '" title="Снова разрешить выдачу задач по этому прогону" aria-label="Продолжить: снова выдавать задачи планировщиком">' + icon('play', 'icon-sm') + 'Продолжить</button>';
     if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
     // A finished run's own actions: retry only the tasks that failed, take it
     // out of the lists, or remove it from history. None of them touches the
@@ -1482,6 +1489,7 @@
       (durable ? 'Сколько раз прогон запускал задачи в этом цикле. Когда запуски цикла кончаются, прогон делает паузу и продолжает сам.'
                : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
       (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
+      pausedNote +
       (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
       (cleanupLine ? '<p class="work-note">' + esc(cleanupLine) + '</p>' : '') +
       currentLine +
@@ -3198,7 +3206,7 @@
     },
     'run-state': function (el) {
       var id = el.getAttribute('data-id'), op = el.getAttribute('data-op');
-      var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.',
+      var done = { pause: 'Планировщик больше не выдаёт новые задачи. Текущие разговоры OpenHands не остановлены — для остановки отмените прогон.', resume: 'Прогон продолжен.',
                    cancel: 'Прогон отменён.', hide: 'Прогон скрыт.',
                    show: 'Прогон возвращён в список.' }[op];
       if (!done) return;
