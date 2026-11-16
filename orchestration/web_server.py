@@ -635,6 +635,14 @@ class App:
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
+        # The "once when the server starts" sweep (see ``_maybe_sweep``) runs
+        # here, synchronously, before the loop thread begins. Left to the loop
+        # it raced anything that created a row after ``start`` returned: the
+        # thread's first pass could sweep an expired session a caller had just
+        # inserted, so a caller could not observe its own row. Doing it here
+        # makes the start-of-process sweep deterministic and stamps
+        # ``_swept_at``, so the loop's first pass does not sweep again.
+        self._maybe_sweep()
         self._loop = threading.Thread(target=self._run, daemon=True)
         self._loop.start()
         self._plan_loop = threading.Thread(target=self._run_planning, daemon=True)
