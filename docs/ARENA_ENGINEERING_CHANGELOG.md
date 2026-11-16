@@ -37,6 +37,9 @@ dropped with the reason recorded.
 - New/recreated deliverables: `ARENA_ENGINEERING_AUDIT.md`,
   `SECURITY_AUDIT.md`, `RUST_MIGRATION_ASSESSMENT.md`, `UX_AUDIT.md`,
   `LOGIC_AND_RELIABILITY_AUDIT.md`, `PERFORMANCE_REPORT.md`, this file.
+- `orchestration/nexus_lab_store.py` — F-06 (below): bounded (×1) retry of a
+  settle aborted by a PostgreSQL deadlock, both `set_run_state` variants;
+  `tests/test_deadlock_retry.py` (2 deterministic tests).
 - `refs/remotes/origin/pr-43` retained locally (not a push) so the old line
   remains recoverable.
 
@@ -46,7 +49,8 @@ dropped with the reason recorded.
 | --- | --- |
 | `ruff check .` | All checks passed |
 | `pytest tests/test_cli_client.py tests/test_studio_ui.py tests/test_artifacts.py` | **46 passed** |
-| Full suite (`tests/`) | running; result appended to this file only when it finishes — see `/home/user/pytest_full5.log` |
+| Full suite, attempt 1 (`/home/user/pytest_full5.log`) | **1937 passed, 1 failed, 49 skipped, EXIT=1** — one intermittent `psycopg.errors.DeadlockDetected` in `test_after_the_run_has_ended_the_same_text_runs_again_from_the_same_plan`; passes 33/33 in isolation |
+| Full suite, attempt 2 after the deadlock fix (`/home/user/pytest_full6.log`) | **1940 passed, 49 skipped, 0 failed — 35m50s, EXIT=0** |
 
 ## Honesty notes
 

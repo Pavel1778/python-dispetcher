@@ -18,7 +18,7 @@ Status vocabulary: **VERIFIED** (ran it) / **TESTED** (suite) /
 | Lineage lost | pre-consolidation branch `arena/b10d2a83-python-dispetcher` is gone from the remote; its commits were recovered from `refs/pull/43/head` and unpushed work recreated (see `ARENA_ENGINEERING_CHANGELOG.md`) |
 | Lint | `ruff check .` → All checks passed (this tree, with F-01 fix) |
 | Focused tests | `tests/test_cli_client.py` + `tests/test_studio_ui.py` → 31 passed |
-| Full suite | see `ARENA_ENGINEERING_CHANGELOG.md` — this document does not claim it |
+| Full suite | **1940 passed, 49 skipped, 0 failed — 35m50s, EXIT=0** (`/home/user/pytest_full6.log`, after the F-06 deadlock fix) |
 
 ## 2. Architecture map (as consolidated)
 
@@ -48,6 +48,7 @@ Status vocabulary: **VERIFIED** (ran it) / **TESTED** (suite) /
 | F-03 | Low | Duplicate migration prefix `0038_lifecycle.sql` vs `0038_project_lifecycle.sql` | **STATICALLY REVIEWED**: both additive (`ADD COLUMN IF NOT EXISTS`); runner is filename-keyed + checksummed → inert; **no rename** (would orphan deployed `schema_migrations` rows) |
 | F-04 | Low | `ruff --select B`: B905/B904/B017 style items | STATICALLY REVIEWED — not changed |
 | F-05 | — | `benchmarks/rust-archive`, `benchmarks/rust-db` (added by consolidation): isolated Rust benchmarks, explicitly "NOT the NEXUS runtime" | noted; see `RUST_MIGRATION_ASSESSMENT.md` |
+| F-06 | Medium | Intermittent `DeadlockDetected` on member-facing cancel (batch task UPDATE vs concurrent worker settle) — found by this branch's own suite run | **FIXED + TESTED** (bounded single retry, `tests/test_deadlock_retry.py`; 30/30 stress; full suite green) |
 
 No Critical or High defect was reproduced in this tree; none is claimed
 without evidence. The security- and logic-sensitive surfaces match the
@@ -72,5 +73,5 @@ That figure is the **ledger's claim**, not this branch's re-verification.
 4. `tests/test_terminal_output.py` (45 tests, pre-consolidation) is
    deliberately **not restored** — superseded by `tests/test_artifacts.py`;
    its API targets no longer exist in this tree.
-5. This branch's full-suite result: recorded in the changelog only after it
-   finishes; nothing else in this document asserts it.
+5. `refs/remotes/origin/pr-43` exists only on this clone; this branch is
+   **not pushed** — see changelog.
