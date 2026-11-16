@@ -278,15 +278,21 @@ def test_a_resend_while_the_plan_is_being_built_does_not_plan_twice(lab):
 def _gone():
     """Take the database away from a store, the way a dead process loses it.
 
-    Swapping the pool stops every *future* call (it points at a port nothing
-    listens on), but a connection the store had already checked out - the stage
-    being planned right now - survives a pool swap and can still write once. A
-    real process death closes its sockets, so PostgreSQL rolls that transaction
-    back; the pool swap alone is therefore an incomplete simulation, and under
-    load the "dead" process raced the recovering one and the stage it was
-    planning was recorded twice (``attempts`` 1 where 2 was expected). The
-    server-side backends are closed here too, so nothing more is written on the
-    dead process's behalf - which is what the test's comment already claims.
+    Three things are needed, and the first version had only the second:
+
+    * the store's own ``dsn`` must point somewhere nothing listens, or
+      ``_ensure_pool`` reopens a *working* pool against the real database the
+      next time it is asked (``App.stop`` calls ``store.close()``, and the next
+      call reopens) - the "dead" process then keeps writing;
+    * the live server sessions must be closed, or a transaction already in
+      flight commits after the process is gone (a real death closes the sockets
+      and PostgreSQL rolls it back);
+    * the pool is swapped so every later call is refused at once.
+
+    Without the first two the recovering process raced the "dead" one and a
+    stage it was planning was recorded twice (``attempts`` 1 where 2 was
+    expected). Reproduced 1/20 on the candidate and on ``main`` + Phase 3
+    without any Phase 4 (0/20 on clean ``main``), so the defect is Phase 3's.
     """
     import psycopg
     import psycopg_pool
@@ -294,9 +300,6 @@ def _gone():
 
     def detach(store):
         dsn = store.dsn
-        # Close the store's live server sessions first, so an in-flight
-        # transaction cannot commit after the "process" is gone; then swap the
-        # pool so every later call is refused at once.
         try:
             with psycopg.connect(dsn, autocommit=True) as admin:
                 with admin.cursor() as cur:
@@ -307,6 +310,9 @@ def _gone():
             pass
         store._pool.close()
         dead = "postgresql://127.0.0.1:1/nexus-gone"
+        # Point the store itself at the dead address: a later ``close()`` and
+        # reopen (``_ensure_pool``) must not reach the real database again.
+        store.dsn = dead
         store._pool = psycopg_pool.ConnectionPool(
             dead, kwargs=store._connect_kwargs, min_size=0, max_size=1,
             open=True, timeout=0.5, reconnect_timeout=0.5,
