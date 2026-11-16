@@ -235,6 +235,28 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(200, {"status": "ok"})
             return
+        # The agent-server's own OpenAPI document, so the inventory's
+        # compatibility check can be exercised over real HTTP. Paths mirror the
+        # v1.60.1 surface the OpenHandsClient uses.
+        if path == "/openapi.json":
+            self._json(200, {
+                "openapi": "3.1.0",
+                "info": {"title": "OpenHands Agent Server", "version": "1.60.1"},
+                "paths": {
+                    "/api/conversations": {"get": {}, "post": {}},
+                    "/api/settings": {"get": {}, "patch": {}},
+                    "/api/conversations/{conversation_id}": {"get": {}},
+                    "/api/conversations/{conversation_id}/events": {"get": {}, "post": {}},
+                    "/api/conversations/{conversation_id}/run": {"post": {}},
+                    "/api/conversations/{conversation_id}/agent_final_response": {"get": {}},
+                    "/api/conversations/{conversation_id}/events/count": {"get": {}},
+                    "/api/conversations/{conversation_id}/events/search": {"get": {}},
+                    "/api/conversations/{conversation_id}/pause": {"post": {}},
+                    "/api/file/upload": {"post": {}},
+                    "/api/file/download": {"get": {}},
+                },
+            })
+            return
         if not self._guard():
             return
         parts = [p for p in path.split("/") if p]

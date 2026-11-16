@@ -364,6 +364,22 @@ def cmd_openhands_diagnostics(args: argparse.Namespace) -> int:
     return EXIT["ok"] if report.get("ok") else EXIT["unavailable"]
 
 
+def cmd_openhands_inventory(args: argparse.Namespace) -> int:
+    """Read-only inventory of the live OpenHands API (version, auth, limits,
+    tools, compatibility). Writes nothing."""
+    client = _client(args)
+    path = "/api/openhands/inventory"
+    if getattr(args, "agent_server_url", None):
+        path += ("?agent_server_url="
+                 + urllib.parse.quote(args.agent_server_url, safe=""))
+    result = client.get(path)
+    checks = (result.get("report") or {}).get("checks", [])
+    human = "\n".join(f"[{c['status']}] {c['name']}: {c['detail']}" for c in checks)
+    _emit(args, result, human=human)
+    ok = (result.get("report") or {}).get("ok", True)
+    return EXIT["ok"] if ok else EXIT["unavailable"]
+
+
 def cmd_openhands_tools(args: argparse.Namespace) -> int:
     """Show which tools are available to NEXUS and which to OpenHands.
 
@@ -954,6 +970,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="read the agent-server's own tool catalog (may provision a sandbox)")
     oht.add_argument("--account", default=None, help="read the catalog from one account id")
     oht.set_defaults(func=cmd_openhands_tools)
+    ohi = oh.add_parser("inventory", parents=[common],
+                        help="read-only inventory of the live OpenHands API")
+    ohi.add_argument("--agent-server-url", default=None,
+                     help="also check an agent-server's openapi.json at this URL")
+    ohi.set_defaults(func=cmd_openhands_inventory)
     pool = oh.add_parser("pool", parents=[common], help="account pool configuration").add_subparsers(dest="action", required=True)
     pool.add_parser("show", parents=[common], help="show the pool configuration and order").set_defaults(func=cmd_openhands_pool_show)
     pool_set = pool.add_parser("set", parents=[common], help="set the selection mode / fallback order")

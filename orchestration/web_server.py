@@ -1726,6 +1726,21 @@ class App:
             out["openhands_error"] = type(e).__name__
         return out
 
+    def openhands_inventory(self, *, agent_server_url: str | None = None,
+                            agent_server_key: str | None = None) -> dict[str, Any]:
+        """Read-only inventory of the OpenHands API the service talks to.
+
+        Reports the live API version, authorization, limits, the tool catalog
+        and whether every endpoint the NEXUS client uses is still present. It
+        never creates or deletes anything and never returns the API key.
+        """
+        from .openhands_inventory import Inventory
+
+        inv = Inventory(cloud_client=self.client,
+                        agent_server_url=agent_server_url,
+                        agent_server_key=agent_server_key)
+        return inv.collect()
+
     def system_info(self) -> dict[str, Any]:
         """Safe diagnostics: presence of settings, never their values."""
         store_ok, store_err = True, None
@@ -4517,6 +4532,13 @@ class Handler(BaseHTTPRequestHandler):
                     live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes"),
                     account_id=(query.get("account_id") or [None])[0],
                     project_id=(query.get("project_id") or [None])[0]))
+            if path == "/api/openhands/inventory":
+                # Read-only inventory of the live OpenHands API: version,
+                # authorization, limits, tools, and whether every endpoint the
+                # client uses is present. Creates and deletes nothing.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                return self._json(200, self.app.openhands_inventory(
+                    agent_server_url=(query.get("agent_server_url") or [None])[0]))
             if path == "/api/providers":
                 # The orchestrator cascade: configured provider names and the
                 # order they are tried in. No key is returned; ?live=1 also

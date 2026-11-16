@@ -81,6 +81,51 @@ class FakeCloud:
         #: Bearer keys this server rejects with 401, as the live service rejects
         #: a wrong or revoked key. Empty means every Bearer key is accepted.
         self.rejected_keys: set[str] = set()
+        #: When True, a keyless request is answered instead of 401 — used by the
+        #: inventory test to prove a service *without* authorization is reported
+        #: FAILED, not VERIFIED.
+        self.ignore_auth = False
+        # Read-only inventory surface (openhands_inventory): the account quota
+        # and the tool catalog, plus the OpenAPI document below.
+        self.quota: dict = {
+            "daily_limit": 20, "used_today": 3, "remaining": 17,
+            "reset_at": "2026-01-02T00:00:00+00:00",
+        }
+        self.tools: list[dict] = [
+            {"name": "file_editor", "user_selectable": True,
+             "usable": True, "in_default_set": True},
+            {"name": "terminal", "user_selectable": True,
+             "usable": True, "in_default_set": True},
+            {"name": "task_tracker", "user_selectable": True,
+             "usable": True, "in_default_set": True},
+            {"name": "task", "user_selectable": False,
+             "usable": True, "in_default_set": False},
+        ]
+        #: The OpenAPI document the fake serves. One source of truth for both the
+        #: connection compatibility check (``CloudClient.REQUIRED_PATHS``) and the
+        #: inventory's full endpoint comparison (``openhands_inventory``). The
+        #: served ``info.version`` is ``api_version``; ``api_paths_missing``
+        #: removes a path, the way an older service would lack it.
+        self.openapi_spec: dict = {
+            "openapi": "3.1.0",
+            "info": {"title": "OpenHands", "version": "1.50.1"},
+            "paths": {
+                "/api/v1/app-conversations": {"get": {}, "post": {}},
+                "/api/v1/app-conversations/count": {"get": {}},
+                "/api/v1/app-conversations/search": {"get": {}},
+                "/api/v1/app-conversations/start-tasks": {"get": {}, "post": {}},
+                "/api/v1/app-conversations/{conversation_id}": {"patch": {}, "delete": {}},
+                "/api/v1/app-conversations/{conversation_id}/send-message": {"post": {}},
+                "/api/v1/app-conversations/{conversation_id}/skills": {"get": {}},
+                "/api/v1/conversation/{conversation_id}/events/search": {"get": {}},
+                "/api/v1/sandboxes": {"get": {}, "post": {}},
+                "/api/v1/sandboxes/{sandbox_id}": {"delete": {}},
+                "/api/v1/sandboxes/{sandbox_id}/pause": {"post": {}},
+                "/api/v1/sandboxes/{sandbox_id}/resume": {"post": {}},
+                "/api/v1/settings": {"get": {}, "post": {}},
+                "/api/agent-profiles": {"get": {}},
+            },
+        }
         #: Seconds to sleep before answering any request, so a test can drive a
         #: real timeout with a short client timeout. 0 means answer at once.
         self.delay: float = 0.0
@@ -189,6 +234,8 @@ class _Handler(BaseHTTPRequestHandler):
         return self.server.cloud  # type: ignore[attr-defined]
 
     def _auth_ok(self) -> bool:
+        if self.cloud.ignore_auth:
+            return True
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             return False
@@ -224,6 +271,29 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ GET
     def do_GET(self):
         self._pause()
+        # The liveness probes and the OpenAPI document are public on the live
+        # service (no credential); the rest is auth-gated.
+        early_path = self.path.split("?")[0]
+        if early_path in ("/alive", "/health", "/ready"):
+            self.cloud.calls.append(("GET", early_path))
+            return self._json(200, {"status": "ok"})
+        if early_path == "/openapi.json":
+            # The live service serves its API description publicly; the version
+            # and the paths are read from it. One document (``openapi_spec``) is
+            # the source of truth: ``api_version`` sets the served version and
+            # ``api_paths_missing`` takes paths out, so the connection
+            # compatibility check and the full inventory read the same thing.
+            self.cloud.calls.append(("GET", early_path))
+            if self.cloud.api_version is None:
+                return self._json(404, {"detail": "Not Found"})
+            spec = {
+                "openapi": self.cloud.openapi_spec.get("openapi", "3.1.0"),
+                "info": {**(self.cloud.openapi_spec.get("info") or {}),
+                         "version": self.cloud.api_version},
+                "paths": {p: v for p, v in self.cloud.openapi_spec["paths"].items()
+                          if p not in self.cloud.api_paths_missing},
+            }
+            return self._json(200, spec)
         if not self._auth_ok():
             return self._json(401, {"detail": "unauthorized"})
         path = self.path.split("?")[0]
@@ -232,27 +302,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/app-conversations/count":
             return self._json(200, {"count": len(self.cloud.conversations)})
 
-        if path == "/openapi.json":
-            # The live service serves this; the version and the paths are read
-            # from it. The parameter names differ from the client's on purpose:
-            # only the shape of a path may matter.
-            if self.cloud.api_version is None:
-                return self._json(404, {"detail": "Not Found"})
-            paths = [
-                "/api/v1/app-conversations",
-                "/api/v1/app-conversations/start-tasks",
-                "/api/v1/app-conversations/search",
-                "/api/v1/app-conversations/count",
-                "/api/v1/app-conversations/{conversation_id}/send-message",
-                "/api/v1/conversation/{conversation_id}/events/search",
-                "/api/v1/sandboxes",
-                "/api/v1/sandboxes/{sandbox_id}/pause",
-                "/api/v1/settings",
-            ]
-            return self._json(200, {
-                "openapi": "3.1.0",
-                "info": {"title": "OpenHands", "version": self.cloud.api_version},
-                "paths": {p: {} for p in paths if p not in self.cloud.api_paths_missing}})
+        # --- read-only inventory surface (openhands_inventory) -------------
+        if path == "/api/quota/status":
+            return self._json(200, self.cloud.quota)
+        if path == "/api/tools/catalog":
+            return self._json(200, {"tools": self.cloud.tools})
 
         if path == "/api/v1/app-conversations":
             ids = self._query("ids")
