@@ -202,7 +202,15 @@ def test_a_report_that_names_no_commit_is_put_right_and_the_run_goes_on(monkeypa
         told = _until(lambda: _told(studio, first), what="the agent to be told what is missing")
         assert "cannot accept it yet" in told[0] and "names no commit" in told[0]
         assert "Push your work" in told[0] and "do not start over" in told[0]
-        detail = _detail(studio, project, run)
+        # The message is delivered the moment the rework is asked for; binding the
+        # new conversation (dispatched -> running) is the next step of the same
+        # pass, so poll for it rather than reading the row mid-transition. Under
+        # load the two are a hair apart.
+        detail = _until(
+            lambda: (lambda d: d if {t["task_key"]: t["state"]
+                                     for t in d["tasks"]}.get("audit") == "running" else None)(
+                _detail(studio, project, run)),
+            what="the rework to be running")
         assert detail["run"]["state"] == "running" and detail["run"]["policy"] == "durable"
         tasks = {t["task_key"]: t for t in detail["tasks"]}
         assert (tasks["audit"]["state"], tasks["audit"]["attempt"]) == ("running", 2)
