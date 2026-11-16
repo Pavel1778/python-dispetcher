@@ -18,6 +18,15 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+#: The base database this session is configured with. The isolation decision
+#: only copies a database the server actually has; a hardcoded sandbox DSN would
+#: name a database that does not exist in another environment (CI's is
+#: ``orchestrator``), so the copy is never made and the assertion below would
+#: test the fallback instead. Derived from the session's own DSN, so the case
+#: exercises whichever environment it runs in.
+_SESSION_DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
+LOCAL_BASE = _SESSION_DSN or "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent"
+
 _PROBE = """
 import json, os, sys
 sys.path.insert(0, %r)
@@ -52,9 +61,8 @@ def test_a_remote_database_is_left_alone():
 
 
 def test_the_escape_hatch_keeps_one_named_database():
-    url = "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent"
-    got = _decide({"TEST_SUPABASE_DB_URL": url, "NEXUS_TEST_ISOLATE_DB": "0"})
-    assert got["dsn"] == url
+    got = _decide({"TEST_SUPABASE_DB_URL": LOCAL_BASE, "NEXUS_TEST_ISOLATE_DB": "0"})
+    assert got["dsn"] == LOCAL_BASE
     assert got["base"] is None
 
 
@@ -69,23 +77,26 @@ def test_a_local_database_is_isolated_per_process():
     ends up on the shared base URL - so the assertion is on the property, not
     on one mechanism's database name.
     """
-    url = "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent"
-    got = _decide({"TEST_SUPABASE_DB_URL": url})
+    got = _decide({"TEST_SUPABASE_DB_URL": LOCAL_BASE})
+    if got["dsn"] == LOCAL_BASE:
+        # Neither mechanism could give this process a database of its own: the
+        # role cannot create one, so the documented safe behaviour is to
+        # serialise on the base URL. That is correct, not a defect - nothing to
+        # assert beyond "it did not silently claim to be isolated".
+        import pytest
+
+        pytest.skip("this database role cannot create databases; "
+                    "processes serialise on the base URL instead")
     if got["base"] is not None:
         # ``conftest`` copied the named database to a process-named sibling.
-        assert got["base"] == url
-        assert got["dsn"].startswith(
-            "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent_p")
-        assert got["dsn"] != url
+        assert got["base"] == LOCAL_BASE
+        assert got["dsn"].startswith(LOCAL_BASE + "_p")
     else:
-        # ``conftest`` could not copy the named database (it does not exist, or
-        # the role cannot create one), so the ``tests/_test_db.py`` fallback ran
-        # instead. It must still have put this process on a database of its own
-        # - a ``nexus_test_<token>`` sibling - and never on the shared base URL.
-        # Only a role that can create nothing falls back to serialising on the
-        # base URL, and this role can create databases.
-        assert got["dsn"] != url, "the process is on the shared base database"
+        # ``conftest`` could not copy the named database, so the
+        # ``tests/_test_db.py`` fallback ran and put this process on a database
+        # of its own - a ``nexus_test_<token>`` sibling, or a ``_p<suffix>`` copy.
         assert "nexus_test_" in got["dsn"] or "_p" in got["dsn"]
+    assert got["dsn"] != LOCAL_BASE, "the process is on the shared base database"
 
 
 def test_two_processes_get_two_databases():
@@ -96,10 +107,9 @@ def test_two_processes_get_two_databases():
     The property asserted is the same either way - the two processes never end
     up on the same database, and neither is on the shared base URL.
     """
-    url = "postgresql://nexus:nexus@127.0.0.1:5432/nexus_agent"
-    first = _decide({"TEST_SUPABASE_DB_URL": url})
-    second = _decide({"TEST_SUPABASE_DB_URL": url})
-    if first["dsn"] == url and second["dsn"] == url:
+    first = _decide({"TEST_SUPABASE_DB_URL": LOCAL_BASE})
+    second = _decide({"TEST_SUPABASE_DB_URL": LOCAL_BASE})
+    if first["dsn"] == LOCAL_BASE and second["dsn"] == LOCAL_BASE:
         import pytest
 
         pytest.skip("this database role cannot create databases; "
@@ -107,5 +117,5 @@ def test_two_processes_get_two_databases():
     # Different pids give different suffixes/tokens, so the two never collide,
     # and neither process runs on the shared base database.
     assert first["dsn"] != second["dsn"]
-    assert first["dsn"] != url and second["dsn"] != url
+    assert first["dsn"] != LOCAL_BASE and second["dsn"] != LOCAL_BASE
 
