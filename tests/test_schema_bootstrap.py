@@ -22,7 +22,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from orchestration.cloud_store import PostgresStore  # noqa: E402
+from orchestration.cloud_store import (  # noqa: E402
+    MIGRATION_CORRECTIONS,
+    MigrationError,
+    PostgresStore,
+)
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
 
@@ -133,6 +137,43 @@ def test_an_edited_migration_is_refused_not_reapplied(tmp_path) -> None:
         with store._tx() as cur:
             cur.execute("SELECT 1 FROM pg_tables WHERE tablename = 'a_new_step'")
             assert cur.fetchone() is not None
+    finally:
+        store.close()
+
+
+def test_registered_correction_supersedes_the_old_0037_body() -> None:
+    """A database that recorded the defective 0037 body converges.
+
+    The defective body is a registered correction (``MIGRATION_CORRECTIONS``):
+    when a recorded checksum is a superseded body, the corrected idempotent body
+    is re-applied and the recorded checksum moves forward. An *unregistered*
+    mismatch is still refused (asserted at the end, so the registry cannot be
+    mistaken for a general "edit in place" escape hatch).
+    """
+    name = "0037_conversation_management.sql"
+    superseded = MIGRATION_CORRECTIONS[name]
+    assert superseded, "the old 0037 body must be registered"
+    _drop_schema()
+    store = PostgresStore(DSN, auto_migrate=False)
+    try:
+        store.apply_migrations()
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s", (name,))
+            current = cur.fetchone()["checksum"]
+        old = next(iter(superseded))
+        assert current != old
+        with store._tx() as cur:
+            cur.execute("UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                        (old, name))
+        assert store.apply_migrations() == [name]
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s", (name,))
+            assert cur.fetchone()["checksum"] == current
+        with store._tx() as cur:
+            cur.execute("UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                        ("0" * 64, name))
+        with pytest.raises(MigrationError):
+            store.apply_migrations()
     finally:
         store.close()
 

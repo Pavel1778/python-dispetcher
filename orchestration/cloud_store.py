@@ -72,6 +72,34 @@ class MigrationError(StoreError):
     """
 
 
+# Corrections of already-shipped migrations, keyed by filename. A value is the
+# set of *superseded* body checksums: the exact bytes that a database may have
+# recorded before the correction. When a recorded checksum is one of these, the
+# runner re-applies the corrected (idempotent) body and rewrites the recorded
+# checksum. Any other mismatch stays a hard refusal -- this list is the only
+# exception, and it is auditable because every entry names the file and the
+# exact bodies it replaces.
+#
+# This is deliberately not a general "edit in place" escape hatch. The rule in
+# ``MigrationError`` stands: a *new* schema change is a new migration. An entry
+# belongs here only for a defect in an already-shipped file whose body cannot be
+# reached by the running service at all (so no database can depend on the
+# broken body) and whose corrected body is idempotent.
+#
+# 0037_conversation_management.sql: the first body declared the role-loop
+# variable as ``record``, so ``format('%I', r)`` produced the quoted row
+# ``"(authenticated)"`` and the REVOKE aborted the whole file on any server that
+# has the Supabase ``authenticated`` role. Such a server never recorded the
+# migration (the transaction rolled back), so it is simply applied fresh from
+# the corrected body. A server *without* that role ran the empty loop, recorded
+# the broken body, and is brought over by this correction.
+MIGRATION_CORRECTIONS: dict[str, frozenset[str]] = {
+    "0037_conversation_management.sql": frozenset({
+        "40863e045f28240fe4b2a6fe38c47a1c8feb34012d0d63a4cf70da6f94e6e187",
+    }),
+}
+
+
 class NotFound(StoreError):
     """The requested row does not exist."""
 
@@ -432,6 +460,13 @@ class PostgresStore:
         edit to an applied one. A *new* file is applied normally. This is the
         one real defect the old runner had: it wrote the new checksum over the
         old with ``ON CONFLICT DO UPDATE`` and executed the changed SQL.
+
+        The single exception is a *registered correction*
+        (:data:`MIGRATION_CORRECTIONS`): a defect in an already-shipped file
+        whose body no database could have depended on. When a recorded checksum
+        is a superseded body of a corrected file, the corrected (idempotent)
+        body is re-applied and the recorded checksum rewritten. Any other
+        mismatch is still refused.
         """
         base = Path(directory) if directory else Path(__file__).resolve().parent.parent / "migrations"
         files = sorted(base.glob("*.sql"))
@@ -453,13 +488,28 @@ class PostgresStore:
                             (path.name,))
                 row = cur.fetchone()
                 if row is not None:
-                    if row["checksum"] == checksum:
+                    recorded = row["checksum"]
+                    if recorded == checksum:
                         continue
-                    raise MigrationError(
-                        f"{path.name} was already applied with a different body; "
-                        "ship a new migration instead of editing an applied one "
-                        "(editing it would re-run a different body under a "
-                        "recorded name)")
+                    superseded = MIGRATION_CORRECTIONS.get(path.name, frozenset())
+                    if recorded not in superseded:
+                        raise MigrationError(
+                            f"{path.name} was already applied with a different body; "
+                            "ship a new migration instead of editing an applied one "
+                            "(editing it would re-run a different body under a "
+                            "recorded name)")
+                    # A registered correction: the recorded body is a known
+                    # defective one no database could rely on. Re-apply the
+                    # corrected body (idempotent) and move the recorded checksum
+                    # forward, so the history and the schema agree again.
+                    cur.execute(sql)
+                    cur.execute(
+                        "UPDATE schema_migrations SET checksum = %s, applied_at = now() "
+                        "WHERE filename = %s",
+                        (checksum, path.name),
+                    )
+                    applied.append(path.name)
+                    continue
                 cur.execute(sql)
                 cur.execute(
                     "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s)",
