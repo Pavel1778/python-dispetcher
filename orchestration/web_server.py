@@ -56,6 +56,7 @@ Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
 from __future__ import annotations
 
 import argparse
+import gzip
 import hmac
 import json
 import logging
@@ -1212,6 +1213,47 @@ class App:
         task = self.store.retry_task(task_id)
         return {"task_id": task.id, "state": task.state.value}
 
+    def _execution_client_for_task(self, principal: str, account_id: Any) -> Any:
+        """The client that can read a task's conversation.
+
+        A task bound to an account is read with that account's execution client;
+        an unbound one with the process client. Reading through the wrong
+        account would ask a different sandbox for a conversation it never had,
+        so the binding is honoured here exactly as the executor honours it.
+        """
+        if account_id:
+            return self.openhands_accounts.execution_client_for_account(
+                principal, str(account_id))
+        return self.client
+
+    def run_task_outputs(self, principal: str, project_id: str, run_id: str,
+                         task_id: str) -> dict[str, Any]:
+        """Which terminal outputs of a task's conversation were cut off.
+
+        One entry per truncated ``ObservationEvent`` with the event id and how
+        many characters the event showed - never the full text, which is read on
+        demand. Empty (never an error) when the task has no conversation, the
+        transport cannot reach the archive, or nothing was cut.
+        """
+        from .terminal_output import run_task_outputs
+
+        return run_task_outputs(self.store, principal, project_id, run_id, task_id,
+                                self._execution_client_for_task)
+
+    def run_task_output(self, principal: str, project_id: str, run_id: str,
+                        task_id: str, event_id: str) -> dict[str, Any]:
+        """The complete terminal output of one truncated event.
+
+        The event is read first (its own text is the key the archive is searched
+        with), so the result is the exact file whose preview the event showed -
+        not a file guessed by name. The text is returned for the interface;
+        nothing is written to the database.
+        """
+        from .terminal_output import run_task_output
+
+        return run_task_output(self.store, principal, project_id, run_id, task_id,
+                               event_id, self._execution_client_for_task)
+
     def switch_task_executor(self, principal: str, project_id: str, run_id: str,
                              task_id: str, account_id: str) -> dict[str, Any]:
         """Hand a running task to another OpenHands account (manual switch).
@@ -1311,17 +1353,40 @@ class App:
         return self.client
 
     def _probe_saved_output(self, client: Any, ref) -> str:
-        from .terminal_output import OutputUnavailable, download_file
+        """Whether the SDK's saved file for *ref* is still on the sandbox.
 
-        try:
-            status, _ = download_file(client, ref.conversation_id, ref._path, limit=1)
-        except OutputUnavailable:
-            return "unknown"
-        if status == 200:
-            return "available"
-        if status == 404:
+        Read through the **conversation-scoped** trajectory archive - the same
+        transport the full read uses - never the global ``/api/file/download``
+        endpoint, which would let a caller name any path on the sandbox. The
+        probe is bounded (only the archive's member list is consulted, plus the
+        one member's bytes when its name matches), so it stays cheap.
+        """
+        import io
+        import zipfile
+
+        from . import terminal_output as to
+
+        if not ref._path:
             return "missing"
-        return "unknown"
+        try:
+            status, blob = to.download_trajectory(client, ref.conversation_id,
+                                                  limit=to.TRAJECTORY_MAX_BYTES)
+        except to.OutputUnavailable:
+            return "unknown"
+        if status in (404, 422):
+            return "missing"
+        if status != 200:
+            return "unknown"
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(blob))
+        except zipfile.BadZipFile:
+            return "unknown"
+        wanted = ref._path.rsplit("/", 1)[-1]
+        with archive:
+            for name in archive.namelist():
+                if name.rsplit("/", 1)[-1] == wanted:
+                    return "available"
+        return "missing"
 
     def terminal_outputs_for_run(self, principal: str, project_id: str,
                                  run_id: str) -> dict[str, Any]:
@@ -1661,6 +1726,21 @@ class App:
             out["openhands_error"] = type(e).__name__
         return out
 
+    def openhands_inventory(self, *, agent_server_url: str | None = None,
+                            agent_server_key: str | None = None) -> dict[str, Any]:
+        """Read-only inventory of the OpenHands API the service talks to.
+
+        Reports the live API version, authorization, limits, the tool catalog
+        and whether every endpoint the NEXUS client uses is still present. It
+        never creates or deletes anything and never returns the API key.
+        """
+        from .openhands_inventory import Inventory
+
+        inv = Inventory(cloud_client=self.client,
+                        agent_server_url=agent_server_url,
+                        agent_server_key=agent_server_key)
+        return inv.collect()
+
     def system_info(self) -> dict[str, Any]:
         """Safe diagnostics: presence of settings, never their values."""
         store_ok, store_err = True, None
@@ -1721,6 +1801,41 @@ class App:
                 "lab_last_tick_at": self.last_lab_tick.get("at"),
             },
         }
+
+
+#: Content types worth compressing: text formats whose gzipped form is much
+#: smaller. Fonts (already compressed) and images are excluded.
+_COMPRESSIBLE_PREFIXES = ("text/", "application/javascript", "application/json",
+                          "image/svg+xml", "application/manifest+json")
+
+
+def _is_compressible(content_type: str) -> bool:
+    base = content_type.split(";", 1)[0].strip().lower()
+    return base.startswith(_COMPRESSIBLE_PREFIXES)
+
+
+def _accepts_gzip(header: str) -> bool:
+    """Whether the client accepts gzip, honouring an explicit ``q=0`` refusal.
+
+    A plain ``"gzip" in header`` is wrong twice over: it matches ``gzip;q=0``
+    (the client saying *no*) and it matches the substring inside another token.
+    Parsing the list is a few lines and removes both.
+    """
+    for part in header.split(","):
+        token, _, params = part.strip().partition(";")
+        if token.strip().lower() not in ("gzip", "x-gzip", "*"):
+            continue
+        q = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    q = float(value.strip())
+                except ValueError:
+                    q = 0.0
+        if q > 0:
+            return True
+    return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1787,11 +1902,35 @@ class Handler(BaseHTTPRequestHandler):
     def _static(
         self, code: int, text: str | bytes, content_type: str, *,
         cache_control: str = "public, max-age=300",
+        precompressed: bytes | None = None,
     ) -> None:
         body = text.encode() if isinstance(text, str) else text
+        encoding = None
+        # Text assets are served gzipped when the client accepts it - a studio
+        # asset is ~4x smaller (app.js 207 KB -> 52 KB), and the same page is
+        # fetched on every visit. A caller that passes a body it already
+        # compressed (*precompressed*, from web_ui.STATIC_GZIP) avoids spending
+        # CPU recompressing an asset that never changes; only a body with no
+        # prepared form is compressed here. Fonts and images are already
+        # compressed and are left alone. `_accepts_gzip` honours an explicit
+        # ``gzip;q=0`` refusal.
+        if _is_compressible(content_type) and _accepts_gzip(
+                self.headers.get("Accept-Encoding", "")):
+            compressed = precompressed
+            if compressed is None:
+                compressed = gzip.compress(body, compresslevel=6)
+            if len(compressed) < len(body):
+                body = compressed
+                encoding = "gzip"
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            # A compressed response varies by Accept-Encoding; say so, so a
+            # shared cache does not hand gzip bytes to a client that cannot read
+            # them.
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", cache_control)
         self.end_headers()
@@ -2233,12 +2372,17 @@ class Handler(BaseHTTPRequestHandler):
             # OpenHands conversations: when they are deleted, how many have
             # been, and why one that is owed a deletion still exists.
             from .nexus_lab import cleanup_retention_seconds
+            from .nexus_profiler import idle_ratio, profile_run
+            profile = profile_run(run)
             return (200, {"run": run, "tasks": tasks,
                           "report": self.app.reports.for_run(rest[1]),
                           "executions": self.app.lab.executions(rest[1]),
                           "switches": self.app.lab.run_handoffs(rest[1]),
                           "events": self.app.lab.run_events(rest[1]),
                           "stops": self.app.lab.stops(rest[1]),
+                          # The run-time profile: where the wall-clock time went,
+                          # and the dominant stage. Read-only and secret-free.
+                          "profile": {**profile, "idle_ratio": idle_ratio(profile)},
                           "cleanup": self.app.lab.cleanup_summary(
                               rest[1], retention_seconds=cleanup_retention_seconds())},
                     None)
@@ -2288,6 +2432,25 @@ class Handler(BaseHTTPRequestHandler):
                 and rest[2] == "report"):
             return (200, {"report": self.app.reports.get(principal, project_id, rest[1])},
                     None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/tasks/{task_id}/outputs
+        #   Which terminal outputs of the task's conversation were cut off. An
+        #   empty list, never an error, when nothing was cut or the transport
+        #   cannot reach the archive (the Cloud app transport); a flag says so.
+        #   Task scoped and membership checked, so a foreign task is a 404.
+        if (len(rest) == 5 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "tasks" and UUID_RE.fullmatch(rest[3])
+                and rest[4] == "outputs"):
+            return (200, self.app.run_task_outputs(
+                principal, project_id, rest[1], rest[3]), None)
+        # GET /api/v1/projects/{id}/runs/{run_id}/tasks/{task_id}/outputs/{event_id}
+        #   The complete terminal output whose preview one event showed. The
+        #   text is returned for the interface; it is never written to the
+        #   database, so a huge output is not duplicated in PostgreSQL.
+        if (len(rest) == 6 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1])
+                and rest[2] == "tasks" and UUID_RE.fullmatch(rest[3])
+                and rest[4] == "outputs"):
+            return (200, self.app.run_task_output(
+                principal, project_id, rest[1], rest[3], rest[5]), None)
         # GET /api/v1/projects/{id}/specs/{spec_id}[/content|sections|requirements|stages]
         if rest and rest[0] == "specs" and len(rest) in (2, 3) and UUID_RE.fullmatch(rest[1]):
             return self._get_spec(principal, project_id, rest[1], rest[2] if len(rest) == 3 else "")
@@ -4210,9 +4373,13 @@ class Handler(BaseHTTPRequestHandler):
                                     cache_control=cache_control)
             if path in web_ui.STATIC:
                 # A closed mapping, not a directory lookup: a path that is not a
-                # key here is never read from disk (see web_ui.STATIC).
+                # key here is never read from disk (see web_ui.STATIC). The
+                # gzipped body is prepared once (web_ui.STATIC_GZIP), so a
+                # repeat request does not spend CPU recompressing an asset that
+                # never changes.
                 body, content_type, cache_control = web_ui.STATIC[path]
-                return self._static(200, body, content_type, cache_control=cache_control)
+                return self._static(200, body, content_type, cache_control=cache_control,
+                                    precompressed=web_ui.STATIC_GZIP.get(path))
 
             # --- everything below requires authentication ---
             if path == "/":
@@ -4365,6 +4532,13 @@ class Handler(BaseHTTPRequestHandler):
                     live=(query.get("live") or ["0"])[0].lower() in ("1", "true", "yes"),
                     account_id=(query.get("account_id") or [None])[0],
                     project_id=(query.get("project_id") or [None])[0]))
+            if path == "/api/openhands/inventory":
+                # Read-only inventory of the live OpenHands API: version,
+                # authorization, limits, tools, and whether every endpoint the
+                # client uses is present. Creates and deletes nothing.
+                query = urllib.parse.parse_qs(urlparse(self.path).query)
+                return self._json(200, self.app.openhands_inventory(
+                    agent_server_url=(query.get("agent_server_url") or [None])[0]))
             if path == "/api/providers":
                 # The orchestrator cascade: configured provider names and the
                 # order they are tried in. No key is returned; ?live=1 also

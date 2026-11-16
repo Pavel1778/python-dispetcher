@@ -27,7 +27,6 @@ import json
 import hashlib
 import os
 import select
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -42,6 +41,11 @@ try:  # psycopg3
 except ImportError:  # pragma: no cover - surfaced with a clear message below
     psycopg = None  # type: ignore
     dict_row = None  # type: ignore
+
+try:  # the connection pool (psycopg_pool ships with psycopg[binary,pool])
+    import psycopg_pool
+except ImportError:  # pragma: no cover - surfaced with a clear message below
+    psycopg_pool = None  # type: ignore
 
 
 class StoreError(RuntimeError):
@@ -66,6 +70,34 @@ class MigrationError(StoreError):
     a recorded name, so the database's history would claim one thing and the
     schema would be another.
     """
+
+
+# Corrections of already-shipped migrations, keyed by filename. A value is the
+# set of *superseded* body checksums: the exact bytes that a database may have
+# recorded before the correction. When a recorded checksum is one of these, the
+# runner re-applies the corrected (idempotent) body and rewrites the recorded
+# checksum. Any other mismatch stays a hard refusal -- this list is the only
+# exception, and it is auditable because every entry names the file and the
+# exact bodies it replaces.
+#
+# This is deliberately not a general "edit in place" escape hatch. The rule in
+# ``MigrationError`` stands: a *new* schema change is a new migration. An entry
+# belongs here only for a defect in an already-shipped file whose body cannot be
+# reached by the running service at all (so no database can depend on the
+# broken body) and whose corrected body is idempotent.
+#
+# 0037_conversation_management.sql: the first body declared the role-loop
+# variable as ``record``, so ``format('%I', r)`` produced the quoted row
+# ``"(authenticated)"`` and the REVOKE aborted the whole file on any server that
+# has the Supabase ``authenticated`` role. Such a server never recorded the
+# migration (the transaction rolled back), so it is simply applied fresh from
+# the corrected body. A server *without* that role ran the empty loop, recorded
+# the broken body, and is brought over by this correction.
+MIGRATION_CORRECTIONS: dict[str, frozenset[str]] = {
+    "0037_conversation_management.sql": frozenset({
+        "40863e045f28240fe4b2a6fe38c47a1c8feb34012d0d63a4cf70da6f94e6e187",
+    }),
+}
 
 
 class NotFound(StoreError):
@@ -210,6 +242,54 @@ def _legal_path(frm: TaskState, to: TaskState) -> list[TaskState] | None:
     return None
 
 
+def _pool_size_env(name: str, default: int) -> int:
+    """A positive pool size from the environment, or *default*.
+
+    A bad value (a typo, a zero, a negative) falls back to the default rather
+    than failing startup: a pool size is an operational knob, not a reason to
+    refuse to serve.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _pool_check_connection(conn: Any) -> None:
+    """Raise if a pooled connection is known unusable, so the pool replaces it.
+
+    A healthy idle connection has nothing waiting to be read. A dropped one does
+    (the server's goodbye, or end-of-file), so one ``poll`` with no timeout
+    separates the two without a round trip; only when something is waiting is
+    the connection actually asked. When the check itself cannot be made the
+    connection is left in service, so this can only add a replacement, never
+    take away a working connection.
+
+    This is the same evidence-based test the single-connection store used,
+    adapted to the pool's contract: the pool discards a connection whose check
+    raises.
+    """
+    if conn.closed:
+        raise psycopg.OperationalError("the connection is closed")
+    try:
+        if not _has_pending_input(conn.fileno()):
+            return
+    except psycopg.Error as e:
+        raise psycopg.OperationalError("the connection is lost") from e
+    except (OSError, ValueError):
+        return          # cannot tell; behave as before
+    try:
+        if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            conn.rollback()
+        conn.execute("SELECT 1").fetchone()
+    except psycopg.Error as e:
+        raise psycopg.OperationalError("the connection is dead") from e
+
+
 def _has_pending_input(fd: int) -> bool:
     """Whether a socket has something to read (data, end-of-file, an error).
 
@@ -231,13 +311,22 @@ class PostgresStore:
                  auto_migrate: bool = True):
         if psycopg is None:  # pragma: no cover
             raise StoreError("psycopg is required: pip install 'psycopg[binary]'")
+        if psycopg_pool is None:  # pragma: no cover
+            raise StoreError("psycopg_pool is required: pip install 'psycopg[binary,pool]'")
         self.dsn = dsn or os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
         if not self.dsn:
             raise StoreError("SUPABASE_DB_URL is not set")
         self._connect_timeout = connect_timeout
-        # A single connection is enough for one dispatcher process; the atomic
-        # claim still protects against *other* processes. Callers needing more
-        # concurrency can open one store per worker.
+        # A pool of connections, not one shared connection. The previous model
+        # held a single connection behind a lock, so every concurrent request
+        # waited for it: at 100 concurrent operations the p99 reached 706 ms
+        # while throughput stayed flat (benchmarks/db_concurrency_bench.py). The
+        # pool hands each caller its own connection, so the lock is gone.
+        #
+        # Sizes are deliberately modest: the database and any transaction-mode
+        # pooler in front of it have their own connection limits, and a large
+        # pool would only move the queue. `min_size` keeps a warm connection so
+        # the first request after a quiet period is not a cold connect.
         #
         # Server-side prepared statements are off by default. A pooler in
         # transaction mode (Supabase port 6543, PgBouncer) hands the server
@@ -270,21 +359,87 @@ class PostgresStore:
             "prepare_threshold": prepare_threshold,
         }
         self.prepare_threshold = prepare_threshold
-        # Kept so a lost connection is replaced by one opened the same way.
+        # Kept so a connection is opened the same way everywhere (the pool and
+        # any direct open share these).
         self._connect_kwargs = connect_kwargs
-        self._reconnect_failed_at = 0.0
-        self._conn = psycopg.connect(self.dsn, **connect_kwargs)
-        # psycopg connections are not thread-safe, but the web server answers
-        # each request on its own thread while sharing this one connection.
-        # Without serializing access, two threads interleave on one transaction
-        # and the loser sees "current transaction is aborted".
-        self._lock = threading.RLock()
+        self.pool_min = _pool_size_env("NEXUS_DB_POOL_MIN", 1)
+        self.pool_max = _pool_size_env("NEXUS_DB_POOL_MAX", 8)
+        if self.pool_max < self.pool_min:
+            self.pool_max = self.pool_min
+        # How long a caller waits for a free connection before it is told the
+        # database is unavailable. Bounds the queue instead of letting it grow.
+        self.pool_timeout = float(os.environ.get("NEXUS_DB_POOL_TIMEOUT", "30") or 30)
+        self._pool: Any = None
+        self._open_pool()
         # Render's free plan has no shell to run ``psql`` in, so the schema must
         # be applied by the process itself. The migrations are idempotent, and
         # ``AUTO_MIGRATE=false`` opts out for environments that apply them out of
         # band (a release step, a DBA).
         if auto_migrate and os.environ.get("AUTO_MIGRATE", "true").lower() not in ("0", "false", "no"):
             self.apply_migrations()
+
+    def _open_pool(self) -> None:
+        """Open the connection pool (also used to reopen one that was closed).
+
+        A store that has been ``close()``d is usable again: the next call opens
+        a fresh pool. This keeps the behaviour the single-connection store had
+        (a closed connection was replaced on the next use), so code that closes
+        a store and later reads from it - a test, a diagnostic - still works.
+        """
+        self._pool = psycopg_pool.ConnectionPool(
+            self.dsn,
+            kwargs=self._connect_kwargs,
+            min_size=self.pool_min,
+            max_size=self.pool_max,
+            open=True,
+            # How long a caller waits for a free connection before it is told
+            # the database is unavailable. Bounds the queue instead of letting
+            # it grow without limit.
+            timeout=self.pool_timeout,
+            # A dropped connection must be discarded, not handed to the next
+            # caller. The cheap check below notices a server-side drop with no
+            # round trip on a healthy connection (the same trick the old store
+            # used); a check that raises makes the pool replace the connection.
+            check=_pool_check_connection,
+            # Do not hammer a database that is down: the pool backs off between
+            # reconnection attempts on its own.
+            reconnect_timeout=self._connect_timeout,
+        )
+        # Surface a bad DSN at construction (the old store connected here too),
+        # so a misconfiguration is one clear error at startup, not a 500 later.
+        try:
+            self._pool.wait(timeout=self._connect_timeout)
+        except psycopg_pool.PoolTimeout as e:
+            raise StoreError("database unavailable") from e
+
+    def _ensure_pool(self) -> Any:
+        """The live pool, reopening it if it was closed. Returns the pool."""
+        if self._pool is None or self._pool.closed:
+            self._open_pool()
+        return self._pool
+
+    def pool_stats(self) -> dict[str, Any]:
+        """A small, safe snapshot of the pool for diagnostics.
+
+        Counts only: no DSN, host, user or credential. ``waiting`` above zero
+        means callers are queued for a connection, which is the signal to raise
+        ``NEXUS_DB_POOL_MAX`` (if the database limit allows) or to look for a
+        slow query holding a connection.
+        """
+        try:
+            s = self._ensure_pool().get_stats()
+        except Exception:  # noqa: BLE001 - diagnostics must not raise
+            return {"available": False}
+        return {
+            "available": True,
+            "min": self.pool_min,
+            "max": self.pool_max,
+            "size": s.get("pool_size"),
+            "idle": s.get("pool_available"),
+            "waiting": s.get("requests_waiting"),
+            "requests": s.get("requests_num"),
+            "wait_ms": s.get("requests_wait_ms"),
+        }
 
     # ------------------------------------------------------------ migrations
     def apply_migrations(self, directory: str | None = None) -> list[str]:
@@ -305,6 +460,13 @@ class PostgresStore:
         edit to an applied one. A *new* file is applied normally. This is the
         one real defect the old runner had: it wrote the new checksum over the
         old with ``ON CONFLICT DO UPDATE`` and executed the changed SQL.
+
+        The single exception is a *registered correction*
+        (:data:`MIGRATION_CORRECTIONS`): a defect in an already-shipped file
+        whose body no database could have depended on. When a recorded checksum
+        is a superseded body of a corrected file, the corrected (idempotent)
+        body is re-applied and the recorded checksum rewritten. Any other
+        mismatch is still refused.
         """
         base = Path(directory) if directory else Path(__file__).resolve().parent.parent / "migrations"
         files = sorted(base.glob("*.sql"))
@@ -326,13 +488,28 @@ class PostgresStore:
                             (path.name,))
                 row = cur.fetchone()
                 if row is not None:
-                    if row["checksum"] == checksum:
+                    recorded = row["checksum"]
+                    if recorded == checksum:
                         continue
-                    raise MigrationError(
-                        f"{path.name} was already applied with a different body; "
-                        "ship a new migration instead of editing an applied one "
-                        "(editing it would re-run a different body under a "
-                        "recorded name)")
+                    superseded = MIGRATION_CORRECTIONS.get(path.name, frozenset())
+                    if recorded not in superseded:
+                        raise MigrationError(
+                            f"{path.name} was already applied with a different body; "
+                            "ship a new migration instead of editing an applied one "
+                            "(editing it would re-run a different body under a "
+                            "recorded name)")
+                    # A registered correction: the recorded body is a known
+                    # defective one no database could rely on. Re-apply the
+                    # corrected body (idempotent) and move the recorded checksum
+                    # forward, so the history and the schema agree again.
+                    cur.execute(sql)
+                    cur.execute(
+                        "UPDATE schema_migrations SET checksum = %s, applied_at = now() "
+                        "WHERE filename = %s",
+                        (checksum, path.name),
+                    )
+                    applied.append(path.name)
+                    continue
                 cur.execute(sql)
                 cur.execute(
                     "INSERT INTO schema_migrations(filename, checksum) VALUES (%s, %s)",
@@ -342,8 +519,7 @@ class PostgresStore:
         return applied
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        self._pool.close()
 
     #: Columns the code reads or writes, per table. Used to detect a database
     #: that has the right table names but the wrong shape - typically one created
@@ -464,80 +640,33 @@ class PostgresStore:
         return missing
 
     # ---------------------------------------------------------------- infra
-    #: After a failed reconnect, how long to refuse further attempts. Every
-    #: caller waits on the same lock, so without this a database outage turns
-    #: into a queue of requests that each spend the whole connect timeout.
-    RECONNECT_BACKOFF_SECONDS = 2.0
-
-    def _connection_is_dead(self, conn: Any) -> bool:
-        """Whether the shared connection is positively known to be unusable.
-
-        The process holds one connection for its whole life. When the server
-        end goes away (a database restart, a pooler recycling its clients, a
-        network reset) nothing tells the client until it next speaks, and the
-        driver never reconnects by itself: before this check existed every call
-        after such a drop failed with ``the connection is lost`` until the
-        process was restarted, while ``/healthz`` kept answering 200.
-
-        A healthy idle connection has nothing waiting to be read. A dropped one
-        does (the server's goodbye, or end-of-file), so one ``poll`` with no
-        timeout separates the two without a round trip; only when something is
-        waiting is the connection actually asked.
-
-        The answer is ``True`` only on evidence: the driver already marked the
-        connection broken, or it failed to answer. When the check itself cannot
-        be made the connection is used as before, so this can add a reconnect
-        but never take away a working connection.
-        """
-        if conn.closed:
-            return True
-        try:
-            if not _has_pending_input(conn.fileno()):
-                return False
-        except psycopg.Error:
-            return True          # no socket: the driver has lost it
-        except (OSError, ValueError):
-            return False         # cannot tell; behave as before
-        try:
-            if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
-                conn.rollback()
-            conn.execute("SELECT 1").fetchone()
-        except psycopg.Error:
-            return True
-        return False
-
-    def _reconnect(self) -> Any:
-        """Replace the shared connection. Raises :class:`StoreUnavailable`."""
-        since_failure = time.monotonic() - self._reconnect_failed_at
-        if self._reconnect_failed_at and since_failure < self.RECONNECT_BACKOFF_SECONDS:
-            raise StoreUnavailable("database unavailable")
-        try:
-            self._conn.close()
-        except Exception:  # noqa: BLE001 - it is already gone; nothing to save
-            pass
-        try:
-            self._conn = psycopg.connect(self.dsn, **self._connect_kwargs)
-        except psycopg.Error as e:
-            self._reconnect_failed_at = time.monotonic()
-            raise StoreUnavailable("database unavailable") from e
-        self._reconnect_failed_at = 0.0
-        return self._conn
-
     @contextmanager
     def _tx(self) -> Iterator[Any]:
         """Yield a cursor inside a transaction, committing or rolling back.
 
-        The lock makes the shared connection safe under the threaded server.
-        A connection the server dropped is replaced before the transaction
-        starts, so the drop costs nothing to the caller. The rollback on entry
-        recovers from a transaction that was already aborted (e.g. by a previous
-        failure) instead of propagating ``InFailedSqlTransaction`` into an
-        unrelated caller.
+        A connection is taken from the pool for the duration of the block and
+        returned to it afterwards, so concurrent callers no longer wait on one
+        shared connection. A healthy connection is reused without a round trip;
+        a dropped one is replaced by the pool's check before it is handed over.
+        The rollback on entry recovers from a transaction that was already
+        aborted (e.g. by a previous failure) instead of propagating
+        ``InFailedSqlTransaction`` into an unrelated caller.
+
+        The pool returns a connection on exit: committed on success, rolled back
+        on any exception (psycopg_pool's context manager does both). A pool that
+        cannot hand out a connection within the timeout is reported as
+        :class:`StoreUnavailable`, the same outcome the old store produced when
+        it could not reconnect.
         """
-        with self._lock:
-            conn = self._conn
-            if self._connection_is_dead(conn):
-                conn = self._reconnect()
+        try:
+            conn = self._ensure_pool().getconn()
+        except psycopg_pool.PoolTimeout as e:
+            raise StoreUnavailable("database unavailable") from e
+        except psycopg_pool.PoolClosed as e:  # pragma: no cover - pool raced closed
+            raise StoreUnavailable("database unavailable") from e
+        except psycopg.Error as e:
+            raise StoreUnavailable("database unavailable") from e
+        try:
             if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
                 conn.rollback()
             try:
@@ -552,6 +681,31 @@ class PostgresStore:
                 except psycopg.Error:
                     pass
                 raise
+        finally:
+            # Always return the connection: on success, on a handled error, and
+            # on a cancel/KeyboardInterrupt. `putconn` discards a connection the
+            # driver marked broken and hands a healthy one to the next caller.
+            try:
+                self._pool.putconn(conn)
+            except Exception:  # noqa: BLE001 - returning must never mask the caller's error
+                pass
+
+    # The single-connection accessors are kept for the tests and diagnostics
+    # that read them (tests/test_store_reconnect.py, tests/test_transactions.py,
+    # tests/test_schema_bootstrap.py). They borrow one pooled connection for the
+    # length of the `with` block, so a test can still inspect a real connection
+    # (its backend pid, its prepare_threshold, its autocommit) without changing
+    # how the store itself works.
+    @contextmanager
+    def _connection(self) -> Iterator[Any]:
+        try:
+            conn = self._ensure_pool().getconn()
+        except psycopg_pool.PoolTimeout as e:
+            raise StoreUnavailable("database unavailable") from e
+        try:
+            yield conn
+        finally:
+            self._pool.putconn(conn)
 
     def _event(
         self,

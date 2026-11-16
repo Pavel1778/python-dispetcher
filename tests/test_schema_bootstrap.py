@@ -22,7 +22,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from orchestration.cloud_store import PostgresStore  # noqa: E402
+from orchestration.cloud_store import (  # noqa: E402
+    MIGRATION_CORRECTIONS,
+    MigrationError,
+    PostgresStore,
+)
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
 
@@ -137,6 +141,43 @@ def test_an_edited_migration_is_refused_not_reapplied(tmp_path) -> None:
         store.close()
 
 
+def test_registered_correction_supersedes_the_old_0037_body() -> None:
+    """A database that recorded the defective 0037 body converges.
+
+    The defective body is a registered correction (``MIGRATION_CORRECTIONS``):
+    when a recorded checksum is a superseded body, the corrected idempotent body
+    is re-applied and the recorded checksum moves forward. An *unregistered*
+    mismatch is still refused (asserted at the end, so the registry cannot be
+    mistaken for a general "edit in place" escape hatch).
+    """
+    name = "0037_conversation_management.sql"
+    superseded = MIGRATION_CORRECTIONS[name]
+    assert superseded, "the old 0037 body must be registered"
+    _drop_schema()
+    store = PostgresStore(DSN, auto_migrate=False)
+    try:
+        store.apply_migrations()
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s", (name,))
+            current = cur.fetchone()["checksum"]
+        old = next(iter(superseded))
+        assert current != old
+        with store._tx() as cur:
+            cur.execute("UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                        (old, name))
+        assert store.apply_migrations() == [name]
+        with store._tx() as cur:
+            cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s", (name,))
+            assert cur.fetchone()["checksum"] == current
+        with store._tx() as cur:
+            cur.execute("UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                        ("0" * 64, name))
+        with pytest.raises(MigrationError):
+            store.apply_migrations()
+    finally:
+        store.close()
+
+
 def test_auto_migrate_can_be_disabled() -> None:
     _drop_schema()
     os.environ["AUTO_MIGRATE"] = "false"
@@ -166,17 +207,22 @@ def test_prepared_statements_are_off_by_default() -> None:
     store = PostgresStore(DSN)
     try:
         # None is what psycopg uses to mean "never prepare server-side".
-        assert store._conn.prepare_threshold is None
         assert store.prepare_threshold is None
-        # Execute the same statement more than the default threshold (5); with
-        # preparation disabled the server must not hold a prepared statement,
-        # because a pooled connection may be handed to another client.
-        with store._conn.cursor() as cur:
-            for _ in range(8):
-                cur.execute("SELECT 1 AS n")
-                cur.fetchone()
-            cur.execute("SELECT count(*) AS n FROM pg_prepared_statements")
-            assert cur.fetchone()["n"] == 0
+        # Every pooled connection must be opened with that policy, because a
+        # pooled connection may be handed to another client.
+        with store._connection() as conn:
+            assert conn.prepare_threshold is None
+            # Execute the same statement more than the default threshold (5);
+            # with preparation disabled the server must not hold a prepared
+            # statement, because a pooled connection may be handed to another
+            # client.
+            with conn.cursor() as cur:
+                for _ in range(8):
+                    cur.execute("SELECT 1 AS n")
+                    cur.fetchone()
+                cur.execute("SELECT count(*) AS n FROM pg_prepared_statements")
+                assert cur.fetchone()["n"] == 0
+            conn.rollback()
     finally:
         store.close()
 
@@ -190,8 +236,9 @@ def test_prepare_can_be_opted_in_for_a_direct_connection() -> None:
     finally:
         os.environ.pop("PSYCOPG_PREPARE", None)
     try:
-        assert store._conn.prepare_threshold == 5
         assert store.prepare_threshold == 5
+        with store._connection() as conn:
+            assert conn.prepare_threshold == 5
     finally:
         store.close()
 
@@ -269,9 +316,25 @@ def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
         # migrations attached to them first (a policy or grant makes the role
         # own objects, and DROP ROLE refuses while they exist). A role that was
         # already there is left untouched.
+        #
+        # The roles are **cluster-global**: another database (a sibling test
+        # database) that ran the same migrations holds policies bound to
+        # ``authenticated``, and ``DROP OWNED BY`` only releases objects in the
+        # *current* database - so the drop can fail with
+        # ``DependentObjectsStillExist`` while a peer database still references
+        # the role. That is housekeeping, not the property under test (which is
+        # that the migrations apply), so a role that cannot be dropped is left in
+        # place rather than failing the test. A leftover NOLOGIN role is
+        # harmless, and the next run reuses it.
         if created:
+            import psycopg.errors
+
             with psycopg.connect(DSN, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     for role in created:
-                        cur.execute(f'DROP OWNED BY "{role}"')
-                        cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                        try:
+                            cur.execute(f'DROP OWNED BY "{role}"')
+                            cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                        except psycopg.errors.DependentObjectsStillExist:
+                            # A peer database still uses the role; leave it.
+                            conn.rollback()

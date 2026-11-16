@@ -246,10 +246,15 @@ def _overflow(page) -> int:
     return page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
 
 
-def _connect_repository(page):
+def _connect_repository(page, *, analyze=True):
     page.click("#repo-chip")
     page.click(f'.picker-item[data-name="{REPO}"]')
     page.wait_for_selector("#repo-branch option:nth-of-type(2)", state="attached")
+    # The connect dialog offers to analyze the repository at once (checked by
+    # default), which fires a background ``context/refresh``. A test that then
+    # forces GitHub to fail would race that request; it asks for no analyze.
+    if not analyze:
+        page.uncheck("#repo-analyze")
     page.click("#repo-connect")
     page.wait_for_selector(".dialog-wrap", state="detached")
     expect(page.locator("#repo-chip-text")).to_have_text(f"{REPO} · main")
@@ -1041,7 +1046,11 @@ def test_a_repository_that_cannot_be_read_is_said_so_under_the_answer(stack, chr
     ctx, page, watch = _open(chromium)
     try:
         _login(page, stack.base)
-        _connect_repository(page)
+        # No analyze on connect: this test forces GitHub to fail next, and the
+        # connect dialog's own background refresh would race that (a 400 the
+        # browser would record). The subject here is the answer under a failed
+        # read, not that refresh.
+        _connect_repository(page, analyze=False)
         stack.github.force_status = 401
         _send(page, "Что в репозитории?")
         expect(page.locator(".msg.assistant .md")).to_contain_text("отвечаю без него")

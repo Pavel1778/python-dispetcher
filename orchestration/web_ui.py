@@ -18,6 +18,7 @@ Nothing in these files may contain a secret: they are served before login.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import html
 from pathlib import Path
@@ -66,6 +67,18 @@ def _load() -> dict[str, tuple[bytes, str, str]]:
 #: Public URL -> (body, content type, Cache-Control). Read once; see the module
 #: docstring for why this is a closed mapping rather than a directory lookup.
 STATIC: dict[str, tuple[bytes, str, str]] = _load()
+
+#: Public URL -> the gzipped body, for the text assets, computed once here.
+#: The assets are static for the life of the process and are requested with a
+#: content hash (``?v=<hash>``), so compressing them on every request spends
+#: CPU for an answer that never changes: app.js alone is 6 ms of gzip per hit.
+#: A binary asset (a font) is left out - it is already compressed.
+STATIC_GZIP: dict[str, bytes] = {}
+for _url, (_body, _ctype, _cache) in STATIC.items():
+    if _ctype.startswith(("text/", "application/javascript")):
+        _gz = gzip.compress(_body, compresslevel=6)
+        if len(_gz) < len(_body):
+            STATIC_GZIP[_url] = _gz
 
 #: A short hash of every asset. Pages reference assets as ``?v=<hash>`` so a new
 #: release is fetched immediately instead of after the cache lifetime.

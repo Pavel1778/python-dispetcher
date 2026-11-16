@@ -1268,6 +1268,31 @@
     return 'через ' + hours + ' ' + plural(hours, 'час', 'часа', 'часов');
   }
 
+  // A stage duration in the run profile, from a number of seconds.
+  function secondsText(value) {
+    var seconds = Math.max(0, Math.round(Number(value) || 0));
+    if (seconds < 60) return seconds + ' с';
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + ' мин ' + (seconds % 60) + ' с';
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + ' ч ' + (minutes % 60) + ' мин';
+    return Math.floor(hours / 24) + ' д ' + (hours % 24) + ' ч';
+  }
+
+  // The profiler's bottleneck token, said in words.
+  function profBottleneckLabel(token) {
+    return ({
+      queue_wait: 'ожидание в очереди',
+      dispatch: 'запуск разговора',
+      openhands_start: 'старт OpenHands',
+      agent_first_event: 'первый ответ агента',
+      agent_execution: 'работа агента',
+      verification: 'проверка результата',
+      finish: 'завершение',
+      idle: 'простой (время без измеренных этапов)'
+    })[token] || token;
+  }
+
   // Which OpenHands a task is (or was last) run by: the newest line of its
   // history. An empty label is the server's own key.
   function taskExecutor(executions, taskId) {
@@ -1326,6 +1351,35 @@
     // A durable run that is between two tries says so, and when it goes on.
     var pause = run.state === 'running' && run.resume_at && run.wait_reason
       ? '<p class="work-reason">' + esc(clip(run.wait_reason, 400)) + ' · продолжит ' + esc(untilText(run.resume_at)) + '</p>' : '';
+    // A paused run that still has conversations in flight: say on the card
+    // itself what the pause did and did not stop - never leave it implied.
+    var inflight = executions.filter(function (item) { return !item.ended_at; }).length;
+    var pausedNote = run.state === 'paused' && inflight
+      ? '<p class="work-reason">Пауза остановила выдачу новых задач. ' + inflight + ' ' +
+        plural(inflight, 'разговор', 'разговора', 'разговоров') +
+        ' OpenHands продолжают работу; для их остановки отмените прогон.</p>' : '';
+    // The run-time profile: where the wall-clock time went. Read-only; the
+    // server computes it. Only the stages that were measured are shown, so a
+    // missing milestone reads as "не измерено", never as zero.
+    var prof = detail.profile;
+    var profileSection = '';
+    if (prof && prof.stages) {
+      var order = [['queue_wait', 'ожидание в очереди'], ['dispatch', 'запуск'],
+                   ['openhands_start', 'старт OpenHands'], ['prompt', 'отправка задачи'],
+                   ['first_event', 'первый ответ агента'], ['execution', 'работа агента'],
+                   ['verification', 'проверка'], ['finish', 'завершение'],
+                   ['idle', 'простой']];
+      var rows = order.map(function (pair) {
+        var v = pair[0] === 'idle' ? prof.idle_seconds : prof.stages[pair[0]];
+        if (v == null) return '';
+        return '<li><span>' + esc(pair[1]) + '</span><span class="mono">' + esc(secondsText(v)) + '</span></li>';
+      }).join('');
+      var ratio = prof.idle_ratio == null ? '' : ' · простой ' + Math.round(prof.idle_ratio * 100) + '%';
+      profileSection = '<details class="work-section"><summary>Профиль времени' + esc(ratio) + '</summary>' +
+        '<ul class="events profile-rows">' + rows + '</ul>' +
+        (prof.bottleneck ? '<p class="step-sub">Основная доля времени: ' + esc(profBottleneckLabel(prof.bottleneck)) + '</p>' : '') +
+        '</details>';
+    }
     // The executor at work right now: the newest execution that has not ended,
     // else the newest one at all. It names the connection, its conversation id
     // and what it is doing - the "текущий OpenHands / используемый аккаунт /
@@ -1402,8 +1456,8 @@
     // conversation, live or over - the output does not disappear when the
     // run ends.
     if (hasConversations) actions += '<button class="btn btn-sm" type="button" data-action="terminal-outputs" data-id="' + esc(entry.id) + '">' + icon('terminal', 'icon-sm') + 'Вывод команд</button>';
-    if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '">' + icon('pause', 'icon-sm') + 'Пауза</button>';
-    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '">' + icon('play', 'icon-sm') + 'Продолжить</button>';
+    if (run.state === 'running') actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="pause" data-id="' + esc(entry.id) + '" title="Планировщик перестанет выдавать новые задачи; выполняющиеся разговоры OpenHands продолжат работу" aria-label="Пауза: остановить выдачу новых задач, не останавливая текущие разговоры OpenHands">' + icon('pause', 'icon-sm') + 'Пауза</button>';
+    if ({ paused: 1, blocked: 1 }[run.state]) actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="resume" data-id="' + esc(entry.id) + '" title="Снова разрешить выдачу задач по этому прогону" aria-label="Продолжить: снова выдавать задачи планировщиком">' + icon('play', 'icon-sm') + 'Продолжить</button>';
     if (live) actions += '<button class="btn btn-sm btn-danger" type="button" data-action="run-state" data-op="cancel" data-id="' + esc(entry.id) + '">' + icon('stop', 'icon-sm') + 'Отменить</button>';
     // A finished run's own actions: retry only the tasks that failed, take it
     // out of the lists, or remove it from history. None of them touches the
@@ -1435,6 +1489,7 @@
       (durable ? 'Сколько раз прогон запускал задачи в этом цикле. Когда запуски цикла кончаются, прогон делает паузу и продолжает сам.'
                : 'Сколько раз прогон запускал задачи и до какого времени он может их запускать') + '">' + budget + '</span></div>' +
       (run.last_error ? '<p class="work-reason">' + esc(clip(run.last_error, 400)) + '</p>' : '') + pause +
+      pausedNote +
       (owed ? '<p class="work-reason">Останавливаем ' + owed + ' ' + plural(owed, 'разговор', 'разговора', 'разговоров') + ' OpenHands, оставленных при повторе.</p>' : '') +
       (cleanupLine ? '<p class="work-note">' + esc(cleanupLine) + '</p>' : '') +
       currentLine +
@@ -1442,7 +1497,7 @@
       (waiting ? '<p class="step-sub">' + (inline
         ? 'Сервер возьмёт первую задачу в течение нескольких секунд. Если на этой ветке сейчас работает задача другого прогона, сначала дождётся её: на одной ветке работает одна задача.'
         : 'Задачи ждут исполнителя. На этом сервере ведение прогонов выключено (NEXUS_LAB_INLINE=0): их должен вести отдельный процесс python -m orchestration.lab_worker. Если такого процесса нет, уберите эту переменную.') + '</p>' : '') + '</div>' +
-      switchesSection + eventsSection + reportSection +
+      switchesSection + eventsSection + profileSection + reportSection +
       (actions ? '<div class="work-foot">' + actions + '</div>' : '') + '</section>';
   }
 
@@ -3151,7 +3206,7 @@
     },
     'run-state': function (el) {
       var id = el.getAttribute('data-id'), op = el.getAttribute('data-op');
-      var done = { pause: 'Прогон на паузе.', resume: 'Прогон продолжен.',
+      var done = { pause: 'Планировщик больше не выдаёт новые задачи. Текущие разговоры OpenHands не остановлены — для остановки отмените прогон.', resume: 'Прогон продолжен.',
                    cancel: 'Прогон отменён.', hide: 'Прогон скрыт.',
                    show: 'Прогон возвращён в список.' }[op];
       if (!done) return;

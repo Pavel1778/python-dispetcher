@@ -1582,6 +1582,9 @@ class LabScheduler:
                               attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
                 report = self.executor.poll(task, conv)
             if report.state == "running":
+                # The agent is at work (or between turns): the first time this is
+                # seen is when the agent began, for the run's profile.
+                self.store.record_run_milestone(run_id, "first_agent_event_at")
                 over = self._over_limit(task, conv, durable)
                 if over is None:
                     in_flight += 1
@@ -1623,10 +1626,12 @@ class LabScheduler:
                 result.note = "executor gone: task requeued for failover"
                 continue
             else:
+                self.store.record_run_milestone(run_id, "verification_started_at")
                 with tracing.span("verify", project_id=task.get("project_id"),
                                   task_id=task.get("id"), conversation_id=conv,
                                   attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
                     verdict = self.verifier.verify(task, report)
+                self.store.record_run_milestone(run_id, "verification_completed_at")
             # The account produced a terminal result, so it is working: mark it
             # healthy again. Without this an account excluded by one transient
             # failure would never come back into the pool.
@@ -1817,6 +1822,8 @@ class LabScheduler:
             # are and which one is its own.
             task = {**task, "project_repositories": ProjectRepositoryService(
                 self.store.store).context(str(task["project_id"]))}
+        # The run's profile: this is the moment a conversation is asked for.
+        self.store.record_run_milestone(run_id, "dispatch_started_at")
         try:
             with tracing.span("dispatch", project_id=task.get("project_id"),
                               task_id=task.get("id"),
@@ -1946,6 +1953,10 @@ class LabScheduler:
                                 delivery=getattr(conversation_id, "delivery", None),
                                 account_id=account_id, base_sha=base_sha, kind=kind,
                                 lease_token=task["lease_token"])
+        # The run's profile: the conversation is bound and the first message is
+        # on its way, so the OpenHands start and the prompt delivery are done.
+        self.store.record_run_milestone(run_id, "conversation_ready_at")
+        self.store.record_run_milestone(run_id, "prompt_sent_at")
 
     def _record_start(self, task: dict, start: dict) -> bool:
         """Keep an accepted start on its task (the executor's ``on_start``)."""

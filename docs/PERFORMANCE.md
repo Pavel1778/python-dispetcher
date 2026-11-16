@@ -116,6 +116,26 @@ the instrument for any such claim.
 - **The pinned section is a client-side partition of one read**, not a second
   request: `GET /conversations` already returns the `pinned` flag and the list
   is already ordered.
+- **The gzipped studio asset is computed once, not per request** (this session).
+  The static assets are immutable for the life of the process and are requested
+  with a content hash (`?v=<hash>`), so recompressing them on every request spent
+  CPU for a body that never changes. `orchestration/web_ui.STATIC_GZIP` holds the
+  gzipped body of every text asset, and `Handler._static` serves it when the
+  client accepts gzip (a body with no prepared form is still compressed on the
+  fly). Measured with `tools/benchmark.py` (`static_asset_ms`, a real gzip
+  fetch of `/static/app.js`):
+
+  | metric | before | after | method |
+  |---|---|---|---|
+  | `static_asset_ms` p50 | 7.23 ms | **0.59 ms** | same benchmark, same dataset |
+  | `static_asset_ms` p90 | 8.19 ms | **0.73 ms** | same |
+  | `static_asset_ms` p99 | 8.59 ms | **0.84 ms** | same |
+
+  The served bytes are unchanged: `gzip.decompress(body) == the file`, asserted
+  in `tests/test_studio_ui.py`. The before/after pair is two runs of the same
+  benchmark with only the `precompressed=` argument toggled; the other rows of
+  that pair differ by run-to-run noise (the code is identical between them) and
+  are **not** claimed as an optimisation.
 
 ## What was not done, and why
 

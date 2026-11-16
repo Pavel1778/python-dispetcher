@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from orchestration import cli  # noqa: E402
 from orchestration.cloud_client import CloudClient  # noqa: E402
 from orchestration.mcp_server import McpServer, serve  # noqa: E402
+from orchestration.nexus_lab_store import LabStore  # noqa: E402
 from orchestration.web_auth import hash_password  # noqa: E402
 from orchestration.web_server import App, WebServer  # noqa: E402
 from tests.fake_cloud import FakeCloudServer  # noqa: E402
@@ -154,6 +155,7 @@ def test_mcp_initialize_and_tool_list(app):
         "get_task", "create_task", "dispatch_task", "get_execution_status",
         "list_evidence", "verify_evidence",
         "list_runs", "get_run", "cancel_run",
+        "list_run_task_outputs", "get_run_task_output",
         "list_project_executors", "assign_project_executor",
     }
 
@@ -195,6 +197,32 @@ def test_mcp_create_task_refuses_unlinked_repository(app):
             "project_id": str(pid), "goal": "x", "repository": "acme/repo"}})
 
 
+def test_mcp_output_tools_are_honest(app):
+    """The two output tools: an unbound task says so, and a foreign project is
+    "not found". On the app transport (the fixture) the full output cannot be
+    reached, so the tool says ``unsupported`` rather than returning nothing."""
+    from orchestration.mcp_server import McpError
+
+    projects = app.projects
+    pid = projects.create("user:owner", "Out")["id"]
+    goal = projects.create_goal("user:owner", pid, "g")[0]["id"]
+    lab = LabStore(app.store)
+    run = lab.start_run("user:owner", pid, goal)
+    task = lab.add_task("user:owner", pid, run["id"], task_key="t", title="t",
+                        repository="", branch="")
+    server = McpServer(app.store, "user:owner")
+    # No conversation yet: an empty list, not an error.
+    result = server.handle("tools/call", {"name": "list_run_task_outputs", "arguments": {
+        "project_id": str(pid), "run_id": str(run["id"]), "task_id": str(task["id"])}})
+    listed = json.loads(result["content"][0]["text"])
+    assert listed["outputs"] == [] and listed["conversation_id"] is None
+    # A project the caller is not a member of is not found.
+    other = projects.create("user:someone", "Theirs")["id"]
+    with pytest.raises(McpError):
+        server.handle("tools/call", {"name": "list_run_task_outputs", "arguments": {
+            "project_id": str(other), "run_id": str(run["id"]), "task_id": str(task["id"])}})
+
+
 def test_mcp_stdio_round_trip(app):
     server = McpServer(app.store, "user:owner")
     stdin = io.StringIO(
@@ -205,7 +233,7 @@ def test_mcp_stdio_round_trip(app):
     serve(server, stdin=stdin, stdout=stdout)
     lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nexus"
-    assert len(lines[1]["result"]["tools"]) == 15
+    assert len(lines[1]["result"]["tools"]) == 17
 
 
 def test_mcp_parse_error_is_reported(app):
@@ -243,7 +271,7 @@ def test_mcp_http_initialize_and_tools(base):
     assert status == 200
     assert body["result"]["serverInfo"]["name"] == "nexus"
     status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert len(body["result"]["tools"]) == 15
+    assert len(body["result"]["tools"]) == 17
 
 
 def test_mcp_http_project_isolation(base, app):

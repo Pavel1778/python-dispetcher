@@ -88,6 +88,15 @@ class Client:
     def get(self, path):
         return self("GET", path)
 
+    def get_raw(self, path, *, headers=None):
+        """A raw GET: the bytes and the Content-Encoding, for a static asset."""
+        request = urllib.request.Request(self.base + path, method="GET")
+        request.add_header("Authorization", f"Bearer {TOKEN}")
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read(), response.headers.get("Content-Encoding")
+
     def post(self, path, body=None):
         return self("POST", path, {} if body is None else body)
 
@@ -230,6 +239,12 @@ def main() -> int:
             lambda: api.get(f"/api/v1/projects/{pid}/conversations/{cid}/messages"),
             repeat=args.repeat))
         m["commands_registry_ms"] = _percentiles(_time(lambda: api.get("/api/commands"), repeat=args.repeat))
+        # A studio asset fetched the way a browser fetches it (gzip accepted).
+        # It is a static file, so its cost is the server's own: this is what the
+        # precomputed gzip body is measured by.
+        m["static_asset_ms"] = _percentiles(_time(
+            lambda: api.get_raw("/static/app.js", headers={"Accept-Encoding": "gzip"}),
+            repeat=args.repeat))
         m["search_by_content_ms"] = _percentiles(_time(
             lambda: api.get(f"/api/v1/projects/{pid}/conversations?q="
                             + urllib.parse.quote("номер") + "&archived=1"),

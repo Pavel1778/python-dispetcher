@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -298,6 +299,66 @@ class OpenHandsClient:
             return e.code, b""
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise ApiUnavailable(f"GET /api/file/download: {type(e).__name__}") from e
+
+    def download_trajectory(
+        self, base_url: str, key: str, conversation_id: str, *, limit: int,
+    ) -> tuple[int, bytes]:
+        """``GET /api/conversations/{id}/file/download-trajectory/{id}`` -> a ZIP.
+
+        The agent-server packs a conversation's own directory (its events, its
+        metadata, and its ``observations/`` - the full terminal outputs a
+        truncated event points at) into one archive. It is **conversation
+        scoped**: the route carries the conversation id, and the server answers
+        ``422`` for a path outside that conversation's own directory, so the
+        archive is the safe way to reach the output files.
+
+        At most *limit* + 1 bytes are read, so a caller that must bound its
+        memory sees "too large" without buffering the whole archive.
+        """
+        url = (f"{base_url.rstrip('/')}/api/conversations/{conversation_id}"
+               f"/file/download-trajectory/{conversation_id}")
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/octet-stream")
+        if key:
+            req.add_header("X-Session-API-Key", key)
+        try:
+            with self._opener().open(req, timeout=self.timeout) as resp:
+                return resp.status, resp.read(limit + 1)
+        except urllib.error.HTTPError as e:
+            return e.code, b""
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ApiUnavailable(
+                f"GET download-trajectory: {type(e).__name__}") from e
+
+    @staticmethod
+    def bounded_zip_member(archive: zipfile.ZipFile, name: str,
+                           *, limit: int) -> bytes | None:
+        """Read one member of *archive*, or ``None`` if it is larger than *limit*.
+
+        The compressed size is bounded by the caller before this is reached; a
+        member's *decompressed* size must be bounded too, or a small archive can
+        expand to gigabytes in memory (a ZIP bomb). ``ZipInfo.file_size`` is
+        read first and refused when it is over the limit, and the stream is read
+        with a cap as well, because a hostile archive can understate the size it
+        declares. Returns ``None`` (never a partial buffer) when the member is
+        too large, so the caller can skip it rather than keep a bomb in memory.
+        """
+        try:
+            info = archive.getinfo(name)
+        except KeyError:
+            return None
+        if info.file_size > limit:
+            return None
+        out = bytearray()
+        with archive.open(info) as handle:
+            while True:
+                chunk = handle.read(min(65536, limit - len(out) + 1))
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > limit:
+                    return None
+        return bytes(out)
 
     # ----------------------------------------------------------- operations
     def health(self) -> bool:
