@@ -332,11 +332,12 @@ class LabStore:
                 raise ValueError("goal already has an active run")
             cur.execute(
                 "INSERT INTO nexus_runs(project_id, goal_id, max_iterations, "
-                "max_attempts_per_task, deadline_at, created_by, policy, conversation_id) "
+                "max_attempts_per_task, deadline_at, created_by, policy, conversation_id, "
+                "queued_at) "
                 "VALUES (%s,%s,%s,%s, now() + %s * interval '1 second', %s, %s, "
                 # A conversation of another project, or one that is gone, is
                 # not a place to report to.
-                "  (SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s)) "
+                "  (SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s), now()) "
                 "RETURNING *",
                 (project_id, goal_id, max_iterations, max_attempts_per_task,
                  deadline_seconds, principal, policy, conversation_id, project_id))
@@ -421,6 +422,41 @@ class LabStore:
             cur.execute("SELECT * FROM nexus_runs WHERE id=%s", (run_id,))
             row = cur.fetchone()
             return self._run_view(row) if row else None
+
+    #: The milestone columns the profiler reads (migration ``0040``). A name
+    #: outside this set is refused, so a caller cannot write an arbitrary
+    #: column through ``record_run_milestone``.
+    _MILESTONES = frozenset({
+        "queued_at", "claimed_at", "dispatch_started_at", "executor_started_at",
+        "conversation_ready_at", "prompt_sent_at", "first_agent_event_at",
+        "last_progress_at", "verification_started_at", "verification_completed_at",
+        "completed_at",
+    })
+
+    def record_run_milestone(self, run_id: str, milestone: str) -> None:
+        """Stamp one milestone on a run, once, at the moment it happens.
+
+        ``COALESCE(col, now())`` is what makes it *once*: the first writer sets
+        it and a later re-claim, retry or second worker leaves it alone, so the
+        profile of a run cannot be rewritten by a later pass. A name that is not
+        a known milestone is refused (``ValueError``), so this is not a way to
+        write an arbitrary column.
+        """
+        if milestone not in self._MILESTONES:
+            raise ValueError(f"unknown run milestone: {milestone!r}")
+        with self.store._tx() as cur:
+            cur.execute(
+                f"UPDATE nexus_runs SET {milestone}=COALESCE({milestone}, now()) "
+                "WHERE id=%s", (run_id,))
+
+    def run_profile(self, run_id: str, *, now: Any = None) -> dict[str, Any]:
+        """The run-time profile of one run (stages, idle, bottleneck)."""
+        from .nexus_profiler import profile_run
+
+        row = self.run_row(run_id)
+        if row is None:
+            raise NotFound("run not found")
+        return profile_run(row, now=now)
 
     def get_run(self, principal: str, project_id: str, run_id: str) -> dict:
         with self.store._tx() as cur:
@@ -682,6 +718,14 @@ class LabStore:
                         "resume_at=NULL, wait_reason=NULL, updated_at=now() "
                         "WHERE id=%s RETURNING *", (state, last_error, run_id))
         run = self._run_view(cur.fetchone())
+        if state in ("completed", "failed", "cancelled"):
+            # The profiler's end of the clock: the run reached a terminal state.
+            # ``COALESCE`` keeps the first terminal stamp if a settle is retried.
+            # Done after the row is read so it does not consume the RETURNING row;
+            # the value is put on the view so a caller sees the same row the DB has.
+            cur.execute("UPDATE nexus_runs SET completed_at=COALESCE(completed_at, now()) "
+                        "WHERE id=%s RETURNING completed_at", (run_id,))
+            run["completed_at"] = cur.fetchone()["completed_at"]
         if state == "cancelled":
             ProjectService._event(cur, project_id, actor or "system", "run.cancelled", run_id)
         # A run that ends *without* completing owes its chat a report too, and
@@ -978,7 +1022,8 @@ class LabStore:
                 if cur.fetchone() is None:
                     return None
             cur.execute("UPDATE nexus_runs SET iteration=iteration+1, "
-                        "total_iterations=total_iterations+1, wait_reason=NULL, updated_at=now() "
+                        "total_iterations=total_iterations+1, wait_reason=NULL, "
+                        "claimed_at=COALESCE(claimed_at, now()), updated_at=now() "
                         "WHERE id=%s", (run_id,))
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='dispatched', attempt=attempt+1, "

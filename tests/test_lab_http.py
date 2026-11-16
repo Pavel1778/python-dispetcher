@@ -216,6 +216,39 @@ def test_full_autonomous_loop_completes_over_http(harness):
     assert "goal_started" in kinds and "goal_completed" in kinds
 
 
+def test_the_run_detail_carries_a_time_profile(harness):
+    """A run's detail includes where its wall-clock time went.
+
+    The profile is computed from the durable milestones (migration ``0040``);
+    a completed run has a total, a measured ``queue_wait``, and a bottleneck,
+    and every stage is a real number - a stage that was not measured is ``None``,
+    never a fabricated zero.
+    """
+    pid = _project(harness)
+    _connect(harness, pid)
+    _, goal = request(harness["base"], f"/api/v1/projects/{pid}/goals", "POST",
+                      {"text": "Profile me"}, session=harness["alice"])
+    gid = goal["goal"]["id"]
+    _, payload = request(harness["base"], f"/api/v1/projects/{pid}/goals/{gid}/run",
+                         "POST", {"repository": "Pavel1778/python-dispetcher"},
+                         session=harness["alice"])
+    run_id = payload["run"]["id"]
+    sched = LabScheduler(harness["app"].lab, _FakeExec(), _FakeVerifier())
+    sched.run_until_done(run_id)
+
+    _, detail = request(harness["base"], f"/api/v1/projects/{pid}/runs/{run_id}",
+                        session=harness["alice"])
+    prof = detail["profile"]
+    assert prof["total_seconds"] is not None
+    assert prof["stages"]["queue_wait"] is not None
+    assert prof["bottleneck"] is not None
+    # The run ended, so the clock stopped and every stage is a number or None.
+    assert isinstance(prof["idle_seconds"], (int, float))
+    assert prof["idle_ratio"] is None or 0.0 <= prof["idle_ratio"] <= 1.0
+    # The milestones are on the run row too, so a reader sees them.
+    assert detail["run"]["queued_at"] is not None
+
+
 def test_pause_and_resume_a_run(harness):
     pid = _project(harness)
     _, goal = request(harness["base"], f"/api/v1/projects/{pid}/goals", "POST",
