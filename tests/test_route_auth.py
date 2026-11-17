@@ -107,6 +107,7 @@ PROTECTED_POST = [
     f"/api/v1/projects/{UUID}/repository", f"/api/v1/projects/{UUID}/context/refresh",
     f"/api/v1/projects/{UUID}/runs/{UUID}/pause", f"/api/v1/projects/{UUID}/runs/{UUID}/cancel",
     f"/api/v1/projects/{UUID}/runs/{UUID}/resume", f"/api/v1/projects/{UUID}/runs/{UUID}/hide",
+    f"/api/v1/projects/{UUID}/runs/{UUID}/restart", f"/api/v1/projects/{UUID}/runs/{UUID}/duplicate",
     f"/api/v1/projects/{UUID}/runs/{UUID}/tasks/{UUID}/switch",
     f"/api/v1/projects/{UUID}/executors",
     f"/api/v1/projects/{UUID}/executors/{UUID}/disable",

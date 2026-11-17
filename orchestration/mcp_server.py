@@ -79,6 +79,8 @@ class McpServer:
             "list_runs": self._list_runs,
             "get_run": self._get_run,
             "cancel_run": self._cancel_run,
+            "restart_run": self._restart_run,
+            "duplicate_run": self._duplicate_run,
             "list_run_task_outputs": self._list_run_task_outputs,
             "get_run_task_output": self._get_run_task_output,
             "list_project_executors": self._list_project_executors,
@@ -120,6 +122,14 @@ class McpServer:
             _tool("cancel_run", "Stop an autonomous run for good (terminal, idempotent).",
                   {"project_id": _s("string"), "run_id": _s("string")},
                   ["project_id", "run_id"]),
+            _tool("restart_run",
+                  "Re-run a finished run's whole plan as a new run under the same goal.",
+                  {"project_id": _s("string"), "run_id": _s("string")},
+                  ["project_id", "run_id"]),
+            _tool("duplicate_run",
+                  "Copy a finished run into a new goal and run (independent of the original).",
+                  {"project_id": _s("string"), "run_id": _s("string"),
+                   "idempotency_key": _s("string")}, ["project_id", "run_id"]),
             _tool("list_run_task_outputs",
                   "List the terminal outputs of a run task's conversation that "
                   "the agent-server cut off (full output is fetched per event).",
@@ -244,6 +254,19 @@ class McpServer:
         run = LabStore(self.store).set_run_state(self.principal, pid, args["run_id"],
                                                  "cancelled")
         return {"run": run}
+
+    def _restart_run(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)
+        from .nexus_lab_store import LabStore
+        return {"run": LabStore(self.store).restart_run(self.principal, pid, args["run_id"])}
+
+    def _duplicate_run(self, args: dict) -> Any:
+        pid = args["project_id"]
+        self._member(pid)
+        from .nexus_lab_store import LabStore
+        return {"run": LabStore(self.store).duplicate_run(
+            self.principal, pid, args["run_id"], key=args.get("idempotency_key"))}
 
     def _list_run_task_outputs(self, args: dict) -> Any:
         """Which terminal outputs of a task's conversation the server cut."""
