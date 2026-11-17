@@ -2765,3 +2765,134 @@ has that the parallel one did not, at the time: a decompressed-member bound
 test suite that pins all of it. The parallel commit claims a stronger
 source-verification (that the saved file is the *clipped rendering*, not raw
 stdout) — worth reading before choosing.
+
+## Canonical consolidation (2026-11-16, this session)
+
+The three consolidation candidates were reconciled into one canonical branch.
+What a future change has to know:
+
+- **One base, three candidates.** Candidate B (`owner/phase34-consolidation`,
+  `3ca8e5f`) is the owner-approved Phase 3+4 reconciliation on `main` (PR #41 and
+  #42 merged); Candidate A (`cand/A`, `d570e89`) is the same work plus the
+  Phase 3 engineering branch (`engineering/performance-evolution`, `ce70f07`);
+  Phase 5 (`phase5/execution-intelligence`, `7859e3a`) adds the durable run-time
+  profiler. This branch is the **union**: B, everything A and Phase 5 carry that
+  B did not, and the parallel consolidation that was merged into `main` as PR
+  #45 (`consolidate/final`, `4282489`) — the OpenHands inventory tool, the
+  registered migration-correction recovery, the pause-honesty UI and the
+  `docs/performance/baseline_db.json` benchmark sample.
+- **The terminal-output design is B's, kept whole.** One canonical module,
+  `orchestration/terminal_output.py`: the conversation-scoped trajectory
+  transport (never the global unscoped `/api/file/download`), with the
+  decompressed-member (ZIP-bomb) bound and the `..`-member skip, **and** PR #42's
+  source verification (the saved file name recomputed from the event; a member
+  whose name is not it is refused). The task-scoped helpers, the HTTP routes, the
+  CLI (`run outputs`/`run output`) and the MCP tools all reach this one module.
+  The separate `orchestration/nexus_outputs.py` (A and Phase 5) is **not** in the
+  canonical branch: it duplicated the same feature on task-level routes.
+- **The run-level (PR #42) terminal-output routes are kept too** —
+  `GET …/runs/{run}/terminal-outputs[/{cid}/{event_id}[/download]]` — because the
+  studio's run card and the CLI/MCP already drive the task-level pair; both reach
+  `terminal_output.py`'s primitives.
+- **The connection pool is kept** (`psycopg_pool`, `NEXUS_DB_POOL_MIN/MAX`), and
+  PR #41's `test_connection_concurrency.py` keeps the pool's real invariants
+  (`pool_stats()`: size ≤ pool_max, idle == size, no caller queued), not the old
+  single-connection model. `_conn`/`_lock` are not restored.
+- **The Phase 5 profiler is integrated, not copied.** Migration
+  `0040_run_profiler.sql`, `orchestration/nexus_profiler.py`,
+  `LabStore.record_run_milestone`/`run_profile`, the milestone stamps in
+  `nexus_lab.py`, the run-detail `profile` (with `idle_ratio`), the studio
+  time-profile section, `tests/test_run_profiler.py`, the run-detail case in
+  `tests/test_lab_http.py` and `docs/RUN-PROFILER.md`. `REQUIRED_COLUMNS` in
+  `cloud_store.py` names the milestone columns.
+- **A test-isolation defect was found and fixed.** Two parallel pytest processes
+  on one cluster both run the cluster-global Supabase-role case and one failed
+  with `UniqueViolation` on `pg_authid_rolname_index`. `test_schema_bootstrap.py`
+  now takes a `pg_advisory_lock` on the shared `postgres` maintenance database
+  (a lock on the per-process test database would not collide) around that case.
+- **The engineering branch's docs and the `file_lab` batch insert** are in the
+  canonical branch (B omitted them): `docs/architecture/` (19 files),
+  `docs/performance/` (12 more), and `file_lab.py`'s `executemany` workspace-file
+  insert.
+- **Verified on the canonical branch** (PostgreSQL 17, per-process isolated DB):
+  `ruff check .` clean; `node tests/studio_render_test.js` passed;
+  `pytest tests/` (browser E2E excluded) **1914 passed, 9 skipped, 0 failed**;
+  browser E2E **37 passed, 0 skipped**; a fresh database applies all 41
+  migrations; two parallel `test_schema_bootstrap.py` runs both pass. Skips are
+  environmental only (Android SDK, mingw-w64, pooler DSN, live-OpenHands section).
+
+## NEXUS 2.0 program: integration, Rust core, acceptance (2026-11-16, this session)
+
+The program's integration branch is `nexus/2.0-integration` (not merged to
+`main`; merging/tagging/deploying need the owner's authorisation). What a future
+change must know:
+
+### Integration
+
+- The **canonical union** (`canonical/union` @ `c09d888` + C1 fix
+  `canonical/union-c1` @ `c2d24b3`) does **not** exist on `origin`; it lives in a
+  preserved local repository (`/workspace/project/030cf2d0.../python-dispetcher`).
+  It was fetched read-only and merged. Its real content: the C1 shutdown check
+  (`_backend_alive`, one specific backend, not the whole-database count), the
+  `executemany` batch insert in `file_lab`, the cluster-wide advisory lock in
+  `test_schema_bootstrap`, route-auth coverage of the run-level output routes,
+  the faithful `_gone()` helper, `docs/phase4-consolidation-audit.md`, **and the
+  schema-guard repair**: `cloud_store.REQUIRED_COLUMNS["nexus_runs"]` now names
+  the profiler columns migration `0040` adds. The C1 *isolation* half is
+  intentionally excluded (main's conftest imports `tests._test_db` first).
+- **PR #49** (`release/acceptance`) merged cleanly but its branch had **dropped
+  `NEXUS_ACCEPTANCE.md`** (a main-side file) as a merge artifact; it was
+  restored. **PR #47** (`feat/run-restart-duplicate`) conflicted in exactly
+  three places: an import (`IdempotencyConflict`), and `COMPLETION_LEDGER.md` /
+  `FINAL_RELEASE_REPORT.md`, where **both** sides' content was kept.
+- The deadlock fix integrated from PR #47 and the bounded retry from PR #46 are
+  **both** preserved: a bounded retry is not a substitute for the lock order.
+
+### The Rust core (`rust/`)
+
+- Three crates: `nexus-domain` (state machines, DAG validation, plan hash,
+  retry), `nexus-core` (the claim decision), `nexus-cli` (`nexus-rs`, also the
+  parity oracle). Pure: no I/O, no DB, no clock.
+- **Parity is the gate.** `tests/test_rust_parity.py` drives both
+  implementations over the same cases and compares - exhaustively for the
+  transition tables, byte for byte for the plan hash, over real runs in a live
+  lab store for the claim decision. A change to a migrated table on either side
+  that the other does not follow fails it.
+- **`can_transition_task` is strict** (no no-op) because
+  `control_plane.transition` is; the run and workflow machines allow a no-op.
+  This asymmetry is real and the parity test pins it.
+- **Do not migrate the intent router or the task-kind derivation.** They are
+  language-sensitive regexes with a history of subtle production bugs; the Rust
+  validator carries the `kind` it is given and does not derive one. See
+  `docs/RUST_MIGRATION.md` §4.
+- The SQL claim, the HTTP layer and the store stay Python. Rust is a **verified
+  candidate**, not authoritative; the switch procedure is in
+  `docs/RUST_PYTHON_COMPATIBILITY.md` §6 and ends with removing the Python
+  version.
+
+### Live acceptance (real, this session)
+
+- Live OpenHands diagnostics: **16 VERIFIED / 0 FAILED / 0 BLOCKED / 1
+  UNVERIFIED** with a stored account (`direct`, `openhands/deepseek-v4.1-flash`).
+  The one UNVERIFIED is `lab_worker` (no worker live, no active run) - correct.
+- The documented trap reproduced live: **without** `OPENHANDS_DEFAULT_MODEL` the
+  probe ends `error` (LLM auth); with the model above it is green.
+- A real autonomous run through NEXUS to live OpenHands dispatched, the agent
+  worked, and NEXUS recorded **`completed_unverified`** ("no repository bound")
+  and **blocked** the run - a textual result is not proof of work. A live
+  `completed_verified` needs a repository bound to a GitHub account with a token
+  the sandbox can push with; the live account has **no GitHub provider token**.
+- `NEXUS_SECRET_KEY` is required to store an account (the cipher refuses
+  without it). A throwaway key was generated for the acceptance run only; the
+  account was removed afterwards.
+
+### Verification numbers (final, at the report's HEAD)
+
+`ruff check .` clean; full suite (Python + browser E2E in one run) **2028 passed,
+9 skipped, 0 failed**; Python-only (browser excluded) **1991 passed, 9 skipped**;
+Rust `cargo test` **29 passed**; parity **9 passed**;
+isolation **8 passed**. The 9 skips: 4 Android SDK, 3 mingw-w64, 1 pooler DSN,
+1 live-OpenHands section F. Docs: `NEXUS_2_0_MASTER_PLAN.md`,
+`NEXUS_2_0_ARCHITECTURE.md`, `NEXUS_2_0_FINAL_ACCEPTANCE_REPORT.md`,
+`docs/RUST_MIGRATION.md`, `docs/RUST_PYTHON_COMPATIBILITY.md`,
+`docs/SECURITY_MODEL.md`, `docs/RELEASE_GUIDE.md`, `docs/COMPLETION_LEDGER.md`.

@@ -222,3 +222,69 @@ commit** on this branch; **no history was rewritten**. After the fix, a re-run
 pushed to the bound branch and `main` was verified unchanged. The cause is fixed
 and covered by two regression tests.
 
+
+---
+
+## 18. Restart / Duplicate Run and the cancel/reclaim deadlock (integrated)
+
+The directive says: stop consolidating, finish the product. A gap analysis of
+the **actual** `main` showed almost everything the directive names is already
+implemented and verified. Three things were genuinely missing or broken:
+
+### Restart Run — implemented
+`LabStore.restart_run`: re-runs a finished run's whole plan as a **new run
+under the same goal**; every task re-created `pending` at attempt 0; the old run
+kept as history. Refused while the goal has an active run, and while the run is
+not over. Surface: `POST …/runs/{id}/restart`, `nexus run restart`, MCP
+`restart_run`, studio «Перезапустить».
+
+### Duplicate Run — implemented
+`LabStore.duplicate_run`: copies a finished run's plan into a **new goal and
+run** (a copy cannot share the goal — one active run per goal). Idempotent with
+a key. Surface: `POST …/runs/{id}/duplicate`, `nexus run duplicate`, MCP
+`duplicate_run`, studio «Дублировать».
+
+### Cancel/reclaim deadlock — fixed (P1 reliability)
+`reclaim_expired` read the run row **without** `FOR UPDATE` and then locked task
+rows; the cancel path locks the run row first and then tasks. The inverted order
+deadlocked under load (`psycopg.errors.DeadlockDetected`). Fixed by locking the
+run row first — the order every other site already uses.
+
+### Quality gates as recorded on that branch
+
+| Gate | Command | Result |
+|---|---|---|
+| Full suite | `pytest tests/ -q` | **1980 passed, 9 skipped, 0 failed** (31:40) |
+| Lint | `ruff check .` | **All checks passed** |
+| Studio render | `node tests/studio_render_test.js` | **studio render tests passed** |
+| Browser E2E | `pytest tests/test_browser_e2e.py` | **37 passed** (Chromium) |
+| Deadlock stress | cancel test ×12 | **0/12 failed** (was 1/6 on clean `main`) |
+
+Reference: clean `main` @ 4282489 (nothing else running) → **1973 passed, 9
+skipped, 0 failed**. This branch adds 7 tests → 1980.
+
+**Skips (environmental, none a defect):** 4 Android SDK build-tools, 3 mingw-w64
+(Windows `.exe`), 1 `TEST_POOLER_DSN` pooler case, 1 section-F live variant.
+
+---
+
+## 19. Acceptance scenario status
+
+| Step | Status |
+|---|---|
+| 1. Start NEXUS | VERIFIED (`/healthz`, `/readyz`) |
+| 2. Create a project | VERIFIED (`test_studio_api.py`, studio) |
+| 3. Connect a repository | VERIFIED (`test_studio_api.py`; live read) |
+| 4. Submit a natural-language task | VERIFIED (`test_pipeline_e2e.py`) |
+| 5. Generate a plan | VERIFIED |
+| 6. Dispatch to OpenHands | VERIFIED (live probe; `test_openhands_failover.py`) |
+| 7. Observe execution | VERIFIED |
+| 8. Retrieve the result | VERIFIED |
+| 9. Run verification | VERIFIED (real `GitVerifier`; `test_pipeline_e2e.py`) |
+| 10. Display evidence | VERIFIED (`test_evidence_trust.py`, studio) |
+| 11. Produce a final report | VERIFIED (`test_run_reports.py`) |
+| 12. In-app notification | VERIFIED (`test_lab_http.py`) |
+| 13. Restart NEXUS, history intact | VERIFIED (durable PostgreSQL; `test_lab_worker_process.py`) |
+
+Plus: project isolation (VERIFIED), failure recovery (VERIFIED), cancellation
+(VERIFIED, live), mobile usability (VERIFIED, browser E2E at phone widths).

@@ -122,6 +122,45 @@ Last updated: 2026-11-16.
 | Direct transport forwards `secrets` (was silently dropped) | VERIFIED | `test_cloud_direct.py::test_secrets_reach_the_sandbox_create_body` |
 | `test_lab_inline` rework-state read made deterministic | VERIFIED | the test, 3× |
 
+## Phase 9 — Restart / Duplicate Run and the cancel/reclaim deadlock (integrated)
+
+| Change | Status | Evidence |
+|---|---|---|
+| Restart Run (`LabStore.restart_run`) — re-run a finished run's whole plan as a new run under the same goal; every task re-created `pending` at attempt 0; the old run stays as history | VERIFIED | `tests/test_run_history.py`; route `POST .../runs/{run_id}/restart`, CLI `nexus run restart`, MCP `restart_run`, studio «Перезапустить» |
+| Duplicate Run (`LabStore.duplicate_run`) — copy a finished run's plan into a new goal and run; idempotent with a key | VERIFIED | `tests/test_run_history.py`; route `POST .../runs/{run_id}/duplicate`, CLI `nexus run duplicate`, MCP `duplicate_run`, studio «Дублировать» |
+| Cancel/reclaim **deadlock** (load-sensitive) | VERIFIED — fixed | `reclaim_expired` locked the run row without `FOR UPDATE` then task rows; a cancel locks the run first then tasks, so the orders inverted under load. Reproduced 1/6 on clean main; 0/12 after the fix (`tests/test_deadlock_retry.py`, `test_run_history.py`) |
+
+### The sprint detail, as delivered
+
+### 1. Restart Run (`LabStore.restart_run`)
+- Re-runs a finished run's whole plan as a **new run under the same goal**;
+  every task re-created `pending` at attempt 0. The old run is untouched history.
+- Refused (409) while the goal already has an active run; refused (409) when the
+  run is not over.
+- Surface: `POST /api/v1/projects/{id}/runs/{run_id}/restart`,
+  `nexus run restart --project <p> <run>`, MCP `restart_run`, studio
+  «Перезапустить» on a finished run card.
+
+### 2. Duplicate Run (`LabStore.duplicate_run`)
+- Copies a finished run's plan into a **new goal and run** (a copy cannot share
+  the goal: one active run per goal). Idempotent with an `idempotency_key`.
+- Surface: `POST .../runs/{run_id}/duplicate`, `nexus run duplicate`,
+  MCP `duplicate_run`, studio «Дублировать».
+
+### 3. Deadlock fix (`LabStore.reclaim_expired`)
+- `reclaim_expired` read the run row **without** `FOR UPDATE` and then locked
+  task rows; a cancel locks the run row first and then tasks. The two orders
+  inverted and deadlocked under load (`psycopg.errors.DeadlockDetected`).
+- Fixed by locking the run row first, the order every other site already uses.
+- Evidence: reproduced **1/6** on clean `main`; **0/12** after the fix.
+
+### 4. Tests (7 new)
+- `tests/test_run_history.py`: restart re-runs every task; restart refuses an
+  active run; duplicate makes an independent goal and run; duplicate idempotency;
+  restart/duplicate are member-only.
+- `tests/test_cli_mcp.py`: CLI registers `run restart`/`run duplicate`; MCP
+  exposes `restart_run`/`duplicate_run` scoped `run:control`.
+
 ## Known BLOCKED / NOT IMPLEMENTED (unchanged, documented)
 
 | Item | Status |
