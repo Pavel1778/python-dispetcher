@@ -110,11 +110,27 @@ Focused pre-flight (before the full run; same environment):
 | `tests/test_schema_bootstrap.py` | 1 | `TEST_POOLER_DSN` (transaction-mode pooler) not set |
 | **Total** | **49** | |
 
-Cross-checked by mapping the `s` clusters in the raw log to collection order
-(5 at ~tests 1–72 = 1 + 4; 2 at ~tests 145–216; 37 at ~217; 1 at ~505 (comprehensive F);
-1 at ~89 % (pooler); 3 at ~99 % (mingw)) — consistent with per-module
-`--collect-only` counts and gate locations (`test_backup_restore` collects
-exactly 2; `test_android_apk` 4; `test_windows_exe` 3; `test_browser_e2e` 37).
+Cross-checked two ways, both consistent: (a) mapping the `s` clusters in the
+raw log to collection order against per-module `--collect-only` counts and gate
+locations; (b) **runtime verification** — each module was re-run standalone
+after the full suite (same environment):
+
+```
+test_browser_e2e.py     37 skipped
+test_android_apk.py      4 skipped
+test_windows_exe.py      3 skipped
+test_backup_restore.py   2 skipped
+test_comprehensive_suite 1 skipped  (18 passed, 1 skipped)
+test_acceptance_dev_task 1 skipped  (2 passed, 1 skipped)
+test_schema_bootstrap    1 skipped  (8 passed, 1 skipped)
+                        = 49 ✔
+```
+
+(Note: the owner's `PRE_MERGE_FORENSIC_AUDIT.md` Appendix A — a static read
+performed without a runnable environment — assigned all 4 "other" skips to
+`test_acceptance_dev_task`. Runtime attribution refines this: 1 there, 2 in
+`test_backup_restore`, 1 Section-F in `test_comprehensive_suite`. Both
+decompositions total 49; no skip was treated as a pass.)
 
 **Consequence:** browser E2E, Android packaging, Windows exe, the live
 Section-F variant, and the pooler case were **NOT RUN** in this environment.
