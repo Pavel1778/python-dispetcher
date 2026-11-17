@@ -16,16 +16,17 @@ VERIFIED** (not run).
 
 | Suite | Result |
 |---|---|
-| Python test suite (all but browser) | **1974 passed, 9 skipped, 0 failed** (28:44) |
+| Python test suite (all but browser) | **1991 passed, 9 skipped, 0 failed** |
 | Browser E2E (Chromium) | **37 passed** |
+| Full suite, everything in one run | **2028 passed, 9 skipped, 0 failed** (31:58) |
 | Rust workspace (`cargo test`) | **29 passed, 0 failed** |
 | Python/Rust parity | **9 passed** |
 | Project isolation | **8 passed** |
 | Live OpenHands diagnostics | **16 VERIFIED, 0 FAILED, 0 BLOCKED, 1 UNVERIFIED** |
 | Live autonomous run through NEXUS → OpenHands | **VERIFIED** (dispatched, agent worked, honest verdict) |
 
-The 9 skips are environmental and are listed in section 6. No assertion was
-weakened to obtain any of these numbers.
+The Python breakdown: 1991 + 37 = 2028. The 9 skips are environmental and are
+listed in section 6. No assertion was weakened to obtain any of these numbers.
 
 ---
 

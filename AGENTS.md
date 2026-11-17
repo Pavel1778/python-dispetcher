@@ -2888,8 +2888,9 @@ change must know:
 
 ### Verification numbers (final, at the report's HEAD)
 
-`ruff check .` clean; Python suite **1974 passed, 9 skipped, 0 failed**; browser
-E2E **37 passed**; Rust `cargo test` **29 passed**; parity **9 passed**;
+`ruff check .` clean; full suite (Python + browser E2E in one run) **2028 passed,
+9 skipped, 0 failed**; Python-only (browser excluded) **1991 passed, 9 skipped**;
+Rust `cargo test` **29 passed**; parity **9 passed**;
 isolation **8 passed**. The 9 skips: 4 Android SDK, 3 mingw-w64, 1 pooler DSN,
 1 live-OpenHands section F. Docs: `NEXUS_2_0_MASTER_PLAN.md`,
 `NEXUS_2_0_ARCHITECTURE.md`, `NEXUS_2_0_FINAL_ACCEPTANCE_REPORT.md`,
