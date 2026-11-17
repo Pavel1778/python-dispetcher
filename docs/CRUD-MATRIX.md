@@ -84,6 +84,8 @@ entity supports. `Project-scoped` means every route is under
 | Pause / resume | DONE | `POST .../runs/{id}/{pause,resume}` |
 | Hide / show | DONE | `POST .../runs/{id}/{hide,show}` |
 | Retry failed tasks | DONE | `POST .../runs/{id}/retry-failed` |
+| Restart run | DONE | `POST .../runs/{id}/restart` (re-runs the whole plan as a new run under the same goal) |
+| Duplicate run | DONE | `POST .../runs/{id}/duplicate` (copies the plan into a new goal and run; idempotent with a key) |
 | Remove from history | DONE | `DELETE .../runs/{id}` (terminal runs only) |
 | Switch executor | DONE | `POST .../runs/{r}/tasks/{t}/switch` |
 | Evidence / executions / switches / events | DONE | part of `GET .../runs/{id}` |
