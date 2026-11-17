@@ -2,7 +2,11 @@
 
 **Date:** 2026-11-17 (UTC)
 **Branch:** `recovery/nexus-integration-revalidated`
-**Tip:** `93bc28f77f78b41bf502161a8f4e78ca0ae698cf` (`93bc28f`)
+**Tip:** the commit carrying this file — resolve mechanically with
+`git rev-parse recovery/nexus-integration-revalidated` (commit sequence:
+`6e5c2b4` base → `e48861f` → `e0ee175` → `ba5ee97` → `13217ba` → `87da686`
+→ `93bc28f` → this document's commit). The integration's code-complete
+state is `ba5ee97`.
 **Base:** `6e5c2b410d531379c3599baa53492c83244551e5` (`6e5c2b4`, merge of PR #49)
 **Scope:** recovery and revalidation only — **no release, no push, no merge, no deploy**
 **Verdict (§9):** **B — VALIDATED RECONSTRUCTION. NOT A. Owner authorization required for the next stage.**
@@ -197,7 +201,8 @@ Both decompositions total 49.
 
 ## 8. Deliverables — inventory and locations
 
-On branch `recovery/nexus-integration-revalidated` (tip `93bc28f`), in
+On branch `recovery/nexus-integration-revalidated` (resolve the tip with
+`git rev-parse`; the integration code-complete state is `ba5ee97`), in
 `/home/user/python-dispetcher/.recovery/repo`:
 
 | Path | Contents |
