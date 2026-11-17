@@ -2765,3 +2765,58 @@ has that the parallel one did not, at the time: a decompressed-member bound
 test suite that pins all of it. The parallel commit claims a stronger
 source-verification (that the saved file is the *clipped rendering*, not raw
 stdout) — worth reading before choosing.
+
+## Canonical consolidation (2026-11-16, this session)
+
+The three consolidation candidates were reconciled into one canonical branch.
+What a future change has to know:
+
+- **One base, three candidates.** Candidate B (`owner/phase34-consolidation`,
+  `3ca8e5f`) is the owner-approved Phase 3+4 reconciliation on `main` (PR #41 and
+  #42 merged); Candidate A (`cand/A`, `d570e89`) is the same work plus the
+  Phase 3 engineering branch (`engineering/performance-evolution`, `ce70f07`);
+  Phase 5 (`phase5/execution-intelligence`, `7859e3a`) adds the durable run-time
+  profiler. This branch is the **union**: B, everything A and Phase 5 carry that
+  B did not, and the parallel consolidation that was merged into `main` as PR
+  #45 (`consolidate/final`, `4282489`) — the OpenHands inventory tool, the
+  registered migration-correction recovery, the pause-honesty UI and the
+  `docs/performance/baseline_db.json` benchmark sample.
+- **The terminal-output design is B's, kept whole.** One canonical module,
+  `orchestration/terminal_output.py`: the conversation-scoped trajectory
+  transport (never the global unscoped `/api/file/download`), with the
+  decompressed-member (ZIP-bomb) bound and the `..`-member skip, **and** PR #42's
+  source verification (the saved file name recomputed from the event; a member
+  whose name is not it is refused). The task-scoped helpers, the HTTP routes, the
+  CLI (`run outputs`/`run output`) and the MCP tools all reach this one module.
+  The separate `orchestration/nexus_outputs.py` (A and Phase 5) is **not** in the
+  canonical branch: it duplicated the same feature on task-level routes.
+- **The run-level (PR #42) terminal-output routes are kept too** —
+  `GET …/runs/{run}/terminal-outputs[/{cid}/{event_id}[/download]]` — because the
+  studio's run card and the CLI/MCP already drive the task-level pair; both reach
+  `terminal_output.py`'s primitives.
+- **The connection pool is kept** (`psycopg_pool`, `NEXUS_DB_POOL_MIN/MAX`), and
+  PR #41's `test_connection_concurrency.py` keeps the pool's real invariants
+  (`pool_stats()`: size ≤ pool_max, idle == size, no caller queued), not the old
+  single-connection model. `_conn`/`_lock` are not restored.
+- **The Phase 5 profiler is integrated, not copied.** Migration
+  `0040_run_profiler.sql`, `orchestration/nexus_profiler.py`,
+  `LabStore.record_run_milestone`/`run_profile`, the milestone stamps in
+  `nexus_lab.py`, the run-detail `profile` (with `idle_ratio`), the studio
+  time-profile section, `tests/test_run_profiler.py`, the run-detail case in
+  `tests/test_lab_http.py` and `docs/RUN-PROFILER.md`. `REQUIRED_COLUMNS` in
+  `cloud_store.py` names the milestone columns.
+- **A test-isolation defect was found and fixed.** Two parallel pytest processes
+  on one cluster both run the cluster-global Supabase-role case and one failed
+  with `UniqueViolation` on `pg_authid_rolname_index`. `test_schema_bootstrap.py`
+  now takes a `pg_advisory_lock` on the shared `postgres` maintenance database
+  (a lock on the per-process test database would not collide) around that case.
+- **The engineering branch's docs and the `file_lab` batch insert** are in the
+  canonical branch (B omitted them): `docs/architecture/` (19 files),
+  `docs/performance/` (12 more), and `file_lab.py`'s `executemany` workspace-file
+  insert.
+- **Verified on the canonical branch** (PostgreSQL 17, per-process isolated DB):
+  `ruff check .` clean; `node tests/studio_render_test.js` passed;
+  `pytest tests/` (browser E2E excluded) **1914 passed, 9 skipped, 0 failed**;
+  browser E2E **37 passed, 0 skipped**; a fresh database applies all 41
+  migrations; two parallel `test_schema_bootstrap.py` runs both pass. Skips are
+  environmental only (Android SDK, mingw-w64, pooler DSN, live-OpenHands section).

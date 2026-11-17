@@ -16,3 +16,4 @@ dist/
 nexus-*.apk
 *.exe
 *.o
+nohup.out

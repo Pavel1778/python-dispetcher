@@ -48,6 +48,12 @@ def _backend_count(store: PostgresStore) -> int:
     Counts every connection to the test database except the one this query
     itself runs on, using a short-lived admin connection so the count is not
     polluted by the probe.
+
+    This is a **whole-database** count: it also sees connections that are not
+    this store's (another store in the same session, or a previous store whose
+    ``psycopg_pool.close()`` is still settling). It is therefore not the right
+    measure for "did this store leave a connection open" - see
+    :func:`_backend_alive`, which asks about one specific backend.
     """
     import psycopg
 
@@ -58,6 +64,21 @@ def _backend_count(store: PostgresStore) -> int:
                 "WHERE datname = current_database() AND pid <> pg_backend_pid()"
             )
             return cur.fetchone()[0]
+
+
+def _backend_alive(pid: int) -> bool:
+    """Whether a specific server-side backend is still open.
+
+    A precise, attributable check: it asks about one pid, so a peer store's
+    connection (or a previous store whose asynchronous ``close()`` is still
+    settling) cannot make it wrong. A backend that has gone is a fact.
+    """
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        with admin.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,))
+            return cur.fetchone()[0] > 0
 
 
 @pytest.fixture
@@ -209,10 +230,15 @@ def test_shutdown_during_an_active_operation_closes_every_connection(store):
     """
     started = threading.Event()
     outcome: dict[str, object] = {}
+    pids: dict[str, int] = {}
 
     def slow_caller():
         try:
             with store._tx() as cur:
+                # The backend this in-flight operation is using: the one that
+                # ``close()`` must not leave open.
+                cur.execute("SELECT pg_backend_pid() AS pid")
+                pids["inflight"] = cur.fetchone()["pid"]
                 started.set()
                 time.sleep(0.3)
                 cur.execute("SELECT 1 AS one")
@@ -243,4 +269,17 @@ def test_shutdown_during_an_active_operation_closes_every_connection(store):
     assert close_errors == [], close_errors
     assert "error" not in outcome, outcome.get("error")
     assert outcome.get("row") == {"one": 1}
-    assert _backend_count(store) == 0, "close() left a pooled connection open"
+    # ``close()`` must leave no pooled backend open. The pool itself is closed,
+    # and the specific backend the in-flight operation was using is gone from
+    # the server. ``psycopg_pool.close()`` is asynchronous, so the server side is
+    # polled briefly to settle; the check is on that one pid, so a peer store's
+    # connection cannot make it wrong (the whole-database count could).
+    assert store._pool.closed, "close() did not close the pool"
+    inflight_pid = pids.get("inflight")
+    assert inflight_pid is not None, "the in-flight operation never ran"
+    for _ in range(40):
+        if not _backend_alive(inflight_pid):
+            break
+        time.sleep(0.05)
+    assert not _backend_alive(inflight_pid), (
+        f"close() left the pooled connection (backend {inflight_pid}) open")

@@ -46,9 +46,23 @@ TABLES = (
 )
 
 
+def _maintenance_dsn() -> str:
+    """The DSN of the ``postgres`` maintenance database on the same server.
+
+    Used as the rendezvous for a cluster-wide advisory lock: ``pg_advisory_lock``
+    is scoped to one database, so a lock that must serialise processes on
+    *different* test databases has to be taken where they all meet. The
+    maintenance database is the one every connection can reach.
+    """
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(DSN)
+    params["dbname"] = "postgres"
+    return make_conninfo(**params)
+
+
 def _drop_schema() -> None:
     import psycopg
-
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -290,6 +304,37 @@ def test_every_migration_applies_when_the_supabase_roles_exist() -> None:
     import psycopg
 
     _drop_schema()
+    # The Supabase roles are **cluster-global**, not per database: two pytest
+    # processes that both create and drop them race, and one drops a role the
+    # other is still using. A PostgreSQL advisory lock serialises this section.
+    #
+    # It must be taken on a database both processes share. ``pg_advisory_lock``
+    # is **per database** - the lock is keyed by (database oid, key), so the
+    # same constant taken on two different databases does not collide. With
+    # per-process test databases (``tests/conftest._isolate_database``) each
+    # process runs on its own database, so a lock taken on the session's own DSN
+    # would not serialise anything: two processes raced and one failed with
+    # ``duplicate key value violates unique constraint pg_authid_rolname_index``
+    # on ``CREATE ROLE "anon"``. The lock is therefore taken on the ``postgres``
+    # maintenance database, which every process shares. The ``database`` clause
+    # of the lock key is the maintenance database's oid, so it is a real
+    # cluster-wide rendezvous.
+    lock_key = 0x4E45585553  # "NEXUS" as an integer
+    with psycopg.connect(_maintenance_dsn(), autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+            try:
+                _run_supabase_role_case(psycopg)
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+
+def _run_supabase_role_case(psycopg) -> None:
+    """Create the two roles, apply every migration, drop them again.
+
+    Runs under the advisory lock taken by the caller, so the cluster-global
+    roles are not created or dropped while another process needs them.
+    """
     # Create the roles only if they do not already exist, and only for the
     # duration of this test. A database user without CREATEROLE cannot do it;
     # that is not the code under test, so the case is skipped, not failed.
