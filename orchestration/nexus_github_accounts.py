@@ -183,6 +183,18 @@ class GitHubAccountService:
         token = self._decrypt(principal, account_id)
         return self._client(token)
 
+    def resolve_token(self, principal: str, account_id: str) -> str:
+        """The decrypted PAT for one account, for the one caller that needs a
+        value: handing a Git credential to a task's sandbox.
+
+        Every other read returns a token-free view or a client. This returns the
+        secret itself, so a caller must not log, return or store it - the
+        executor passes it straight into the sandbox's ``secrets`` (where the
+        agent-server masks it in the agent's output). Raises for a missing or
+        inactive account, exactly as :meth:`_decrypt` does.
+        """
+        return self._decrypt(principal, account_id)
+
     def _decrypt(self, principal: str, account_id: str) -> str:
         with self.store._tx() as cur:
             cur.execute("SELECT token_encrypted, state FROM nexus_github_accounts "

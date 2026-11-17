@@ -242,6 +242,12 @@ class OpenHandsExecutor:
         #: it, the process-wide ``client`` is used, exactly as before.
         self.router = router
         self._client_factory = client_factory
+        #: ``git_secrets_for(task)``: the sandbox ``secrets`` that let the agent
+        #: push (a resolved GitHub token). ``None`` (the default) means no
+        #: credential is handed over, exactly as before - a task that must push
+        #: then ends ``completed_unverified`` honestly. Set only where a
+        #: credential can be resolved (``git_credential_for``).
+        self.git_secrets_for: Callable[[dict], dict[str, Any] | None] | None = None
         #: Called with the task and a record of the start as soon as the
         #: service has accepted it and before its conversation exists. The
         #: scheduler keeps the record on the task (``LabStore.record_start``),
@@ -535,6 +541,20 @@ class OpenHandsExecutor:
         extra: dict[str, Any] = {}
         if delivery is not None and delivery.files:
             extra["files"] = delivery.files
+        # The Git credential, when one can be resolved: without it a task that
+        # must push is refused by the sandbox and can never verify. The transport
+        # shape is its own (``git_secret``); a transport that does not support it
+        # is left exactly as it was.
+        secrets = None
+        if self.git_secrets_for is not None and getattr(
+                client, "supports_git_secrets", False):
+            try:
+                secrets = self.git_secrets_for(task)
+            except Exception as e:  # noqa: BLE001 - a missing credential is not a start failure
+                log.warning("could not resolve a git credential: %s", type(e).__name__)
+                secrets = None
+        if secrets:
+            extra["secrets"] = secrets
         previous = _last_account(task)
         kind = ("handoff" if self.router is not None and previous
                 and previous != str(account_id or "") else "start")
@@ -889,6 +909,56 @@ def project_github(store: PostgresStore, fallback: GitHubClient, *,
         return service.client_for_account(principal, account_id)
 
     return client_for
+
+
+def git_credential_for(store: PostgresStore, *,
+                       accounts: GitHubAccountService | None = None,
+                       fallback_token: str | None = None
+                       ) -> Callable[[dict], dict[str, Any] | None]:
+    """``git_secrets_for(task)``: the sandbox ``secrets`` that let an agent push.
+
+    A task that must push to GitHub cannot: the sandbox has no credential, so
+    its ``git push`` is refused and the task can never verify. This resolves the
+    credential to hand the sandbox, using the **same identity** the task's
+    repository is read with (``project_github``): the GitHub account of the
+    project's link for that repository, else the project's account, else the
+    server's own token (``fallback_token``).
+
+    The value is never returned to a caller that logs or stores it: the executor
+    passes it straight into the agent-server's ``secrets`` (``StaticSecret``),
+    where the server injects it into the agent's environment and masks it in the
+    agent's output. A task with no repository, or with no credential resolvable,
+    gets ``None`` - the task runs exactly as before and the verifier reports
+    ``completed_unverified`` honestly.
+
+    Returns ``None`` (no credential) rather than raising when the account cannot
+    be resolved: a missing credential is not a dispatch failure.
+    """
+    service = accounts or GitHubAccountService(store)
+    links = ProjectRepositoryService(store)
+
+    def secrets_for(task: dict) -> dict[str, Any] | None:
+        repository = task.get("repository") or ""
+        if not repository:
+            return None
+        token = ""
+        try:
+            principal, account_id = links.account_for_repository(
+                str(task["project_id"]), repository)
+            if account_id is not None and principal is not None:
+                token = service.resolve_token(principal, account_id)
+        except (NotFound, SecretsError, ValueError) as e:
+            # A revoked or undecryptable account is not a reason to run with a
+            # different identity; the task simply runs with no credential.
+            log.warning("no git credential for %s: %s", repository, type(e).__name__)
+            return None
+        if not token:
+            token = (fallback_token or "").strip()
+        if not token:
+            return None
+        return {"GITHUB_TOKEN": {"kind": "StaticSecret", "value": token}}
+
+    return secrets_for
 
 
 class GitVerifier:
