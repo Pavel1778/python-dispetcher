@@ -3212,6 +3212,13 @@ class Handler(BaseHTTPRequestHandler):
             # linked repository is primary in effect). This is what makes the
             # "primary repository" real instead of a label.
             repository = self.app.project_repos.primary_repository(project_id) or ""
+        if not branch:
+            # No branch named: use the project's bound branch, exactly as the
+            # repository falls back to the primary one. A run that ignored the
+            # binding would dispatch to the bound branch (the instructions name
+            # it) but have the verifier read the default branch - a false
+            # "the branch did not move" for work that landed correctly.
+            branch = self.app.project_repos.primary_branch(project_id, repository)
         if repository and not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
             self._json(400, {"error": "repository must be owner/name"})
             return

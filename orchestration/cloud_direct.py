@@ -343,7 +343,7 @@ class CloudDirectClient:
         title: str | None = None,
         parent_conversation_id: str | None = None,
         tags: dict[str, str] | None = None,
-        secrets: dict[str, str] | None = None,
+        secrets: dict[str, Any] | None = None,
         client_tools: list[dict[str, Any]] | None = None,
         agent_profile_id: str | None = None,
         agent_type: str | None = None,
@@ -464,6 +464,23 @@ class CloudDirectClient:
     #: The direct transport has no native repository-selection field on the
     #: agent-server create call. Callers (and the UI diagnostics) read this.
     supports_repository_selection = False
+
+    #: The agent-server's ``StartConversationRequest.secrets`` is a mapping of
+    #: name -> ``StaticSecret`` (``{"kind": "StaticSecret", "value": ...}``), and
+    #: the server masks the value in the agent's own output. That is how a task
+    #: can be given a Git credential (a private clone, a push) without the value
+    #: reaching the transcript.
+    supports_git_secrets = True
+
+    @staticmethod
+    def git_secret(token: str) -> dict[str, Any]:
+        """The ``secrets`` payload that gives the agent a GitHub token.
+
+        The name is the conventional one the agent's ``git`` already looks for
+        when the repository's clone URL is rewritten; the value is a
+        ``StaticSecret`` so the agent-server injects it and masks it.
+        """
+        return {"GITHUB_TOKEN": {"kind": "StaticSecret", "value": token}}
 
     @property
     def base_url(self) -> str:

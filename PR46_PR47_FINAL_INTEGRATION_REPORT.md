@@ -1,3 +1,22 @@
+> **SUPERSEDED — HISTORICAL DELIVERY RECORD (preserved verbatim).**
+>
+> This report was written by the original 2026-11-16 integration session on
+> `arena/71f72168-python-dispetcher`. The commits it names — `ec0d553`,
+> `2fbdcad`, `e2c7575`, `ce21e47`, `baa3251` — **do not exist**: the sandbox
+> was re-created as a shallow clone of `main`, and those objects are absent
+> locally and on GitHub (HTTP 422, checked 2026-11-17T09:55Z). The evidence
+> paths it cites (`/home/user/pytest_integration_final.log`,
+> `/tmp/stress_rep_*.log`, `PR46_PR47_COMPATIBILITY_REVIEW.md`) were destroyed
+> with that sandbox or never committed; the environment it ran against no
+> longer exists.
+>
+> **Do NOT read this document as evidence for the current tree.** The verified
+> state of the integration on this branch — fresh commands, fresh environment,
+> fresh logs — is in `reports/INTEGRATION_RECOVERY_EVIDENCE.md` and the verdict
+> in `NEXUS_INTEGRATION_RECOVERY_FINAL_REPORT.md` (branch
+> `recovery/nexus-integration-revalidated`). The body below is otherwise
+> byte-identical to the delivered file (SHA-256 `425a48e6cf8bbbecb7a33e376afe4ce8fbf490f0434f28cf4a44404b08628bc4`).
+
 # PR #46 → PR #47 Integration — Final Report
 
 **Date:** 2026-11-16

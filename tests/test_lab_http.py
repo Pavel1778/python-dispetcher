@@ -221,6 +221,41 @@ def test_full_autonomous_loop_completes_over_http(harness):
     assert "task_completed_verified" in kinds
 
 
+def test_a_run_without_a_named_branch_uses_the_projects_bound_branch(harness):
+    """The regression: a run started with no branch must not fall back to the
+    default branch.
+
+    The project is bound to ``dev``. A run that named no branch used to store an
+    empty branch on its tasks, so the executor's instructions named the default
+    branch and the verifier read the default branch - reporting "the branch did
+    not move" for work that had landed correctly on ``dev``. The bound branch is
+    now the one the run's tasks carry.
+    """
+    pid = _project(harness)
+    _connect(harness, pid, branch="dev")
+    gid = _goal(harness, pid)
+    _, payload = request(harness["base"], f"/api/v1/projects/{pid}/goals/{gid}/run",
+                         "POST", {}, session=harness["alice"])
+    run_id = payload["run"]["id"]
+    _, detail = request(harness["base"], f"/api/v1/projects/{pid}/runs/{run_id}",
+                        session=harness["alice"])
+    assert detail["tasks"], "the run has tasks"
+    assert {t["branch"] for t in detail["tasks"]} == {"dev"}, detail["tasks"]
+
+
+def test_a_named_branch_still_wins_over_the_binding(harness):
+    """An explicit branch in the request is honoured, not overridden."""
+    pid = _project(harness)
+    _connect(harness, pid, branch="dev")
+    gid = _goal(harness, pid)
+    _, payload = request(harness["base"], f"/api/v1/projects/{pid}/goals/{gid}/run",
+                         "POST", {"branch": "main"}, session=harness["alice"])
+    run_id = payload["run"]["id"]
+    _, detail = request(harness["base"], f"/api/v1/projects/{pid}/runs/{run_id}",
+                        session=harness["alice"])
+    assert {t["branch"] for t in detail["tasks"]} == {"main"}
+
+
 def test_the_run_detail_carries_a_time_profile(harness):
     """A run's detail includes where its wall-clock time went.
 
