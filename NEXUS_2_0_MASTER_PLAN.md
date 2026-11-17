@@ -108,7 +108,9 @@ the task-kind derivation (language-sensitive), and the SQL claim transaction
 
 Benchmark, real numbers on this machine (`benchmarks/rust_vs_python.json`):
 Python 4.88 s vs Rust 1.27 s over 20 000 cases including one process start
-(~3.8×) - **on the migrated decisions only**, no product-level claim.
+(~3.8–4.2× across runs) - **on the migrated decisions only**, no product-level
+claim. Rust is not in the production execution path; Python remains
+authoritative.
 
 ## 6. Phase 5 — UX and distribution
 

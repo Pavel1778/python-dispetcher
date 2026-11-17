@@ -621,10 +621,11 @@ class PostgresStore:
         table is returned as ``table(column)`` so the name that matters is
         visible. This method only reads; it never alters the schema.
         """
-        required = (
-            "workflows", "tasks", "conversations", "repositories",
-            "task_events", "sr_tool_calls", "sessions", "login_attempts",
-        )
+        # Every table the column map names, not a hand-kept subset: the eight
+        # legacy tables were once the whole set, and the NEXUS tables added to
+        # the map later (the profiler columns of migration 0040 among them) went
+        # unchecked. The map is exactly the columns the code reads.
+        required = tuple(self.REQUIRED_COLUMNS)
         with self._tx() as cur:
             cur.execute(
                 "SELECT table_name, column_name FROM information_schema.columns "

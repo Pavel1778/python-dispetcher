@@ -22,7 +22,7 @@ VERIFIED** (not run).
 | Rust workspace (`cargo test`) | **29 passed, 0 failed** |
 | Python/Rust parity | **9 passed** |
 | Project isolation | **8 passed** |
-| Live OpenHands diagnostics | **16 VERIFIED, 0 FAILED, 0 BLOCKED, 1 UNVERIFIED** |
+| Live OpenHands diagnostics | **17 VERIFIED, 0 FAILED, 0 BLOCKED, 1 UNVERIFIED** (one run; the live count is non-deterministic — see section 9) |
 | Live autonomous run through NEXUS → OpenHands | **VERIFIED** (dispatched, agent worked, honest verdict) |
 
 The Python breakdown: 1991 + 37 = 2028. The 9 skips are environmental and are
@@ -65,8 +65,10 @@ exhaustive where it can be:
 
 Benchmark, real, this machine, 20 000 cases, best of 5
 (`benchmarks/rust_vs_python.json`): Python 4.88 s vs Rust 1.27 s including one
-process start (~3.8×) — **on the migrated decisions only**. No product-level
-speedup is claimed.
+process start (~3.8–4.2× across runs; a fresh run on this candidate measured
+4.0×) — **on the migrated decisions only**. Rust is **not in the production
+execution path**: it is invoked only by the parity test and this benchmark, and
+**Python remains authoritative**. No product-level speedup is claimed.
 
 **Honest limitation:** the SQL claim transaction, the intent router and the
 task-kind derivation are **not** migrated. They are named in
@@ -107,6 +109,18 @@ OpenHands Cloud with a stored account (`transport=direct`,
 
 `lab_worker` is UNVERIFIED **correctly**: no worker is live and no active run
 needs one. It is not a pass and not a failure — it is "not run".
+
+**The live count is non-deterministic (measured 2026-11-17).** Re-running the
+same probe on the same candidate gave **17 VERIFIED / 1 UNVERIFIED** on one run
+and **16 VERIFIED / 1 FAILED / 1 UNVERIFIED** on the next. The variable check is
+`workspace_rw`, which uploads a file to the sandbox and reads it back; the
+OpenHands sandbox file-upload endpoint intermittently answers **`502`**
+(`DeliveryError: the files could not be placed in the sandbox: … upload -> 502`).
+That is an external service condition, not a NEXUS defect: the same code path
+passes on the next run, and the fifteen other checks are stable. The report
+therefore states **17** as one observed run and does **not** claim the live probe
+is a fixed number. A red `workspace_rw` is a sandbox-upload failure to retry, not
+a regression in NEXUS.
 
 The documented trap was reproduced and then worked around as the repository
 predicts: **without** `OPENHANDS_DEFAULT_MODEL` the same probe ends `error`

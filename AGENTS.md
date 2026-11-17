@@ -2872,9 +2872,13 @@ change must know:
 
 ### Live acceptance (real, this session)
 
-- Live OpenHands diagnostics: **16 VERIFIED / 0 FAILED / 0 BLOCKED / 1
-  UNVERIFIED** with a stored account (`direct`, `openhands/deepseek-v4.1-flash`).
-  The one UNVERIFIED is `lab_worker` (no worker live, no active run) - correct.
+- Live OpenHands diagnostics: **17 VERIFIED / 0 FAILED / 0 BLOCKED / 1
+  UNVERIFIED** on one run, with a stored account (`direct`,
+  `openhands/deepseek-v4.1-flash`). The one UNVERIFIED is `lab_worker` (no worker
+  live, no active run) - correct. **The live count is not fixed:** a re-run on
+  the same candidate gave 16 VERIFIED / 1 FAILED (`workspace_rw`), because the
+  OpenHands sandbox file-upload endpoint intermittently answers 502. A red
+  `workspace_rw` is a sandbox-upload failure to retry, not a NEXUS regression.
 - The documented trap reproduced live: **without** `OPENHANDS_DEFAULT_MODEL` the
   probe ends `error` (LLM auth); with the model above it is green.
 - A real autonomous run through NEXUS to live OpenHands dispatched, the agent
@@ -2896,3 +2900,23 @@ isolation **8 passed**. The 9 skips: 4 Android SDK, 3 mingw-w64, 1 pooler DSN,
 `NEXUS_2_0_ARCHITECTURE.md`, `NEXUS_2_0_FINAL_ACCEPTANCE_REPORT.md`,
 `docs/RUST_MIGRATION.md`, `docs/RUST_PYTHON_COMPATIBILITY.md`,
 `docs/SECURITY_MODEL.md`, `docs/RELEASE_GUIDE.md`, `docs/COMPLETION_LEDGER.md`.
+
+### The schema guard was checking eight tables, not all of them (2026-11-17)
+
+`PostgresStore.verify_schema()` iterated a **hardcoded eight-table tuple**
+(`workflows`, `tasks`, `conversations`, `repositories`, `task_events`,
+`sr_tool_calls`, `sessions`, `login_attempts`) and only then consulted
+`REQUIRED_COLUMNS` for those tables. Every table added to the map later - the
+whole `nexus_*` family, `nexus_runs` among them - was **never checked**: dropping
+`nexus_runs.completed_at`, or the entire `nexus_runs` table, produced
+`verify_schema() == []`. The union's "profiler schema guard" repair had added the
+eleven columns to the map, but the map was not being consulted for that table, so
+the repair was **inert**. Fixed by iterating `tuple(self.REQUIRED_COLUMNS)` - the
+map is exactly the columns the code reads - so all 32 tables are now guarded.
+Regression tests: `tests/test_run_profiler.py::
+test_the_eleven_profiler_columns_are_required_for_nexus_runs` and
+`::test_a_schema_missing_any_profiler_column_fails_validation` (drops each of the
+eleven in turn, asserts it is named). Both fail if a column is removed from the
+map **or** if the guard reverts to the eight-table tuple. Do not narrow the
+guard back to a hand-kept subset: a table the map names but the loop skips is a
+schema contract that is not enforced.

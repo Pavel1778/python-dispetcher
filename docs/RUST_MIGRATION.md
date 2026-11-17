@@ -145,14 +145,15 @@ implementations on identical inputs, on one machine. Real numbers, best of five,
 |---|---|
 | Python, validate + hash + retry (in-process) | 4.88 s |
 | Rust, all three, one process for the whole batch | 1.27 s |
-| **Ratio** | **~3.8×** |
+| **Ratio** | **~3.8–4.2×** (varies run to run; a fresh run on the 2.0 candidate measured 4.0×) |
 
 What this shows: for the pure decisions, Rust is materially faster even when the
 figure **includes one process start** for the whole batch. What it does **not**
 show: any end-to-end product speedup. The slow paths of NEXUS are network-bound
 (a provider, OpenHands, GitHub) and database-bound; a faster plan hash does not
-move them. The requirement says *"Do not fabricate performance improvements"* -
-so this document claims a ~3.8× improvement **on the migrated decisions only**,
+move them. Rust is **not in the production execution path** — it is invoked only
+by the parity test and this benchmark, and **Python remains authoritative** — so
+this document claims a ~3.8–4.2× improvement **on the migrated decisions only**,
 and nothing about the product.
 
 ## 7. How to build and test
