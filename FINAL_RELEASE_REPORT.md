@@ -2,8 +2,8 @@
 
 **Date:** 2026-11-16
 **Repository:** `Pavel1778/python-dispetcher`
-**Base `main` SHA:** `42824896e388c97e218a8915cab56a8498a28473`
-**This session's branch:** `fix/approval-notification` (5 commits, see §14)
+**Base `main` SHA:** `25bd484d80a7292ed7211a203bb91190d23816f2` (PR #48 merged)
+**This session's branch:** `release/acceptance` (5 commits, see §14)
 **Verdict:** **RELEASE CANDIDATE READY WITH EXTERNAL BLOCKERS**
 
 NEXUS is a working autonomous AI Development Lab. It starts reliably, applies
@@ -15,6 +15,15 @@ OpenHands Cloud in this session (§9).
 Two acceptance items need credentials this environment does not have (a second
 live OpenHands account; a live account with a GitHub provider token). They are
 named, not faked (§12).
+
+> **Session 2026-11-16 (release/acceptance).** This pass drove a **full
+> autonomous run against live OpenHands** and found and fixed two real defects
+> that had blocked live execution: the sandbox was given no Git credential (so
+> no push could succeed), and a run started without a named branch ignored the
+> project's bound branch (a false "the branch did not move", and a real risk of
+> pushing to the default branch). It also added a real Self-QA engine and a user
+> guide. The new sections are §16 (this session's live acceptance) and §17 (the
+> incident and its clean-up); §14 lists the new commits.
 
 ---
 
@@ -170,3 +179,46 @@ Neither is faked anywhere in this repository.
 The product is usable today: it starts, plans, dispatches to live OpenHands,
 verifies, reports and notifies. The two blocked items require credentials this
 environment does not have and are documented with exact acceptance steps.
+
+---
+
+## 16. Live acceptance (2026-11-16, release/acceptance)
+
+A **full autonomous run through NEXUS against the live OpenHands Cloud**:
+
+1. A project was created and bound to a real GitHub repository and a **non-default
+   branch** (`nexus-live-acceptance`).
+2. A goal was submitted in plain language; the run **planned** it into a
+   **two-task DAG**.
+3. Each task was dispatched to a **live OpenHands conversation** on a real
+   sandbox.
+4. The agent **cloned** the repository, made the change, **committed and pushed**
+   to the bound branch (verified on GitHub: `main` untouched, the branch moved).
+5. NEXUS **verified** both tasks — the branch head was the commit the agent
+   named — recording **`completed_verified`**.
+6. The run reached **`completed`** and a **report** was written (`outcome:
+   success`) and a `run_report` notification raised. Task/run notifications
+   (`task_started`, `task_completed_verified`, `task_retry`, `goal_completed`)
+   were persisted.
+
+**Persistence / restart drill** (real HTTP, no SQL): a project, a conversation
+and a goal were created, the server was stopped **gracefully** and then
+**SIGKILLed**, and each restart preserved all three; the store reconnected and a
+new write succeeded after the kill.
+
+**Self-QA**: `nexus qa run --repo . --commit HEAD` → `passed` (real `ruff` and
+`pytest` in an isolated clone).
+
+**Studio**: Chromium E2E **37/37** (phone 390×844 touch, tablet, desktop,
+keyboard-up, project switching, chat, run monitoring, notifications).
+
+## 17. Incident and clean-up
+
+Before the branch fix (§3), a live run pushed a one-line file
+(`NEXUS_ACCEPTANCE.md`) to **`main`** (commit `198d5e22`, parent `25bd484`)
+instead of the bound branch, because the run's task branch was empty and the
+agent was told the default branch. The file is **removed with a normal forward
+commit** on this branch; **no history was rewritten**. After the fix, a re-run
+pushed to the bound branch and `main` was verified unchanged. The cause is fixed
+and covered by two regression tests.
+

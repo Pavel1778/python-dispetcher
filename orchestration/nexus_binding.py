@@ -397,6 +397,32 @@ class ProjectRepositoryService:
             rows = cur.fetchall()
             return rows[0]["full_name"] if len(rows) == 1 else None
 
+    def primary_branch(self, project_id: str, repository: str = "") -> str:
+        """The branch a task that names none runs on.
+
+        The project's own ``selected_branch`` (what the studio's "connect
+        repository" set), else the working branch of the primary link for
+        *repository*, else empty (the repository's default). Returning the bound
+        branch matters: a run started with no branch must not silently check the
+        default branch instead, or a task that pushed to the bound branch is
+        read as "the branch did not move" - a false negative.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT selected_branch FROM nexus_projects WHERE id=%s",
+                        (project_id,))
+            row = cur.fetchone()
+            if row is not None and row["selected_branch"]:
+                return str(row["selected_branch"])
+            if repository:
+                cur.execute(
+                    "SELECT pr.branch FROM nexus_project_repositories pr "
+                    "JOIN repositories r ON r.id = pr.repository_id "
+                    "WHERE pr.project_id=%s AND r.full_name=%s", (project_id, repository))
+                link = cur.fetchone()
+                if link is not None and link["branch"]:
+                    return str(link["branch"])
+        return ""
+
     def account_for_repository(self, project_id: str, repository_full_name: str
                                ) -> tuple[str | None, str | None]:
         """The ``(principal, account_id)`` that reads a repository of a project,

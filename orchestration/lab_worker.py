@@ -35,7 +35,9 @@ from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
 from .github_client import GitHubClient
 from .nexus_github_accounts import GitHubAccountService
-from .nexus_lab import GitVerifier, LabScheduler, OpenHandsExecutor, project_github
+from .nexus_lab import (
+    GitVerifier, LabScheduler, OpenHandsExecutor, git_credential_for, project_github,
+)
 from .nexus_lab_store import ACTIVE_RUN_STATES, LabStore
 from .nexus_policy import install_log_redaction
 from .nexus_reports import ReportService
@@ -128,6 +130,15 @@ class LabWorker:
         # the studio reads it; the server token only where no account is bound.
         self.verifier = GitVerifier(self.github, client_for=project_github(
             store, self.github, accounts=github_accounts))
+        # A task that must push needs a Git credential in its sandbox; without
+        # one the push is refused and the task can never verify. The credential
+        # is resolved from the same identity the repository is read with, and
+        # handed over only to a transport that supports it (the direct one).
+        # A deployment with no GitHub credential at all keeps the old behaviour:
+        # the task runs and ends ``completed_unverified`` honestly.
+        self.executor.git_secrets_for = git_credential_for(
+            store, accounts=github_accounts,
+            fallback_token=(os.environ.get("GITHUB_TOKEN") or ""))
         self.worker_id = worker_id
         self.poll_interval = poll_interval
         self.lease_seconds = lease_seconds

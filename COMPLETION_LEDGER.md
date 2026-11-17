@@ -127,8 +127,8 @@ Last updated: 2026-11-16.
 | Item | Status |
 |---|---|
 | Two-live-account failover | BLOCKED — EXTERNAL DEPENDENCY (one key) |
-| Section F live development task on the live service | BLOCKED — needs a live sandbox + GitHub provider token on the account |
-| MCP **client** (NEXUS → external MCP servers) | NOT IMPLEMENTED (design only; the MCP **server** is implemented) |
-| Self-QA engine | NOT IMPLEMENTED (design only) |
+| Section F live development task on the live service | **VERIFIED (2026-11-16)** — a full autonomous run reached `completed` with both tasks `completed_verified` against live OpenHands (see `FINAL_RELEASE_REPORT.md` §16) |
+| MCP **client** (NEXUS → external MCP servers) | NOT IMPLEMENTED — and **not needed** by any current flow (NEXUS is the MCP server; a conversation's MCP servers are reached by the agent-server, not NEXUS) |
+| Self-QA engine | **IMPLEMENTED (deterministic)** — `orchestration/nexus_selfqa.py`, `nexus qa run`; not yet an automatic run gate, and does not judge intent |
 | Studio screens for File Lab / evidence / allowlist / accounts | IMPLEMENTED — NOT LIVE VERIFIED (routes exist; no screen) |
 | PDF/DOCX/XLSX/PPTX inline preview | NOT IMPLEMENTED (offered as download; UI says so) |
