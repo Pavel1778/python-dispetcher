@@ -2820,3 +2820,78 @@ What a future change has to know:
   browser E2E **37 passed, 0 skipped**; a fresh database applies all 41
   migrations; two parallel `test_schema_bootstrap.py` runs both pass. Skips are
   environmental only (Android SDK, mingw-w64, pooler DSN, live-OpenHands section).
+
+## NEXUS 2.0 program: integration, Rust core, acceptance (2026-11-16, this session)
+
+The program's integration branch is `nexus/2.0-integration` (not merged to
+`main`; merging/tagging/deploying need the owner's authorisation). What a future
+change must know:
+
+### Integration
+
+- The **canonical union** (`canonical/union` @ `c09d888` + C1 fix
+  `canonical/union-c1` @ `c2d24b3`) does **not** exist on `origin`; it lives in a
+  preserved local repository (`/workspace/project/030cf2d0.../python-dispetcher`).
+  It was fetched read-only and merged. Its real content: the C1 shutdown check
+  (`_backend_alive`, one specific backend, not the whole-database count), the
+  `executemany` batch insert in `file_lab`, the cluster-wide advisory lock in
+  `test_schema_bootstrap`, route-auth coverage of the run-level output routes,
+  the faithful `_gone()` helper, `docs/phase4-consolidation-audit.md`, **and the
+  schema-guard repair**: `cloud_store.REQUIRED_COLUMNS["nexus_runs"]` now names
+  the profiler columns migration `0040` adds. The C1 *isolation* half is
+  intentionally excluded (main's conftest imports `tests._test_db` first).
+- **PR #49** (`release/acceptance`) merged cleanly but its branch had **dropped
+  `NEXUS_ACCEPTANCE.md`** (a main-side file) as a merge artifact; it was
+  restored. **PR #47** (`feat/run-restart-duplicate`) conflicted in exactly
+  three places: an import (`IdempotencyConflict`), and `COMPLETION_LEDGER.md` /
+  `FINAL_RELEASE_REPORT.md`, where **both** sides' content was kept.
+- The deadlock fix integrated from PR #47 and the bounded retry from PR #46 are
+  **both** preserved: a bounded retry is not a substitute for the lock order.
+
+### The Rust core (`rust/`)
+
+- Three crates: `nexus-domain` (state machines, DAG validation, plan hash,
+  retry), `nexus-core` (the claim decision), `nexus-cli` (`nexus-rs`, also the
+  parity oracle). Pure: no I/O, no DB, no clock.
+- **Parity is the gate.** `tests/test_rust_parity.py` drives both
+  implementations over the same cases and compares - exhaustively for the
+  transition tables, byte for byte for the plan hash, over real runs in a live
+  lab store for the claim decision. A change to a migrated table on either side
+  that the other does not follow fails it.
+- **`can_transition_task` is strict** (no no-op) because
+  `control_plane.transition` is; the run and workflow machines allow a no-op.
+  This asymmetry is real and the parity test pins it.
+- **Do not migrate the intent router or the task-kind derivation.** They are
+  language-sensitive regexes with a history of subtle production bugs; the Rust
+  validator carries the `kind` it is given and does not derive one. See
+  `docs/RUST_MIGRATION.md` §4.
+- The SQL claim, the HTTP layer and the store stay Python. Rust is a **verified
+  candidate**, not authoritative; the switch procedure is in
+  `docs/RUST_PYTHON_COMPATIBILITY.md` §6 and ends with removing the Python
+  version.
+
+### Live acceptance (real, this session)
+
+- Live OpenHands diagnostics: **16 VERIFIED / 0 FAILED / 0 BLOCKED / 1
+  UNVERIFIED** with a stored account (`direct`, `openhands/deepseek-v4.1-flash`).
+  The one UNVERIFIED is `lab_worker` (no worker live, no active run) - correct.
+- The documented trap reproduced live: **without** `OPENHANDS_DEFAULT_MODEL` the
+  probe ends `error` (LLM auth); with the model above it is green.
+- A real autonomous run through NEXUS to live OpenHands dispatched, the agent
+  worked, and NEXUS recorded **`completed_unverified`** ("no repository bound")
+  and **blocked** the run - a textual result is not proof of work. A live
+  `completed_verified` needs a repository bound to a GitHub account with a token
+  the sandbox can push with; the live account has **no GitHub provider token**.
+- `NEXUS_SECRET_KEY` is required to store an account (the cipher refuses
+  without it). A throwaway key was generated for the acceptance run only; the
+  account was removed afterwards.
+
+### Verification numbers (final, at the report's HEAD)
+
+`ruff check .` clean; Python suite **1974 passed, 9 skipped, 0 failed**; browser
+E2E **37 passed**; Rust `cargo test` **29 passed**; parity **9 passed**;
+isolation **8 passed**. The 9 skips: 4 Android SDK, 3 mingw-w64, 1 pooler DSN,
+1 live-OpenHands section F. Docs: `NEXUS_2_0_MASTER_PLAN.md`,
+`NEXUS_2_0_ARCHITECTURE.md`, `NEXUS_2_0_FINAL_ACCEPTANCE_REPORT.md`,
+`docs/RUST_MIGRATION.md`, `docs/RUST_PYTHON_COMPATIBILITY.md`,
+`docs/SECURITY_MODEL.md`, `docs/RELEASE_GUIDE.md`, `docs/COMPLETION_LEDGER.md`.
