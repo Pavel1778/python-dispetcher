@@ -642,6 +642,26 @@ def cmd_run_hide(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_run_restart(args: argparse.Namespace) -> int:
+    """Re-run a finished run's whole plan as a new run under the same goal."""
+    client = _client(args)
+    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/restart", {})
+    run = result["run"]
+    _emit(args, result, human=f"restarted {args.run_id} -> run {run['id']} ({run['state']})")
+    return EXIT["ok"]
+
+
+def cmd_run_duplicate(args: argparse.Namespace) -> int:
+    """Copy a finished run into a new goal and run."""
+    client = _client(args)
+    body = {"idempotency_key": args.idempotency_key} if args.idempotency_key else {}
+    result = client.post(f"/api/v1/projects/{args.project_id}/runs/{args.run_id}/duplicate", body)
+    run = result["run"]
+    _emit(args, result, human=f"duplicated {args.run_id} -> run {run['id']} "
+                              f"(goal {run.get('goal_id') or result.get('goal_id')})")
+    return EXIT["ok"]
+
+
 def cmd_run_outputs(args: argparse.Namespace) -> int:
     """List the terminal outputs of a task's conversation that the server cut.
 
@@ -916,6 +936,18 @@ def build_parser() -> argparse.ArgumentParser:
     rh.add_argument("run_id")
     rh.add_argument("--project", dest="project_id", required=True)
     rh.set_defaults(func=cmd_run_hide)
+    rr = run.add_parser("restart", parents=[common],
+                        help="re-run a finished run's whole plan as a new run")
+    rr.add_argument("run_id")
+    rr.add_argument("--project", dest="project_id", required=True)
+    rr.set_defaults(func=cmd_run_restart)
+    rd = run.add_parser("duplicate", parents=[common],
+                        help="copy a finished run into a new goal and run")
+    rd.add_argument("run_id")
+    rd.add_argument("--project", dest="project_id", required=True)
+    rd.add_argument("--idempotency-key", dest="idempotency_key", default=None,
+                    help="a retried duplicate with the same key returns the same copy")
+    rd.set_defaults(func=cmd_run_duplicate)
     ro = run.add_parser("outputs", parents=[common],
                         help="list the terminal outputs a task's conversation cut")
     ro.add_argument("run_id")

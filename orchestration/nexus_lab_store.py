@@ -64,8 +64,7 @@ from datetime import timedelta
 from typing import Any
 
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
-
-from .nexus_projects import ProjectService
+from .nexus_projects import IdempotencyConflict, ProjectService
 
 log = logging.getLogger("nexus_lab_store")
 
@@ -588,6 +587,174 @@ class LabStore:
             run = self._run_view(cur.fetchone())
             ProjectService._event(cur, project_id, principal, "run.retry_failed", run_id)
             return {**run, "retried": requeued}
+
+    # ------------------------------------------------------- restart / duplicate
+    @staticmethod
+    def _plan_from_run(cur: Any, run_id: str) -> list[dict[str, Any]]:
+        """The plan of *run_id* as the ``start_run`` plan shape, in plan order.
+
+        One entry per task, carrying everything that describes the work but not
+        what happened to it: the key, title, description, acceptance, the
+        dependencies it declared, its repository/branch, kind and spec_ref. The
+        fresh run starts every task over (attempt 0, pending), so a restart or a
+        copy is a clean re-run, not a replay of the old attempts.
+        """
+        cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s ORDER BY created_at, id",
+                    (run_id,))
+        plan: list[dict[str, Any]] = []
+        for row in cur.fetchall():
+            task = LabStore._task_row(row)
+            plan.append({
+                "id": task["task_key"],
+                "title": task["title"],
+                "description": task.get("description") or "",
+                "acceptance": task.get("acceptance") or [],
+                "dependencies": task.get("dependencies") or [],
+                "repository": task.get("repository") or "",
+                "branch": task.get("branch") or "",
+                "kind": task.get("kind") or "implementation",
+                "spec_ref": task.get("spec_ref"),
+            })
+        return plan
+
+    def _insert_run_with_plan(self, cur: Any, principal: str, project_id: str, goal_id: str,
+                              *, plan: list[dict[str, Any]], source: dict[str, Any],
+                              conversation_id: str | None) -> dict:
+        """Insert a run for *goal_id* and store *plan* in the same transaction.
+
+        Budgets (``max_iterations``, ``max_attempts_per_task``) and the
+        ``policy`` are carried over from *source*; the deadline is fresh from
+        now, so a restarted or copied run gets its own clock. The goal is moved
+        to ``running`` with this run as its active one. Callers have already
+        refused a second active run for the goal (the unique index would refuse
+        it anyway).
+        """
+        cur.execute(
+            "INSERT INTO nexus_runs(project_id, goal_id, max_iterations, "
+            "max_attempts_per_task, deadline_at, created_by, policy, conversation_id, "
+            "queued_at) "
+            "VALUES (%s,%s,%s,%s, now() + %s * interval '1 second', %s, %s, "
+            "  (SELECT id FROM nexus_conversations WHERE id=%s AND project_id=%s), now()) "
+            "RETURNING *",
+            (project_id, goal_id, source["max_iterations"], source["max_attempts_per_task"],
+             DEFAULT_DEADLINE_SECONDS, principal, source["policy"],
+             conversation_id, project_id))
+        run = self._run_view(cur.fetchone())
+        cur.execute("UPDATE nexus_goals SET state='running', active_run_id=%s, updated_at=now() "
+                    "WHERE id=%s", (run["id"], goal_id))
+        for position, task in enumerate(plan):
+            self._insert_task(
+                cur, run["id"], project_id, task_key=task["id"], title=task["title"],
+                description=task.get("description") or "",
+                acceptance=task.get("acceptance") or [],
+                dependencies=task.get("dependencies") or [],
+                repository=task.get("repository") or "",
+                branch=task.get("branch") or "",
+                max_attempts=source["max_attempts_per_task"], position=position,
+                spec_ref=task.get("spec_ref"),
+                kind=task.get("kind") or "implementation")
+        return run
+
+    def restart_run(self, principal: str, project_id: str, run_id: str) -> dict:
+        """Run the same goal again from the beginning, as a new run.
+
+        A run that is over (completed, failed or cancelled) is re-run under its
+        own goal with a fresh plan: every task of the old run is re-created
+        ``pending`` with attempt 0, so the whole plan is carried out again -
+        unlike ``retry_failed``, which keeps the same run row and requeues only
+        the tasks that did not verify. The old run is left untouched as history
+        (its tasks, report and evidence all stay), and the goal is moved back to
+        ``running`` with the new run as its active one.
+
+        Refused when the goal already has an active run: a restart is not a way
+        to run a goal twice at once.
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (run_id, project_id))
+            source = cur.fetchone()
+            if source is None:
+                raise NotFound("run not found")
+            if source["state"] not in TERMINAL_RUN_STATES:
+                raise InvalidTransition(
+                    f"a {source['state']} run is not over; cancel it before restarting")
+            cur.execute("SELECT id FROM nexus_runs WHERE goal_id=%s AND state = ANY(%s)",
+                        (source["goal_id"], list(ACTIVE_RUN_STATES)))
+            if cur.fetchone() is not None:
+                raise InvalidTransition("the goal already has an active run")
+            plan = self._plan_from_run(cur, run_id)
+            if not plan:
+                raise InvalidTransition("the run has no plan to restart")
+            run = self._insert_run_with_plan(
+                cur, principal, project_id, str(source["goal_id"]), plan=plan,
+                source=dict(source), conversation_id=source.get("conversation_id"))
+            ProjectService._event(cur, project_id, principal, "run.restarted", run["id"])
+            self._notify(cur, project_id, "goal_started", "Цель перезапущена", run["id"])
+            return {**run, "restarted_from": run_id}
+
+    def duplicate_run(self, principal: str, project_id: str, run_id: str, *,
+                      key: str | None = None) -> dict:
+        """Copy a finished run into a new goal and run, so it can be run again.
+
+        The plan is copied into a **new goal** (a copy of the original request's
+        text) so the copy is independent of the original: the original keeps its
+        history, and the copy can run on its own. Every task starts over. This
+        is what "duplicate" means here - a run has at most one active run per
+        goal, so a copy under the same goal could not run alongside the original.
+
+        *key* is an optional idempotency key: a retried duplicate with the same
+        key returns the goal and run it already made instead of making another.
+        """
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
+                        (run_id, project_id))
+            source = cur.fetchone()
+            if source is None:
+                raise NotFound("run not found")
+            if source["state"] not in TERMINAL_RUN_STATES:
+                raise InvalidTransition(
+                    f"a {source['state']} run is not over; cancel it before duplicating")
+            cur.execute("SELECT text FROM nexus_goals WHERE id=%s", (source["goal_id"],))
+            goal = cur.fetchone()
+            if goal is None:
+                raise NotFound("goal not found")
+            plan = self._plan_from_run(cur, run_id)
+            if not plan:
+                raise InvalidTransition("the run has no plan to duplicate")
+            text = f"{goal['text']}\n\n(копия прогона)"
+            if len(text) > 20000:
+                text = goal["text"][:1980] + "\n\n(копия прогона)"
+            cur.execute(
+                "INSERT INTO nexus_goals(project_id, text, created_by, idempotency_key) "
+                "VALUES (%s,%s,%s,%s) ON CONFLICT (project_id, idempotency_key) "
+                "DO NOTHING RETURNING id, project_id, text, state, created_by, created_at",
+                (project_id, text, principal, key))
+            new_goal = cur.fetchone()
+            created = new_goal is not None
+            if not created:
+                # A retried duplicate with the same key: reuse the goal it made.
+                cur.execute("SELECT id, project_id, text, state, created_by, created_at "
+                            "FROM nexus_goals WHERE project_id=%s AND idempotency_key=%s",
+                            (project_id, key))
+                new_goal = cur.fetchone()
+                if new_goal is None:  # pragma: no cover - the key must have matched a row
+                    raise IdempotencyConflict("idempotency key already used")
+                cur.execute("SELECT * FROM nexus_runs WHERE goal_id=%s "
+                            "ORDER BY created_at DESC, id LIMIT 1", (new_goal["id"],))
+                existing = cur.fetchone()
+                if existing is not None:
+                    return {**self._run_view(existing), "goal_id": str(new_goal["id"]),
+                            "duplicated_from": run_id, "created": False}
+            run = self._insert_run_with_plan(
+                cur, principal, project_id, str(new_goal["id"]), plan=plan,
+                source=dict(source), conversation_id=None)
+            ProjectService._event(cur, project_id, principal, "goal.created", new_goal["id"])
+            ProjectService._event(cur, project_id, principal, "run.duplicated", run["id"])
+            self._notify(cur, project_id, "goal_started", "Цель запущена", run["id"])
+            return {**run, "goal_id": str(new_goal["id"]),
+                    "duplicated_from": run_id, "created": created}
 
     def delete_run(self, principal: str, project_id: str, run_id: str) -> dict:
         """Remove a finished run from the history. Nothing else is touched.
@@ -1911,7 +2078,13 @@ class LabStore:
         """
         out = []
         with self.store._tx() as cur:
-            cur.execute("SELECT policy FROM nexus_runs WHERE id=%s", (run_id,))
+            # The run row is locked first, in the same order every other site
+            # that locks both takes (``_apply_run_state``, ``claim_task``,
+            # ``postpone_task``). Reading it without ``FOR UPDATE`` and then
+            # locking task rows let a cancel (run, then tasks) and a reclaim
+            # (tasks, then run) take the two in opposite order and deadlock
+            # under load.
+            cur.execute("SELECT policy FROM nexus_runs WHERE id=%s FOR UPDATE", (run_id,))
             run = cur.fetchone()
             durable = bool(run) and run["policy"] == "durable"
             cur.execute(

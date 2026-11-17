@@ -1465,6 +1465,8 @@
     if (!live) {
       var failed = tasks.filter(function (task) { return FAILED_TASK_STATES[task.state]; }).length;
       if (failed) actions += '<button class="btn btn-sm" type="button" data-action="retry-failed" data-id="' + esc(entry.id) + '">' + icon('refresh', 'icon-sm') + 'Повторить неудачные (' + failed + ')</button>';
+      actions += '<button class="btn btn-sm" type="button" data-action="run-restart" data-id="' + esc(entry.id) + '" title="Запустить весь план этого прогона заново, как новый прогон той же цели" aria-label="Перезапустить: выполнить весь план заново">' + icon('play', 'icon-sm') + 'Перезапустить</button>';
+      actions += '<button class="btn btn-sm" type="button" data-action="run-duplicate" data-id="' + esc(entry.id) + '" title="Скопировать план в новую цель и запустить её" aria-label="Дублировать: скопировать в новую цель и запустить">' + icon('copy', 'icon-sm') + 'Дублировать</button>';
       actions += '<button class="btn btn-sm" type="button" data-action="run-state" data-op="hide" data-id="' + esc(entry.id) + '">' + icon('archive', 'icon-sm') + 'Скрыть</button>';
       actions += '<button class="btn btn-sm btn-danger" type="button" data-action="delete-run" data-id="' + esc(entry.id) + '">' + icon('x', 'icon-sm') + 'Удалить из истории</button>';
     }
@@ -3190,6 +3192,23 @@
       workAction(el, api(projectUrl('/runs/' + enc(id) + '/retry-failed'),
                          { method: 'POST', body: {} }),
                  'Неудачные задачи снова в работе.');
+    },
+    // Re-run the whole plan as a new run under the same goal. Every task starts
+    // over; the old run stays as history. No confirmation: nothing is destroyed
+    // and the previous run's record is untouched.
+    'run-restart': function (el) {
+      var id = el.getAttribute('data-id');
+      workAction(el, api(projectUrl('/runs/' + enc(id) + '/restart'),
+                         { method: 'POST', body: {} }),
+                 'Прогон запущен заново: весь план выполняется с начала.');
+    },
+    // Copy the plan into a new goal and run it. The copy is independent of the
+    // original; no confirmation (nothing is destroyed).
+    'run-duplicate': function (el) {
+      var id = el.getAttribute('data-id');
+      workAction(el, api(projectUrl('/runs/' + enc(id) + '/duplicate'),
+                         { method: 'POST', body: {} }),
+                 'Создана копия: новая цель и новый прогон того же плана.');
     },
     'delete-run': function (el) {
       var id = el.getAttribute('data-id');
