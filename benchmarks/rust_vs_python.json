@@ -1,0 +1,24 @@
+{
+  "cases": 20000,
+  "comparison": {
+    "note": "The Rust figure includes one process start for the whole batch; the Python figures are in-process. Both are real wall times on this machine, best of 5.",
+    "python_combined_s": 4.670173470003647,
+    "rust_combined_s": 1.1436934230005136,
+    "speedup": 4.083413768133167
+  },
+  "python": {
+    "hash_per_case_s": 0.0001216558496500511,
+    "hash_s": 2.433116993001022,
+    "retry_per_case_s": 1.4237505001801764e-06,
+    "retry_s": 0.02847501000360353,
+    "validate_per_case_s": 0.00011042907334995107,
+    "validate_s": 2.2085814669990214
+  },
+  "repeat": 5,
+  "rust": {
+    "batch_wall_s": 1.1436934230005136,
+    "per_case_s": 5.718467115002568e-05
+  },
+  "rust_available": true,
+  "rust_bin": "/workspace/nexus-integration/rust/target/release/nexus-rs"
+}

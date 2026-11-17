@@ -1,0 +1,18 @@
+[package]
+name = "nexus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The NEXUS CLI, migrated to Rust: domain and scheduler decisions, and a parity oracle."
+
+[[bin]]
+name = "nexus-rs"
+path = "src/main.rs"
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+nexus-core = { path = "../nexus-core" }
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
