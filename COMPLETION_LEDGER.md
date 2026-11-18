@@ -1,9 +1,9 @@
 # NEXUS — Completion Ledger
 
 Status of every requirement in the "Final Completion Program" against the actual
-repository at `main` (current base `6e5c2b410d531379c3599baa53492c83244551e5`,
-PR #49 release-acceptance merge; before that, PR #46 `6629161`) plus the
-reconstructed integration branch `recovery/nexus-integration-revalidated`.
+repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,
+PR #50 reconstruction-merge; before that, PR #49 `6e5c2b4`, PR #46 `6629161`)
+plus the reconstructed integration that PR #50 carried.
 Legend:
 
 - **VERIFIED** — implemented and proven (test, live run, or both).
@@ -13,7 +13,7 @@ Legend:
 - **NOT IMPLEMENTED** — absent.
 - **FAILED** — present but broken.
 
-Last updated: 2026-11-17 (integration reconstructed and revalidated on this branch).
+Last updated: 2026-11-18 (PR #50 merged into `main` as `c0f49fc`; combined CI green).
 
 ---
 
@@ -23,7 +23,8 @@ Last updated: 2026-11-17 (integration reconstructed and revalidated on this bran
 |---|---|---|
 | `main` = `4282489` (PR #45) | VERIFIED (historical, fix/approval-notification session) | `git log`, `git ls-remote` |
 | `main` = `6629161` (PR #46 merged) | VERIFIED | PR #46 state MERGED 2026-11-16T22:36:31Z |
-| `main` = `6e5c2b4` (PR #49 merged) | VERIFIED | PR #49 state MERGED 2026-11-17T09:24:41Z; base of this branch |
+| `main` = `6e5c2b4` (PR #49 merged) | VERIFIED | PR #49 state MERGED 2026-11-17T09:24:41Z |
+| `main` = `c0f49fc` (PR #50 merged — reconstruction re-delivery) | VERIFIED | PR #50 state MERGED 2026-11-18T16:46:28Z; combined CI `test` pass 31m20s (run 44151435593) |
 | Migrations `0001`–`0040` (41 files, gaps 0012/0013 reserved) | VERIFIED | `ls migrations/` |
 | Full suite on fresh PostgreSQL 17 | VERIFIED (historical, fix/approval-notification session; see `FINAL_RELEASE_REPORT.md` §13 and §18 for the reconstructed tree) | see report |
 | `ruff check .` clean | VERIFIED (fix/approval-notification session; re-run under this recovery — see `reports/INTEGRATION_RECOVERY_EVIDENCE.md`) | this branch |

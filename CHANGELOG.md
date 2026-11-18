@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — auth-gate guard, packaging hygiene, evidence addenda
+
+### Added
+
+- **A structural guard for the auth gate** (`tests/test_write_gate.py`). The
+  web server dispatches explicitly public routes and then refuses everything
+  without a credential; the regression this class produces — an endpoint added
+  above the gate or a method losing its gate call — passes any hand-maintained
+  route list it is not added to. The guard reads `orchestration/web_server.py`
+  with `ast` and requires, per method, that every path dispatched *before*
+  `self._require_read()` / `self._require_write()` is a member of a small,
+  exact allowlist (GET: `/`, `/login`, `/login/state`, `/healthz`, `/readyz`
+  plus the static asset maps; POST: `/login`, `/logout`; DELETE/PATCH: none).
+  It also fails when the gate itself disappears, and when the allowlist goes
+  stale. Discrimination verified: an injected pre-gate route and a deleted
+  gate both fail the test. The guard import-analyzes only; it needs no
+  database.
+
+### Changed
+
+- **`.dockerignore` added** (there was none): the runtime image's build
+  context no longer carries `.git/`, tests, docs, reports, tooling or local
+  state into the Docker daemon or the image layers.
+- **Post-merge addenda** to `NEXUS_INTEGRATION_RECOVERY_FINAL_REPORT.md`
+  (PR #50, combined CI pass, merged 2026-11-18T16:46:28Z as `c0f49fc`) and to
+  `COMPLETION_LEDGER.md` (current `main`).
+
 ## Unreleased — full terminal output, run controls, test isolation, asset latency
 
 ### Added

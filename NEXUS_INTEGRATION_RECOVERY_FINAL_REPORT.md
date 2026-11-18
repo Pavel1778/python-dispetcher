@@ -1,5 +1,16 @@
 # NEXUS — Integration Recovery: Final Report
 
+> **Post-merge status (2026-11-18).** The statements in this document were true
+> when written on 2026-11-17. Since then, with the owner's authorization: the
+> branch was pushed and opened as **PR #50**; combined CI **passed** (the
+> `test` job, PostgreSQL 17 + Chromium, run 44151435593, 31m20s); and PR #50
+> was **merged into `main` on 2026-11-18T16:46:28Z** (merge commit `c0f49fc`),
+> via a merge commit (rollback: `git revert -m 1 c0f49fc`). The statements in
+> §1, §7, §11 and §12 about pushing/merging describe the pre-merge state and
+> are kept verbatim for the record; the effective outcome is: pushed ✔ · CI
+> green ✔ · merged ✔. The provenance verdict (B — validated reconstruction;
+> the original SHAs remain unrecoverable) is unaffected by the merge.
+
 **Date:** 2026-11-17 (UTC)
 **Branch:** `recovery/nexus-integration-revalidated`
 **Tip:** the commit carrying this file — resolve mechanically with
