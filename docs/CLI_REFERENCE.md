@@ -92,6 +92,18 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | `nexus qa report` | `GET /api/dashboard`, `GET /api/system` |
 | `nexus qa verify --project <id>` | evidence verdicts (exit 5 if any FAILED) |
 
+### Autonomous runs
+
+| Command | Backed by |
+|---|---|
+| `nexus run show <run_id> --project <id>` | `GET /api/v1/projects/{p}/runs/{id}` |
+| `nexus run cancel <run_id> --project <id>` | `POST …/runs/{id}/cancel` |
+| `nexus run hide <run_id> --project <id>` | `POST …/runs/{id}/hide` |
+| `nexus run restart <run_id> --project <id>` | `POST …/runs/{id}/restart` (re-runs the whole plan as a new run) |
+| `nexus run duplicate <run_id> --project <id> [--idempotency-key K]` | `POST …/runs/{id}/duplicate` (copies the plan into a new goal and run) |
+| `nexus run outputs <run_id> <task_id> --project <id>` | `GET …/runs/{r}/tasks/{t}/outputs` |
+| `nexus run output <run_id> <task_id> <event_id> --project <id> [--out FILE]` | `GET …/runs/{r}/tasks/{t}/outputs/{event}` |
+
 ### OpenHands accounts
 
 | Command | Backed by |
