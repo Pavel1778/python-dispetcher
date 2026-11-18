@@ -1,9 +1,10 @@
 # NEXUS — local, reproducible stack (PostgreSQL + the single NEXUS instance).
 #
-# Not a production topology: this runs one app instance and one database on your
-# machine so the MVP can be started from a clean environment with one command.
-# The app is stateful (it runs the dispatch loop), so never scale it past one
-# replica.
+# The smallest complete deployment: one database, one app instance, one
+# autonomous worker — everything on one machine. Suitable for small installs
+# (see docs/SINGLE_VM.md for operations and hardening); it is deliberately
+# *not* a multi-replica topology — the app is stateful (it runs the dispatch
+# loop), so never scale it past one replica.
 #
 #   cp .env.example .env       # then fill in the values (see README)
 #   docker compose up --build
@@ -33,6 +34,7 @@ services:
       retries: 10
     volumes:
       - nexus-db:/var/lib/postgresql/data
+    restart: unless-stopped
 
   app:
     build: .
@@ -40,15 +42,19 @@ services:
       db:
         condition: service_healthy
     environment:
-      # Overrides the DSN so the app talks to the compose database.
+      # Overrides the DSN so the app talks to the compose database. The port
+      # is fixed by the image CMD (`--port 8000`); there is deliberately no
+      # HOST/PORT here — the app takes them only as flags, and setting them in
+      # the environment would be dead configuration that lies to the reader.
       SUPABASE_DB_URL: postgresql://nexus:nexus@db:5432/nexus
       AUTO_MIGRATE: "true"
-      HOST: 0.0.0.0
-      PORT: "8000"
     env_file:
       - .env
     ports:
       - "8000:8000"
+    # Comes back with the VM. Safe to add here (the app is single-instance by
+    # design; one replica is the correct topology).
+    restart: unless-stopped
     # The image CMD starts the server; it reads WEB_AUTH_TOKEN and
     # AUTH_PASSWORD_HASH from the environment (env_file). Migrations are applied
     # by the process on first connect (idempotent).

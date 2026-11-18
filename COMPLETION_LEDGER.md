@@ -13,7 +13,7 @@ Legend:
 - **NOT IMPLEMENTED** — absent.
 - **FAILED** — present but broken.
 
-Last updated: 2026-11-18 (PR #50 merged into `main` as `c0f49fc`; combined CI green).
+Last updated: 2026-11-18 (PR #50 merged as `c0f49fc`; this branch adds `0041` claim-path indexes, single-VM stack docs, write-gate guard).
 
 ---
 
@@ -25,7 +25,7 @@ Last updated: 2026-11-18 (PR #50 merged into `main` as `c0f49fc`; combined CI gr
 | `main` = `6629161` (PR #46 merged) | VERIFIED | PR #46 state MERGED 2026-11-16T22:36:31Z |
 | `main` = `6e5c2b4` (PR #49 merged) | VERIFIED | PR #49 state MERGED 2026-11-17T09:24:41Z |
 | `main` = `c0f49fc` (PR #50 merged — reconstruction re-delivery) | VERIFIED | PR #50 state MERGED 2026-11-18T16:46:28Z; combined CI `test` pass 31m20s (run 44151435593) |
-| Migrations `0001`–`0040` (41 files, gaps 0012/0013 reserved) | VERIFIED | `ls migrations/` |
+| Migrations `0001`–`0041` (42 files, gaps 0012/0013 reserved; `0041` = claim-path indexes) | VERIFIED | `ls migrations/` |
 | Full suite on fresh PostgreSQL 17 | VERIFIED (historical, fix/approval-notification session; see `FINAL_RELEASE_REPORT.md` §13 and §18 for the reconstructed tree) | see report |
 | `ruff check .` clean | VERIFIED (fix/approval-notification session; re-run under this recovery — see `reports/INTEGRATION_RECOVERY_EVIDENCE.md`) | this branch |
 | Browser E2E (Chromium) | VERIFIED (historical, release/acceptance session, 37/37) | `tests/test_browser_e2e.py` |

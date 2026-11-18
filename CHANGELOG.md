@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — single VM, claim-path indexes, evidence refresh
+
+### Added
+
+- **One virtual machine, everything on it** (`docs/SINGLE_VM.md`): PostgreSQL
+  17, the app and the lab worker via `docker compose` — quickstart, required
+  secrets, backups, hardening and honest limits. `docker-compose.yml` now has
+  `restart: unless-stopped` on `db`, `app` and `worker` (a VM reboot brings the
+  stack back), and no longer carries the dead `HOST`/`PORT` keys (the app
+  takes host/port only as CLI flags).
+- **Migration `0041_branch_claim_indexes.sql`** — the claim path's
+  `_BRANCH_FREE` probes get `(repository, branch)` indexes
+  (`nexus_run_tasks`, `nexus_executor_stops`). Measured with
+  `EXPLAIN (ANALYZE, BUFFERS)` on 60,000 seeded tasks: Q2 (abandoned probe)
+  11.51 ms seq scan → **0.008 ms**; Q1 (active probe) 1.40 ms → **0.037 ms**.
+  Claim latency and its lock hold no longer grow with task history.
+
+### Changed
+
+- **One timing-sensitive test observed flaking under full-suite load**
+  (2026-11-18, this branch): `test_long_task_cases.py::test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on`
+  expects the third stage's planning attempt to have committed before the
+  simulated crash (`attempts == [1, 1, 2, 1, 1]`); under 2-CPU saturation the
+  kill can land first and yields `[1, 1, 1, 1, 1]`. The run itself stays
+  correct in both interleavings (stages planned, one run, `asked` has the
+  repeated third request). Passes 6 of 6 in isolation; unrelated to the
+  claim-path/migration work. Left untouched deliberately — see
+  `docs/KNOWN_LIMITATIONS.md`.
+- **Migration-bearing test fixture fixed.** `tests/test_durable_migrations.py`
+  simulates a database from *before* the durable-runs work by applying every
+  migration except the ones under test; `0041` (created after that state, and
+  indexing a table migration `0030` creates) now belongs to the same "new"
+  set — caught by a failing full-suite run, not by inspection.
+- **Docs refreshed to current reality**: `docs/PERFORMANCE.md` (0041 measured
+  before/after; `orjson` measured and recorded as not-adopted with the
+  reason), `docs/RUST_MIGRATION_ASSESSMENT.md` (dated 2026-11-18
+  re-validation: no toolchain in this sandbox, crates.io unreachable, apt
+  refused — the assessment stands; nothing was wired into the runtime),
+  README (single-VM pointer), DEPLOY.md, COMPLETION_LEDGER.md,
+  DEPLOYMENT_CHECKLIST.md (42 migrations), FINAL_RELEASE_REPORT.md.
+
 ## Unreleased — auth-gate guard, packaging hygiene, evidence addenda
 
 ### Added

@@ -44,3 +44,39 @@ updated to the consolidated base.)
 2. One-binary CLI distribution requirement.
 3. A controlled prototype showing > 5× end-to-end on a named hot path, with
    identical inputs/machine, reported with p50/p95/p99 + peak RSS.
+
+## Re-validation (2026-11-18)
+
+Requested again ("write everything you can and need in Rust"). The finding
+stands, re-measured from the sandbox, and the one real hot-path fix that fell
+out of the investigation shipped as migration `0041` (see
+`docs/PERFORMANCE.md` — the claim path went from an 11.5 ms sequential scan
+to 0.008 ms).
+
+Fresh toolchain evidence, 2026-11-18, this sandbox:
+
+- `rustc` / `cargo`: **not installed** (`command not found`);
+- crates.io: **unreachable** (TLS EOF on `https://crates.io/api/...` and on
+  `https://static.crates.io/...` — egress allowlist is github / pypi / npm
+  only);
+- `apt-get install rustc cargo`: **refused** — `Could not open lock file
+  /var/lib/dpkg/lock-frontend (13: Permission denied)` (not root);
+- `gcc`/`g++` are present, but a C or Rust hot path would still have nothing
+  crates.io-grade to link against here, and CPython's own hot primitives
+  (`hashlib`, `bytes.find`, the C `json` accelerator) are already C.
+
+Zero-dependency pure-std Rust is strictly *not* faster than `hashlib`
+(OpenSSL) for the hash/chain work and cannot verify Ed25519 at all, so a
+std-only crate would add build and review surface without moving a single
+measured number. The pre-registered re-justify criteria above stand
+unchanged: a py-spy/pg_stat_statements p95 problem on the planner or the
+canonical evidence encoder in a live workload, then a measured Rust pilot.
+Nothing in tonight's profiling shows that; the bottleneck was SQL, and it is
+fixed.
+
+No "optional accelerator" was wired into the runtime. A component that
+cannot be built and exercised in the environment it ships from is not an
+optimisation; it is an unverified claim. If the owner wants the Rust path
+exercised for real, it needs a build host with crates.io access (CI already
+has Rust) — say so and it will be done there, behind the existing
+`orchestration/` seam, with the same test corpus.

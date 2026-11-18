@@ -48,6 +48,18 @@ this environment:
   the value and masks it in the agent's output.
 
 
+## Testing caveats
+
+- **One load-sensitive test can flake on a saturated 2-CPU box.**
+  `tests/test_long_task_cases.py::test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on`
+  kills the simulated crashing process at a point that races the spec
+  planner's attempt bookkeeping: under heavy load the third stage can read
+  `attempts=1` instead of `2` (the rest of the assertions still hold; the
+  suite is green on CI and in isolated runs). Not a correctness defect — the
+  attempt counter is a diagnostic, the plan and the run complete correctly
+  either way. Documented so nobody "fixes" it by loosening the assertion;
+  the real fix is a deterministic seam in the test's crash timing.
+
 ## Verified only against the local stand-in servers
 
 Every test uses `tests/fake_cloud.py`, `tests/fake_runtime.py`,

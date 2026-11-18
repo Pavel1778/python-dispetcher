@@ -43,6 +43,7 @@ Start here:
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable, run
   command, dependency and required permission in one place.
 - [DEPLOY.md](DEPLOY.md) — deployment guide.
+- [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — one VM, everything on it (compose + PostgreSQL).
 - [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.
 
 ## What is ready today
@@ -172,6 +173,10 @@ python -m orchestration.web_server --host 0.0.0.0 --port 8000 --token "$WEB_AUTH
 Open `http://localhost:8000`, sign in, create a project, link a repository,
 create a task, and watch the execution state. `GET /healthz` is liveness;
 `GET /readyz` adds a real database round-trip.
+
+> **One virtual machine, everything on it (PostgreSQL + app + worker):**
+> see [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — `cp .env.example .env`, fill the
+> secrets, `docker compose up -d --build`. No external database service needed.
 
 The CLI is a thin client over the same API:
 
