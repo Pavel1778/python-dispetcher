@@ -203,6 +203,45 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_migrations(args: argparse.Namespace) -> int:
+    """Where this database stands against migrations/ (read-only)."""
+    client = _client(args)
+    data = client.get("/api/migrations")
+    pending = data.get("pending") or []
+    lines = [f"migrations: {data.get('applied')}/{data.get('total')} applied",
+             f"up to date: {'yes' if data.get('up_to_date') else 'no'}"]
+    if data.get("latest_applied"):
+        lines.append(f"latest applied: {data['latest_applied']} ({data.get('latest_applied_at')})")
+    if pending:
+        lines.append("pending:")
+        lines += [f"  - {name}" for name in pending]
+    _emit(args, data, human="\n".join(lines))
+    return EXIT["ok"] if data.get("up_to_date") else EXIT["error"]
+
+
+def cmd_worker_status(args: argparse.Namespace) -> int:
+    """What the execution path is doing: queue depth, stuck tasks, live workers."""
+    client = _client(args)
+    data = client.get("/api/observability")
+    workers = data.get("workers") or {}
+    lines = []
+    if isinstance(workers, dict) and "live" in workers:
+        lines.append(f"live workers (last 120s): {workers.get('count', 0)}")
+        for w in workers.get("live") or []:
+            lines.append(f"  - {w.get('worker_id')} ({w.get('kind')}) age={w.get('age_seconds'):.0f}s"
+                         + (f" last_error={w.get('last_error')}" if w.get("last_error") else ""))
+    else:
+        lines.append(f"workers: {workers.get('error', 'unknown')}" if isinstance(workers, dict)
+                     else "workers: unknown")
+    queue = data.get("queue") or {}
+    lines.append("queue: " + ", ".join(f"{k}={v}" for k, v in queue.items() if isinstance(v, (int, float)))
+                 if isinstance(queue, dict) else "queue: unknown")
+    stuck = data.get("stuck_tasks")
+    lines.append(f"stuck tasks: {len(stuck) if isinstance(stuck, list) else stuck}")
+    _emit(args, data, human="\n".join(lines))
+    return EXIT["ok"]
+
+
 def cmd_project_list(args: argparse.Namespace) -> int:
     client = _client(args)
     projects = client.get("/api/v1/projects").get("projects", [])
@@ -877,6 +916,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", parents=[common], help="print the version").set_defaults(func=cmd_version)
     sub.add_parser("doctor", parents=[common], help="diagnose connectivity and configuration").set_defaults(func=cmd_doctor)
     sub.add_parser("status", parents=[common], help="dashboard counts and health").set_defaults(func=cmd_status)
+    sub.add_parser("migrations", parents=[common],
+                   help="show which migrations this database has applied (read-only)").set_defaults(func=cmd_migrations)
+    sub.add_parser("worker-status", parents=[common],
+                   help="queue depth, stuck tasks and live workers (read-only)").set_defaults(func=cmd_worker_status)
     providers = sub.add_parser("providers", parents=[common],
                                help="show the LLM orchestrator cascade (Gemini → Groq → OpenRouter → OpenHands)")
     providers.add_argument("--live", action="store_true",

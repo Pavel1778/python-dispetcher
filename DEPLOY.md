@@ -5,6 +5,9 @@ dispatcher and for applying database migrations. By default the application
 automatically applies migrations at startup; set `AUTO_MIGRATE=false` to manage
 them out of band. Review and back up the database before deployment.
 
+Running everything — PostgreSQL, this service and the lab worker — on **one
+virtual machine**? See [docs/SINGLE_VM.md](docs/SINGLE_VM.md).
+
 ## What the service is
 
 A single stdlib HTTP server, started as a module:

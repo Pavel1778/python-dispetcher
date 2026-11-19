@@ -49,7 +49,8 @@ PUBLIC_GET = {"/login", "/login/state", "/static/login.js",
 
 # Endpoints that must require a session or bearer. Method + path.
 PROTECTED_GET = [
-    "/", "/api/session", "/api/studio", "/api/dashboard", "/api/system", "/api/config",
+    "/", "/api/session", "/api/studio", "/api/dashboard", "/api/system",
+    "/api/migrations", "/api/config",
     "/api/repositories", "/api/github/status", "/api/github/repositories",
     "/api/tasks", "/api/workflows", f"/api/workflows/{UUID}", "/api/health",
     "/api/capabilities", "/api/v1/projects",
