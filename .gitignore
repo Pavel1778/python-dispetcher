@@ -19,3 +19,5 @@ nexus-*.apk
 *.exe
 *.o
 nohup.out
+# Database dumps from scripts/nexus.sh backup — never commit data.
+backups/

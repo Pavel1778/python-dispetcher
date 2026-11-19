@@ -28,8 +28,12 @@ Cloud transport provisions a sandbox and drives its agent-server directly
 
 Start here:
 
+- [docs/PRODUCT_STATUS.md](docs/PRODUCT_STATUS.md) — what works today, with the
+  test that proves each claim, and what is honestly still missing.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the component map and how the
   parts interact.
+- [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) — run NEXUS on your own Debian 13
+  box with one command (`scripts/nexus.sh`).
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — run, monitor, diagnose, recover,
   back up.
 - [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) — per-subsystem
@@ -43,7 +47,10 @@ Start here:
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable, run
   command, dependency and required permission in one place.
 - [DEPLOY.md](DEPLOY.md) — deployment guide.
-- [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — one VM, everything on it (compose + PostgreSQL).
+- [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — one VM via Docker Compose (an alternative to the native `scripts/nexus.sh` path).
+- [docs/BACKUP_AND_RESTORE.md](docs/BACKUP_AND_RESTORE.md) — the backup policy and the restore drill.
+- [docs/CLOUDFLARE_TUNNEL.md](docs/CLOUDFLARE_TUNNEL.md) — a temporary or stable public URL.
+- [docs/PRODUCT_ROADMAP.md](docs/PRODUCT_ROADMAP.md) — what is next, and what is deliberately out of scope.
 - [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — dependency direction and module boundaries.
 - [docs/performance/BASELINE.md](docs/performance/BASELINE.md) — measured startup/footprint/claim-path numbers.
 - [docs/security/SECURITY_AUDIT.md](docs/security/SECURITY_AUDIT.md) — security findings and their classes.
