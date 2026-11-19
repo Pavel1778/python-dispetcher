@@ -645,6 +645,37 @@ class PostgresStore:
                     missing.append(f"{table}({column})")
         return missing
 
+    def migration_status(self, directory: str | None = None) -> dict[str, Any]:
+        """Read-only view of where this database stands against ``migrations/``.
+
+        Used by ``GET /api/migrations`` and the CLI's ``nexus migrations``. Never
+        writes and never applies anything; a partially-migrated database is
+        reported as such, not "fixed" silently. If the ``schema_migrations``
+        bookkeeping table is missing it means nothing was ever applied here, so
+        every file is reported pending.
+        """
+        base = Path(directory) if directory else Path(__file__).resolve().parent.parent / "migrations"
+        files = sorted(p.name for p in base.glob("*.sql"))
+        applied_at: dict[str, str] = {}
+        try:
+            with self._tx() as cur:
+                cur.execute("SELECT filename, applied_at FROM schema_migrations")
+                for row in cur.fetchall():
+                    applied_at[row["filename"]] = (
+                        row["applied_at"].isoformat() if hasattr(row["applied_at"], "isoformat")
+                        else str(row["applied_at"]))
+        except psycopg.errors.UndefinedTable:
+            applied_at = {}
+        pending = [name for name in files if name not in applied_at]
+        return {
+            "total": len(files),
+            "applied": len(applied_at),
+            "pending": pending,
+            "latest_applied": max(applied_at) if applied_at else None,
+            "latest_applied_at": (applied_at.get(max(applied_at)) if applied_at else None),
+            "up_to_date": not pending,
+        }
+
     # ---------------------------------------------------------------- infra
     @contextmanager
     def _tx(self) -> Iterator[Any]:

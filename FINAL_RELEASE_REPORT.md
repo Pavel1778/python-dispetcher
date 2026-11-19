@@ -60,7 +60,7 @@ control plane that orchestrates OpenHands agent conversations:
 - **Interface** — the Studio (`orchestration/studio/`, static, no framework) and
   a thin CLI/MCP client (`cli.py`, `mcp_server.py`).
 
-41 migrations, `0001`–`0040`.
+42 migrations, `0001`–`0041` (`0041_branch_claim_indexes.sql` added 2026-11-18).
 
 ## 2. Implemented features
 
@@ -114,7 +114,7 @@ the two new MCP tools carry `SCOPE_RUN_CONTROL`. No protection was weakened.
 
 ## 6. Migration status
 
-41 files, `0001`–`0040`, applied idempotently by the process on first connect
+42 files, `0001`–`0041`, applied idempotently by the process on first connect
 (recorded in `schema_migrations`). Gaps `0012`/`0013` are reserved for the
 deferred File Lab and are intentional. An edited, applied migration is refused
 (`MigrationError`); the one registered production correction (0037) converges

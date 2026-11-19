@@ -2332,7 +2332,7 @@ given to a model, which said it cannot start a run.
   a question) starts one.
 - A bare go-ahead («делай», «приступай», "go ahead") starts work only when an
   earlier user message of the conversation names work (`has_context`,
-  `_names_work` in `web_server.py`); otherwise it is answered. The go-ahead
+  `_names_work` in `orchestration/web_helpers.py`); otherwise it is answered. The go-ahead
   rule stands **before** the question rule: `_INTERROGATIVE` reads "do …" as a
   question.
 - An answer to the router's own clarifying question is read for what it names
@@ -2527,7 +2527,7 @@ The repository was synchronized and released. What a future change must know:
 - **`arena/ab0d7665` (PR #38) was ported, not merged.** Its base was the old
   `main`; a merge would have reverted the command system, conversation
   management, stop generation and run history. Only its unique work was taken:
-  `_continues_analysis` in `web_server.py`, `tests/test_regression_p0_suite.py`,
+  `_continues_analysis` (now `orchestration/web_helpers.py`), `tests/test_regression_p0_suite.py`,
   `tests/test_concurrent_runs_policy.py`, `docs/P0-INCIDENT-FINAL-REPORT.md`.
 - **`nexus/continue-longtask-hardening` is a stale snapshot** of an older
   `main`: `git diff main origin/nexus/continue-longtask-hardening` mostly

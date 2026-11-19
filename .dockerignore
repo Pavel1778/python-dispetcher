@@ -1,0 +1,49 @@
+# Build context for the runtime image (Dockerfile copies only requirements.txt,
+# orchestration/, migrations/, pyproject.toml — everything else is noise here and
+# must never reach the build host or the image layers).
+.git/
+.github/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+render.yaml
+
+# Tests, benchmarks, docs and reports are not part of the runtime service.
+tests/
+benchmarks/
+docs/
+reports/
+tools/
+*.md
+!README.md
+
+# Python debris and local state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+state/
+*.db
+*.db-wal
+*.db-shm
+
+# Node / packaging leftovers
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# Audit and restore artifacts
+.audit-baseline/
+.restore-points/
+*.deb
+*.keystore
+nexus-*.apk
+*.exe
+*.o

@@ -45,7 +45,7 @@ To apply out of band:
 for f in $(ls migrations/*.sql | sort); do psql "$SUPABASE_DB_URL" -f "$f"; done
 ```
 
-- 41 files, `0001`–`0040` (the `0012`/`0013` gap is reserved and permanent).
+- 42 files, `0001`–`0041` (the `0012`/`0013` gap is reserved and permanent; `0041` indexes the claim path).
 - A migration whose body changed **after** it was applied is refused
   (`MigrationError`), never re-run — ship a new file instead.
 - `AUTO_MIGRATE=false` turns the automatic apply off for environments that

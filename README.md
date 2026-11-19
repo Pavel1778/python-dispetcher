@@ -43,7 +43,18 @@ Start here:
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable, run
   command, dependency and required permission in one place.
 - [DEPLOY.md](DEPLOY.md) — deployment guide.
+- [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — one VM, everything on it (compose + PostgreSQL).
+- [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — dependency direction and module boundaries.
+- [docs/performance/BASELINE.md](docs/performance/BASELINE.md) — measured startup/footprint/claim-path numbers.
+- [docs/security/SECURITY_AUDIT.md](docs/security/SECURITY_AUDIT.md) — security findings and their classes.
 - [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.
+
+> **A note on root-level reports.** Files such as `FINAL_RELEASE_REPORT.md`,
+> `NEXUS_INTEGRATION_RECOVERY_FINAL_REPORT.md`, `PR46_PR47_FINAL_INTEGRATION_REPORT.md`
+> and the ones under `reports/` are **historical audit artifacts** from earlier
+> phases. They are kept for provenance and are not updated to match every
+> commit; the living state is `COMPLETION_LEDGER.md`, this README, and the
+> documents linked above.
 
 ## What is ready today
 
@@ -172,6 +183,10 @@ python -m orchestration.web_server --host 0.0.0.0 --port 8000 --token "$WEB_AUTH
 Open `http://localhost:8000`, sign in, create a project, link a repository,
 create a task, and watch the execution state. `GET /healthz` is liveness;
 `GET /readyz` adds a real database round-trip.
+
+> **One virtual machine, everything on it (PostgreSQL + app + worker):**
+> see [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — `cp .env.example .env`, fill the
+> secrets, `docker compose up -d --build`. No external database service needed.
 
 The CLI is a thin client over the same API:
 

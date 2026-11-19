@@ -137,6 +137,25 @@ the instrument for any such claim.
   that pair differ by run-to-run noise (the code is identical between them) and
   are **not** claimed as an optimisation.
 
+- **Indexes for the claim path** (migration `0041`, 2026-11-18). Every
+  `claim_task` candidate applies `_BRANCH_FREE`: three correlated subqueries.
+  Two probe `nexus_run_tasks` by `(repository, branch)` and one probes
+  `nexus_executor_stops` the same way; no index existed. Measured with
+  `EXPLAIN (ANALYZE, BUFFERS)` on a scratch PG 16.2 cluster seeded with
+  60,000 tasks / 3,000 executor-stop rows:
+
+  | probe | before | after | plan before | plan after |
+  |---|---|---|---|---|
+  | active-on-branch (Q1) | 1.40 ms | **0.037 ms** | bitmap over `idx_nexus_run_tasks_state`, 6,000 rows filtered | bitmap over `idx_nexus_run_tasks_repo_branch`, ~50 rows |
+  | abandoned-on-branch (Q2) | **11.51 ms** | **0.008 ms** | **sequential scan, 60,000 rows** | bitmap over the new index |
+  | executor_stops requested (Q3) | 0.006 ms | 0.004 ms | seq scan (3k rows) | seq scan (tiny; index present for scale) |
+
+  (`SELECT 1 ... EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)`, 30–50 repetitions,
+  after `ANALYZE`. The seed generator and the exact queries are the ones from
+  the 2026-11-18 session; reproduce by seeding the same shape and running the
+  three statements.) Claim latency and its lock hold now do not grow with
+  task history on this path.
+
 ## What was not done, and why
 
 - **No language migration.** A Go/Rust rewrite of the API would not move these
@@ -148,6 +167,15 @@ the instrument for any such claim.
   pay off under a load this deployment does not have, and would split the
   invariants the AGENTS.md documents in one place. The evidence is the table
   above.
+- **No `orjson` (Rust-backed JSON).** Measured ~2.8–2.9× faster than
+  `json` on a 1.3 MB trajectory-like payload (9.2 → 3.2 ms). Not adopted: the
+  repository is deliberately stdlib-only (+psycopg, +cryptography); the hot
+  paths are database and network, not JSON tokenising; and a drop-in risks
+  byte-format drift exactly where byte fidelity is load-bearing (the
+  canonical evidence encoding) — orjson would never be applied there, and a
+  partial adoption is a trap. Recorded here so the measurement is not lost.
+  Re-evaluate per release with `tools/benchmark.py`; adopt only with the
+  signing path schema-gated.
 - **No caching layer.** The read paths are cheap and correctness (project
   isolation, a message appearing at once) matters more than a cache that could
   serve one project's data to another. Nothing is cached between projects.

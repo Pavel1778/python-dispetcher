@@ -27,6 +27,104 @@
   and a cluster-wide advisory lock around the cluster-global Supabase-role test
   case. See `AGENTS.md`, "Canonical consolidation".
 
+## Unreleased — hardening, audits, CLI, architecture extraction
+
+### Added
+
+- **`nexus migrations`** and **`nexus worker-status`** CLI commands and
+  **`GET /api/migrations`** (read-only; applied/pending against `migrations/`;
+  behind the read gate; pinned by route-auth and functional tests).
+- **`tests/test_project_isolation.py`** — 18-surface cross-project refusal
+  battery (non-member gets `NotFound` everywhere: tasks, runs, repositories,
+  files, conversations, notifications, context, memory, reports, executors…),
+  plus membership-revocation and no-self-grant cases.
+- **Docs**: `docs/audit/INITIAL_REPOSITORY_FORENSICS.md` (measured Phase Zero
+  inventory), `docs/audit/FEATURE_MATRIX.md` (22 features with executed
+  evidence), `docs/architecture/ARCHITECTURE.md` (dependency direction;
+  deferred Handler split and why), `docs/performance/BASELINE.md` (startup,
+  ~52 MB idle VmRSS, measured claim-path numbers), `docs/security/SECURITY_AUDIT.md`
+  (0 critical / 0 high; mediums/lows with mitigations), `docs/deployment/
+  SINGLE_VM_OPERATIONS.md` (tested backup/restore rehearsal, Caddy/HTTPS,
+  resource budget, RPO/RTO honesty), `docs/mcp/MCP_AND_SELFQA.md` (actual MCP
+  surface and self-QA bounds).
+
+### Changed
+
+- **Refactor**: pure HTTP helpers extracted from `web_server.py` into
+  `orchestration/web_helpers.py` (no behavior change; re-exported for
+  compatibility; auth/route/web/write-gate suites green).
+- **Docs**: `OPERATIONS.md`/`CLI_REFERENCE.md` cover the new commands;
+  `KNOWN_LIMITATIONS.md` records security follow-ups (generic 500s, cookie
+  `Secure` deploy flag, requirements lock) and the load-sensitive flake.
+
+## Unreleased — single VM, claim-path indexes, evidence refresh
+
+### Added
+
+- **One virtual machine, everything on it** (`docs/SINGLE_VM.md`): PostgreSQL
+  17, the app and the lab worker via `docker compose` — quickstart, required
+  secrets, backups, hardening and honest limits. `docker-compose.yml` now has
+  `restart: unless-stopped` on `db`, `app` and `worker` (a VM reboot brings the
+  stack back), and no longer carries the dead `HOST`/`PORT` keys (the app
+  takes host/port only as CLI flags).
+- **Migration `0041_branch_claim_indexes.sql`** — the claim path's
+  `_BRANCH_FREE` probes get `(repository, branch)` indexes
+  (`nexus_run_tasks`, `nexus_executor_stops`). Measured with
+  `EXPLAIN (ANALYZE, BUFFERS)` on 60,000 seeded tasks: Q2 (abandoned probe)
+  11.51 ms seq scan → **0.008 ms**; Q1 (active probe) 1.40 ms → **0.037 ms**.
+  Claim latency and its lock hold no longer grow with task history.
+
+### Changed
+
+- **One timing-sensitive test observed flaking under full-suite load**
+  (2026-11-18, this branch): `test_long_task_cases.py::test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on`
+  expects the third stage's planning attempt to have committed before the
+  simulated crash (`attempts == [1, 1, 2, 1, 1]`); under 2-CPU saturation the
+  kill can land first and yields `[1, 1, 1, 1, 1]`. The run itself stays
+  correct in both interleavings (stages planned, one run, `asked` has the
+  repeated third request). Passes 6 of 6 in isolation; unrelated to the
+  claim-path/migration work. Left untouched deliberately — see
+  `docs/KNOWN_LIMITATIONS.md`.
+- **Migration-bearing test fixture fixed.** `tests/test_durable_migrations.py`
+  simulates a database from *before* the durable-runs work by applying every
+  migration except the ones under test; `0041` (created after that state, and
+  indexing a table migration `0030` creates) now belongs to the same "new"
+  set — caught by a failing full-suite run, not by inspection.
+- **Docs refreshed to current reality**: `docs/PERFORMANCE.md` (0041 measured
+  before/after; `orjson` measured and recorded as not-adopted with the
+  reason), `docs/RUST_MIGRATION_ASSESSMENT.md` (dated 2026-11-18
+  re-validation: no toolchain in this sandbox, crates.io unreachable, apt
+  refused — the assessment stands; nothing was wired into the runtime),
+  README (single-VM pointer), DEPLOY.md, COMPLETION_LEDGER.md,
+  DEPLOYMENT_CHECKLIST.md (42 migrations), FINAL_RELEASE_REPORT.md.
+
+## Unreleased — auth-gate guard, packaging hygiene, evidence addenda
+
+### Added
+
+- **A structural guard for the auth gate** (`tests/test_write_gate.py`). The
+  web server dispatches explicitly public routes and then refuses everything
+  without a credential; the regression this class produces — an endpoint added
+  above the gate or a method losing its gate call — passes any hand-maintained
+  route list it is not added to. The guard reads `orchestration/web_server.py`
+  with `ast` and requires, per method, that every path dispatched *before*
+  `self._require_read()` / `self._require_write()` is a member of a small,
+  exact allowlist (GET: `/`, `/login`, `/login/state`, `/healthz`, `/readyz`
+  plus the static asset maps; POST: `/login`, `/logout`; DELETE/PATCH: none).
+  It also fails when the gate itself disappears, and when the allowlist goes
+  stale. Discrimination verified: an injected pre-gate route and a deleted
+  gate both fail the test. The guard import-analyzes only; it needs no
+  database.
+
+### Changed
+
+- **`.dockerignore` added** (there was none): the runtime image's build
+  context no longer carries `.git/`, tests, docs, reports, tooling or local
+  state into the Docker daemon or the image layers.
+- **Post-merge addenda** to `NEXUS_INTEGRATION_RECOVERY_FINAL_REPORT.md`
+  (PR #50, combined CI pass, merged 2026-11-18T16:46:28Z as `c0f49fc`) and to
+  `COMPLETION_LEDGER.md` (current `main`).
+
 ## Unreleased — full terminal output, run controls, test isolation, asset latency
 
 ### Added
