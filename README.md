@@ -44,6 +44,9 @@ Start here:
   command, dependency and required permission in one place.
 - [DEPLOY.md](DEPLOY.md) — deployment guide.
 - [docs/SINGLE_VM.md](docs/SINGLE_VM.md) — one VM, everything on it (compose + PostgreSQL).
+- [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — dependency direction and module boundaries.
+- [docs/performance/BASELINE.md](docs/performance/BASELINE.md) — measured startup/footprint/claim-path numbers.
+- [docs/security/SECURITY_AUDIT.md](docs/security/SECURITY_AUDIT.md) — security findings and their classes.
 - [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.
 
 ## What is ready today

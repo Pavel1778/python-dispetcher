@@ -63,6 +63,9 @@ docker compose down               # stop everything (data survives)
 docker compose down -v            # stop and DELETE the database volume — deliberate
 ```
 
+Full operations playbook (resource budget, tested restore rehearsal, Caddy/HTTPS,
+firewall, RPO/RTO): [docs/deployment/SINGLE_VM_OPERATIONS.md](deployment/SINGLE_VM_OPERATIONS.md).
+
 ### Backups
 
 The database is one volume. Nightly logical dump from the db container:

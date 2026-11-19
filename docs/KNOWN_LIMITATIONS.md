@@ -48,6 +48,18 @@ this environment:
   the value and masks it in the agent's output.
 
 
+## Security follow-ups (documented, not yet done)
+
+- Some non-project routes still echo `type(e).__name__: message` on a 500
+  (project routes return a generic `internal error`). No secrets are included,
+  but normalize the remaining routes to the generic form (`docs/security/SECURITY_AUDIT.md` M4).
+- Deployment must set `WEB_COOKIE_SECURE=1` (or a proxy that emits
+  `X-Forwarded-Proto: https`) or the session cookie is not `Secure` on
+  plain-HTTP installs (M1).
+- `requirements.txt` uses ranges, not a hashed lock file; rebuilds can drift
+  within `>=,<` (L2). Generate and verify a `requirements.lock` before the
+  next release if reproducible builds matter.
+
 ## Testing caveats
 
 - **One load-sensitive test can flake on a saturated 2-CPU box.**
