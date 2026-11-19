@@ -50,6 +50,7 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | `nexus doctor` | `GET /healthz`, `GET /api/system` (component status) |
 | `nexus status` | `GET /api/dashboard`, `GET /api/health` |
 | `nexus migrations` | `GET /api/migrations` (read-only; exit 0 when up to date, else 1) |
+| `nexus worker-status` | `GET /api/observability` (queue depth, stuck tasks, live workers; read-only) |
 | `nexus providers [--live]` | `GET /api/providers` (LLM orchestrator cascade; `--live` probes each configured provider, exit 6 if a key was refused or a model is missing) |
 
 ### Projects
