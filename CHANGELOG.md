@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — hardening, audits, CLI, architecture extraction
+
+### Added
+
+- **`nexus migrations`** and **`nexus worker-status`** CLI commands and
+  **`GET /api/migrations`** (read-only; applied/pending against `migrations/`;
+  behind the read gate; pinned by route-auth and functional tests).
+- **`tests/test_project_isolation.py`** — 18-surface cross-project refusal
+  battery (non-member gets `NotFound` everywhere: tasks, runs, repositories,
+  files, conversations, notifications, context, memory, reports, executors…),
+  plus membership-revocation and no-self-grant cases.
+- **Docs**: `docs/audit/INITIAL_REPOSITORY_FORENSICS.md` (measured Phase Zero
+  inventory), `docs/audit/FEATURE_MATRIX.md` (22 features with executed
+  evidence), `docs/architecture/ARCHITECTURE.md` (dependency direction;
+  deferred Handler split and why), `docs/performance/BASELINE.md` (startup,
+  ~52 MB idle VmRSS, measured claim-path numbers), `docs/security/SECURITY_AUDIT.md`
+  (0 critical / 0 high; mediums/lows with mitigations), `docs/deployment/
+  SINGLE_VM_OPERATIONS.md` (tested backup/restore rehearsal, Caddy/HTTPS,
+  resource budget, RPO/RTO honesty), `docs/mcp/MCP_AND_SELFQA.md` (actual MCP
+  surface and self-QA bounds).
+
+### Changed
+
+- **Refactor**: pure HTTP helpers extracted from `web_server.py` into
+  `orchestration/web_helpers.py` (no behavior change; re-exported for
+  compatibility; auth/route/web/write-gate suites green).
+- **Docs**: `OPERATIONS.md`/`CLI_REFERENCE.md` cover the new commands;
+  `KNOWN_LIMITATIONS.md` records security follow-ups (generic 500s, cookie
+  `Secure` deploy flag, requirements lock) and the load-sensitive flake.
+
 ## Unreleased — single VM, claim-path indexes, evidence refresh
 
 ### Added

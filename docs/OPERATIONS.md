@@ -51,6 +51,8 @@ sets `NEXUS_LAB_INLINE=0` and runs `lab_worker` (see `docs/WORKER_SETUP.md`).
 ```bash
 # One command, everything the operator needs
 TEST_SUPABASE_DB_URL=... python -m orchestration.cli doctor
+python -m orchestration.cli migrations          # 42/42 applied? which file pending?
+python -m orchestration.cli worker-status       # queue, stuck tasks, live workers
 
 # The OpenHands diagnostics, live
 python -m orchestration.cli openhands diagnostics --live
