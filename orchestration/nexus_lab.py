@@ -1410,6 +1410,7 @@ class LabScheduler:
                  reports: Any | None = None,
                  cycle_wait: Callable[..., float] | None = None,
                  evidence: Any | None = None, acceptance: Any | None = None,
+                 quality_gate: Any | None = None,
                  stopping: Callable[[], bool] | None = None):
         self.store = store
         self.executor = executor
@@ -1450,6 +1451,14 @@ class LabScheduler:
         #: records nothing without a signer.
         self.acceptance = acceptance if acceptance is not None else LabEvidence(
             store.store, principal=principal)
+        #: The QUALITY GATE: an optional deterministic Self-QA run of the
+        #: project's own checks against the exact commit the Git verifier just
+        #: accepted. It can only *downgrade* a ``completed_verified`` verdict -
+        #: a failing required check makes the task ``completed_unverified`` so it
+        #: is reworked; a skipped or blocked run never upgrades anything and
+        #: never turns a pass into a failure (the tooling may simply be absent).
+        #: ``None`` (the default) leaves the loop exactly as it was.
+        self.quality_gate = quality_gate
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -1470,6 +1479,55 @@ class LabScheduler:
             return float(self.start_wait(refused, int(task.get("refusals") or 0)))
         except TypeError:                  # a caller's own rule that takes the error only
             return float(self.start_wait(refused))
+
+    def _apply_quality_gate(self, task: dict, verdict: Verification) -> Verification:
+        """QUALITY GATE: run the project's own checks against the accepted commit.
+
+        This is the one stage that separates "a commit landed" (what
+        ``GitVerifier`` proves) from "the project still works". It runs the
+        deterministic ``SelfQa`` engine on the exact ``remote_sha`` the Git
+        verifier just read, and can only make a verdict *weaker*:
+
+        * ``failed`` (a required check exited non-zero) downgrades
+          ``completed_verified`` to ``completed_unverified`` with
+          ``retry="followup"``, so the scheduler reworks it;
+        * ``passed`` leaves the verdict as it was;
+        * ``skipped``/``blocked`` (no tooling, no network) leave it as it was -
+          an absent check is never a pass and never a failure.
+
+        It only runs when a gate is configured *and* the verdict is a verified
+        one with a readable commit; anything else is returned untouched. A gate
+        that raises is logged and ignored: the task's own verdict stands, and a
+        broken checker must not stall a run. The gate never sees a credential -
+        ``SelfQa`` strips NEXUS secrets from the child environment.
+        """
+        gate = self.quality_gate
+        if gate is None or verdict.verdict not in VERIFIED_VERDICTS:
+            return verdict
+        commit = str(verdict.evidence.get("remote_sha") or "")
+        repository = task.get("repository") or ""
+        if not commit or not repository:
+            return verdict
+        try:
+            qa = gate.run(repository=repository, commit=commit)
+        except Exception as e:  # noqa: BLE001 - the gate must not stall a run
+            log.warning("quality gate failed for task %s: %s",
+                        task.get("task_key"), type(e).__name__)
+            return verdict
+        summary = qa.as_dict() if hasattr(qa, "as_dict") else dict(qa)
+        evidence = {**verdict.evidence, "self_qa": {
+            "verdict": summary.get("verdict"), "reason": summary.get("reason"),
+            "checks": [{"name": c.get("name"), "status": c.get("status"),
+                        "exit_code": c.get("exit_code")}
+                       for c in summary.get("checks", [])],
+        }}
+        if summary.get("verdict") == "failed":
+            return Verification(
+                "completed_unverified",
+                f"self-QA failed: {summary.get('reason') or 'a required check failed'}",
+                evidence, retry="followup")
+        # passed / skipped / blocked: the verdict stands, unchanged.
+        return Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
 
     def _record_evidence(self, task: dict, verdict: Verification, report: TaskReport) -> None:
         """EVIDENCE stage: sign a settled task result into the Trust Engine.
@@ -1702,6 +1760,7 @@ class LabScheduler:
                                   attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
                     verdict = self.verifier.verify(task, report)
                 self.store.record_run_milestone(run_id, "verification_completed_at")
+                verdict = self._apply_quality_gate(task, verdict)
             # The account produced a terminal result, so it is working: mark it
             # healthy again. Without this an account excluded by one transient
             # failure would never come back into the pool.

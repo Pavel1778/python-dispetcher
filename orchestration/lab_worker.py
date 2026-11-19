@@ -91,6 +91,7 @@ class LabWorker:
                  github_accounts: GitHubAccountService | None = None,
                  heartbeat_seconds: int = 60, account_router: Any | None = None,
                  evidence: Any | None = None, discover_router: bool = True,
+                 quality_gate: Any | None = None,
                  stopping: Callable[[], bool] | None = None):
         self.store = store
         self.lab = LabStore(store)
@@ -111,6 +112,11 @@ class LabWorker:
         # environment by ``main`` (a signer only when the key is configured),
         # so a deployment without one keeps the loop exactly as it was.
         self.evidence = evidence
+        # The QUALITY GATE: when given a ``SelfQa``, a task the Git verifier
+        # accepted is then run against the project's own checks at that exact
+        # commit; a failing required check reworks it. Off by default - a
+        # deployment that has not opted in keeps the loop exactly as it was.
+        self.quality_gate = quality_gate
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
         self.executor = OpenHandsExecutor(
@@ -176,7 +182,8 @@ class LabWorker:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
                             router=self.account_router, reports=self.reports,
-                            evidence=self.evidence, stopping=self.stopping)
+                            evidence=self.evidence, quality_gate=self.quality_gate,
+                            stopping=self.stopping)
 
     def stopping(self) -> bool:
         """Whether this worker has been told to stop."""
@@ -342,6 +349,24 @@ class LabWorker:
         self._stop.set()
 
 
+def build_quality_gate() -> Any | None:
+    """The Self-QA gate when the operator has opted in (``NEXUS_SELFQA_GATE``).
+
+    Off by default: running a project's checks clones its repository and runs
+    arbitrary commands inside it, which costs time and is only meaningful when
+    the project declares checks. When on, every task the Git verifier accepts is
+    run against the project's own checks at that commit, and a failing required
+    check reworks the task. The engine strips NEXUS secrets from the child
+    environment (``nexus_selfqa._child_env``), so the checks never see a
+    credential.
+    """
+    raw = os.environ.get("NEXUS_SELFQA_GATE", "").strip().lower()
+    if raw not in ("1", "true", "yes", "on"):
+        return None
+    from .nexus_selfqa import SelfQa
+    return SelfQa()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="NEXUS autonomous lab worker")
     parser.add_argument("--worker-id", default=f"lab-{os.getpid()}")
@@ -360,11 +385,14 @@ def main(argv: list[str] | None = None) -> int:
     router = build_account_router(store, principal="machine:default")
     worker = LabWorker(store, worker_id=args.worker_id,
                        poll_interval=args.poll_interval, lease_seconds=args.lease_seconds,
-                       account_router=router, evidence=build_evidence_service(store))
+                       account_router=router, evidence=build_evidence_service(store),
+                       quality_gate=build_quality_gate())
     if router is not None:
         log.info("OpenHands account pool is active")
     if worker.evidence is not None:
         log.info("Evidence Trust Engine is active: task results are signed")
+    if worker.quality_gate is not None:
+        log.info("Self-QA gate is active: accepted commits are checked")
 
     def _stop(signum, frame):  # graceful shutdown
         log.info("signal %s: stopping after the current pass", signum)

@@ -332,6 +332,12 @@ class App:
             self.store,
             EvidenceTrustEngine(self.evidence_keyring, self.evidence_signer),
         )
+        # The QUALITY GATE (Self-QA), opt-in via NEXUS_SELFQA_GATE. When on, a
+        # task the Git verifier accepts is run against the project's own checks
+        # at that commit and a failing required check reworks it. Off by
+        # default; the gate only ever downgrades a verified verdict.
+        from .lab_worker import build_quality_gate
+        self.quality_gate = build_quality_gate()
         self.github_confirmations = Confirmations()
         self.github_writes_enabled = os.environ.get("GITHUB_ENABLE_WRITES", "").lower() in ("1", "true", "yes")
         # The LLM orchestrator cascade (Gemini -> Groq -> OpenRouter ->
@@ -542,6 +548,7 @@ class App:
                                       github_accounts=self.github_accounts,
                                       account_router=build_account_router(self.store),
                                       evidence=self.evidence,
+                                      quality_gate=self.quality_gate,
                                       # A start that is on its way when the
                                       # server is stopped is left, recorded, to
                                       # the process that replaces this one.
