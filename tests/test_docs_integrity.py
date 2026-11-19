@@ -34,8 +34,8 @@ def test_no_readme_doc_link_is_broken():
     src = open(os.path.join(_ROOT, "README.md")).read()
     links = re.findall(
         r"\]\((docs/[^)#]+\.md|AGENTS\.md|CHANGELOG\.md|DEPLOY\.md)\)", src)
-    broken = [l for l in sorted(set(links))
-              if not os.path.exists(os.path.join(_ROOT, l))]
+    broken = [link for link in sorted(set(links))
+              if not os.path.exists(os.path.join(_ROOT, link))]
     assert not broken, f"broken README links: {broken}"
 
 
