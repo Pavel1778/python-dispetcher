@@ -4531,6 +4531,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"counts": self.app.store.dashboard_counts()})
             if path == "/api/system":
                 return self._json(200, self.app.system_info())
+            if path == "/api/migrations":
+                # Where this database stands against migrations/. Read-only;
+                # pending files mean the next disconnect/upgrade applies them,
+                # or that an upgrade ran against a read-only role.
+                return self._json(200, self.app.store.migration_status())
             if path == "/api/observability":
                 # Queue depth, stuck tasks, worker heartbeat, per-stage latency.
                 # Booleans, counts and durations only; never a secret.

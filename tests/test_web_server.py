@@ -299,6 +299,15 @@ def test_dashboard_counts(http):
     assert set(body["counts"]) >= {"tasks", "queued", "running", "completed", "failed"}
 
 
+def test_migrations_endpoint_reports_the_applied_state(http):
+    st, body = http.get("/api/migrations")
+    assert st == 200
+    assert body["up_to_date"] is True
+    assert body["pending"] == []
+    assert body["applied"] == body["total"] > 0
+    assert body["latest_applied"]
+
+
 def test_system_info_hides_secrets(http, monkeypatch):
     monkeypatch.setenv("AUTH_SESSION_SECRET", "super-secret-value")
     st, body = http.get("/api/system")

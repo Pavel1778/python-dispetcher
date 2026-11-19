@@ -203,6 +203,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_migrations(args: argparse.Namespace) -> int:
+    """Where this database stands against migrations/ (read-only)."""
+    client = _client(args)
+    data = client.get("/api/migrations")
+    pending = data.get("pending") or []
+    lines = [f"migrations: {data.get('applied')}/{data.get('total')} applied",
+             f"up to date: {'yes' if data.get('up_to_date') else 'no'}"]
+    if data.get("latest_applied"):
+        lines.append(f"latest applied: {data['latest_applied']} ({data.get('latest_applied_at')})")
+    if pending:
+        lines.append("pending:")
+        lines += [f"  - {name}" for name in pending]
+    _emit(args, data, human="\n".join(lines))
+    return EXIT["ok"] if data.get("up_to_date") else EXIT["error"]
+
+
 def cmd_project_list(args: argparse.Namespace) -> int:
     client = _client(args)
     projects = client.get("/api/v1/projects").get("projects", [])
@@ -877,6 +893,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", parents=[common], help="print the version").set_defaults(func=cmd_version)
     sub.add_parser("doctor", parents=[common], help="diagnose connectivity and configuration").set_defaults(func=cmd_doctor)
     sub.add_parser("status", parents=[common], help="dashboard counts and health").set_defaults(func=cmd_status)
+    sub.add_parser("migrations", parents=[common],
+                   help="show which migrations this database has applied (read-only)").set_defaults(func=cmd_migrations)
     providers = sub.add_parser("providers", parents=[common],
                                help="show the LLM orchestrator cascade (Gemini → Groq → OpenRouter → OpenHands)")
     providers.add_argument("--live", action="store_true",
