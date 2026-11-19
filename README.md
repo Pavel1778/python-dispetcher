@@ -49,6 +49,13 @@ Start here:
 - [docs/security/SECURITY_AUDIT.md](docs/security/SECURITY_AUDIT.md) — security findings and their classes.
 - [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.
 
+> **A note on root-level reports.** Files such as `FINAL_RELEASE_REPORT.md`,
+> `NEXUS_INTEGRATION_RECOVERY_FINAL_REPORT.md`, `PR46_PR47_FINAL_INTEGRATION_REPORT.md`
+> and the ones under `reports/` are **historical audit artifacts** from earlier
+> phases. They are kept for provenance and are not updated to match every
+> commit; the living state is `COMPLETION_LEDGER.md`, this README, and the
+> documents linked above.
+
 ## What is ready today
 
 Working and covered by tests (the suite passes against a disposable
