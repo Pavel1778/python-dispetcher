@@ -64,6 +64,7 @@ from datetime import timedelta
 from typing import Any
 
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
+
 from .nexus_projects import IdempotencyConflict, ProjectService
 
 log = logging.getLogger("nexus_lab_store")
@@ -886,16 +887,23 @@ class LabStore:
                 "WHERE run_id=%s AND state = ANY(%s) AND conversation_id IS NOT NULL "
                 "ON CONFLICT (conversation_id) DO NOTHING",
                 (why[:200], run_id, list(IN_FLIGHT_TASK_STATES)))
-            cur.execute(
-                "UPDATE nexus_task_executions SET ended_at=now(), outcome=%s, reason=%s "
-                "WHERE run_id=%s AND ended_at IS NULL",
-                ("cancelled" if state == "cancelled" else "stopped", why[:500], run_id))
+            # One lock order for the whole system: run row, then task rows,
+            # then execution rows. The bulk execution update used to run first,
+            # which inverted against every worker-side settle (a worker locks
+            # its task row first and closes executions second) - cancel held
+            # the executions of the whole run and then waited for a task the
+            # worker held, while the worker waited for the executions cancel
+            # held. Tasks are locked first here, the order workers take.
             cur.execute(
                 "UPDATE nexus_run_tasks SET state='blocked', lease_expires=NULL, retry_at=NULL, "
                 "lease_owner=NULL, lease_token=lease_token+1, "
                 "wait_reason=NULL, resume_conversation_id=NULL, last_error=%s, updated_at=now() "
                 "WHERE run_id=%s AND state = ANY(%s)",
                 (why[:500], run_id, list(UNFINISHED_TASK_STATES)))
+            cur.execute(
+                "UPDATE nexus_task_executions SET ended_at=now(), outcome=%s, reason=%s "
+                "WHERE run_id=%s AND ended_at IS NULL",
+                ("cancelled" if state == "cancelled" else "stopped", why[:500], run_id))
         if state == "running":
             # A run that is going again no longer has the error that stopped it,
             # and does not wait out a pause that belonged to it.
