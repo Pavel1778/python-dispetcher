@@ -1,6 +1,10 @@
 # Rust Migration
 
-Status: **Phase 3-4 delivered, partial by design.** The deterministic core of
+> **Scope:** this is the historical NEXUS 2.0 sidecar report. Its phase numbers
+> are not milestones of the 3.0 migration. For the current storage candidate,
+> gates and measured results see [NEXUS 3](../reports/nexus3/README.md).
+
+2.0 status: **Phase 3-4 delivered, partial by design.** The deterministic core of
 NEXUS is implemented in Rust with proven parity; the I/O, SQL and HTTP layers
 remain in Python. This document says exactly what moved, what did not, why, and
 what the evidence is. It does not claim more than was measured.

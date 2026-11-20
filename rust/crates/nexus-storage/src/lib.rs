@@ -108,3 +108,38 @@ pub async fn claim_task(
     tx.commit().await?;
     Ok(Some(Grant { id, lease_token }))
 }
+
+/// Recover at most `batch` expired, unbound starts from one project's run.
+/// Return the revoked task IDs, *not* write grants. A new dispatch still needs
+/// a new claim and must try adoption first. A bound conversation is never
+/// reclaimed; polling it belongs to the ordinary recovery loop. Multiple
+/// batches are intentional: no sweep may hold unbounded task locks/results.
+pub async fn reclaim_expired(
+    pool: &PgPool,
+    project_id: Uuid,
+    run_id: Uuid,
+    batch: std::num::NonZeroU16,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Identical lock order to claim and Python pause/cancel: run, then tasks.
+    let durable: Option<bool> = sqlx::query_scalar(
+        "SELECT policy='durable' FROM nexus_runs WHERE id=$1 AND project_id=$2 FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(durable) = durable else {
+        tx.rollback().await?;
+        return Ok(Vec::new());
+    };
+    let ids = sqlx::query_scalar(include_str!("reclaim_expired.sql"))
+        .bind(run_id)
+        .bind(project_id)
+        .bind(i32::from(batch.get()))
+        .bind(durable)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ids)
+}

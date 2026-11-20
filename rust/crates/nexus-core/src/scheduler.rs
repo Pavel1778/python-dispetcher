@@ -3,9 +3,9 @@
 //!
 //! This mirrors the conditions `LabStore.claim_task` evaluates in SQL
 //! (`_TASK_DUE`, `_DEPS_VERIFIED`, `_BRANCH_FREE`) and the run-level gate on
-//! the locked run row. The SQL stays in Python until the whole claim path is
-//! migrated; this module is the **decision**, as a pure function of a snapshot,
-//! so it can be compared against Python over the same inputs.
+//! the locked run row. This is only a **run-local prediction**, not authority
+//! to start work. The Python store and the SQLx candidate in `nexus-storage`
+//! arbitrate across runs using committed PostgreSQL state.
 //!
 //! The snapshot types are plain data, so a test (Python or Rust) can build one
 //! without a database.

@@ -44,7 +44,7 @@ def start(store, lab, tasks, repo='', **options):
     return pid, run['id']
 
 
-def rust_claim(pid, rid, worker='rust', limit=8):
+def probe(*args):
     # tests._test_db produces libpq conninfo; never place a password on argv.
     params = conninfo_to_dict(DSN)
     env = {'PATH': os.environ['PATH']}
@@ -52,9 +52,13 @@ def rust_claim(pid, rid, worker='rust', limit=8):
                      ('user', 'PGUSER'), ('password', 'PGPASSWORD')):
         if key in params:
             env[var] = params[key]
-    child = subprocess.run([PROBE, str(pid), str(rid), worker, '900', str(limit)],
+    child = subprocess.run([PROBE, *map(str, args)],
                            env=env, capture_output=True, text=True, timeout=30, check=True)
     return json.loads(child.stdout)
+
+
+def rust_claim(pid, rid, worker='rust', limit=8):
+    return probe('claim', pid, rid, worker, 900, limit)
 
 
 def test_rust_claim_survives_process_exit_and_python_recovery(queue):
@@ -147,3 +151,51 @@ def test_failed_task_update_rolls_back_the_run_budget(queue):
         assert cur.fetchone() == {'iteration': 0, 'total_iterations': 0}
     (task,) = lab.list_tasks_internal(rid)
     assert (task['state'], task['lease_owner'], task['attempt']) == ('pending', None, 0)
+
+
+@pytest.mark.parametrize(('policy', 'budget'), [('bounded', 1), ('durable', 1),
+                                               ('bounded', 2), ('durable', 2)])
+def test_expired_attempts_match_committed_python_state(queue, policy, budget):
+    store, lab = queue
+    fields = ('state', 'lease_token', 'lease_expires', 'lease_owner', 'attempt', 'cycle',
+              'tried_accounts', 'evidence', 'last_error', 'pending_start')
+
+    def fixture(recover):
+        pid, rid = start(store, lab, [{'id': 'a', 'title': 'A'}],
+                         policy=policy, max_attempts_per_task=budget)
+        task = lab.claim_task(rid, 'worker')
+        assert lab.record_start(task['id'], start={'start_task_id': 'accepted'}, lease_token=task['lease_token'])
+        with store._tx() as cur:
+            cur.execute("UPDATE nexus_run_tasks SET lease_expires=now()-interval '1 second', "
+                        "tried_accounts='[\"fixture\"]'::jsonb WHERE id=%s", (task['id'],))
+        assert recover(pid, rid) == [str(task['id'])]
+        assert not recover(pid, rid) and not lab.pending_starts(rid)
+        row = lab.get_task_internal(task['id'])
+        assert row['lease_token'] > task['lease_token'] and row['lease_owner'] is None
+        late = lab.mark_running(task['id'], conversation_id='late-' + str(rid),
+                                lease_token=task['lease_token'])
+        assert late['conversation_id'] is None and lab.stop_for('late-' + str(rid))['state'] == 'requested'
+        return {f: row[f] for f in fields}
+
+    expected = fixture(lambda _, rid: [str(t['id']) for t in lab.reclaim_expired(rid)])
+    observed = fixture(lambda pid, rid: probe('reclaim', pid, rid, 4))
+    assert observed == expected
+
+
+def test_sweep_is_bounded_scoped_and_never_requeues_bound_conversation(queue):
+    store, lab = queue
+    pid, rid = start(store, lab, [{'id': f't{i}', 'title': 'T'} for i in range(5)])
+    other, _ = start(store, lab, [{'id': 'other', 'title': 'T'}])
+    tasks = [lab.claim_task(rid, 'python') for _ in range(5)]
+    bound, live, *lost = tasks
+    lab.mark_running(bound['id'], conversation_id='in-cloud', lease_token=bound['lease_token'])
+    with store._tx() as cur:
+        cur.execute("UPDATE nexus_run_tasks SET lease_expires=now()-interval '1 second' "
+                    "WHERE run_id=%s AND id<>%s", (rid, live['id']))
+    assert not probe('reclaim', other, rid, 20)
+    first = probe('reclaim', pid, rid, 2)
+    second = probe('reclaim', pid, rid, 2)
+    assert len(first) == 2 and len(second) == 1 and not probe('reclaim', pid, rid, 2)
+    assert set(first + second) == {str(t['id']) for t in lost}
+    assert lab.get_task_internal(bound['id'])['conversation_id'] == 'in-cloud'
+    assert lab.get_task_internal(live['id'])['lease_token'] == live['lease_token']

@@ -38,8 +38,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustc --version
-          cargo --version
+          echo "::notice title=Rust toolchain::$(rustc --version); $(cargo --version)"
 
       - name: Build the Rust workspace
         timeout-minutes: 10
@@ -71,7 +70,23 @@ jobs:
           NEXUS_CLAIM_PROBE: ${{ github.workspace }}/rust/target/release/examples/claim_probe
         run: |
           set -o pipefail
+          test -x "$NEXUS_RUST_BIN" && test -x "$NEXUS_CLAIM_PROBE"
           pytest tests/test_rust_parity.py tests/test_rust_claim.py -q -p no:cacheprovider -rfEs 2>&1 | tee /tmp/parity.log
+          if grep -q '^SKIPPED ' /tmp/parity.log; then
+            echo "::error title=parity::the SQLx gate must run every case on PostgreSQL"
+            exit 1
+          fi
+
+      # Same PG service, one physical clone per trial; no cloud or UI load.
+      # No speed threshold: variance or a slower candidate must be visible.
+      - name: Measure successful storage grants
+        timeout-minutes: 5
+        env:
+          NEXUS_CLAIM_PROBE: ${{ github.workspace }}/rust/target/release/examples/claim_probe
+          COMPARISON_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python benchmarks/compare_claims.py --tasks 200 --rounds 4 --out /tmp/claim-comparison.json
+          python -c 'import json; print("::notice title=claim-comparison::" + json.dumps(json.load(open("/tmp/claim-comparison.json")), separators=(",", ":")))'
 
       - name: Parity report
         if: always()
