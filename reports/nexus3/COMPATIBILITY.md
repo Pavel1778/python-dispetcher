@@ -34,6 +34,16 @@
 * Direct/App, pool, retry/429, timeout и stop — разные транспортные контракты. Подтверждение принятого start хранится до получения conversation id. Сначала оба stand-in HTTP стенда; затем разрешённые тестовые аккаунты, отказ первого, привязка ко второму, результат и очистка только собственных ресурсов. SelfQA: отдельный ограниченный исполнитель без production credentials, проверка точного commit; не смешивать результат агента с независимым verdict.
 * Одна серверная Studio, без замены JS/CSS. Новые SSE-события — добавка с cursor/reconnect и fallback к существующему polling. Для Tauri 2 — согласованный HTTPS origin, browser session, никакого bearer в localStorage; удалённой странице **по умолчанию никакого IPC**. Разрешать конкретную ОС-операцию только после проверки origin и выбора пользователем. Не кэшировать приватные ответы в service worker. Девять исходных PNG — в `studio/`; сверка на том же Chromium/шрифтах, затем реальное устройство.
 
+### Проверяемый снимок wire protocol
+
+[Ответы исходного сервера](evidence/wire_contract.json) получены по loopback HTTP и через отдельный stdio-процесс MCP, не из описания API. Новый кластер на `170eaf96e23b56a89adca0a3c0c168eb3261b142` дал те же данные: 9 HTTP cases и 5 MCP-сообщений. В файле — status, разрешённый набор response headers, JSON или размер/хэш байтов; ни cookies, ни значения bearer не сохраняются. Для неавторизованного `/` — **303** и Location, не 200 с новым dashboard; API без auth — 401, чужой проект — 404, некорректное JSON-тело `/mcp` — 400. Для четырёх запросов с id ответы stdio и JSON-RPC/HTTP совпадают, включая схемы/полномочия всех 19 tools и ошибку −32004; notification — пустой HTTP 202 и **нет** строки в stdout. Это выбранная регрессия, не исчерпывающая OpenAPI-спецификация и не утверждение об SSE/batch support.
+
+```sh
+# Из корня измеряемого checkout, в новую output file.
+tools/with_disposable_postgres.sh python reports/nexus3/capture_wire.py /tmp/wire.json \
+    --compare reports/nexus3/evidence/wire_contract.json
+```
+
 ### Порядок допуска
 
 | Фаза | Измеримый результат до переключения | Откат |

@@ -2,6 +2,12 @@
 
 **Это не release candidate.** Предмет Phase 0 — действующая платформа при входе в миграцию, не обещания в документах 2.0. Исходный `main` и начальный HEAD ветки `arena/6f80793e-python-dispetcher`: **`2edf3aa70eefb0628fa88997a1d1c095b133e007`**. Production, его БД, аккаунты OpenHands и пользовательские репозитории не использовались. Ниже `VERIFIED` всегда ограничено указанным стендом и проверкой.
 
+**Навигация:** [ADR и контракты (Phase 1)](COMPATIBILITY.md) · [две транзакции Rust, тесты и ограничения (Phase 2)](STORAGE.md) · [draft PR #54](https://github.com/Pavel1778/python-dispetcher/pull/54). Документ различает исходный baseline, проверенные изменения в ветке и условия будущего cutover.
+
+**Итог на последней ревизии продукта `170eaf96e23b56a89adca0a3c0c168eb3261b142`:** локальная полная suite — **2089 passed, 32 skipped in 464.82s**; [hosted CI](https://github.com/Pavel1778/python-dispetcher/actions/runs/44786382445) — **2102 passed, 19 skipped, 1 warning in 564.65s**, отдельный Linux/PG17 Rust job — locked build, unit tests и **22 passed in 2.22s** в Python↔Rust gate. Результаты **не складываются**: отдельный job исполняет и часть ранее проверенных parity cases. Разбивка по четырём CI runs, пяти local suites, ревизиям и пропускам — [checks.json](evidence/checks.json). В Python CI job 13 из 19 skips — тесты storage probe, которые выполняет Rust job; локально дополнительно нет Rust toolchain в PATH suite и Android SDK. Не выдаём skip реального cloud task за pass.
+
+Две операции Rust проверены транзакционно, но последний тест на клонах одной БД дал медиану **488.0 успешных выдач/с у Rust и 500.35 у Python**. Экономия памяти драйвера не доказывает ускорения всего worker. Поэтому операционное решение — **не переключать планировщик**. Разрешения на rollout или RC нет.
+
 ## 1. Что сохранили
 
 * Начальный `git status --porcelain` пуст. Checkout shallow; отсутствие локального remote-tracking ref не означает отсутствие ветки на сервере. `git ls-remote`, `gh pr list --state all`, `gh api …/actions/runs` проверены заново. [Снимок](evidence/refs.json): 8 remote heads, 17 tags (без peeled псевдорефов), 53 PR на момент входа: 40 merged, 12 closed, 1 open. PR #53 уже в исходном SHA. #52 (`5c001f90f5b90b25dadd1cb2412dc85df3b62015`) **не предок** main; деревья тоже не совпадают. Не закрывать и не удалять его ветку на основании старого отчёта.
@@ -67,6 +73,7 @@ $W python tools/studio_snapshots.py /tmp/new-studio --compare reports/nexus3/stu
 
 * В первом прогоне с UTF8 encoding, но `LC_CTYPE=C`: **2081 passed, 19 skipped, 3 failed in 479.05s**. Именно поиск по кириллице (browser, service и HTTP) не совпал с `lower()` в БД. Все три теста прошли в кластере `C.UTF-8` (**3 passed in 3.86s**), код поиска и assertions не менялись. Collation действующей БД надо обследовать, а не менять production locale на месте.
 * Для контроля снят отдельный чистый checkout того же SHA и той же ветки. Полный прогон C.UTF-8: **2082 passed, 19 skipped, 2 errors in 461.81s**. Обе ошибки setup одного DEB fixture: наш wrapper распространил `umask 077` на `dpkg-deb`, который требует control dir ≥0755. Wrapper теперь держит кластер приватным, но возвращает дочернему процессу исходный umask. Повтор **на исходном SHA**: `tests/test_deb_package.py` **5 passed in 0.15s**. Это не выдаётся за полностью зелёный первый прогон.
+* Контрольный **полный** локальный прогон на чистом `2edf3aa…` с окончательным wrapper, после исправления обеих проблем окружения: **2084 passed, 19 skipped in 442.05s**.
 * 19 skips: 9 Rust parity без собранного бинарника в тестовой среде, 4 Android SDK, 3 MinGW, 1 transaction-mode pooler, 1 local agent-server, 1 live development task. Ни один skip не засчитан за поддержку платформы. `ruff check .` — без замечаний.
 
 Локальный чистый Cargo home: `cargo test --locked --offline` не смог разрешить `serde_json`. Crates.io downloads не входят в разрешённые сетевые источники. Локальные исходники из tarball и замены зависимостей не принимались за locked build. Версия компилятора сама по себе ничего не доказывает.
@@ -76,3 +83,47 @@ $W python tools/studio_snapshots.py /tmp/new-studio --compare reports/nexus3/stu
 **Restore**: исходная проверка после `pg_restore` открывала store с автоматической миграцией. Теперь на восстановленной копии она запрещена. Проверяются полный ledger с SHA, project/repo, обе модели задач, token/зависимости, история чата, права и байты файла, параметр quality gate и две подписи/цепочка Ed25519 с отдельно сохранённым публичным ключом. Ещё один дефект: `sed` не разбирает libpq DSN с повторным dbname. `scripts/nexus.sh restore` теперь выбирает БД парсером libpq, сверяет фактический `current_database()` и, при наличии sidecar, checksum выбранного дампа **до** restore. Расширенная проверка скрипта и dump/restore: **13 passed in 2.17s**. Это восстановление fixture, **не production backup**. План для оператора, включая остановку writers и безопасный возврат: [BACKUP_AND_RESTORE](../../docs/BACKUP_AND_RESTORE.md).
 
 План по каждой группе API, типу данных, поставщику и платформе, решения и порядок отката — [Phase 1 / ADR](COMPATIBILITY.md). Не переходить к rollout по зелёному unit-тесту. Портирование OpenHands, Axum/Tower, Rust MCP, Tauri и сборки/установки APK, DEB, NSIS EXE остаются самостоятельными gates. Внешние блокеры — разрешённые тестовые cloud accounts, ключ release signing вне репозитория, физическое устройство и целевые ОС. До этих проверок статуса «NEXUS 3.0 готов» нет.
+
+## 6. Дополнительные проверки исходного SHA и ветки
+
+Исходный checkout `2edf3aa…` проверялся тем же инструментом, что и **Python-путь** на `fa1dae8d387a5e0a9a66de8fd447dd743c042be7`. Это две отдельные серии, на свежих кластерах, без одновременного нагрузчика/pytest. Исполняемый Rust в этих локальных числах **не участвует**.
+
+| Сценарий | Исходный Python | Python после исправлений | Что проверялось |
+|---|---:|---:|---|
+| 4 параллельных run × chain из 40 задач, 1000 посторонних pending задач | 160 / 0.5688 s; 0.2440 CPU-s | 160 / 0.5570 s; 0.2355 CPU-s | Общий limit 8; разные ветки; строго все 160 ID по одному разу, после своего предка. Синтетический `completed_no_changes`, **не** 160 проверенных работ. |
+| Тёплый `EXPLAIN (ANALYZE, BUFFERS)` настоящего SELECT кандидата | 0.270 ms; shared hits 126 | 0.270 ms; shared hits 126 | Для одного grant с веткой и глобальным лимитом — **8** прикладных execute без BEGIN/COMMIT. Разбор запроса, время отдельных execute и полное дерево плана в JSON, а не предлагаемая наугад смена индекса. |
+| Restart: новый процесс → сохранён зависимый start | 204.16–205.00 ms | 205.09–205.67 ms | По 3 SIGKILL штатного **Python** worker после привязки первой conversation. На каждый run ровно 2 старта, обе подписи task/commit и подпись решения ACCEPTED проверены публичным ключом. |
+| Запрос → видна подписанная приёмка двух задач | 0.8201–0.8310 s | 0.7671–0.8293 s | Внешние планировщик/OpenHands/GitHub — локальные doubles. Экстраполяция из 6 результатов: 8720.9 / 8939.3 fixture tasks/h, **не** час наблюдения, не время реального агента и не выполнение проекта. |
+
+Данные: [DAG/SQL до](evidence/queue_baseline.json) и [после](evidence/queue_candidate.json); [restart до](evidence/restart_baseline.json) и [после](evidence/restart_candidate.json). Небольшое расхождение времени одного прогона — не доказательство выигрыша. В локальном плане фильтрация по run использует bitmap/index scan; есть и последовательные сканы подветок. Нельзя переносить решение об индексах с 1200 fixture tasks на production без повторного плана и данных о кардинальности.
+
+[Короткая нагрузка на исходном SHA](evidence/short_soak_baseline.json): 5 читателей, запрошены 2 минуты, последняя точка на 122.1 s, File Lab burst и один принудительный обрыв соединений PG. 74 985 успешных чтений; p50/p95/p99 успешных — 7.79/12.77/16.73 ms. **Одна ошибка запроса**, не скрыта. Снимки до/после обрыва: 61 618 → 74 969 чтений без перезапуска. RSS benchmark-процесса от 58.4 до 61.7 MiB; в нём находятся и клиенты, и растущий список latency, это не профиль аллокаций сервера. Ни OOM, ни зависания за окно не наблюдалось; многочасовая стабильность и RTO при падении всего хоста этим не доказаны.
+
+```sh
+# Из корня измеряемого checkout; HARNESS можно взять из ветки с инструментами.
+HARNESS=/absolute/path/to/benchmarks/forensic_workload.py
+WRAPPER=/absolute/path/to/tools/with_disposable_postgres.sh
+$WRAPPER python "$HARNESS" queue --runs 4 --depth 40 --out /tmp/queue.json
+$WRAPPER python "$HARNESS" restart --repeat 3 --out /tmp/restart.json
+$WRAPPER python benchmarks/soak_test.py --minutes 2 --readers 5 --out /tmp/soak.json
+```
+
+**Целостность evidence.** У двух разных записей одного scope раньше мог оказаться один и тот же predecessor: подписи готовились параллельно, а последний hash читался до транзакции INSERT. Для v2 project и v1 unscoped из четырёх одновременно готовых подписей три связи на каждом стенде оказались нарушены (`2 failed in 0.38s` до исправления). Исправление `1b1ebafcd95c9421fae1a4004f5bfc184fa520d6`: одна блокировка на scope, чтение tail **после** ожидания, расчёт ссылки и INSERT с seq — в одной транзакции. Подписываемые байты и прежние записи не изменяются. Фикс с сервисными/лабораторными тестами: **28 passed in 0.99s**; в ветке совместно с restore, lease и handover: **95 passed in 19.34s**. Это предупреждает новые разветвления; не переписывает старые цепочки и не сертифицирует произвольную БД. Для проверки больших историй до cutover нужен полный проход каждой области: существующий `EvidenceService.index_integrity` читает ограниченную выборку (до 1000 записей).
+
+**Восстановление credential:** на `170eaf96e23b56a89adca0a3c0c168eb3261b142` в drill добавлена запись OpenHands-аккаунта с одноразовым значением, привязкой к проекту и реальным шифрованием через штатный account service. Endpoint для заполнения — локальный double. После `pg_restore` совпадает digest ciphertext; чужой principal и другой ключ не дают использовать credential. С отдельно удержанным правильным ключом совпадает digest расшифрованного значения. Сеть для этой проверки не нужна. Restore + self-hosting: **13 passed in 2.60s**. Не доказательство действительности какой-либо внешней учётной записи.
+
+**UI после исправлений:** на `fa1dae8…` ещё один отдельный `studio_snapshots.py --compare`: **9/9 одинаковы по всем RGB-пикселям** с исходными эталонами. [Перечень сравнения](evidence/studio_comparison.json). В diff нет `orchestration/studio/` и `migrations/`. После переноса API, для настоящего активного run и на физических клиентах проверку нужно выполнить заново.
+
+## 7. Состав поставки и границы приёмки
+
+| Этап | Изменённые файлы | Результат |
+|---|---|---|
+| 0 · baseline | `reports/nexus3/{catalog.sql,evidence/,studio/}`, `reports/nexus3/capture_wire.py`, `tools/{with_disposable_postgres.sh,studio_snapshots.py}`, `benchmarks/{api_bench,scheduler_bench,forensic_workload}.py` | Локальная воспроизводимая точка отсчёта, не спецификация производительности dedicated host. |
+| Preservation / корректность oracle | `scripts/nexus.sh`, `docs/BACKUP_AND_RESTORE.md`, `orchestration/{nexus_lab_store,cloud_store,nexus_evidence}.py`, `tests/{test_backup_restore,test_self_hosting,test_lab_store,test_evidence_trust}.py` | Проверенный scratch restore, fence при durable rollover и конкурентная append-only запись evidence. Ни исправления production данных, ни автоматической ротации настоящих ключей. |
+| 1 · проект | [`COMPATIBILITY.md`](COMPATIBILITY.md), `docs/RUST_MIGRATION.md` (уточнение границы старого отчёта) | Владение данными, контракты и порядок переключения заданы; проектирование не засчитывается за реализацию. Нет измеримого RAM/CPU эффекта от документа. |
+| 2 · storage (часть) | `rust/{Cargo.toml,Cargo.lock,crates/nexus-storage/}`, `rust/crates/nexus-core/{src,tests}/scheduler.rs`, `orchestration/sql/*.sql`, `pyproject.toml`, `tests/test_rust_claim.py`, `benchmarks/compare_claims.py`, `.github/workflows/tests.yml` | [Транзакционный grant/reclaim на реальном PG и ограничения](STORAGE.md); нет handoff полномочий на исполнение. |
+| 3–7 | **Нет релизных файлов этих фаз.** | Реальные Direct/App + смена двух аккаунтов, SelfQA/отчёты в новом worker, совместимый Axum/MCP, Tauri 2, install/upgrade на Debian 13/Windows/Android, прогон на целевом хосте и RC **NOT VERIFIED**. Нет release APK/DEB/EXE от 3.0. |
+
+Точки истории ветки: база `2edf3aa70eefb0628fa88997a1d1c095b133e007`; baseline/restore `e4eb5f309892a818fbe461a08cdb551a7811566e`; ADR `3543860d126ada14f6fdd773e41c5c6d68a07fcc`; первый SQLx gate `a59c00c0ae17117b01b0b6b3da699b6bd0b06261`; целостность evidence `1b1ebafcd95c9421fae1a4004f5bfc184fa520d6`; recovery/сравнение `fa1dae8d387a5e0a9a66de8fd447dd743c042be7`; последняя ревизия ядра и тестов продукта `170eaf96e23b56a89adca0a3c0c168eb3261b142`. Последующий commit с отчётами, reference-данными и инструментом чтения wire contract не меняет этот код. Рабочая ветка и draft PR не являются разрешением на merge, deployment или миграцию существующей БД.
+
+Отдельные блокеры нативной приёмки: в этом сеансе нет подключённого физического Android, release signing identity и Debian 13/Windows-системы с проведённой install/upgrade-проверкой. Основной CI использует **Ubuntu**, а не Windows runner. Отсутствие Tauri-кода/отдельных build jobs — ещё не выполненная работа фазы 5, **не** доказательство, что hosted runner недоступен. Ключ подписи нельзя давать непроверенному PR. Для фаз 3 и 6 нужны разрешённые тестовые внешние аккаунты/репозиторий и целевая машина; реальные пользовательские данные для измерений не брались.

@@ -1,0 +1,19 @@
+{
+  "reference": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+  "candidate": "fa1dae8d387a5e0a9a66de8fd447dd743c042be7",
+  "chromium": "153.0.8010.0",
+  "playwright": "1.65.2",
+  "assets": 15,
+  "decoded_rgb_identical": [
+    "desktop-agent.png",
+    "desktop-chat.png",
+    "desktop-files.png",
+    "desktop-home.png",
+    "desktop-login.png",
+    "desktop-settings.png",
+    "phone-chat.png",
+    "phone-history.png",
+    "phone-home.png"
+  ],
+  "png_and_asset_checksums_match": true
+}
