@@ -67,8 +67,9 @@ artefact. See `ARCHITECTURE_RECONCILIATION.md`.
 | --- | --- | --- |
 | Baseline (pre-change) | `pytest tests/ -q` | **2085 passed, 66 skipped** |
 | Post-change Python | `pytest tests/ -q` | **2094 passed, 66 skipped** |
+| **Final (all changes, all deps)** | `pytest tests/ -q` (Chromium + Rust probe) | **2161 passed, 9 skipped, 0 failed** |
 | Browser E2E | `E2E_CHROMIUM_EXECUTABLE=/usr/bin/chromium pytest tests/test_browser_e2e.py -q` | **38 passed** |
-| OpenHands config | `pytest tests/test_openhands_config_persistence.py -q` | **10 passed** |
+| OpenHands config | `pytest tests/test_openhands_config_persistence.py -q` | **11 passed** |
 | Dispatch durability | `pytest tests/test_dispatch_durability.py test_start_handover test_race_protection -q` | **45 passed** |
 | Concurrent claims | `NEXUS_STRESS=1 pytest tests/test_concurrent_claims.py -q` | **6 passed** |
 | Rust claim parity | `NEXUS_CLAIM_PROBE=… pytest tests/test_rust_claim.py -q` | **19 passed** |
@@ -123,9 +124,29 @@ Claim correctness proven at 1–128 workers.
 
 ## 10. Final full-suite result
 
-Recorded after the last code change (see §11 for the exact tail). The Python
-suite, browser E2E and Rust checks all pass; the skips are the documented
-environmental ones (Android SDK, mingw-w64, pooler DSN, live-OpenHands section F).
+Recorded after the **last** code change, with every optional dependency present
+(Chromium, the Rust claim probe, the Rust parity binary):
+
+```
+TEST_SUPABASE_DB_URL=… E2E_CHROMIUM_EXECUTABLE=/usr/bin/chromium \
+NEXUS_CLAIM_PROBE=…/claim_probe NEXUS_RUST_BIN=…/nexus-rs \
+  python -m pytest tests/ -q -p no:cacheprovider
+-> 2161 passed, 9 skipped, 1 warning in 545.84s (0:09:05)
+   (0 FAILED, 0 ERROR)
+```
+
+The 9 skips are environmental, not hidden failures:
+
+| Skip | Count | Why |
+| --- | ---: | --- |
+| Android APK build | 4 | no Android SDK build-tools in this environment |
+| Windows `.exe` cross-compile | 3 | no mingw-w64 in this environment |
+| Pooler schema-bootstrap | 1 | needs a PgBouncer DSN (`TEST_POOLER_DSN`) |
+| Live-OpenHands section F | 1 | needs a push-capable account (no GitHub provider token) |
+
+Rust, run separately: `cargo fmt --all --check` clean, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean, `cargo test --workspace`
+**30 passed**.
 
 ## 11. Remaining blockers (specific, reproducible, actionable)
 
