@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — full audit: a 140x JIT slowdown fixed, a diagnostics screen, the audit document
+
+### Fixed
+
+- **PostgreSQL's JIT made the worker's cleanup scan 140x slower.** `queue_cleanups`
+  unions five sources with `jsonb_array_elements` lateral joins; the planner
+  prices that in the millions, so JIT *compiled* the plan — **500-670 ms** of
+  compilation for a query returning zero rows in microseconds, on the worker's
+  hot path every pass. `PostgresStore` now opens connections with `jit = off`
+  (`NEXUS_DB_JIT=on` restores the server default). Measured with
+  `benchmarks/scheduler_bench.py`: **635 ms -> 4.5 ms** p50. An index on the
+  conversation columns and raising `jit_above_cost` to 10^7 were both tried and
+  did not help (recorded in `docs/PERFORMANCE.md`). Pinned by
+  `tests/test_jit_settings.py` (16 cases, mutation-proven).
+- **`benchmarks/scheduler_bench.py` leaked state that starved the queue.** It
+  reset the schema on the way in but left 2 050 tasks `dispatched` and 5 runs
+  `running`; those hold the global in-flight budget, so every real claim was
+  refused until their leases expired. It now resets the schema on the way out.
+
+### Added
+
+- **A Диагностика tab in the Studio's settings.** The 18-check diagnostic report
+  was CLI/API only. Every check is shown with its own status and reason
+  (VERIFIED / FAILED / BLOCKED / UNVERIFIED), and BLOCKED is explained as "no
+  key or resource", not a failure.
+- **`docs/AUDIT-2026-11-20.md`** — the full audit: what it can do (with the test
+  behind each claim), what is left, the test-suite time (2 117 passed in 8m22s,
+  per-test timings), and the performance numbers.
+
 ## Unreleased — measured under real load, with a real provider
 
 ### Added

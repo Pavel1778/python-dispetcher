@@ -191,6 +191,52 @@ before the merge: min 645 ms, **p50 896 ms**, max 981 ms, mean 829 ms (was p50
 round-trips fell from 7–9 transactions to 2); it is a single 5-sample reading on
 a shared box, so treat it as a direction, not a precise figure.
 
+## The audit's own finding: a 140x slowdown from PostgreSQL's JIT (2026-11-20)
+
+Auditing the running system turned up a real performance defect that no test
+covered. It is fixed, and the fix is pinned by `tests/test_jit_settings.py`.
+
+**What was wrong.** `LabStore.queue_cleanups` (the worker's retention scan, run
+on every pass) unions five sources with `jsonb_array_elements` lateral joins.
+The planner prices that in the millions, so PostgreSQL's **JIT compiled the
+plan**: on a database with ~6 000 tasks the compile took **500–670 ms**, and
+the query then returned zero rows in microseconds.
+
+**Measured, with the project's own benchmark** (`benchmarks/scheduler_bench.py`,
+`--repeat 10`):
+
+| metric | before | after |
+| --- | ---: | ---: |
+| `queue_cleanups_ms` p50 | **635 ms** | **4.5 ms** |
+| p90 | 705 ms | 6.4 ms |
+
+`EXPLAIN (ANALYZE)` showed `JIT: Timing … Total 557 ms` against
+`Execution Time: 558 ms` — the whole cost was compilation. Setting `jit = off`
+on the same query took it to **3–6 ms** (a ~170× difference).
+
+**What was tried and did not work** (recorded so nobody repeats it):
+
+- **An index** on `nexus_run_tasks(conversation_id, resume_conversation_id)`:
+  581 ms → 579 ms. The predicate is not the cost.
+- **Raising `jit_above_cost`** to 10 000 000: still 600 ms. The plan's estimate
+  exceeds even that, so JIT still engaged.
+- **`ANALYZE`** made it *worse* in one direction (8 ms → 604 ms): accurate
+  statistics made the planner more confident the plan was expensive, so JIT
+  engaged where stale statistics had left it off. The benchmark still runs
+  `ANALYZE` before this measurement, so it reports the real plan.
+
+**The fix.** `PostgresStore` opens every connection with `jit = off`
+(`cloud_store._jit_options`). This is a control plane — short OLTP statements,
+no analytical scans — so JIT has nothing to win here. `NEXUS_DB_JIT=on` restores
+the server's own behaviour for a deployment that runs heavy queries through the
+same database.
+
+**Also fixed in the same audit:** `benchmarks/scheduler_bench.py` reset the
+schema on the way in but left its runs behind. A run left `running` with tasks
+still `dispatched` holds the global in-flight budget until their leases expire,
+so the next thing to use the database was refused every claim. It now resets the
+schema on the way out too, and a run leaves **0 runs, 0 tasks** behind.
+
 ## What was not done, and why
 
 - **No language migration.** A Go/Rust rewrite of the API would not move these

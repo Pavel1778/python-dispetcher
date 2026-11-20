@@ -3091,3 +3091,37 @@ and drove it over real sockets, with the live provider keys. Keep the method:
   RSS 65–67 MB; 0.9 % CPU idle, 10–15 % under load; 8 threads idle, 14 under
   load. Update `docs/PERFORMANCE.md` with the same method when you re-measure;
   never replace a measured row with an estimate.
+
+## The audit, and the JIT defect it found (2026-11-20)
+
+`docs/AUDIT-2026-11-20.md` is the dated full audit: what the product does (with
+the test behind each claim), what is left, the suite time and the performance
+numbers. Two invariants came out of it that a future change must keep.
+
+- **PostgreSQL's JIT is off on every connection** (`cloud_store._jit_options`,
+  `NEXUS_DB_JIT`). It is not a preference: `LabStore.queue_cleanups` unions five
+  sources with `jsonb_array_elements` lateral joins, the planner prices that in
+  the millions, and PostgreSQL **compiled the plan for ~500–670 ms** to then
+  return zero rows in microseconds. With `jit = off` the same call is 3–6 ms.
+  Measured with the project's own benchmark: **635 ms → 4.5 ms** p50.
+  - Do **not** "fix" this by adding an index or raising `jit_above_cost`: both
+    were tried (581 → 579 ms; still 600 ms at a threshold of 10⁷) and neither
+    works. The estimate exceeds any sane threshold.
+  - `ANALYZE` is not a fix either, and it can make it *worse*: accurate
+    statistics made the planner more confident the plan was expensive, so JIT
+    engaged where stale statistics had left it off.
+  - `tests/test_jit_settings.py` pins both directions (16 cases). Removing the
+    `options` from `connect_kwargs` fails two of them, so they are load-bearing.
+- **A benchmark must leave the database as it found it.**
+  `benchmarks/scheduler_bench.py` reset the schema on the way in but left 2 050
+  tasks `dispatched` and 5 runs `running`. Those hold the global in-flight
+  budget (`IN_FLIGHT_TASK_STATES`), so every real claim was refused until the
+  leases expired — the next thing to use the database was starved by the
+  measurement. It now resets the schema in a `finally`. Any new benchmark that
+  seeds runs must do the same, or it will starve the deployment it measures.
+- **The Studio's Диагностика tab** (settings → Диагностика) renders the real
+  diagnostic report, each check with its own status and reason. It is how the
+  queue-starvation above was found: it showed `queues_leases` FAILED with
+  "claim_task returned no task". Keep it reading `GET
+  /api/openhands/diagnostics` (read-only) and never summarise a status the
+  engine did not produce.

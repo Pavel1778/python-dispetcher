@@ -2157,8 +2157,10 @@
   var settingsTab = null;
 
   function openSettings(tab) {
-    settingsTab = tab === 'project' ? 'project' : 'connections';
-    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект']];
+    settingsTab = tab === 'project' ? 'project'
+      : tab === 'diagnostics' ? 'diagnostics' : 'connections';
+    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект'],
+                ['diagnostics', 'check', 'Диагностика']];
     openDialog({
       title: 'Настройки',
       className: 'is-wide is-settings',
@@ -2181,30 +2183,42 @@
     });
     if (!pane.firstChild || pane.getAttribute('data-tab') !== tab) pane.innerHTML = SKELETON;
     pane.setAttribute('data-tab', tab);
-    var load = tab === 'project'
-      ? (S.projectId
-         ? Promise.all([
-             api(projectUrl('/context')).then(function (data) { return data.context; },
-                                             function () { return null; }),
-             api(projectUrl('/executors')).then(null, function () { return {}; }),
-             api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
-                                                   function () { return []; }),
-             loadGithubAccounts().then(null, function () { S.accounts.github = []; })
-           ]).then(function (parts) {
-             return { context: parts[0], executors: parts[1], repositories: parts[2] };
-           })
-         : Promise.resolve(null))
-      : Promise.all([
-          loadGithubAccounts().catch(function () { S.accounts.github = []; }),
-          loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
-          loadOpenhandsPool().catch(function () { S.pool = null; }),
-          api('/api/studio').then(function (data) { S.status = data; }, function () {})
-        ]);
+    var load;
+    if (tab === 'project') {
+      load = S.projectId
+        ? Promise.all([
+            api(projectUrl('/context')).then(function (data) { return data.context; },
+                                            function () { return null; }),
+            api(projectUrl('/executors')).then(null, function () { return {}; }),
+            api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
+                                                  function () { return []; }),
+            loadGithubAccounts().then(null, function () { S.accounts.github = []; })
+          ]).then(function (parts) {
+            return { context: parts[0], executors: parts[1], repositories: parts[2] };
+          })
+        : Promise.resolve(null);
+    } else if (tab === 'diagnostics') {
+      load = Promise.all([
+        api('/api/openhands/diagnostics').then(function (data) { return data; },
+                                               function (error) { return { error: error.message }; }),
+        api('/api/studio').then(function (data) { S.status = data; return data; },
+                                function () { return null; })
+      ]).then(function (parts) { return { report: parts[0], status: parts[1] }; });
+    } else {
+      load = Promise.all([
+        loadGithubAccounts().catch(function () { S.accounts.github = []; }),
+        loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
+        loadOpenhandsPool().catch(function () { S.pool = null; }),
+        api('/api/studio').then(function (data) { S.status = data; }, function () {})
+      ]);
+    }
     return load.then(function (result) {
       if (settingsTab !== tab || !document.contains(pane)) return;
       if (tab === 'project') {
         S.projectSettings = result || null;
         pane.innerHTML = projectSettingsHtml(result);
+      } else if (tab === 'diagnostics') {
+        pane.innerHTML = diagnosticsHtml(result);
       } else {
         pane.innerHTML = connectionsHtml();
       }
@@ -2390,6 +2404,43 @@
       }).join('') + '</select>' +
       '<span class="field-hint">' + esc(modeNote) + '</span></label>' +
       rows + '</div>';
+  }
+
+  // The diagnostic report: every check's own status, never a summary the page
+  // invented. The four statuses are the engine's; VERIFIED means the check ran
+  // and worked, BLOCKED that it could not run (no credential/resource), FAILED
+  // that it ran and failed, UNVERIFIED that it was not run (the live probe is
+  // opt-in). A check that is BLOCKED is not a failure, and the page says so.
+  function diagnosticsHtml(result) {
+    result = result || {};
+    var report = result.report || {};
+    var checks = report.checks || [];
+    if (report.error) {
+      return '<div class="section"><h3 class="section-title">' + icon('alert', 'icon-sm') +
+        'Диагностика</h3><p class="section-note is-bad">' + esc(report.error) + '</p></div>';
+    }
+    var counts = { VERIFIED: 0, FAILED: 0, BLOCKED: 0, UNVERIFIED: 0 };
+    checks.forEach(function (c) { if (counts[c.status] !== undefined) counts[c.status] += 1; });
+    var head = '<div class="section"><h3 class="section-title">' + icon('check', 'icon-sm') +
+      'Диагностика</h3><p class="section-note">Реальный отчёт: каждый пункт либо проверен, ' +
+      'либо честно помечен «нет доступа» (BLOCKED) или «не проверялся» (UNVERIFIED). ' +
+      'BLOCKED — не ошибка, а отсутствие ключа или ресурса.</p>' +
+      '<dl class="kv"><dt>Итог</dt><dd><span class="pill is-' +
+      (report.ok ? 'ok' : 'bad') + '">' + (report.ok ? 'ok' : 'есть проблемы') + '</span></dd>' +
+      '<dt>Проверено</dt><dd>' + counts.VERIFIED + ' VERIFIED · ' + counts.FAILED +
+      ' FAILED · ' + counts.BLOCKED + ' BLOCKED · ' + counts.UNVERIFIED + ' UNVERIFIED</dd></dl>' +
+      '<div class="row"><button class="btn btn-sm" type="button" data-action="run-diagnostics">' +
+      icon('refresh', 'icon-sm') + 'Обновить</button></div></div>';
+    if (!checks.length) return head + '<p class="step-sub">Отчёт пуст.</p>';
+    return head + '<ul class="evidence-list">' + checks.map(function (c) {
+      var tone = VERDICT_TONE[c.status] || 'idle';
+      return '<li class="evidence-row"><div class="evidence-line">' +
+        '<span class="dot is-' + tone + '"></span>' +
+        '<span class="evidence-subject">' + esc(c.name || '') + '</span>' +
+        '<span class="pill is-' + tone + '">' + esc(c.status || '') + '</span></div>' +
+        (c.detail ? '<p class="step-sub evidence-detail">' + esc(c.detail) + '</p>' : '') +
+        '</li>';
+    }).join('') + '</ul>';
   }
 
   function connectionsHtml() {
@@ -3123,6 +3174,7 @@
       else if (tab) { settingsTab = tab; refreshSettings(); }
     },
     'settings-tab': function (el) { settingsTab = el.getAttribute('data-tab'); refreshSettings(); },
+    'run-diagnostics': function () { refreshSettings(); },
     'open-repo': function (el) {
       closeMenu();
       if (repoState) return;
