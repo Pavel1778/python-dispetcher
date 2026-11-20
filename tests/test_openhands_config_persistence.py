@@ -275,3 +275,36 @@ def test_the_workflow_resolver_cannot_reach_another_projects_account(store, clou
     wf_b, _ = store.create_workflow_once("work in b", project_id=project_b["id"])
     with pytest.raises(NotFound):
         app._workflow_client(wf_b)
+
+
+# ------------------------------------------------ one bad connection != dead loop
+def test_a_revoked_connection_does_not_stop_the_sr_tick(store, cloud, service):
+    """A workflow whose connection is unusable is reported, not fatal to the tick.
+
+    ``SrRuntime.tick`` drives every workflow's Sr. If one workflow's bound
+    connection raises (revoked account -> ValueError, vanished -> NotFound), the
+    loop must report that workflow unavailable and keep going, never abort the
+    whole pass and leave every other workflow unserviced.
+    """
+    from orchestration.cloud_client import CloudClient  # noqa: E402
+    from orchestration.nexus_projects import ProjectService  # noqa: E402
+    from orchestration.sr_runtime import SrRuntime  # noqa: E402
+    from orchestration.sr_tools import SrTools  # noqa: E402
+
+    account = service.add(PRINCIPAL, label="primary", api_key=KEY,
+                          base_url=cloud.base_url, transport="direct",
+                          default_model="openhands/deepseek-v4.1-flash")
+    project = ProjectService(store).create(PRINCIPAL, name="p")
+    service.bind_project(PRINCIPAL, project["id"], account["id"])
+    wf, _ = store.create_workflow_once("do", project_id=project["id"])
+    store.bind_sr(wf, conversation_id="conv-x", status="running")
+    service.revoke(PRINCIPAL, account["id"])
+
+    # A resolver that raises the way a revoked account does.
+    def boom(_wf):
+        raise ValueError("account is revoked")
+
+    rt = SrRuntime(store, CloudClient(cloud.base_url, api_key=KEY),
+                   SrTools(store, None), client_for_workflow=boom)
+    report = rt.tick()  # must not raise
+    assert wf in report.unavailable

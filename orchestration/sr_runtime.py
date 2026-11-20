@@ -336,6 +336,16 @@ class SrRuntime:
                     backoff_seconds=0, give_up=True,
                 )
                 report.retry_blocked.append(workflow_id)
+            except (ValueError, NotFound) as e:
+                # The workflow's bound connection is unusable (revoked, or the
+                # account vanished). This is not transient: block with the reason
+                # rather than retry forever or let it escape the tick.
+                self.store.release_sr_start(workflow_id)
+                self.store.record_sr_failure(
+                    workflow_id, error=f"connection unusable: {e}", attempt=used,
+                    backoff_seconds=0, give_up=True,
+                )
+                report.retry_blocked.append(workflow_id)
             except CloudError as e:
                 self.store.release_sr_start(workflow_id)
                 give_up = used >= self.sr_start_max_attempts
@@ -383,11 +393,19 @@ class SrRuntime:
             if not sr_conv:
                 continue
             try:
-                events = self._client_for(workflow_id).list_events(sr_conv)
+                client = self._client_for(workflow_id)
+                events = client.list_events(sr_conv)
             except CloudNotFound:
                 report.unavailable.append(workflow_id)
                 continue
             except CloudUnavailable:
+                report.unavailable.append(workflow_id)
+                continue
+            except (ValueError, NotFound) as e:
+                # The workflow's bound connection is unusable (revoked, or the
+                # account vanished). One bad connection must not stop the loop
+                # for every other workflow: report it and move on.
+                log.warning("workflow %s: connection unusable: %s", workflow_id, e)
                 report.unavailable.append(workflow_id)
                 continue
             for event in events:
