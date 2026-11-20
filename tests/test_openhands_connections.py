@@ -524,8 +524,9 @@ def test_a_backup_takes_over_while_the_primary_is_down_and_gives_work_back(lab):
     lab["executors"].set(OWNER, lab["project"], executors=[ids["A"], ids["B"]])
     a = lab["clouds"]["A"]
 
-    # The primary cannot start anything; the task is handed to the backup.
-    a.cloud.start_status, a.cloud.start_status_times = 503, 100
+    # A definitive rejection allows failover; a 503 is covered separately
+    # below and would not prove whether the start was accepted.
+    a.cloud.start_status, a.cloud.start_status_times = 403, 100
     run_id = _run(lab, ["first"])
     for _ in range(3):
         lab["scheduler"].tick(run_id)
@@ -673,3 +674,19 @@ def test_a_worker_started_with_no_connection_uses_one_that_is_added_later(
                       discover_router=False)
     fixed.tick_once()
     assert fixed.account_router is None
+
+
+def test_503_from_start_never_fails_over_without_proof(lab):
+    ids = {name: a['id'] for name, a in lab['accounts'].items()}
+    lab['executors'].set(OWNER, lab['project'], executors=[ids['A'], ids['B']])
+    primary = lab['clouds']['A'].cloud
+    # The socket fixture knows this request produced zero conversations. The
+    # client only saw 503. Even a now-healthy server and empty search are not
+    # authority for another POST on A or B.
+    primary.start_status, primary.start_status_times = 503, 1
+    rid = _run(lab, ['one'])
+    for _ in range(4):
+        lab['scheduler'].tick(rid)
+    assert primary.calls.count(('POST', '/api/v1/app-conversations')) == 1
+    assert not primary.start_bodies and not lab['clouds']['B'].cloud.start_bodies
+    assert sql(lab, 'SELECT state FROM nexus_dispatch_intents WHERE run_id=%s', rid) == [{'state': 'uncertain'}]

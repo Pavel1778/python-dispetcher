@@ -88,6 +88,20 @@ def store():
     s.close()
 
 
+def _settled_stats(store):
+    # psycopg_pool increments pool_size BEFORE scheduling AddConnection. The
+    # callers can all finish while that last slot is still connecting: it is
+    # neither idle nor checked out. Allow the background worker to publish it.
+    # A retained connection still fails the unchanged idle == size assertion.
+    end = time.monotonic() + 2
+    while True:
+        stats = store.pool_stats()
+        assert stats['size'] <= store.pool_max and stats['waiting'] == 0, stats
+        if stats['idle'] == stats['size'] or time.monotonic() >= end:
+            return stats
+        time.sleep(0.01)
+
+
 def _hammer(store: PostgresStore, n_threads: int, ops_per_thread: int = 20):
     """Run mixed read/write operations from ``n_threads`` concurrently.
 
@@ -153,7 +167,7 @@ def test_concurrent_access_does_not_error_or_leak_connections(store, n_threads):
     # connection. This is the store-attributable bound; the database's total
     # backend count also includes other stores in the session, so it is not the
     # invariant here.
-    stats = store.pool_stats()
+    stats = _settled_stats(store)
     size, idle, waiting = stats["size"], stats["idle"], stats["waiting"]
     assert size is None or size <= store.pool_max, (
         f"concurrency={n_threads}: the pool holds {size} connections, above its "
@@ -182,7 +196,7 @@ def test_ten_consecutive_sweeps_do_not_accumulate_connections(store):
             assert errors == [], (
                 f"sweep {sweep}, concurrency={n_threads}: {errors[0][1]!r}"
             )
-        stats = store.pool_stats()
+        stats = _settled_stats(store)
         size, idle = stats["size"], stats["idle"]
         assert size is None or size <= store.pool_max, (
             f"sweep {sweep}: the pool holds {size} connections, above its "

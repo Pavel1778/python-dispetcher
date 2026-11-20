@@ -202,6 +202,16 @@ def test_revoked_unknown_keeps_branch_until_late_receipt_owes_a_stop(env, monkey
         (cid,) = server.cloud.start_bodies
         assert lab.stop_for(cid)['state'] == 'requested'
         assert lab.claim_task(other, 'still-too-early') is None
+        # Repointed process connection: even at the legacy stop ceiling,
+        # a 404 from a different server cannot release the branch.
+        from orchestration.nexus_lab import MAX_STOP_ATTEMPTS
+        with FakeCloudServer() as other_server:
+            sched.executor.client = CloudClient(base_url=other_server.base_url, api_key='other')
+            sql(env, 'UPDATE nexus_executor_stops SET attempts=%s', MAX_STOP_ATTEMPTS)
+            assert sched.deliver_stops()['pending'] == 1 and not other_server.cloud.calls
+            assert lab.claim_task(other, 'wrong-service') is None
+        sched.executor.client = client
+        sql(env, 'UPDATE nexus_executor_stops SET next_attempt_at=now()')
         sched.deliver_stops()
         assert lab.claim_task(other, 'now-safe') and len(server.cloud.start_bodies) == 1
 
@@ -311,3 +321,97 @@ def test_expired_prepared_grant_cannot_send_or_disarm_its_successor(env):  # noq
     assert not journal.rejected(stale)  # late preflight failure is not a rejection of the new send
     assert sql(env, 'SELECT state FROM nexus_dispatch_intents') == [{'state': 'sending'}]
     assert sql(env, 'SELECT iteration,total_iterations FROM nexus_runs') == [{'iteration': 1, 'total_iterations': 1}]
+
+
+def test_delayed_reverify_does_not_hold_a_replacement_attempt(env):  # noqa: F811
+    from orchestration.nexus_lab import Verification
+    from tests.test_durable_runs import Conversations
+    lab = env['lab']
+    rid = start(env, [{'task_key': 't', 'title': 'one'}])
+    executor = Conversations()
+
+    class LateVerifier:
+        def verify(self, task, report):
+            # A different verifier already returned, and a new grant is live,
+            # while this worker was waiting for GitHub.
+            lab.retry_task(task['id'], verdict='failed', evidence={}, note='redo', continue_conversation=False,
+                           lease_token=task['lease_token'])
+            new = lab.claim_task(rid, 'other')
+            lab.mark_running(new['id'], conversation_id='replacement', lease_token=new['lease_token'])
+            return Verification('blocked', 'GitHub temporarily unavailable', retry='reverify')
+
+    sched = scheduler(env, executor, verifier=LateVerifier())
+    sched.tick(rid)
+    executor.finish(executor.of('t')[0])
+    sched.tick(rid)
+    current, = lab.list_tasks_internal(rid)
+    assert current['conversation_id'] == 'replacement' and current['retry_at'] is None
+
+
+def test_timeout_at_cycle_ceiling_settles_failure_with_durable_stop(env, monkeypatch):  # noqa: F811
+    from tests.test_durable_runs import Conversations
+    monkeypatch.setenv('NEXUS_RETRY_MAX_CYCLES', '1')
+    rid = start(env, [{'task_key': 'a', 'title': 'a'}, {'task_key': 'b', 'title': 'b', 'dependencies': ['a']}])
+    sched = scheduler(env, Conversations())
+    sched.tick(rid)
+    sql(env, "UPDATE nexus_run_tasks SET started_at=now()-interval '1 hour',timeout_seconds=1, "
+             "max_attempts=1 WHERE task_key='a'")
+    sched.tick(rid)
+    assert [t['state'] for t in env['lab'].list_tasks_internal(rid)] == ['failed', 'pending']
+    assert [s['state'] for s in env['lab'].stops(rid)] == ['requested']
+
+
+def test_broken_signer_keeps_both_obligations_until_task_signature_is_written(env, monkeypatch):  # noqa: F811
+    from tests.test_durable_runs import Conversations
+    from orchestration.lab_worker import build_evidence_service
+
+    monkeypatch.setenv('NEXUS_EVIDENCE_PRIVATE_KEY', 'invalid-test-key')
+    executor = Conversations()
+    sched = scheduler(env, executor, evidence=build_evidence_service(env['store']))
+    rid = start(env, [{'task_key': 'sign', 'title': 'sign me'}])
+    sched.tick(rid)
+    executor.finish(executor.of('sign')[0])
+    sched.tick(rid)
+    assert env['lab'].run_row(rid)['state'] == 'completed' and rid in active_run_ids(env['store'])
+    assert not env['store'].evidence_for_project(env['project'])
+    due, = sql(env, 'SELECT id FROM nexus_task_attestations_due')
+    assert len(sql(env, 'SELECT 1 FROM nexus_run_attestations_due')) == 1
+
+    _signer_env(monkeypatch)
+    signer = build_evidence_service(env['store'])
+    repaired = scheduler(env, executor, evidence=signer)
+    with monkeypatch.context() as m:
+        def offline(*_):
+            raise RuntimeError('signer offline')
+        m.setattr(signer, 'record_task_result', offline)
+        repaired.tick(rid)
+        assert not env['store'].evidence_for_project(env['project'])  # no premature signed acceptance
+    repaired.tick(rid)
+    assert rid not in active_run_ids(env['store'])
+    run, task = env['store'].evidence_for_project(env['project'])
+    engine = EvidenceTrustEngine(Keyring.from_env())
+    assert str(task['id']) == str(due['id']) and run['body']['detail']['decision'] == 'ACCEPTED'
+    assert all(engine.verify(r).verdict == VERIFIED for r in (task, run))
+    assert engine.index_integrity([task, run])['intact']
+
+
+def test_result_read_on_wrong_endpoint_or_malformed_response_does_not_advance_dag(env, monkeypatch):  # noqa: F811
+    rid = start(env, [{'task_key': 'a', 'title': 'first'}, {'task_key': 'b', 'title': 'next', 'dependencies': ['a']}])
+    with FakeCloudServer() as a, FakeCloudServer() as b:
+        client = CloudClient(base_url=a.base_url, api_key='test')
+        sched = scheduler(env, OpenHandsExecutor(client))
+        sched.tick(rid)
+        cid, = a.cloud.start_bodies
+        sched.executor.client = CloudClient(base_url=b.base_url, api_key='test')
+        sched.tick(rid)
+        assert not b.cloud.calls
+        sched.executor.client = client
+        with monkeypatch.context() as m:
+            # An HTTP success without the requested row is not a terminal
+            # failure or a report from some other conversation.
+            m.setattr(client, '_request', lambda *args: (200, [{'id': 'unrelated', 'execution_status': 'error'}]))
+            sched.tick(rid)
+        parent, child = env['lab'].list_tasks_internal(rid)
+        assert (parent['state'], parent['conversation_id'], child['state'], child['attempt']) == (
+            'running', cid, 'pending', 0)
+        assert len(a.cloud.start_bodies) == 1

@@ -1609,7 +1609,7 @@ class LabStore:
             cur.execute("UPDATE nexus_run_tasks SET "
                         "state = CASE WHEN state='dispatched' THEN 'running' ELSE state END, "
                         "conversation_id=COALESCE(%s, conversation_id), "
-                        "openhands_account_id=COALESCE(%s, openhands_account_id), "
+                        f"openhands_account_id={'%s' if intent_id else 'COALESCE(%s, openhands_account_id)'}, "
                         "preferred_account_id = CASE WHEN %s::uuid IS NULL THEN "
                         "  preferred_account_id ELSE NULL END, "
                         "spec_ref = CASE WHEN %s::jsonb IS NULL THEN spec_ref ELSE "
@@ -1704,7 +1704,8 @@ class LabStore:
 
     def record_verification(self, task_id: str, *, verdict: str, evidence: dict,
                             detail: dict | None = None, attestation: dict | None = None,
-                            lease_token: int | None = None) -> dict:
+                            stop_reason: str | None = None, applied_only: bool = False,
+                            lease_token: int | None = None) -> dict | None:
         """Set the terminal task state from a verifier verdict.
 
         ``verdict`` is one of the terminal task outcomes. Only
@@ -1738,12 +1739,16 @@ class LabStore:
                 tuple(params))
             row = cur.fetchone()
             if row is None:
+                if applied_only:
+                    return None
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
                 row = cur.fetchone()
                 if row is None:
                     raise NotFound("task not found")
                 return self._task_row(row)
             task = self._task_row(row)
+            if stop_reason and task['conversation_id']:
+                self._owe_stop(cur, task, task['conversation_id'], stop_reason)
             self._close_execution(cur, task_id, outcome=verdict,
                                   reason=str(evidence.get("reason") or ""),
                                   head_sha=evidence.get("remote_sha"))
@@ -1758,7 +1763,8 @@ class LabStore:
                    detail: dict | None = None, note: str, continue_conversation: bool,
                    wait_seconds: float | None = None, outcome: str | None = None,
                    attestation: dict | None = None,
-                   lease_token: int | None = None) -> dict:
+                   stop_reason: str | None = None, applied_only: bool = False,
+                   lease_token: int | None = None) -> dict | None:
         """The attempt is over and did not verify; the task will be tried again.
 
         What the attempt was is kept: *evidence* joins the task's evidence
@@ -1790,9 +1796,11 @@ class LabStore:
             if row is None:
                 raise NotFound("task not found")
             if row["state"] not in IN_FLIGHT_TASK_STATES:
-                return self._task_row(row)
+                return None if applied_only else self._task_row(row)
             if lease_token is not None and int(row["lease_token"] or 0) != int(lease_token):
-                return self._task_row(row)
+                return None if applied_only else self._task_row(row)
+            if stop_reason and row['conversation_id']:
+                self._owe_stop(cur, row, row['conversation_id'], stop_reason)
             waiting = wait_seconds is not None
             record = {**evidence, "verdict": verdict, "attempt": row["attempt"],
                       "cycle": row["cycle"], "conversation_id": row["conversation_id"]}
@@ -1865,7 +1873,7 @@ class LabStore:
                 row = cur.fetchone()
             return self._task_row(row)
 
-    def hold_task(self, task_id: str, *, seconds: float, reason: str) -> None:
+    def hold_task(self, task_id: str, *, seconds: float, reason: str, lease_token: int | None = None) -> None:
         """Leave a running task as it is and do not look at it again for
         *seconds*: its conversation ended, and the result cannot be checked
         right now (GitHub does not answer). Nothing is spent and nothing is
@@ -1874,10 +1882,10 @@ class LabStore:
             cur.execute(
                 "UPDATE nexus_run_tasks SET retry_at = now() + %s * interval '1 second', "
                 "wait_reason=%s, started_at = COALESCE(started_at, updated_at), "
-                "updated_at=now() WHERE id=%s AND state = ANY(%s)",
-                (max(0.0, float(seconds)), reason[:1000], task_id, list(IN_FLIGHT_TASK_STATES)))
+                "updated_at=now() WHERE id=%s AND state = ANY(%s) AND (%s::bigint IS NULL OR lease_token=%s)",
+                (max(0.0, float(seconds)), reason[:1000], task_id, list(IN_FLIGHT_TASK_STATES), lease_token, lease_token))
 
-    def note_progress(self, task_id: str, marker: str | None) -> bool:
+    def note_progress(self, task_id: str, marker: str | None, *, lease_token: int | None = None) -> bool:
         """Record that the task's conversation was looked at, and whether it
         has moved since the last look. Returns whether it has."""
         with self.store._tx() as cur:
@@ -1887,8 +1895,8 @@ class LabStore:
                 "  AND progress_marker IS DISTINCT FROM %s::text THEN now() ELSE progress_at END, "
                 "progress_marker = COALESCE(%s::text, progress_marker) "
                 "WHERE id=%s AND state = ANY(%s) "
-                "RETURNING (progress_at = now()) AS moved",
-                (marker, marker, marker, task_id, list(IN_FLIGHT_TASK_STATES)))
+                "AND (%s::bigint IS NULL OR lease_token=%s) RETURNING (progress_at = now()) AS moved",
+                (marker, marker, marker, task_id, list(IN_FLIGHT_TASK_STATES), lease_token, lease_token))
             row = cur.fetchone()
             return bool(row and row["moved"])
 
@@ -2028,7 +2036,8 @@ class LabStore:
 
     def requeue_for_failover(self, task_id: str, *, failed_account_id: str,
                              error: str, requeue: bool = True,
-                             lease_token: int | None = None) -> dict:
+                             applied_only: bool = False,
+                             lease_token: int | None = None) -> dict | None:
         """Requeue a task whose executor failed, excluding that account.
 
         Works from ``dispatched`` or ``running`` (a conversation that was
@@ -2067,6 +2076,8 @@ class LabStore:
             if row is not None:
                 self._close_execution(cur, task_id, outcome="vanished", reason=error)
             if row is None:
+                if applied_only:
+                    return None
                 cur.execute("SELECT * FROM nexus_run_tasks WHERE id=%s", (task_id,))
                 row = cur.fetchone()
             if row is None:
@@ -2413,8 +2424,9 @@ class LabStore:
                 # What the current conversation is to the task (a start, or a
                 # continuation of the one before).
                 "(SELECT e.kind FROM nexus_task_executions e WHERE e.task_id = t.id "
-                "  AND e.ended_at IS NULL ORDER BY e.started_at DESC LIMIT 1) AS execution_kind "
-                "FROM nexus_run_tasks t WHERE t.run_id=%s "
+                "  AND e.ended_at IS NULL ORDER BY e.started_at DESC LIMIT 1) AS execution_kind, "
+                "i.context AS _dispatch_origin FROM nexus_run_tasks t LEFT JOIN nexus_dispatch_intents i "
+                "ON i.task_id=t.id AND i.lease_token=t.lease_token AND i.state='bound' WHERE t.run_id=%s "
                 "AND t.state IN ('dispatched','running') ORDER BY t.created_at, t.id",
                 (run_id,))
             out = []
@@ -2634,13 +2646,17 @@ class LabStore:
         """Record that *conversation_id* has to stop. Idempotent: one stop per
         conversation, whoever asks and however often."""
         with self.store._tx() as cur:
-            cur.execute(
-                "INSERT INTO nexus_executor_stops(run_id, task_id, project_id, conversation_id, "
-                "  openhands_account_id, repository, branch, reason) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (conversation_id) DO NOTHING",
-                (task["run_id"], task["id"], task["project_id"], str(conversation_id),
-                 task.get("openhands_account_id"), task.get("repository") or "",
-                 task.get("branch") or "", reason[:200]))
+            self._owe_stop(cur, task, conversation_id, reason)
+
+    @staticmethod
+    def _owe_stop(cur: Any, task: dict, conversation_id: str, reason: str) -> None:
+        cur.execute(
+            "INSERT INTO nexus_executor_stops(run_id, task_id, project_id, conversation_id, "
+            "  openhands_account_id, repository, branch, reason) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (conversation_id) DO NOTHING",
+            (task["run_id"], task["id"], task["project_id"], str(conversation_id),
+             task.get("openhands_account_id"), task.get("repository") or "",
+             task.get("branch") or "", reason[:200]))
 
     def claim_stops(self, worker_id: str, *, limit: int = 10,
                     lease_seconds: int = 120) -> list[dict]:
@@ -2657,9 +2673,12 @@ class LabStore:
             if not ids:
                 return []
             cur.execute(
-                "UPDATE nexus_executor_stops SET attempts = attempts + 1, "
+                "UPDATE nexus_executor_stops s SET attempts = attempts + 1, "
                 "lease_expires = now() + (%s || ' seconds')::interval "
-                "WHERE id = ANY(%s) RETURNING *", (lease_seconds, ids))
+                "WHERE id = ANY(%s) RETURNING s.*, (SELECT i.context || jsonb_build_object('state',i.state) "
+                " FROM nexus_dispatch_intents i WHERE i.task_id=s.task_id AND i.conversation_id=s.conversation_id "
+                " AND i.state IN ('bound','stop_owed') ORDER BY i.created_at DESC LIMIT 1) AS _dispatch_origin",
+                (lease_seconds, ids))
             return [self._stop_row(row) for row in cur.fetchall()]
 
     def stop_result(self, stop_id: str, *, signalled: bool | None = None,

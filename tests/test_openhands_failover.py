@@ -759,3 +759,27 @@ def test_a_start_that_two_workers_saw_come_up_is_bound_once(store, service, clou
     assert stops == 0
     assert len(client.started) == 1 and _account(service, va["id"])["error_count"] == 0
 
+
+
+def test_two_result_observers_report_one_account_recovery(store, service, clouds):
+    from concurrent.futures import ThreadPoolExecutor
+    account = service.add(PRINCIPAL, label='A', api_key='sk-a', base_url=clouds[0].base_url)
+    clients = {account['id']: AccountClient('A')}
+    barrier = threading.Barrier(2, timeout=8)
+
+    class RacingVerifier(StubVerifier):
+        def verify(self, task, report):
+            barrier.wait()
+            return super().verify(task, report)
+
+    a, b = (_stack(store, service, clients, verifier=RacingVerifier())[2] for _ in range(2))
+    _, run, _ = _make_run(store)
+    rid = str(run['id'])
+    a.tick(rid)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(lambda s: s.tick(rid), (a, b)))
+    with store._tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM nexus_openhands_account_events WHERE account_id=%s AND kind='recovered'",
+                    (account['id'],))
+        assert cur.fetchone()['n'] == 1
+    assert [r.verified for r in results].count('T1') == 1
