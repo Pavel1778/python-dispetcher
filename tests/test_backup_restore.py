@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import uuid
 
+from cryptography.fernet import Fernet, InvalidToken
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +34,8 @@ from orchestration.nexus_evidence import EvidenceService  # noqa: E402
 from orchestration.nexus_files import FileService  # noqa: E402
 from orchestration.nexus_lab_store import LabStore  # noqa: E402
 from orchestration.nexus_projects import ProjectService  # noqa: E402
+from orchestration.nexus_openhands_accounts import OpenHandsAccountService  # noqa: E402
+from tests.fake_cloud import FakeCloudServer  # noqa: E402
 
 DSN = os.environ.get("TEST_SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL")
 
@@ -106,7 +110,7 @@ def _run(*cmd: str, env_extra: dict | None = None) -> None:
         )
 
 
-def test_dump_and_restore_into_a_fresh_database(tmp_path):
+def test_dump_and_restore_into_a_fresh_database(tmp_path, monkeypatch):
     _reset_schema()
     source = PostgresStore(DSN)
     restore_db = "nexus_restore_" + uuid.uuid4().hex[:8]
@@ -131,6 +135,24 @@ def test_dump_and_restore_into_a_fresh_database(tmp_path):
                         "SELECT %s, id FROM repositories WHERE full_name='acme/repo'", (pid,))
         task = source.submit_task("drill work", project_id=pid,
                                   selected_repository="acme/repo", selected_branch="main")
+
+        # The account/key exist only for this drill. Store one real Fernet
+        # ciphertext via the account service against a loopback provider.
+        # Neither the plaintext nor the wrapping key needs to enter pg_dump.
+        wrapping_key = Fernet.generate_key().decode()
+        secret = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(secret.encode()).digest()
+        with monkeypatch.context() as mp, FakeCloudServer() as cloud:
+            mp.setenv("NEXUS_SECRET_KEY", wrapping_key)
+            accounts = OpenHandsAccountService(source)
+            account = accounts.add(owner, label="backup drill", api_key=secret,
+                                   base_url=cloud.base_url, transport="app")
+            accounts.bind_project(owner, pid, account['id'])
+        del secret
+        with source._tx() as cur:
+            cur.execute("SELECT api_key_encrypted FROM nexus_openhands_accounts WHERE id=%s", (account['id'],))
+            cipher_digest = hashlib.sha256(cur.fetchone()['api_key_encrypted']).digest()
+        assert cipher_digest != digest
 
         # A dump taken in the middle of a run must neither lose the claim nor
         # make its dependent runnable. Keep both IDs and the fencing token.
@@ -184,6 +206,21 @@ def test_dump_and_restore_into_a_fresh_database(tmp_path):
                 assert files.download(owner, pid, file['id'])['content'] == attachment
                 with pytest.raises(NotFound):
                     files.download("user:outsider", pid, file['id'])
+                # The provider is already stopped. A digest sink verifies the
+                # bound client's recovered key, without printing or using it.
+                restored_accounts = OpenHandsAccountService(
+                    restored, client_factory=lambda _, key: hashlib.sha256(key.encode()).digest())
+                with restored._tx() as cur:
+                    cur.execute("SELECT api_key_encrypted FROM nexus_openhands_accounts WHERE id=%s", (account['id'],))
+                    assert hashlib.sha256(cur.fetchone()['api_key_encrypted']).digest() == cipher_digest
+                with monkeypatch.context() as mp:
+                    mp.setenv("NEXUS_SECRET_KEY", Fernet.generate_key().decode())
+                    with pytest.raises(InvalidToken):
+                        restored_accounts.client_for_project(owner, pid)
+                    mp.setenv("NEXUS_SECRET_KEY", wrapping_key)
+                    assert secrets.compare_digest(restored_accounts.client_for_project(owner, pid), digest)
+                    with pytest.raises(NotFound):
+                        restored_accounts.client_for_project("user:outsider", pid)
                 verifier = EvidenceService(restored, EvidenceTrustEngine(keys))
                 for record in records:
                     checked = verifier.reverify(record['id'], project_id=pid)

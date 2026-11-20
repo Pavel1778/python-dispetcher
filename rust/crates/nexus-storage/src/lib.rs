@@ -42,11 +42,10 @@ pub async fn claim_task(
     lease_seconds: NonZeroU32,
     active_limit: u32,
 ) -> Result<Option<Grant>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    // Advisory-lock waiters must observe the previous holder's *commit* in
-    // their next statement. Do not silently inherit REPEATABLE READ here.
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        .execute(&mut *tx)
+    // Waiters must see the previous holder's commit on the next statement.
+    // Set isolation in BEGIN itself, not via a second network round trip.
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
         .await?;
     let run = sqlx::query(
         "SELECT id FROM nexus_runs WHERE id=$1 AND project_id=$2 AND state='running' \

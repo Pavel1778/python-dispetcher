@@ -8,7 +8,9 @@ import json
 import os
 import subprocess
 import threading
+import time
 
+import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict
 
@@ -44,7 +46,7 @@ def start(store, lab, tasks, repo='', **options):
     return pid, run['id']
 
 
-def probe(*args):
+def probe_env():
     # tests._test_db produces libpq conninfo; never place a password on argv.
     params = conninfo_to_dict(DSN)
     env = {'PATH': os.environ['PATH']}
@@ -52,8 +54,12 @@ def probe(*args):
                      ('user', 'PGUSER'), ('password', 'PGPASSWORD')):
         if key in params:
             env[var] = params[key]
+    return env
+
+
+def probe(*args):
     child = subprocess.run([PROBE, *map(str, args)],
-                           env=env, capture_output=True, text=True, timeout=30, check=True)
+                           env=probe_env(), capture_output=True, text=True, timeout=30, check=True)
     return json.loads(child.stdout)
 
 
@@ -199,3 +205,60 @@ def test_sweep_is_bounded_scoped_and_never_requeues_bound_conversation(queue):
     assert set(first + second) == {str(t['id']) for t in lost}
     assert lab.get_task_internal(bound['id'])['conversation_id'] == 'in-cloud'
     assert lab.get_task_internal(live['id'])['lease_token'] == live['lease_token']
+
+
+def test_locking_one_task_does_not_block_a_second_eligible_grant(queue):
+    store, lab = queue
+    pid, rid = start(store, lab, [{'id': k, 'title': k} for k in ('x', 'y')])
+    with store._tx() as cur:
+        cur.execute('SELECT id FROM nexus_run_tasks WHERE run_id=%s ORDER BY created_at,id LIMIT 1 FOR UPDATE',
+                    (rid,))
+        locked = str(cur.fetchone()['id'])
+        second = rust_claim(pid, rid)
+        assert second and second['id'] != locked
+    assert rust_claim(pid, rid)['id'] == locked
+    assert lab.claim_task(rid, 'extra') is None
+
+
+def test_killed_sqlx_client_before_commit_releases_the_run_and_budget(queue):
+    store, lab = queue
+    pid, rid = start(store, lab, [{'id': 't', 'title': 'T'}], repo='org/kill')
+    # This is the SAME branch lock as the application. When pg_blocking_pids
+    # reports our backend, SQLx is inside the real transaction holding the
+    # run/task rows, not sleeping in test code before (or after) the claim.
+    with psycopg.connect(DSN, autocommit=True) as blocker:
+        blocker.execute("SELECT pg_advisory_lock(hashtextextended('nexus-branch:org/kill#main',0))")
+        child = subprocess.Popen([PROBE, 'claim', str(pid), str(rid), 'lost', '900', '0'],
+                                 env=probe_env(), stdout=subprocess.DEVNULL)
+        try:
+            until = time.monotonic() + 10
+            while not blocker.execute("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                      "WHERE datname=current_database() AND wait_event='advisory' "
+                                      "AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))").fetchone()[0]:
+                assert child.poll() is None and time.monotonic() < until, 'SQLx never reached branch lock'
+                time.sleep(0.01)
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+    # Wait for the unfinished transaction to actually release the run lock,
+    # rather than relying on a snapshot that just cannot see its writes yet.
+    with store._tx() as cur:
+        cur.execute("SET LOCAL lock_timeout='5s'")
+        cur.execute('SELECT iteration,total_iterations FROM nexus_runs WHERE id=%s FOR UPDATE', (rid,))
+        assert cur.fetchone() == {'iteration': 0, 'total_iterations': 0}
+    (t,) = lab.list_tasks_internal(rid)
+    assert (t['state'], t['attempt'], t['lease_owner'], t['lease_token']) == ('pending', 0, None, 0)
+    assert lab.claim_task(rid, 'replacement')['lease_token'] == 1 and rust_claim(pid, rid) is None
+
+
+@pytest.mark.parametrize(('policy', 'allowed'), [('bounded', False), ('durable', True)])
+def test_legacy_null_deadline_and_pause_are_decided_on_the_db_clock(queue, policy, allowed):
+    store, lab = queue
+    pid, rid = start(store, lab, [{'id': 't', 'title': 'T'}], policy=policy)
+    with store._tx() as cur:
+        cur.execute("UPDATE nexus_runs SET deadline_at=NULL, created_at=now()-interval '2 days', "
+                    "resume_at=now()+interval '1 day' WHERE id=%s", (rid,))
+    assert rust_claim(pid, rid) is None
+    with store._tx() as cur:
+        cur.execute("UPDATE nexus_runs SET resume_at=now()-interval '1 second' WHERE id=%s", (rid,))
+    assert (rust_claim(pid, rid) is not None) is allowed
