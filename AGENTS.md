@@ -3010,3 +3010,54 @@ started, never deletes user data, and `restore` proves a dump loads into a
 `backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
 both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
 per-process isolation passes the latter.
+
+## NEXUS 3.0 mission (2026-11-20, this session)
+
+Worked on `nexus/3.0-mission` (local, from `main` `20eb8bf`; not pushed/merged).
+Facts and invariants a future change must keep:
+
+- **The brief's "two competing Rust implementations" do not exist.** `nexus-store`,
+  `nexus-worker`, `nexus-api` and the branch `nexus/3.0-foundation` were never in
+  this repository (checked on every ref). Only `nexus-domain`, `nexus-core`,
+  `nexus-storage`, `nexus-cli` exist; `nexus-storage` is the one canonical
+  storage crate. See `docs/nexus-3.0/ARCHITECTURE_RECONCILIATION.md`. Do not
+  "delete a duplicate" that is not there.
+- **OpenHands model/Base URL persistence had two real root causes, both fixed:**
+  (1) `OpenHandsAccountService.add` upserted `default_model=EXCLUDED.default_model`,
+  so a reconnect that omitted the model wiped it; an omitted field now keeps its
+  stored value (also `transport` and the limits), and the account-add route no
+  longer defaults `transport` to `direct`. (2) `SrRuntime` drove every `code`
+  workflow on the process-wide client; it now resolves the client per workflow
+  from the project's bound account (`App._workflow_client`), falling back to the
+  process client only on `NotFound` (no bound account), never to a *different*
+  account. Tests: `tests/test_openhands_config_persistence.py`.
+- **One bad connection must not kill the Sr loop.** `SrRuntime.tick` and
+  `_retry_sr_starts` now catch `ValueError`/`NotFound` from the resolver (revoked
+  or vanished account) and report/block that workflow instead of aborting the
+  pass for every workflow.
+- **`tools/parity_matrix.py` is the honest parity counter** (282 distinct
+  Python↔Rust comparisons, 0 disagree), not a count of test functions. It skips a
+  duplicated `(from,to)` pair, exits non-zero on any disagreement, and is gated by
+  `tests/test_parity_matrix_tool.py` (≥ 100 comparisons).
+- **`main` shipped with Rust fmt/clippy failing** (10 files unformatted,
+  `manual_clamp`, `manual_range_contains`); CI never ran them. Fixed and gated:
+  `.github/workflows/tests.yml` now runs `cargo fmt --all --check` and
+  `cargo clippy -D warnings`. Do not remove those steps.
+- **`tests/test_concurrent_claims.py` is the real claim-concurrency proof**
+  (1/4/16/64 workers unconditional, 128 with `NEXUS_STRESS=1`). It lifts
+  `NEXUS_LAB_MAX_ACTIVE_TASKS` to 0 because the default 8 caps in-flight tasks
+  and would otherwise stop a 40-task sweep at 8. Mutation-proven: re-allowing
+  `dispatched` in `task_due.sql` makes the 64-worker case fail with 3× claims.
+- **Live OpenHands execution was verified** (`OpenHandsDiagnostics(live=True)`:
+  17 VERIFIED incl. `conversation_create`, `run_command`, `workspace_rw`,
+  `task_completion`). A **push-verified** (`completed_verified`) live task is
+  BLOCKED: the live account has no GitHub provider token
+  (`provider_tokens_set: {'github': False}`). That is a capability limit, not a
+  defect — do not fabricate a completion for it.
+- **A throwaway `NEXUS_SECRET_KEY` is needed to store an account**; changing it
+  makes stored keys unreadable (`InvalidToken`). The test DB is per-process and
+  dropped at session end, so a stored account does not persist across runs.
+- Final verified suite (all deps present): **2161 passed, 9 skipped, 0 failed**;
+  `cargo test --workspace` 30 passed; `cargo fmt`/`clippy` clean; `ruff` clean.
+  The 9 skips are environmental (Android SDK, mingw-w64, pooler DSN, section F).
+- Docs for this increment live in `docs/nexus-3.0/` (12 files named by the brief).
