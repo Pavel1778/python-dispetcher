@@ -43,9 +43,7 @@ enum Command {
         path: String,
     },
     /// Print the plan version hash (the approval binding) of a plan (JSON).
-    PlanHash {
-        path: String,
-    },
+    PlanHash { path: String },
     /// Whether a run transition is legal. Prints `true`/`false`.
     Transition {
         /// running|paused|waiting_for_approval|blocked|completed|failed|cancelled

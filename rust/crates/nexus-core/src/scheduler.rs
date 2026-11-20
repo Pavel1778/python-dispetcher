@@ -174,9 +174,7 @@ pub fn run_complete(tasks: &[TaskSnapshot]) -> bool {
 
 /// Whether any task of the run is claimable right now.
 pub fn has_claimable(run: &RunSnapshot, tasks: &[TaskSnapshot]) -> bool {
-    tasks
-        .iter()
-        .any(|t| claimable(run, tasks, &t.id).claimable)
+    tasks.iter().any(|t| claimable(run, tasks, &t.id).claimable)
 }
 
 /// A convenience: the state of a task as the enum, when it is a known state.

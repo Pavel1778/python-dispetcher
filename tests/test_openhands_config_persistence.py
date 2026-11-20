@@ -245,3 +245,33 @@ def test_the_model_never_appears_as_a_secret_and_the_key_never_leaks(store, clou
         assert view["default_model"] == "openhands/deepseek-v4.1-flash"
         assert KEY not in str(view)
         assert "api_key_encrypted" not in view
+
+
+# ------------------------------------------------------- project isolation
+def test_the_workflow_resolver_cannot_reach_another_projects_account(store, cloud, service):
+    """A workflow resolves only its *own* project's bound account.
+
+    Security half of Defect 2: the per-workflow resolver must not let project B
+    inherit project A's connection. Two projects, only A bound; a workflow in B
+    gets NotFound (fall back to the process client), never A's account.
+    """
+    from orchestration.cloud_store import NotFound  # noqa: E402
+    from orchestration.nexus_projects import ProjectService  # noqa: E402
+    from orchestration.web_server import App  # noqa: E402
+
+    account = service.add(PRINCIPAL, label="primary", api_key=KEY,
+                          base_url=cloud.base_url, transport="direct",
+                          default_model="openhands/deepseek-v4.1-flash")
+    projects = ProjectService(store)
+    project_a = projects.create(PRINCIPAL, name="a")
+    project_b = projects.create(PRINCIPAL, name="b")
+    service.bind_project(PRINCIPAL, project_a["id"], account["id"])
+    # B is deliberately left unbound.
+
+    app = App.__new__(App)
+    app.store = store
+    app.openhands_accounts = service
+    app.projects = projects
+    wf_b, _ = store.create_workflow_once("work in b", project_id=project_b["id"])
+    with pytest.raises(NotFound):
+        app._workflow_client(wf_b)

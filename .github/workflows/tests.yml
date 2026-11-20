@@ -46,7 +46,18 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+          rustup component add rustfmt clippy
           echo "::notice title=Rust toolchain::$(rustc --version); $(cargo --version)"
+
+      - name: Rust formatting
+        timeout-minutes: 5
+        working-directory: rust
+        run: cargo fmt --all --check
+
+      - name: Rust lints
+        timeout-minutes: 10
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Build the Rust workspace
         timeout-minutes: 10
