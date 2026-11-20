@@ -79,9 +79,14 @@ PROTECTED_GET = [
     f"/api/v1/projects/{UUID}/workflows/{UUID}", f"/api/v1/projects/{UUID}/runs/{UUID}",
     f"/api/v1/projects/{UUID}/context",
     f"/api/v1/projects/{UUID}/executors",
-    f"/api/v1/projects/{UUID}/runs", f"/api/v1/projects/{UUID}/runs/{UUID}/report",
+    f"/api/v1/projects/{UUID}/runs",     f"/api/v1/projects/{UUID}/runs/{UUID}/report",
     f"/api/v1/projects/{UUID}/runs/{UUID}/tasks/{UUID}/outputs",
     f"/api/v1/projects/{UUID}/runs/{UUID}/tasks/{UUID}/outputs/{UUID}",
+    # The run-level terminal-output list and one event's saved rendering (the
+    # PR #42 design; the task-level routes above are the other). Both read a
+    # sandbox file and are behind the same auth as every other project route.
+    f"/api/v1/projects/{UUID}/runs/{UUID}/terminal-outputs",
+    f"/api/v1/projects/{UUID}/runs/{UUID}/terminal-outputs/{UUID}/evt-1",
     f"/api/v1/projects/{UUID}/repositories",
     f"/api/openhands/accounts/{UUID}/dependencies",
     f"/api/openhands/accounts/{UUID}/executions",
@@ -234,6 +239,8 @@ def test_protected_patch_and_delete_endpoints_require_auth(base):
     """The studio renames and archives with PATCH; neither works without a credential."""
     for method, path, body in [
         ("PATCH", f"/api/v1/projects/{UUID}", {"name": "x"}),
+        # The project's quality-gate mode is the same admin route.
+        ("PATCH", f"/api/v1/projects/{UUID}", {"quality_gate": "off"}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"archived": True}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"title": "x"}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"pinned": True}),

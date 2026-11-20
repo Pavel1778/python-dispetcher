@@ -678,10 +678,11 @@ class SpecPlanner:
                 f"a time) this specification needs {len(stages)} planning stages; the limit "
                 f"is {MAX_STAGES}. Configure a provider with a larger window, or split the text")
         owner = f"{self.owner}:request:{uuid.uuid4().hex[:8]}"
+        full_options = {"principal": principal, "repository": repository,
+                        "branch": branch, **(options or {})}
         decision = self.specs.decide_start(
             spec_id, goal_id, stages=stage_rows(stages, index.sections), budget=limits.text,
-            options={"principal": principal, "repository": repository, "branch": branch,
-                     **(options or {})},
+            options=full_options,
             owner=owner, lease_seconds=self.lease_seconds)
         kind = decision["decision"]
         if kind == "existing":
@@ -691,8 +692,19 @@ class SpecPlanner:
             if done["status"] != "lost":
                 return {**done, "spec": spec}
         elif kind == "begin" and decision.get("claimed") is not None:
-            done = self._plan_stage(decision["claimed"], owner=owner, interactive=True,
-                                    text=text, index=index)
+            claimed = decision["claimed"]
+            spec_with_opts = {
+                **spec,
+                "state": "planning",
+                "stage_budget": limits.text,
+                "plan_options": full_options,
+                "goal_id": str(goal_id),
+            }
+            done = self._plan_stage(
+                claimed, owner=owner, interactive=True,
+                text=text, index=index,
+                spec_row=spec_with_opts, stages_rows=[claimed],
+            )
             if isinstance(done, dict) and done["status"] != "lost":
                 return {**done, "spec": spec}
         self.wake()
@@ -740,7 +752,9 @@ class SpecPlanner:
 
     # ----------------------------------------------------------- one stage
     def _plan_stage(self, stage: dict, *, owner: str, interactive: bool,
-                    text: str | None = None, index: Any = None) -> Any:
+                    text: str | None = None, index: Any = None,
+                    spec_row: dict | None = None,
+                    stages_rows: list[dict] | None = None) -> Any:
         """Plan one claimed stage.
 
         In the background returns ``planned``, ``split``, ``retry``, ``failed``
@@ -755,7 +769,8 @@ class SpecPlanner:
             self.lease_seconds / 3)
         try:
             with beat:
-                return self._plan_claimed(stage, owner, interactive, text, index)
+                return self._plan_claimed(stage, owner, interactive, text, index,
+                                          spec_row=spec_row, stages_rows=stages_rows)
         except (AllProvidersFailed, PlanningFailed) as e:
             if interactive:
                 raise
@@ -770,15 +785,46 @@ class SpecPlanner:
             return self._retry_or_fail(stage, owner, reason, permanent=False)
 
     def _plan_claimed(self, stage: dict, owner: str, interactive: bool,
-                      text: str | None, index: Any) -> Any:
+                      text: str | None, index: Any, *,
+                      spec_row: dict | None = None,
+                      stages_rows: list[dict] | None = None) -> Any:
         spec_id, ordinal = str(stage["spec_id"]), stage["ordinal"]
-        spec = self.specs.meta_internal(spec_id)
-        stages = self.specs.stages_internal(spec_id)
+        if index is not None and text is not None and spec_row is not None and stages_rows is not None:
+            spec = spec_row
+            stages = stages_rows
+            begin, end = stage["start_char"], stage["end_char"]
+            pieces = [
+                {"ordinal": x.ordinal, "key": x.key, "section": x.section,
+                 "kind": x.kind, "normative": x.normative, "start_char": x.start,
+                 "end_char": x.end, "start_line": x.start_line,
+                 "end_line": x.end_line, "excerpt": x.excerpt}
+                for x in index.requirements
+                if x.end > begin and (end is None or x.start < end)
+            ]
+            sections = [
+                {"ordinal": x.ordinal, "key": x.key, "level": x.level,
+                 "number": x.number, "title": x.title, "parent": x.parent,
+                 "start_char": x.start, "end_char": x.end,
+                 "start_line": x.start_line, "end_line": x.end_line,
+                 "token_estimate": x.tokens}
+                for x in index.sections
+            ]
+            links = [
+                {"ordinal": x.ordinal, "requirement": x.requirement,
+                 "target_section": x.target_section, "reference": x.reference}
+                for x in index.links
+            ]
+        else:
+            spec, loaded_text, stages, pieces, sections, links = (
+                self.specs.stage_context_internal(
+                    spec_id, stage["start_char"], stage["end_char"],
+                    need_text=text is None)
+            )
+            if text is None:
+                text = loaded_text
         position = next((i for i, row in enumerate(stages, 1) if row["ordinal"] == ordinal), 0)
         if spec is None or not position:
             return "lost"
-        if text is None:
-            _spec, text = self.specs.content_internal(spec_id)
         total = len(stages)
         earlier = [(task["key"], task["title"]) for row in stages[:position - 1]
                    for task in ((row.get("plan") or {}).get("tasks") or [])]
@@ -797,11 +843,7 @@ class SpecPlanner:
         options = spec.get("plan_options") or {}
         project = self.describe(options.get("principal") or spec["created_by"],
                                 spec["project_id"])
-        pieces = self.specs.requirements_internal(spec_id, stage["start_char"],
-                                                  stage["end_char"])
-        sections = self.specs.sections_internal(spec_id)
-        refs, see = cross_references(text, stage, pieces, sections,
-                                     self.specs.links_internal(spec_id), limits.see)
+        refs, see = cross_references(text, stage, pieces, sections, links, limits.see)
         prompt = stage_prompt(
             project=project, spec=spec, position=position, total=total, stage=stage,
             annotated=annotate(text, stage["start_char"], stage["end_char"], pieces),
@@ -851,7 +893,8 @@ class SpecPlanner:
         if interactive and total == 1:
             return self._finish(spec_id, announce=False,
                                 inline=(ordinal, owner, plan, provider),
-                                meta={"provider": provider, "failovers": failovers})
+                                meta={"provider": provider, "failovers": failovers},
+                                spec=spec, stages=stages, described=project)
         planned = self.specs.stage_planned(spec_id, ordinal, owner, plan=plan, provider=provider)
         return "planned" if planned else "lost"
 
@@ -993,7 +1036,10 @@ class SpecPlanner:
 
     def _finish(self, spec_id: str, *, announce: bool, reuse: bool = False,
                 inline: tuple[int, str, dict, str] | None = None,
-                meta: dict[str, Any] | None = None) -> dict[str, Any]:
+                meta: dict[str, Any] | None = None,
+                spec: dict[str, Any] | None = None,
+                stages: list[dict] | None = None,
+                described: dict[str, Any] | None = None) -> dict[str, Any]:
         """Merge the stage plans and create the run, as one fact.
 
         The run, its tasks, "this specification has its run" and - for a plan
@@ -1006,10 +1052,12 @@ class SpecPlanner:
         when the goal already has a live run, or ``{"status": "lost"}`` when
         another process finished first. Raises :class:`PlanningFailed`.
         """
-        spec = self.specs.meta_internal(spec_id)
+        if spec is None:
+            spec = self.specs.meta_internal(spec_id)
         if spec is None or not spec.get("goal_id"):
             raise PlanningFailed("the specification or its goal no longer exists")
-        stages = self.specs.stages_internal(spec_id)
+        if stages is None:
+            stages = self.specs.stages_internal(spec_id)
         if inline is not None:
             ordinal, owner, plan, provider = inline
             stages = [{**row, "state": "planned", "plan": plan, "provider": provider}
@@ -1039,10 +1087,11 @@ class SpecPlanner:
         # its tasks work on - as the project stands now, not as it stood when
         # planning began. A task that names one that has left the project
         # meanwhile works in the main repository.
-        try:
-            described = self.describe(principal, spec["project_id"])
-        except NotFound:
-            described = {}
+        if described is None:
+            try:
+                described = self.describe(principal, spec["project_id"])
+            except NotFound:
+                described = {}
         repositories = {item["full_name"]: item.get("branch") or ""
                         for item in described.get("repositories") or []
                         if item["full_name"] != repository}
@@ -1097,7 +1146,7 @@ class SpecPlanner:
                 return {"status": "existing", "run_id": str(live["id"])}
             self._failed(spec_id, str(e), announce=announce, while_in=states)
             raise PlanningFailed(str(e)) from None
-        return {"status": "started", "run": run, "plan": plan_meta}
+        return {"status": "started", "run": run, "plan": plan_meta, "tasks": tasks}
 
     # --------------------------------------------------------- telling the chat
     def _announce_run(self, cur: Any, spec: dict, run: dict, plan: dict,

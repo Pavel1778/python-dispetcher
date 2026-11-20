@@ -603,13 +603,28 @@ class OpenHandsExecutor:
                     raise CloudError(f"start task failed: {getattr(current, 'detail', '')}")
                 if recorded and self.stopping is not None and self.stopping():
                     raise StartLeft(f"start task {start.id} is left to the next worker")
-                time.sleep(self.poll_interval)
+                self._sleep_start(recorded)
+                if recorded and self.stopping is not None and self.stopping():
+                    raise StartLeft(f"start task {start.id} is left to the next worker")
                 nxt = client.get_start_task(current.id)
                 if nxt is None:
                     raise CloudError("start task disappeared")
                 current = nxt
             raise CloudError("start task not READY within the poll budget")
         return Dispatched(getattr(start, "id", ""), proof, account_id, kind)
+
+    def _sleep_start(self, recorded: bool) -> None:
+        if not recorded or self.stopping is None or self.poll_interval <= 0.05:
+            time.sleep(self.poll_interval)
+            return
+        deadline = time.monotonic() + self.poll_interval
+        while True:
+            if self.stopping():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
 
     def _start_accepted(self, task: dict, start: dict) -> bool:
         """Hand the accepted start to whoever keeps it. Returns whether it was
@@ -1410,6 +1425,7 @@ class LabScheduler:
                  reports: Any | None = None,
                  cycle_wait: Callable[..., float] | None = None,
                  evidence: Any | None = None, acceptance: Any | None = None,
+                 quality_gate: Any | None = None,
                  stopping: Callable[[], bool] | None = None):
         self.store = store
         self.executor = executor
@@ -1450,6 +1466,14 @@ class LabScheduler:
         #: records nothing without a signer.
         self.acceptance = acceptance if acceptance is not None else LabEvidence(
             store.store, principal=principal)
+        #: The QUALITY GATE: an optional deterministic Self-QA run of the
+        #: project's own checks against the exact commit the Git verifier just
+        #: accepted. It can only *downgrade* a ``completed_verified`` verdict -
+        #: a failing required check makes the task ``completed_unverified`` so it
+        #: is reworked; a skipped or blocked run never upgrades anything and
+        #: never turns a pass into a failure (the tooling may simply be absent).
+        #: ``None`` (the default) leaves the loop exactly as it was.
+        self.quality_gate = quality_gate
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -1470,6 +1494,57 @@ class LabScheduler:
             return float(self.start_wait(refused, int(task.get("refusals") or 0)))
         except TypeError:                  # a caller's own rule that takes the error only
             return float(self.start_wait(refused))
+
+    def _apply_quality_gate(self, task: dict, verdict: Verification) -> Verification:
+        """QUALITY GATE: run the project's own checks against the accepted commit.
+
+        This is the one stage that separates "a commit landed" (what
+        ``GitVerifier`` proves) from "the project still works". It runs the
+        deterministic ``SelfQa`` engine on the exact ``remote_sha`` the Git
+        verifier just read, and can only make a verdict *weaker*:
+
+        * ``failed`` (a required check exited non-zero) downgrades
+          ``completed_verified`` to ``completed_unverified`` with
+          ``retry="followup"``, so the scheduler reworks it;
+        * ``passed`` leaves the verdict as it was;
+        * ``skipped``/``blocked`` (no tooling, no network) leave it as it was -
+          an absent check is never a pass and never a failure.
+
+        It only runs when a gate is configured *and* the verdict is a verified
+        one with a readable commit; anything else is returned untouched. A gate
+        that raises is logged and ignored: the task's own verdict stands, and a
+        broken checker must not stall a run. The gate never sees a credential -
+        ``SelfQa`` strips NEXUS secrets from the child environment.
+        """
+        gate = self.quality_gate
+        if gate is None or verdict.verdict not in VERIFIED_VERDICTS:
+            return verdict
+        commit = str(verdict.evidence.get("remote_sha") or "")
+        repository = task.get("repository") or ""
+        if not commit or not repository:
+            return verdict
+        try:
+            qa = gate.run(repository=repository, commit=commit,
+                          project_id=str(task.get("project_id") or ""),
+                          branch=task.get("branch") or None)
+        except Exception as e:  # noqa: BLE001 - the gate must not stall a run
+            log.warning("quality gate failed for task %s: %s",
+                        task.get("task_key"), type(e).__name__)
+            return verdict
+        summary = qa.as_dict() if hasattr(qa, "as_dict") else dict(qa)
+        evidence = {**verdict.evidence, "self_qa": {
+            "verdict": summary.get("verdict"), "reason": summary.get("reason"),
+            "checks": [{"name": c.get("name"), "status": c.get("status"),
+                        "exit_code": c.get("exit_code")}
+                       for c in summary.get("checks", [])],
+        }}
+        if summary.get("verdict") == "failed":
+            return Verification(
+                "completed_unverified",
+                f"self-QA failed: {summary.get('reason') or 'a required check failed'}",
+                evidence, retry="followup")
+        # passed / skipped / blocked: the verdict stands, unchanged.
+        return Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
 
     def _record_evidence(self, task: dict, verdict: Verification, report: TaskReport) -> None:
         """EVIDENCE stage: sign a settled task result into the Trust Engine.
@@ -1562,7 +1637,8 @@ class LabScheduler:
     # ------------------------------------------------------------- the tick
     def tick(self, run_id: str) -> TickResult:
         result = TickResult()
-        run = self.store.run_row(run_id)
+        fetch_row = getattr(self.store, "_tick_run_row", self.store.run_row)
+        run = fetch_row(run_id)
         if run is None:
             result.finished = True
             result.note = "run not found"
@@ -1577,18 +1653,24 @@ class LabScheduler:
             result.note = f"run is {run['state']}"
             return result
         durable = run.get("policy") == "durable"
-        result.reclaimed = len(self.store.reclaim_expired(run_id))
+        if run.get("_has_expired_unclaimed", True):
+            result.reclaimed = len(self.store.reclaim_expired(run_id))
         # A start that was accepted before the worker that asked for it was
         # replaced: its conversation is bound here, by whoever runs now.
-        self._follow_starts(run_id, durable, result)
+        if run.get("_has_pending_starts", True):
+            self._follow_starts(run_id, durable, result, run=run)
 
         # 0. Stop every conversation a switch or failover left behind, so a task
         #    cannot have two writers on its branch at once. The branch stays held
         #    (``_BRANCH_FREE``) until this succeeds.
-        self._stop_abandoned(run_id)
+        if run.get("_has_abandoned", True):
+            self._stop_abandoned(run_id)
 
         # 1. Poll every task already dispatched, so a slow conversation advances.
-        in_flight = self._collect(run, durable, result)
+        if run.get("_has_in_flight", True) or result.followed > 0:
+            in_flight, abandoned_added = self._collect(run, durable, result)
+        else:
+            in_flight, abandoned_added = 0, False
 
         if run["state"] != "running":
             result.idle = in_flight == 0
@@ -1599,7 +1681,8 @@ class LabScheduler:
         #    itself when the run stopped running, pauses or is out of budget. Any
         #    conversation the poll above just abandoned is stopped first, so a
         #    failover in this same tick is not held back by the branch lock.
-        self._stop_abandoned(run_id)
+        if abandoned_added:
+            self._stop_abandoned(run_id)
         if self._stopping is not None and self._stopping():
             # The worker is being stopped. What is at work has been looked at;
             # a task claimed now would be a start this process cannot see
@@ -1611,9 +1694,12 @@ class LabScheduler:
             result.claimed = task["task_key"]
             if self._start(run, durable, task, result):
                 return result
+            if result.dispatched:
+                in_flight += 1
 
-        # 3. Decide the run's fate.
-        outcome = self._decide(run_id, durable)
+        # 3. Decide the run's fate. When work is already in flight, ``_decide``
+        #    always returns ``None``.
+        outcome = None if in_flight > 0 else self._decide(run_id, durable)
         if outcome is not None:
             state, last_error, note = outcome
             if state == "completed":
@@ -1638,10 +1724,12 @@ class LabScheduler:
         return result
 
     # ----------------------------------------------- what is already at work
-    def _collect(self, run: dict, durable: bool, result: TickResult) -> int:
-        """Read the conversations under way; returns how many still are."""
+    def _collect(self, run: dict, durable: bool,
+                 result: TickResult) -> tuple[int, bool]:
+        """Read the conversations under way; returns ``(in_flight, abandoned_added)``."""
         run_id = str(run["id"])
         in_flight = 0
+        abandoned_added = False
         for task in self.store.in_flight_tasks(run_id):
             conv = task.get("conversation_id")
             if not conv or task.get("held"):
@@ -1654,7 +1742,9 @@ class LabScheduler:
             if report.state == "running":
                 # The agent is at work (or between turns): the first time this is
                 # seen is when the agent began, for the run's profile.
-                self.store.record_run_milestone(run_id, "first_agent_event_at")
+                if run.get("first_agent_event_at") is None:
+                    self.store.record_run_milestone(run_id, "first_agent_event_at")
+                    run["first_agent_event_at"] = True
                 over = self._over_limit(task, conv, durable)
                 if over is None:
                     in_flight += 1
@@ -1693,15 +1783,21 @@ class LabScheduler:
                         task["id"], failed_account_id=account_id,
                         error="conversation missing; executor may be gone", requeue=again,
                         lease_token=task["lease_token"])
+                    abandoned_added = True
                 result.note = "executor gone: task requeued for failover"
                 continue
             else:
-                self.store.record_run_milestone(run_id, "verification_started_at")
+                if run.get("verification_started_at") is None:
+                    self.store.record_run_milestone(run_id, "verification_started_at")
+                    run["verification_started_at"] = True
                 with tracing.span("verify", project_id=task.get("project_id"),
                                   task_id=task.get("id"), conversation_id=conv,
                                   attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
                     verdict = self.verifier.verify(task, report)
-                self.store.record_run_milestone(run_id, "verification_completed_at")
+                if run.get("verification_completed_at") is None:
+                    self.store.record_run_milestone(run_id, "verification_completed_at")
+                    run["verification_completed_at"] = True
+                verdict = self._apply_quality_gate(task, verdict)
             # The account produced a terminal result, so it is working: mark it
             # healthy again. Without this an account excluded by one transient
             # failure would never come back into the pool.
@@ -1724,7 +1820,7 @@ class LabScheduler:
             self._record_evidence(task, verdict, report)
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
-        return in_flight
+        return in_flight, abandoned_added
 
     def _over_limit(self, task: dict, conversation_id: str,
                     durable: bool) -> tuple[str, str] | None:
@@ -1893,7 +1989,9 @@ class LabScheduler:
             task = {**task, "project_repositories": ProjectRepositoryService(
                 self.store.store).context(str(task["project_id"]))}
         # The run's profile: this is the moment a conversation is asked for.
-        self.store.record_run_milestone(run_id, "dispatch_started_at")
+        if run.get("dispatch_started_at") is None:
+            self.store.record_run_milestone(run_id, "dispatch_started_at")
+            run["dispatch_started_at"] = True
         try:
             with tracing.span("dispatch", project_id=task.get("project_id"),
                               task_id=task.get("id"),
@@ -1938,9 +2036,13 @@ class LabScheduler:
                     return True
             self._dispatch_failed(task, e, durable, result)
             return True
+        was_recorded = str(task["id"]) in self._recorded
         self._recorded.discard(str(task["id"]))
-        self._bind(run_id, task, conversation_id, base_sha)
+        bound = self._bind(run_id, task, conversation_id, base_sha, run=run,
+                           recorded=was_recorded)
         result.dispatched = True
+        if bound is not None and bound.get("state") != "running":
+            return True
         return False
 
     def _dispatch_failed(self, task: dict, e: Exception, durable: bool,
@@ -1988,16 +2090,19 @@ class LabScheduler:
         result.note = f"dispatch failed: {type(e).__name__}"
 
     def _bind(self, run_id: str, task: dict, conversation_id: str,
-              base_sha: str | None, *, start: dict | None = None) -> None:
+              base_sha: str | None, *, start: dict | None = None,
+              run: dict | None = None, recorded: bool = False) -> dict | None:
         """Bind the conversation a start produced to its task.
 
         One place for the worker that asked for the start and for a worker that
         found the start recorded and followed it (``_follow_starts``; *start*
         is then that record, and says which account the task had before).
         """
-        if self.store.conversation_of(task["id"]) == str(conversation_id):
+        if (start is not None or recorded) and (
+            self.store.conversation_of(task["id"]) == str(conversation_id)
+        ):
             # Another worker followed the same start and was first.
-            return
+            return None
         account_id = getattr(conversation_id, "account_id", None)
         if account_id is None and task.get("openhands_account_id"):
             account_id = str(task["openhands_account_id"])
@@ -2019,14 +2124,19 @@ class LabScheduler:
                 reason="previous account failed", context=context)
             if kind == "start":
                 kind = "handoff"
-        self.store.mark_running(task["id"], conversation_id=conversation_id or None,
-                                delivery=getattr(conversation_id, "delivery", None),
-                                account_id=account_id, base_sha=base_sha, kind=kind,
-                                lease_token=task["lease_token"])
+        bound = self.store.mark_running(
+            task["id"], conversation_id=conversation_id or None,
+            delivery=getattr(conversation_id, "delivery", None),
+            account_id=account_id, base_sha=base_sha, kind=kind,
+            lease_token=task["lease_token"])
         # The run's profile: the conversation is bound and the first message is
         # on its way, so the OpenHands start and the prompt delivery are done.
-        self.store.record_run_milestone(run_id, "conversation_ready_at")
-        self.store.record_run_milestone(run_id, "prompt_sent_at")
+        if run is None or run.get("conversation_ready_at") is None or run.get("prompt_sent_at") is None:
+            self.store.record_run_milestone(run_id, "conversation_ready_at", "prompt_sent_at")
+            if run is not None:
+                run["conversation_ready_at"] = True
+                run["prompt_sent_at"] = True
+        return bound
 
     def _record_start(self, task: dict, start: dict) -> bool:
         """Keep an accepted start on its task (the executor's ``on_start``)."""
@@ -2040,7 +2150,8 @@ class LabScheduler:
             self._recorded.add(str(task["id"]))
         return recorded
 
-    def _follow_starts(self, run_id: str, durable: bool, result: TickResult) -> None:
+    def _follow_starts(self, run_id: str, durable: bool, result: TickResult,
+                       *, run: dict | None = None) -> None:
         """Finish the starts that were accepted and not bound.
 
         A conversation is started in two steps, and for about a minute the
@@ -2076,7 +2187,7 @@ class LabScheduler:
                      task["task_key"], conversation_id)
             start = task.get("pending_start") or {}
             self._bind(run_id, task, conversation_id, start.get("base_sha") or None,
-                       start=start)
+                       start=start, run=run)
             result.followed += 1
 
     def _set_aside(self, task: dict, reason: str, result: TickResult, *,
@@ -2150,9 +2261,11 @@ class LabScheduler:
                     "blocked: tasks remain unverified")
         if sum(counts.get(state, 0) for state in IN_FLIGHT_TASK_STATES) > 0:
             return None                     # work is in flight; wait for it
+        has_unverified = total > (accepted + unfinished)
         spent = self.store.budget_spent(run_id)
         if durable:
-            if self.store.blocked_ancestry(run_id) and not self.store.has_claimable(run_id):
+            if (has_unverified and self.store.blocked_ancestry(run_id)
+                    and not self.store.has_claimable(run_id)):
                 # Everything that is left waits for a task that will not be
                 # tried again. Only a person can move this.
                 return ("blocked", "dependency graph deadlocked: a dependency is not verified"

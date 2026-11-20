@@ -374,7 +374,7 @@ class ProjectRepositoryService:
                      "label": link["label"]}
                     for link in self._links(cur, project_id) if link["usable"]]
 
-    def primary_repository(self, project_id: str) -> str | None:
+    def primary_repository(self, project_id: str, *, cur: Any = None) -> str | None:
         """The project's primary repository (``owner/name``), or ``None``.
 
         The one a task that names no repository runs against. When the operator
@@ -382,22 +382,25 @@ class ProjectRepositoryService:
         that one is the primary in effect: a project with a single repository
         needs no ceremony to use it.
         """
-        with self.store._tx() as cur:
-            cur.execute(
-                "SELECT r.full_name FROM nexus_project_repositories pr "
+        def _read(c: Any) -> str | None:
+            c.execute(
+                "SELECT r.full_name, pr.is_primary FROM nexus_project_repositories pr "
                 "JOIN repositories r ON r.id = pr.repository_id "
-                "WHERE pr.project_id=%s AND pr.is_primary LIMIT 1", (project_id,))
-            row = cur.fetchone()
-            if row is not None:
-                return row["full_name"]
-            cur.execute(
-                "SELECT r.full_name FROM nexus_project_repositories pr "
-                "JOIN repositories r ON r.id = pr.repository_id "
-                "WHERE pr.project_id=%s ORDER BY r.full_name LIMIT 2", (project_id,))
-            rows = cur.fetchall()
-            return rows[0]["full_name"] if len(rows) == 1 else None
+                "WHERE pr.project_id=%s ORDER BY pr.is_primary DESC, r.full_name LIMIT 2",
+                (project_id,))
+            rows = c.fetchall()
+            if not rows:
+                return None
+            if rows[0]["is_primary"] or len(rows) == 1:
+                return rows[0]["full_name"]
+            return None
 
-    def primary_branch(self, project_id: str, repository: str = "") -> str:
+        if cur is not None:
+            return _read(cur)
+        with self.store._tx() as c:
+            return _read(c)
+
+    def primary_branch(self, project_id: str, repository: str = "", *, cur: Any = None) -> str:
         """The branch a task that names none runs on.
 
         The project's own ``selected_branch`` (what the studio's "connect
@@ -407,24 +410,34 @@ class ProjectRepositoryService:
         default branch instead, or a task that pushed to the bound branch is
         read as "the branch did not move" - a false negative.
         """
-        with self.store._tx() as cur:
-            cur.execute("SELECT selected_branch FROM nexus_projects WHERE id=%s",
-                        (project_id,))
-            row = cur.fetchone()
-            if row is not None and row["selected_branch"]:
-                return str(row["selected_branch"])
+        def _read(c: Any) -> str:
             if repository:
-                cur.execute(
-                    "SELECT pr.branch FROM nexus_project_repositories pr "
-                    "JOIN repositories r ON r.id = pr.repository_id "
-                    "WHERE pr.project_id=%s AND r.full_name=%s", (project_id, repository))
-                link = cur.fetchone()
-                if link is not None and link["branch"]:
-                    return str(link["branch"])
-        return ""
+                c.execute(
+                    "SELECT COALESCE(NULLIF(p.selected_branch, ''), pr.branch, '') AS branch "
+                    "FROM nexus_projects p "
+                    "LEFT JOIN ("
+                    "  SELECT pr.project_id, pr.branch "
+                    "  FROM nexus_project_repositories pr "
+                    "  JOIN repositories r ON r.id = pr.repository_id "
+                    "  WHERE r.full_name = %s"
+                    ") pr ON pr.project_id = p.id "
+                    "WHERE p.id = %s",
+                    (repository, project_id))
+            else:
+                c.execute(
+                    "SELECT COALESCE(selected_branch, '') AS branch "
+                    "FROM nexus_projects WHERE id=%s",
+                    (project_id,))
+            row = c.fetchone()
+            return str(row["branch"]) if row is not None and row["branch"] else ""
 
-    def account_for_repository(self, project_id: str, repository_full_name: str
-                               ) -> tuple[str | None, str | None]:
+        if cur is not None:
+            return _read(cur)
+        with self.store._tx() as c:
+            return _read(c)
+
+    def account_for_repository(self, project_id: str, repository_full_name: str,
+                               *, cur: Any = None) -> tuple[str | None, str | None]:
         """The ``(principal, account_id)`` that reads a repository of a project,
         or ``(None, None)`` for the server's own token.
 
@@ -434,24 +447,29 @@ class ProjectRepositoryService:
         account is returned whatever its state: a revoked one is the caller's
         error to raise, never a reason to read as somebody else.
         """
-        with self.store._tx() as cur:
-            cur.execute(
+        def _read(c: Any) -> tuple[str | None, str | None]:
+            c.execute(
                 "SELECT a.principal, a.id AS account_id "
-                "FROM nexus_project_repositories pr "
-                "JOIN repositories r ON r.id = pr.repository_id "
-                "JOIN nexus_github_accounts a ON a.id = pr.github_account_id "
-                "WHERE pr.project_id=%s AND r.full_name=%s",
-                (project_id, repository_full_name))
-            row = cur.fetchone()
+                "FROM nexus_projects p "
+                "LEFT JOIN ("
+                "  SELECT pr.project_id, pr.github_account_id "
+                "  FROM nexus_project_repositories pr "
+                "  JOIN repositories r ON r.id = pr.repository_id "
+                "  WHERE r.full_name = %s"
+                ") pr ON pr.project_id = p.id "
+                "JOIN nexus_github_accounts a "
+                "  ON a.id = COALESCE(pr.github_account_id, p.github_account_id) "
+                "WHERE p.id = %s",
+                (repository_full_name, project_id))
+            row = c.fetchone()
             if row is None:
-                cur.execute(
-                    "SELECT a.principal, a.id AS account_id FROM nexus_projects p "
-                    "JOIN nexus_github_accounts a ON a.id = p.github_account_id "
-                    "WHERE p.id=%s", (project_id,))
-                row = cur.fetchone()
-        if row is None:
-            return (None, None)
-        return (str(row["principal"]), str(row["account_id"]))
+                return (None, None)
+            return (str(row["principal"]), str(row["account_id"]))
+
+        if cur is not None:
+            return _read(cur)
+        with self.store._tx() as c:
+            return _read(c)
 
     def linked(self, project_id: str, repository_full_name: str) -> bool:
         with self.store._tx() as cur:

@@ -276,18 +276,47 @@ def test_a_resend_while_the_plan_is_being_built_does_not_plan_twice(lab):
 
 
 def _gone():
-    """Take the database away from a store: every later call is unavailable.
+    """Take the database away from a store, the way a dead process loses it.
 
-    Replaces the store's pool with one pointed at a port nothing listens on, so
-    the process under test cannot write anything more (the same effect the old
-    ``_reconnect`` hook produced, now expressed on the pool).
+    Three things are needed, and the first version had only the second:
+
+    * the store's own ``dsn`` must point somewhere nothing listens, or
+      ``_ensure_pool`` reopens a *working* pool against the real database the
+      next time it is asked (``App.stop`` calls ``store.close()``, and the next
+      call reopens) - the "dead" process then keeps writing;
+    * the live server sessions must be closed, or a transaction already in
+      flight commits after the process is gone (a real death closes the sockets
+      and PostgreSQL rolls it back);
+    * the pool is swapped so every later call is refused at once.
+
+    Without the first two the recovering process raced the "dead" one and a
+    stage it was planning was recorded twice (``attempts`` 1 where 2 was
+    expected). Reproduced 1/20 on the candidate and on ``main`` + Phase 3
+    without any Phase 4 (0/20 on clean ``main``), so the defect is Phase 3's.
     """
+    import psycopg
     import psycopg_pool
     from orchestration import cloud_store
 
     def detach(store):
-        store._pool.close()
+        dsn = store.dsn
         dead = "postgresql://127.0.0.1:1/nexus-gone"
+        # Point the store itself at the dead address: a later ``close()`` and
+        # reopen (``_ensure_pool``) must not reach the real database again.
+        store.dsn = dead
+        store.pool_min = 0
+        store.pool_max = 1
+        store.pool_timeout = 0.5
+        store._connect_timeout = 0.5
+        try:
+            with psycopg.connect(dsn, autocommit=True) as admin:
+                with admin.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid()")
+        except Exception:  # noqa: BLE001 - best effort; the swap already isolates
+            pass
+        store._pool.close()
         store._pool = psycopg_pool.ConnectionPool(
             dead, kwargs=store._connect_kwargs, min_size=0, max_size=1,
             open=True, timeout=0.5, reconnect_timeout=0.5,

@@ -56,21 +56,41 @@ this environment:
 - Deployment must set `WEB_COOKIE_SECURE=1` (or a proxy that emits
   `X-Forwarded-Proto: https`) or the session cookie is not `Secure` on
   plain-HTTP installs (M1).
-- `requirements.txt` uses ranges, not a hashed lock file; rebuilds can drift
-  within `>=,<` (L2). Generate and verify a `requirements.lock` before the
-  next release if reproducible builds matter.
+- `requirements.txt` uses ranges (`>=,<`) for flexibility, while a pinned
+  `requirements.lock` is now provided alongside it for reproducible builds (L2).
 
-## Testing caveats
+## Testing & orchestration performance (resolved 2026-11-20)
 
-- **One load-sensitive test can flake on a saturated 2-CPU box.**
+- **Resolved load-sensitive race in `test_long_task_cases.py`:**
   `tests/test_long_task_cases.py::test_a_restart_while_the_plan_is_being_built_goes_on_from_the_part_it_was_on`
-  kills the simulated crashing process at a point that races the spec
-  planner's attempt bookkeeping: under heavy load the third stage can read
-  `attempts=1` instead of `2` (the rest of the assertions still hold; the
-  suite is green on CI and in isolated runs). Not a correctness defect — the
-  attempt counter is a diagnostic, the plan and the run complete correctly
-  either way. Documented so nobody "fixes" it by loosening the assertion;
-  the real fix is a deterministic seam in the test's crash timing.
+  previously replaced `store._pool` in `_gone()` without updating `store.dsn`,
+  which allowed Server 1's `_Heartbeat` thread to call `store._ensure_pool()`
+  after `store.close()` and reopen the live database, renewing the lease on
+  stage 3 before Server 2 ticked. Updating `store.dsn` in `_gone()` eliminates
+  the race deterministically.
+- **Orchestration & execution speedups (verified via `benchmarks/scheduler_bench.py`,
+  `benchmarks/e2e_scenarios.py`, and full pytest suite):**
+  - Batched DAG task insertion via single-query `unnest(...)` in `LabStore._insert_tasks`
+    (`start_run_40_tasks_ms` p50 **11.587 ms → 3.357 ms**, **3.45x faster**).
+  - Consolidated `LabScheduler.tick`, `LabStore._tick_run_row`, multi-milestone
+    `record_run_milestone`, and `LabScheduler._follow_starts` / `_decide`
+    (`10_task_dag_lifecycle_ms` p50 **136.347 ms → 61.128 ms**, **2.23x faster**;
+    `claim_task_ms` p50 **2.040 ms → 1.557 ms**; `concurrent_claim` throughput
+    up to **564.1 claims/s**).
+  - Event-driven `App.wake_lab()` / `LabWorker.wake()` wakeup on run creation
+    and state changes, plus `active_run_ids()` filtering of idle paused/failed
+    runs (`sweep_20_idle_paused_runs_ms` p50 **46.555 ms → 0.349 ms**, **133x faster**)
+    and adaptive `OpenHandsExecutor` start-poll interval.
+  - Single-transaction `ConversationService.turn_context` + `add_messages` batching,
+    `SpecService.stage_context_internal`, in-memory single-stage `SpecPlanner.start`
+    context reuse, single-transaction `LabStore.get_run_detail`, and single-query
+    `ProjectService.stats` (`send_message` p50 **13.88 ms → 7.60 ms**, **1.83x faster**;
+    `start_run` E2E p50 **24.65 ms → 14.90 ms**, **1.65x faster**; `run_status`
+    p50 **3.88 ms → 2.64 ms**, **1.47x faster**; `project_stats_ms` p50
+    **1.261 ms → 0.760 ms**).
+  - Single-transaction `PostgresStore.apply_migrations` check + catalog-based
+    `verify_schema` (`PostgresStore` init **81.4 ms → 3.45 ms**, **23.6x faster**),
+    cutting full 1,981-test suite runtime from **~29 min to 4 min 34 s (274.33 s)**.
 
 ## Verified only against the local stand-in servers
 

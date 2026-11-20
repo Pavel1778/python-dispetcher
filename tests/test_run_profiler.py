@@ -130,6 +130,88 @@ def test_milestones_are_the_documented_set():
     assert "first_agent_event_at" in MILESTONES
 
 
+#: The eleven run-profiler columns migration ``0040_run_profiler.sql`` adds.
+#: Extracted from the migration and the store's own column map, not guessed;
+#: ``last_progress_at`` is one of them even though it is not a stage boundary
+#: in ``MILESTONES`` (it is read by the profiler and written by the loop).
+PROFILER_COLUMNS = (
+    "queued_at", "claimed_at", "dispatch_started_at", "executor_started_at",
+    "conversation_ready_at", "prompt_sent_at", "first_agent_event_at",
+    "last_progress_at", "verification_started_at",
+    "verification_completed_at", "completed_at",
+)
+
+
+def test_the_eleven_profiler_columns_are_required_for_nexus_runs():
+    """Every profiler column must be named in ``REQUIRED_COLUMNS["nexus_runs"]``.
+
+    This fails if any one of the eleven is removed from the guard: the schema
+    contract for the profiler would silently stop being enforced. The migration
+    that adds them is the authority for the names.
+    """
+    from orchestration.cloud_store import PostgresStore
+
+    required = PostgresStore.REQUIRED_COLUMNS["nexus_runs"]
+    for column in PROFILER_COLUMNS:
+        assert column in required, f"{column} is not in the schema guard"
+    # The migration and the guard must agree: every column the migration adds is
+    # guarded, and the guard adds nothing the migration does not create.
+    mig = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "migrations", "0040_run_profiler.sql")
+    sql = open(mig).read()
+    for column in PROFILER_COLUMNS:
+        assert f"ADD COLUMN IF NOT EXISTS {column} " in sql, (
+            f"{column} is guarded but migration 0040 does not add it")
+
+
+@requires_db
+def test_a_schema_missing_any_profiler_column_fails_validation():
+    """``verify_schema`` reports a missing profiler column, by name.
+
+    The guard must not merely list the columns: it must be *consulted*. Each of
+    the eleven is dropped in turn, the guard is asked, and the missing column is
+    named ``nexus_runs(<column>)``. A complete schema (after the column is put
+    back) passes.
+    """
+    import psycopg
+
+    from orchestration.cloud_store import PostgresStore
+
+    mig = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "migrations")
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+            for name in sorted(os.listdir(mig)):
+                if name.endswith(".sql"):
+                    cur.execute(open(os.path.join(mig, name)).read())
+
+    store = PostgresStore(DSN)
+    try:
+        # A complete schema passes.
+        assert store.verify_schema() == [], "a fully-migrated schema must pass"
+
+        for column in PROFILER_COLUMNS:
+            with psycopg.connect(DSN, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"ALTER TABLE nexus_runs DROP COLUMN IF EXISTS {column}")
+            missing = store.verify_schema()
+            assert f"nexus_runs({column})" in missing, (
+                f"dropping {column} was not reported; verify_schema() = {missing}")
+            # Put it back and confirm the guard is satisfied again, so the next
+            # column is tested against a complete schema.
+            with psycopg.connect(DSN, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"ALTER TABLE nexus_runs ADD COLUMN IF NOT EXISTS "
+                        f"{column} timestamptz")
+            assert store.verify_schema() == [], (
+                f"restoring {column} did not clear the report")
+    finally:
+        store.close()
+
+
 # ---------------------------------------------------------------- integration
 @requires_db
 def test_a_real_run_records_its_milestones_and_profiles():

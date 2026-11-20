@@ -2323,6 +2323,9 @@
         ? 'включено' : 'NEXUS_SECRET_KEY не задан — аккаунты не сохранятся') +
       '<dt>Автономные прогоны</dt>' + line(lab.inline, lab.inline
         ? 'ведёт сам сервер' : 'выключено (NEXUS_LAB_INLINE=0) — нужен процесс lab_worker') +
+      '<dt>Самопроверка (Self-QA)</dt>' + line(!!lab.selfqa_gate, lab.selfqa_gate
+        ? 'доступна — режим задаётся в настройках проекта (авто / всегда / никогда)'
+        : 'выключена во всём развёртывании (NEXUS_SELFQA_GATE=0)') +
       '<dt>Версия</dt><dd>' + esc(status.version || '—') + '</dd></dl></div>';
   }
 
@@ -2339,6 +2342,7 @@
       '<form class="row row-fill" id="project-rename"><input class="input" name="name" required maxlength="120" value="' + esc(current.name) + '" aria-label="Название проекта">' +
       '<button class="btn btn-primary" type="submit">Сохранить</button></form><p class="form-msg" id="project-msg" role="status"></p></div>' +
       projectRepositoriesHtml(data.repositories) +
+      projectQualityGateHtml(current) +
       '<div class="section"><h3 class="section-title">' + icon('eye', 'icon-sm') + 'Контекст для ассистента</h3>' +
       '<p class="section-note">Сводка структуры основного репозитория, которую ассистент получает вместе с вопросом.</p>' +
       (context
@@ -2358,6 +2362,27 @@
       '<button class="btn" type="button" data-action="project-archive" data-archived="0">Вернуть из архива</button>' +
       '<button class="btn btn-danger" type="button" data-action="project-delete">В корзину</button>' +
       '</div></div>';
+  }
+
+  // Whether a project's own checks gate a task it produces. The mode is the
+  // server's setting; this only renders it and posts a change. "auto" is the
+  // default: the checks run only when the repository declares .nexus-qa.json,
+  // so a project that never declared them is not slowed down.
+  function projectQualityGateHtml(current) {
+    var mode = (current && current.quality_gate) || 'auto';
+    var options = [
+      ['auto', 'Авто — только если репозиторий объявляет проверки (.nexus-qa.json)'],
+      ['on', 'Всегда — проверки объявленные или стандартные'],
+      ['off', 'Никогда — проверки не запускать']
+    ].map(function (item) {
+      return '<option value="' + item[0] + '"' + (item[0] === mode ? ' selected' : '') + '>' + esc(item[1]) + '</option>';
+    }).join('');
+    return '<div class="section"><h3 class="section-title">' + icon('check', 'icon-sm') + 'Самопроверка проекта</h3>' +
+      '<p class="section-note">После того как правка задачи принята, NEXUS может прогнать собственные проверки проекта ' +
+      '(линт, тесты) в изолированной копии именно на принятом коммите. Провал обязательной проверки возвращает задачу в работу. ' +
+      '«Авто» запускает их только если репозиторий объявляет файл <code>.nexus-qa.json</code>.</p>' +
+      '<label class="field"><span>Режим</span><select class="select" id="quality-gate-mode" aria-label="Режим самопроверки">' +
+      options + '</select></label></div>';
   }
 
   // What the last access check of a repository found, in a line.
@@ -3602,6 +3627,20 @@
       api(projectUrl('/executors'), { method: 'POST', body: { strategy: event.target.value } })
         .then(function () { toast('Сохранено.'); return refreshSettings(); },
               function (error) { toast(explain(error.message).text, 'bad'); refreshSettings(); });
+    });
+    // The quality-gate mode is the project's own setting, changed on the project
+    // object (PATCH), so the server is the one that records it.
+    document.addEventListener('change', function (event) {
+      if (event.target.id !== 'quality-gate-mode') return;
+      var mode = event.target.value;
+      api(projectUrl(''), { method: 'PATCH', body: { quality_gate: mode } })
+        .then(function (data) {
+          S.projects = S.projects.map(function (item) {
+            return item.id === data.project.id ? data.project : item;
+          });
+          toast('Самопроверка: ' + mode + '.');
+          return refreshSettings();
+        }, function (error) { toast(explain(error.message).text, 'bad'); refreshSettings(); });
     });
     // The OpenHands selection mode is the pool's own setting, not the project's.
     document.addEventListener('change', function (event) {

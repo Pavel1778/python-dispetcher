@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased — the Self-QA gate is per project, and it works on a real repository
+
+### Added
+
+- **A per-project quality-gate mode** (`nexus_projects.quality_gate`,
+  migration `0042_project_quality_gate.sql`): `auto` (the default) runs the
+  project's own checks only when its repository declares `.nexus-qa.json`;
+  `on` always; `off` never. Set from the Studio's project settings, with
+  `PATCH /api/v1/projects/{id}` and `nexus project quality-gate <id> [mode]`.
+  `NEXUS_SELFQA_GATE` remains a deployment-wide override. A project that
+  declares its checks is now gated without any operator switch — roadmap P1 #1.
+- **The two check timeouts are settings** (`NEXUS_SELFQA_CHECK_TIMEOUT`,
+  `NEXUS_SELFQA_TOTAL_TIMEOUT`); a junk or non-positive value is the default.
+
+### Fixed
+
+- **The gate never worked on a real project.** A task's `repository` is
+  `owner/name`, and the gate ran `git clone owner/name`, which git reads as a
+  *path* — every real project came back `blocked` ("repository does not
+  exist") while every test passed on a local directory. `clone_url` resolves
+  `owner/name` to its https URL; the clone fetches the exact accepted commit
+  (a shallow clone cannot check out an arbitrary SHA); a private repository is
+  cloned with the project's own account, and the token reaches git through the
+  environment only — never argv, never the URL, never a report.
+- **A failing project passed after the first task.** A fixed `workdir/checkout`
+  was reused by the next run, so the clone failed, the report was `blocked`,
+  and a `blocked` gate leaves the verdict alone. Each run now gets its own
+  scratch directory.
+
+Tests: `tests/test_quality_gate_policy.py` (33 cases; the clone, the mode
+policy and the shared-checkout fix each fail when reverted), and the updated
+`tests/test_quality_gate.py`.
+
+## Unreleased — run-time profile (Phase 5), canonical consolidation
+
+### Added
+
+- **A durable run-time profile.** `nexus_runs` gains stage milestones
+  (`queued_at`, `claimed_at`, `dispatch_started_at`, `conversation_ready_at`,
+  `prompt_sent_at`, `first_agent_event_at`, `verification_started_at`,
+  `verification_completed_at`, `completed_at`) written once at each lifecycle
+  point (migration `0040_run_profiler.sql`). `orchestration/nexus_profiler.py`
+  turns them into per-stage durations, idle time and the dominant bottleneck;
+  the run-detail route returns a `profile`, and the studio shows it. A stage
+  that was not measured is `None`, never a fabricated zero.
+  (`nexus_profiler.py`, `nexus_lab_store.py`, `nexus_lab.py`, `web_server.py`,
+  `cloud_store.py`; tests `tests/test_run_profiler.py`, the run-detail case in
+  `tests/test_lab_http.py`; doc `docs/RUN-PROFILER.md`.)
+
+### Changed
+
+- **Canonical consolidation.** The three consolidation candidates (the
+  owner-approved Phase 3+4 base, the engineering/performance-evolution branch,
+  and the Phase 5 profiler) are reconciled into one branch: one
+  `terminal_output.py` (the conversation-scoped trajectory transport with the
+  ZIP-bomb bound, the `..`-skip and PR #42's recomputed-name source verification),
+  the kept connection pool, the engineering docs and the `file_lab` batch insert,
+  and a cluster-wide advisory lock around the cluster-global Supabase-role test
+  case. See `AGENTS.md`, "Canonical consolidation".
+
 ## Unreleased — hardening, audits, CLI, architecture extraction
 
 ### Added
@@ -114,7 +174,7 @@
   `list_run_task_outputs` and `get_run_task_output`. The Cloud *app* transport
   cannot reach a sandbox filesystem and says so (`unsupported`), never an empty
   result. See `AGENTS.md`, "Full terminal output recovery".
-  (`orchestration/nexus_outputs.py`, `cloud_direct.py`, `local_runtime.py`,
+  (`orchestration/terminal_output.py`, `cloud_direct.py`, `local_runtime.py`,
   `openhands_client.py`, `web_server.py`, `cli.py`, `mcp_server.py`; tests
   `tests/test_artifacts.py`.)
 

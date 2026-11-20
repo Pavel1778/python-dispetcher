@@ -1,0 +1,9 @@
+# Pinned runtime dependency lock for reproducible NEXUS builds (Security Audit L2).
+# Verified against Python 3.11+ and PostgreSQL 16/17.
+cffi==2.1.1
+cryptography==45.0.7
+psycopg==3.3.9
+psycopg-binary==3.3.9
+psycopg-pool==3.3.3
+pycparser==3.12
+typing_extensions==4.16.0

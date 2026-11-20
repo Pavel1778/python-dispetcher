@@ -11,8 +11,13 @@ state/
 .audit-baseline/
 .restore-points/
 dist/
+# Rust build output (the crate's own Cargo.lock IS committed; the build tree is not).
+rust/target/
 *.deb
 *.keystore
 nexus-*.apk
 *.exe
 *.o
+nohup.out
+# Database dumps from scripts/nexus.sh backup — never commit data.
+backups/

@@ -1,11 +1,38 @@
 """Defaults for the whole test session."""
 import os
+import socketserver
 
 # The test suites drop and re-create the public schema of the database they
 # run against. Giving every pytest process a database of its own (or, when
 # that is not allowed, serialising the processes) is what stops two parallel
 # runs from corrupting each other; see tests/_test_db.py.
 from tests import _test_db  # noqa: F401 - the import does the setup
+
+# Python's BaseServer.serve_forever defaults to a 0.5s select() poll interval,
+# which makes every test HTTP server (WebServer, FakeCloudServer,
+# FakeGitHubServer, FakeServer, FakeProvider) wait up to 500ms on shutdown().
+_orig_serve_forever = socketserver.BaseServer.serve_forever
+
+
+def _fast_serve_forever(self: socketserver.BaseServer, poll_interval: float = 0.02) -> None:
+    return _orig_serve_forever(self, poll_interval=poll_interval)
+
+
+socketserver.BaseServer.serve_forever = _fast_serve_forever  # type: ignore[method-assign]
+
+_PATCHED_RESET_MODULES: set[str] = set()
+
+
+def pytest_runtest_setup(item) -> None:
+    mod = getattr(item, "module", None)
+    if mod is None or mod.__name__ in _PATCHED_RESET_MODULES:
+        return
+    _PATCHED_RESET_MODULES.add(mod.__name__)
+    dsn = getattr(mod, "DSN", None)
+    for fn_name in ("_reset_schema", "_reset", "reset_schema"):
+        fn = getattr(mod, fn_name, None)
+        if callable(fn) and getattr(fn, "__code__", None) and fn.__code__.co_argcount == 0:
+            setattr(mod, fn_name, lambda _d=dsn: _test_db.reset_schema(_d))
 
 # A server advances autonomous runs itself unless NEXUS_LAB_INLINE says no
 # (``orchestration.web_server.lab_inline_default``). Most tests here start a

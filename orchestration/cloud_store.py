@@ -290,6 +290,21 @@ def _pool_check_connection(conn: Any) -> None:
         raise psycopg.OperationalError("the connection is dead") from e
 
 
+_MIGRATION_FILE_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
+
+
+def _read_migration_file(path: Path) -> tuple[str, str]:
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _MIGRATION_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    sql = path.read_text(encoding="utf-8")
+    checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    _MIGRATION_FILE_CACHE[key] = (sql, checksum)
+    return sql, checksum
+
+
 def _has_pending_input(fd: int) -> bool:
     """Whether a socket has something to read (data, end-of-file, an error).
 
@@ -479,10 +494,13 @@ class PostgresStore:
                 "  checksum text NOT NULL,"
                 "  applied_at timestamptz NOT NULL DEFAULT now())"
             )
+            cur.execute("SELECT filename, checksum FROM schema_migrations")
+            existing = {row["filename"]: row["checksum"] for row in cur.fetchall()}
         applied: list[str] = []
         for path in files:
-            sql = path.read_text(encoding="utf-8")
-            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            sql, checksum = _read_migration_file(path)
+            if existing.get(path.name) == checksum:
+                continue
             with self._tx() as cur:
                 cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
                             (path.name,))
@@ -558,7 +576,8 @@ class PostgresStore:
                                      "error_count"),
         "nexus_openhands_account_events": ("id", "account_id", "kind", "detail"),
         "nexus_openhands_pool": ("principal", "selection_mode", "fallback_order"),
-        "nexus_projects": ("id", "name", "description", "archived_at", "deleted_at"),
+        "nexus_projects": ("id", "name", "description", "archived_at", "deleted_at",
+                           "quality_gate"),
         "nexus_conversations": ("id", "project_id", "title", "mode", "state",
                                 "archived", "pinned", "pinned_at", "deleted_at",
                                 "workflow_state", "workflow_goal_id",
@@ -586,7 +605,12 @@ class PostgresStore:
                             "pending_start"),
         "nexus_runs": ("id", "project_id", "goal_id", "state", "iteration",
                        "policy", "cycle", "resume_at", "conversation_id",
-                       "hidden_at", "total_iterations"),
+                       "hidden_at", "total_iterations",
+                       "queued_at", "claimed_at", "dispatch_started_at",
+                       "executor_started_at", "conversation_ready_at",
+                       "prompt_sent_at", "first_agent_event_at", "last_progress_at",
+                       "verification_started_at", "verification_completed_at",
+                       "completed_at"),
         "nexus_run_reports": ("run_id", "project_id", "conversation_id", "state",
                               "body", "attempts", "next_attempt_at"),
         "nexus_executor_stops": ("id", "run_id", "task_id", "conversation_id",
@@ -616,14 +640,21 @@ class PostgresStore:
         table is returned as ``table(column)`` so the name that matters is
         visible. This method only reads; it never alters the schema.
         """
-        required = (
-            "workflows", "tasks", "conversations", "repositories",
-            "task_events", "sr_tool_calls", "sessions", "login_attempts",
-        )
+        # Every table the column map names, not a hand-kept subset: the eight
+        # legacy tables were once the whole set, and the NEXUS tables added to
+        # the map later (the profiler columns of migration 0040 among them) went
+        # unchecked. The map is exactly the columns the code reads.
+        required = tuple(self.REQUIRED_COLUMNS)
         with self._tx() as cur:
             cur.execute(
-                "SELECT table_name, column_name FROM information_schema.columns "
-                "WHERE table_schema = current_schema()"
+                "SELECT c.relname AS table_name, a.attname AS column_name "
+                "FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_attribute a ON a.attrelid = c.oid "
+                "WHERE n.nspname = current_schema() "
+                "  AND c.relname = ANY(%s) "
+                "  AND a.attnum > 0 AND NOT a.attisdropped",
+                (list(required),),
             )
             columns: dict[str, set[str]] = {}
             for row in cur.fetchall():

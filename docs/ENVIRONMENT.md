@@ -166,6 +166,9 @@ Without a key pair the lab records no evidence (never a fabricated one).
 | `NEXUS_RETRY_BASE_SECONDS` | `60` | `nexus_retry.py` | Wait after the first exhausted work cycle. |
 | `NEXUS_RETRY_MAX_SECONDS` | `3600` | `nexus_retry.py` | Longest wait between cycles. |
 | `NEXUS_RETRY_MAX_CYCLES` | `0` | `nexus_retry.py` | Operator ceiling on cycles per task (`0` = none; then the run waits for a person). |
+| `NEXUS_SELFQA_GATE` | — | `lab_worker.py` | Deployment-wide override for the Self-QA gate. Unset, each project's own mode decides (`nexus_projects.quality_gate`: `auto`/`on`/`off`). A true value forces every project's checks to run; a false value turns the gate off everywhere. |
+| `NEXUS_SELFQA_CHECK_TIMEOUT` | `900` | `nexus_selfqa.py` | Seconds one declared check may run. A check that hangs is a failure of the check. |
+| `NEXUS_SELFQA_TOTAL_TIMEOUT` | `2400` | `nexus_selfqa.py` | Seconds the whole run of a project's checks may take. |
 | `NEXUS_SPEC_MAX_CHARS` | `1000000` | `nexus_specs.py` | Longest task text accepted. |
 | `NEXUS_SPEC_INLINE_CHARS` | `20000` | `nexus_specs.py` | Up to this, the text travels inside the agent's first message. |
 | `NEXUS_SPEC_MESSAGE_CHARS` | `60000` | `nexus_specs.py` | `app` transport: up to this the whole text is in the message; longer, each task gets the part it was planned from. |

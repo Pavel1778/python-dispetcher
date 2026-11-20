@@ -664,6 +664,10 @@ def test_a_phone_gets_one_column_and_nothing_wider_than_the_screen(stack, chromi
         assert page.locator("#sidebar").bounding_box()["x"] == 0
         assert page.evaluate(shadow) != "none", "the open drawer is lifted off the page"
         # Without hover the per-chat menu has to be visible to be reachable.
+        # Wait for the list first: on a slow runner the history can still be
+        # drawing, and querying a selector that is not there yet is a null
+        # getComputedStyle, not the property this case is about.
+        page.wait_for_selector(".sb-item .icon-btn")
         assert page.evaluate("() => getComputedStyle(document.querySelector('.sb-item .icon-btn')).opacity") == "1"
         assert _overflow(page) <= 0
         page.tap(".sb-link")
@@ -1941,6 +1945,44 @@ def test_pin_export_and_delete_a_chat_from_its_menu(stack, chromium):
         page.wait_for_selector("[data-action='restore-chat']")
         page.click("[data-action='restore-chat']")
         expect(page.locator(".sb-item:not(.is-archived)")).to_have_count(2)
+        assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+def test_the_project_quality_gate_is_changed_from_the_project_settings(stack, chromium):
+    """The project's Self-QA mode is a real server setting, changed from the
+    project tab of the settings. ``auto`` is the default; the interface reads it
+    from the server, posts a change, and the server records it."""
+    stack.answers("Готово.")
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        # One message creates the project and the chat.
+        _send(page, "Привет")
+        page.wait_for_selector(".msg.assistant")
+
+        page.click("#user-menu")
+        page.click(".menu-item[data-action='open-settings']")
+        page.click(".settings-nav [data-tab='project']")
+        page.wait_for_selector("#quality-gate-mode")
+        # The control shows the server's current value (the default).
+        assert page.input_value("#quality-gate-mode") == "auto"
+
+        # Changing it is a real PATCH, recorded on the project.
+        page.select_option("#quality-gate-mode", "off")
+        expect(page.locator(".toast", has_text="Самопроверка")).to_be_visible()
+        project_id = _first_project(stack.app)
+        principal = _owner_principal(stack.app)
+        assert stack.app.projects.get(principal, project_id)["quality_gate"] == "off"
+
+        # It is durable: reopening the settings reads the stored value back.
+        page.keyboard.press("Escape")
+        page.click("#user-menu")
+        page.click(".menu-item[data-action='open-settings']")
+        page.click(".settings-nav [data-tab='project']")
+        page.wait_for_selector("#quality-gate-mode")
+        assert page.input_value("#quality-gate-mode") == "off"
         assert watch.problems == []
     finally:
         ctx.close()

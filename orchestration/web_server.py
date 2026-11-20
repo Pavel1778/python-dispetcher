@@ -332,6 +332,8 @@ class App:
             self.store,
             EvidenceTrustEngine(self.evidence_keyring, self.evidence_signer),
         )
+        # The QUALITY GATE (Self-QA) is built once the GitHub identity above
+        # exists; see just below.
         self.github_confirmations = Confirmations()
         self.github_writes_enabled = os.environ.get("GITHUB_ENABLE_WRITES", "").lower() in ("1", "true", "yes")
         # The LLM orchestrator cascade (Gemini -> Groq -> OpenRouter ->
@@ -415,6 +417,15 @@ class App:
         # that only needs to read can reach a write, and every call happens
         # inside a confirmed-action handler (see ``_github_*`` routes).
         self.github_writer = GitHubWriter(self.github)
+        # The QUALITY GATE (Self-QA). Each project carries its own mode
+        # (``nexus_projects.quality_gate``): ``auto`` runs the checks only when
+        # the repository declares them, ``on`` always, ``off`` never.
+        # ``NEXUS_SELFQA_GATE`` remains a deployment-wide override. The gate can
+        # only ever downgrade a verified verdict, and a failing required check
+        # reworks the task.
+        from .lab_worker import build_quality_gate
+        self.quality_gate = build_quality_gate(
+            self.store, github=self.github, github_accounts=self.github_accounts)
         # Bearer token for the machine API. Without one, only read-only requests
         # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
         # stranger to start Cloud conversations. ``None`` means "not set".
@@ -446,6 +457,7 @@ class App:
             global_max_attempts=_int_env("LOGIN_MAX_ATTEMPTS_GLOBAL", 120),
         )
         self._stop = threading.Event()
+        self._lab_wake = threading.Event()
         self._loop: threading.Thread | None = None
         self._lab_loop: threading.Thread | None = None
         self._plan_loop: threading.Thread | None = None
@@ -458,6 +470,10 @@ class App:
         #: rows, by the clock (see ``_maybe_sweep``).
         self._sweep_interval = 300.0
         self._swept_at: float | None = None
+
+    def wake_lab(self) -> None:
+        """Wake the inline lab loop so a newly started/resumed/cancelled run is handled immediately."""
+        self._lab_wake.set()
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
@@ -472,6 +488,7 @@ class App:
     def stop(self) -> None:
         self._stop.set()
         self.spec_planner.wake()
+        self.wake_lab()
         # The pass that advances runs is given the time to finish what it has
         # in hand: closing the store under it would lose what it was about to
         # write (a start it has just been given, a verdict). It does not wait
@@ -499,6 +516,8 @@ class App:
         while not self._stop.is_set():
             try:
                 self.last_plan_tick = {"at": time.time(), **self.spec_planner.tick()}
+                if self.last_plan_tick.get("started"):
+                    self.wake_lab()
             except Exception as e:  # noqa: BLE001 - the loop must survive
                 log.exception("planning pass failed")
                 self.last_plan_tick = {"at": time.time(),
@@ -507,14 +526,29 @@ class App:
 
     def _describe_project(self, principal: str, project_id: str) -> dict[str, Any]:
         """What a planning request says about the project besides the task."""
-        project = self.projects.get(principal, project_id)
-        context = self.context.current(principal, project_id)
+        with self.store._tx() as cur:
+            project = ProjectService._project(cur, principal, project_id)
+            cur.execute(
+                "SELECT summary FROM nexus_project_context "
+                "WHERE project_id=%s AND state='current' "
+                "ORDER BY created_at DESC, id LIMIT 1", (project_id,))
+            ctx_row = cur.fetchone()
+            cur.execute(
+                "SELECT id, project_id, kind, content, provenance, confidence, source, "
+                "created_at, updated_at FROM nexus_memory "
+                "WHERE (project_id=%s OR project_id IS NULL) AND superseded_by IS NULL "
+                "ORDER BY created_at DESC, id LIMIT 30", (project_id,))
+            memories = [dict(r) for r in cur.fetchall()]
+            repos = [{"full_name": link["full_name"], "branch": link["working_branch"],
+                      "is_primary": link["is_primary"], "role_note": link["role_note"],
+                      "label": link["label"]}
+                     for link in self.project_repos._links(cur, project_id) if link["usable"]]
         return {"name": project["name"],
-                "context": (context or {}).get("summary") or {},
-                "memory": self.memory.retrieve(principal, project_id, limit=30),
+                "context": (ctx_row["summary"] if ctx_row else None) or {},
+                "memory": memories,
                 # The repositories work may run on; with several, the planner
                 # assigns each task to one (``nexus_spec_planner``).
-                "repositories": self.project_repos.context(project_id)}
+                "repositories": repos}
 
     def _run_lab(self) -> None:
         """Advance autonomous runs from inside this process.
@@ -531,6 +565,7 @@ class App:
         log.info("this server advances autonomous runs itself (worker %s)",
                  self._lab_worker_id)
         while not self._stop.is_set():
+            self._lab_wake.clear()
             try:
                 if worker is None:
                     # Built here, not before the loop: if it cannot be built
@@ -538,10 +573,12 @@ class App:
                     # status. A thread that died on its first line would leave
                     # a server that says it advances runs and does not.
                     built = LabWorker(self.store, worker_id=self._lab_worker_id,
+                                      poll_interval=self.poll_interval,
                                       client=self.client, github=self.github,
                                       github_accounts=self.github_accounts,
                                       account_router=build_account_router(self.store),
                                       evidence=self.evidence,
+                                      quality_gate=self.quality_gate,
                                       # A start that is on its way when the
                                       # server is stopped is left, recorded, to
                                       # the process that replaces this one.
@@ -559,7 +596,9 @@ class App:
                 log.exception("lab tick failed")
                 self.last_lab_tick = {"at": time.time(),
                                       "errors": [f"{type(e).__name__}: {e}"]}
-            self._stop.wait(self.poll_interval)
+            if not self._stop.is_set():
+                self._lab_wake.wait(self.poll_interval)
+                self._lab_wake.clear()
         if worker is not None:
             try:
                 worker.lab.stop_worker(self._lab_worker_id)
@@ -741,9 +780,10 @@ class App:
         summary = SpecService.summary(spec)
         if outcome["status"] == "started":
             run_id = str(outcome["run"]["id"])
+            self.wake_lab()
             return {"status": "started", "run_id": run_id, "spec": summary,
                     "plan": outcome["plan"],
-                    "tasks": self.lab.list_tasks(principal, project_id, run_id)}
+                    "tasks": outcome.get("tasks") or []}
         if outcome["status"] == "existing":
             return {"status": "existing", "run_id": outcome["run_id"], "spec": summary}
         return {"status": "planning", "spec": summary, "stages": outcome["stages"]}
@@ -770,7 +810,12 @@ class App:
             # and the page says so instead of showing a run that never moves.
             # ``cleanup_hours``: how long after a run is over its OpenHands
             # conversations are deleted; ``None`` when they are kept for ever.
-            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours()},
+            # ``selfqa_gate``: whether the Self-QA gate mechanism is active at
+            # all. It is on unless the deployment sets ``NEXUS_SELFQA_GATE=0``;
+            # whether a given project's checks actually run is that project's
+            # own ``quality_gate`` mode (auto/on/off), shown in its settings.
+            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours(),
+                    "selfqa_gate": self.quality_gate is not None},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {
@@ -2150,8 +2195,6 @@ class Handler(BaseHTTPRequestHandler):
                 principal, project_id, include_hidden=wanted)}, None)
         # GET /api/v1/projects/{id}/runs/{run_id}
         if len(rest) == 2 and rest[0] == "runs" and UUID_RE.fullmatch(rest[1]):
-            run = self.app.lab.get_run(principal, project_id, rest[1])
-            tasks = self.app.lab.list_tasks(principal, project_id, rest[1])
             # The report is part of the run's record: the same text that was
             # delivered to the chat the run came from, so a person reading the
             # run sees it too. ``None`` until the run has completed. And who
@@ -2164,19 +2207,14 @@ class Handler(BaseHTTPRequestHandler):
             # been, and why one that is owed a deletion still exists.
             from .nexus_lab import cleanup_retention_seconds
             from .nexus_profiler import idle_ratio, profile_run
-            profile = profile_run(run)
-            return (200, {"run": run, "tasks": tasks,
-                          "report": self.app.reports.for_run(rest[1]),
-                          "executions": self.app.lab.executions(rest[1]),
-                          "switches": self.app.lab.run_handoffs(rest[1]),
-                          "events": self.app.lab.run_events(rest[1]),
-                          "stops": self.app.lab.stops(rest[1]),
-                          # The run-time profile: where the wall-clock time went,
-                          # and the dominant stage. Read-only and secret-free.
-                          "profile": {**profile, "idle_ratio": idle_ratio(profile)},
-                          "cleanup": self.app.lab.cleanup_summary(
-                              rest[1], retention_seconds=cleanup_retention_seconds())},
-                    None)
+            detail = self.app.lab.get_run_detail(
+                principal, project_id, rest[1],
+                retention_seconds=cleanup_retention_seconds(),
+                reports=self.app.reports,
+            )
+            profile = profile_run(detail["run"])
+            detail["profile"] = {**profile, "idle_ratio": idle_ratio(profile)}
+            return (200, detail, None)
         # GET /api/v1/projects/{id}/runs/{run_id}/terminal-outputs
         #   Every terminal observation of the run's conversations: what the
         #   agent ran, what the clipped event shows, and whether the SDK's saved
@@ -2779,27 +2817,35 @@ class Handler(BaseHTTPRequestHandler):
                 return True
             if rest[2] == "retry-failed":
                 try:
-                    self._json(200, {"run": self.app.lab.retry_failed(
-                        principal, project_id, rest[1])})
+                    run_row = self.app.lab.retry_failed(principal, project_id, rest[1])
                 except InvalidTransition as e:
                     self._json(409, {"error": str(e)})
+                    return True
+                self.app.wake_lab()
+                self._json(200, {"run": run_row})
                 return True
             if rest[2] == "restart":
                 try:
-                    self._json(200, {"run": self.app.lab.restart_run(
-                        principal, project_id, rest[1])})
+                    run_row = self.app.lab.restart_run(principal, project_id, rest[1])
                 except InvalidTransition as e:
                     self._json(409, {"error": str(e)})
+                    return True
+                self.app.wake_lab()
+                self._json(200, {"run": run_row})
                 return True
             if rest[2] == "duplicate":
                 key = body.get("idempotency_key") or self.headers.get("Idempotency-Key")
                 try:
-                    self._json(200, {"run": self.app.lab.duplicate_run(
-                        principal, project_id, rest[1], key=key)})
+                    run_row = self.app.lab.duplicate_run(
+                        principal, project_id, rest[1], key=key)
                 except InvalidTransition as e:
                     self._json(409, {"error": str(e)})
+                    return True
                 except IdempotencyConflict as e:
                     self._json(409, {"error": str(e)})
+                    return True
+                self.app.wake_lab()
+                self._json(200, {"run": run_row})
                 return True
             # ``cancelled`` settles the run, takes it out of the lists and
             # leaves a stop signal for every conversation at work for it - all
@@ -2807,8 +2853,11 @@ class Handler(BaseHTTPRequestHandler):
             # delivers the signals. A second cancel changes nothing.
             state = {"pause": "paused", "resume": "running",
                      "cancel": "cancelled"}[rest[2]]
-            self._json(200, {"run": self.app.lab.set_run_state(
-                principal, project_id, rest[1], state)})
+            run_row = self.app.lab.set_run_state(
+                principal, project_id, rest[1], state)
+            if state in ("running", "cancelled"):
+                self.app.wake_lab()
+            self._json(200, {"run": run_row})
             return True
         # POST /api/v1/projects/{id}/runs/{run_id}/tasks/{task_id}/switch
         #   {"account_id": "<uuid>"}  — hand the task to another account.
@@ -2828,6 +2877,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 self._json(409, {"error": str(e)})
                 return True
+            self.app.wake_lab()
             self._json(200, result)
             return True
         # POST /api/v1/projects/{id}/conversations   (create)
@@ -2998,33 +3048,45 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "repository and branch must be strings"})
             return
         repository, branch = repository.strip(), branch.strip()
-        if not repository:
-            # No repository named: use the project's primary one (the single
-            # linked repository is primary in effect). This is what makes the
-            # "primary repository" real instead of a label.
-            repository = self.app.project_repos.primary_repository(project_id) or ""
-        if not branch:
-            # No branch named: use the project's bound branch, exactly as the
-            # repository falls back to the primary one. A run that ignored the
-            # binding would dispatch to the bound branch (the instructions name
-            # it) but have the verifier read the default branch - a false
-            # "the branch did not move" for work that landed correctly.
-            branch = self.app.project_repos.primary_branch(project_id, repository)
         if repository and not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
             self._json(400, {"error": "repository must be owner/name"})
             return
 
-        # Membership first, then the goal itself - looked up by id, not found by
-        # scanning the list of goals, which shows only the 200 newest.
-        try:
-            self.app.projects.get(principal, project_id)
-        except NotFound:
-            self._json(404, {"error": "not found"})
-            return
-        try:
-            self.app.projects.get_goal(principal, project_id, goal_id)
-        except NotFound:
-            self._json(404, {"error": "goal not found"})
+        # Membership, goal existence, default repository/branch resolution, and
+        # whether the goal already has a live run — checked in one transaction.
+        with self.app.store._tx() as cur:
+            cur.execute(
+                "SELECT 1 FROM nexus_projects p "
+                "JOIN nexus_project_members m ON m.project_id = p.id "
+                "WHERE p.id=%s AND m.principal=%s AND p.deleted_at IS NULL",
+                (project_id, principal),
+            )
+            if cur.fetchone() is None:
+                self._json(404, {"error": "not found"})
+                return
+            cur.execute(
+                "SELECT 1 FROM nexus_goals WHERE id=%s AND project_id=%s",
+                (goal_id, project_id),
+            )
+            if cur.fetchone() is None:
+                self._json(404, {"error": "goal not found"})
+                return
+            if not repository:
+                repository = self.app.project_repos.primary_repository(
+                    project_id, cur=cur) or ""
+            if not branch:
+                branch = self.app.project_repos.primary_branch(
+                    project_id, repository, cur=cur)
+            cur.execute(
+                "SELECT id FROM nexus_runs "
+                "WHERE goal_id=%s AND project_id=%s "
+                "  AND state IN ('running','paused','waiting_for_approval') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (goal_id, project_id),
+            )
+            live = cur.fetchone()
+        if repository and not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+            self._json(400, {"error": "repository must be owner/name"})
             return
         try:
             authorize_run_task(self.app.store, project_id=project_id,
@@ -3032,7 +3094,6 @@ class Handler(BaseHTTPRequestHandler):
         except AuthorizationError as e:
             self._json(409, {"error": str(e)})
             return
-        live = self.app.lab.active_run_for_goal(principal, project_id, goal_id)
         if live is not None:
             self._json(409, {"error": "goal already has an active run",
                              "run_id": str(live["id"])})
@@ -3082,6 +3143,7 @@ class Handler(BaseHTTPRequestHandler):
                              "planning": outcome["stages"]})
             return
         run = outcome["run"]
+        self.app.wake_lab()
         stored = self.app.lab.list_tasks(principal, project_id, str(run["id"]))
         self._json(201, {"run": run, "tasks": stored, "plan": outcome["plan"],
                          "spec": summary})
@@ -3150,6 +3212,7 @@ class Handler(BaseHTTPRequestHandler):
                 return [{"role": "assistant",
                          "content": f"Прогон {run_id[:8]} не удалось продолжить: {e}",
                          "meta": {"mode": "autonomous", "run_id": run_id}}]
+            self.app.wake_lab()
             content = (f"Продолжаю прогон {run_id[:8]}: задачи, не прошедшие проверку, "
                        "возвращены в работу. Ход работы виден на вкладке «Агент».")
             return [{"role": "assistant", "content": content,
@@ -3358,6 +3421,7 @@ class Handler(BaseHTTPRequestHandler):
                 also=also)
         except (ValueError, InvalidTransition) as e:
             return self._manual_text(f"Не удалось запустить прогон: {e}", error=True)
+        self.app.wake_lab()
         run_id = str(run["id"])
         tasks = len(plan)
         content = (f"Подтверждено. Автономный прогон запущен: репозиторий "
@@ -3406,18 +3470,15 @@ class Handler(BaseHTTPRequestHandler):
         # the interface injected.
         typed = sent
         mode = body.get("mode")
-        conversation = self.app.conversations.get(principal, project_id, conversation_id)
         # Everything that can refuse the message is checked before anything is
         # written, so a refused message leaves no trace: not a new mode, not a
         # title made of words that were never accepted. The raised errors are
         # answered 400, or 413 for a text that is too long.
         if mode:
             self.app.conversations.check_mode(mode)
-        active_run = self.app.conversations.linked_run(principal, project_id, conversation_id)
+        conversation, active_run, history = self.app.conversations.turn_context(
+            principal, project_id, conversation_id)
         chosen = mode or conversation["mode"]
-        # What was said before this turn. The turn's own text is the request
-        # and is not part of it.
-        history = self.app.conversations.list_messages(principal, project_id, conversation_id)
 
         # The Command System runs first. A message may carry slash commands
         # (``/plan``, ``/autorun``), hashtags (``#backend #security``) and typed
@@ -3449,14 +3510,17 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.help:
             # ``/help`` answers with the vocabulary; it starts nothing and asks
             # no model. It wins over any request written beside it.
-            user_msg = self.app.conversations.add_message(
-                principal, project_id, conversation_id, role="user", content=typed,
-                meta={"command": command_metadata(parsed)})
-            help_msg = self.app.conversations.add_message(
-                principal, project_id, conversation_id, role="assistant",
-                content=help_text(), meta={"mode": "help", "help": True})
-            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
-            self._json(200, {"messages": [user_msg, help_msg]})
+            msgs = self.app.conversations.add_messages(
+                principal, project_id, conversation_id,
+                [
+                    {"role": "user", "content": typed,
+                     "meta": {"command": command_metadata(parsed)}},
+                    {"role": "assistant", "content": help_text(),
+                     "meta": {"mode": "help", "help": True}},
+                ],
+                state="idle",
+            )
+            self._json(200, {"messages": msgs})
             return
         # An explicit mode command overrides the conversation's mode for this
         # turn only; the conversation keeps its own setting.
@@ -3512,17 +3576,16 @@ class Handler(BaseHTTPRequestHandler):
             check_text(sent)
         else:
             check_message(sent, turn_mode)
-        if mode:
-            self.app.conversations.set_mode(principal, project_id, conversation_id, mode)
-            # Re-read so the joined repository/branch fields are present; set_mode
-            # returns only the conversation row itself.
-            conversation = self.app.conversations.get(principal, project_id, conversation_id)
+        new_mode = mode if (mode and mode != conversation.get("mode")) else None
+        if new_mode is not None:
+            conversation["mode"] = new_mode
+        new_title = None
         if not (conversation.get("title") or "").strip():
             # An untitled conversation is named after its first message, so the
             # history reads as what was asked. This only fills a blank; a title
             # the user chose is never replaced.
-            self.app.conversations.rename(
-                principal, project_id, conversation_id, title_from_message(typed))
+            new_title = title_from_message(typed)
+            conversation["title"] = new_title
         # A turn that starts work has a task, and a short message is not one by
         # itself: "делай" says to act, and what to do was said before it. Such
         # a message takes the conversation with it (``task_with_context``), so
@@ -3561,67 +3624,59 @@ class Handler(BaseHTTPRequestHandler):
                 # points at the whole text. Nothing downstream reads this copy.
                 shown = preview(request)
                 user_meta["spec"]["preview"] = True
+        is_continue = bool(intent.continue_run and active_run is not None)
+        is_ambiguous = bool(intent.ambiguous and turn_mode != "autonomous"
+                            and not intent.starts_work)
+        is_manual = bool(chosen == "manual" or (turn_mode == "plan" and chosen == "manual"))
         # Persist the user turn first: it must not be lost to an assistant failure.
         user_msg = self.app.conversations.add_message(
             principal, project_id, conversation_id, role="user", content=shown,
-            meta=user_meta)
+            meta=user_meta, title=new_title, mode=new_mode,
+            state=None if (is_continue or is_ambiguous or is_manual) else "thinking")
         appended: list[dict] = [user_msg]
         # "Продолжи" continues the run this conversation already started; it
         # never creates a second one. A run that is paused or blocked is
         # resumed; a run that is already working is reported as it is.
-        if intent.continue_run and active_run is not None:
+        if is_continue:
             produced = self._continue_run(principal, project_id, conversation_id,
                                           active_run)
-            for msg in produced:
-                appended.append(self.app.conversations.add_message(
-                    principal, project_id, conversation_id, role=msg["role"],
-                    content=msg["content"], meta=msg.get("meta")))
-            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+            appended.extend(self.app.conversations.add_messages(
+                principal, project_id, conversation_id, produced, state="idle"))
             self._json(200, {"messages": appended})
             return
         # An ambiguous message in a mode the router had to guess (``auto``) does
         # not start a run: it is answered with one short clarifying question. In
         # an explicit ``autonomous`` conversation the person already chose work,
         # so an unclear *goal* runs rather than being turned into a question.
-        if intent.ambiguous and turn_mode != "autonomous" and not intent.starts_work:
-            self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
+        if is_ambiguous:
             ask = self.app.conversations.add_message(
                 principal, project_id, conversation_id, role="assistant",
                 content=clarifying_question(),
-                meta={"mode": "ask", "clarify": True, "intent": intent.intent})
+                meta={"mode": "ask", "clarify": True, "intent": intent.intent},
+                state="idle")
             self._json(200, {"messages": appended + [ask]})
             return
         # Manual mode: a work order proposes a plan and waits; only an explicit
         # launch command starts the approved run. The decision to *run* is the
         # launch command, never the words of the order - a "Manual" mode must
         # not start work because a message contained an imperative verb.
-        if chosen == "manual" or (turn_mode == "plan" and chosen == "manual"):
+        if is_manual:
             produced = self._manual_turn(
                 principal, project_id, conversation_id, text, intent, active_run,
                 conversation, history, request=request, chose_work=chose_work)
             if produced is not None:
-                for msg in produced:
-                    appended.append(self.app.conversations.add_message(
-                        principal, project_id, conversation_id, role=msg["role"],
-                        content=msg["content"], meta=msg.get("meta")))
-                    meta = msg.get("meta") or {}
-                    if meta.get("run_id") and msg["role"] == "assistant":
-                        self.app.conversations.link_run(
-                            principal, project_id, conversation_id, str(meta["run_id"]))
-                self.app.conversations.set_state(principal, project_id, conversation_id,
-                                                "idle")
+                linked_run_id = next(
+                    (str((m.get("meta") or {}).get("run_id"))
+                     for m in produced
+                     if m["role"] == "assistant" and (m.get("meta") or {}).get("run_id")),
+                    None,
+                )
+                appended.extend(self.app.conversations.add_messages(
+                    principal, project_id, conversation_id, produced,
+                    run_id=linked_run_id, state="idle"))
                 self._json(200, {"messages": appended})
                 return
-        self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
-        context = self.app.context.current(principal, project_id)
-        memory = self.app.memory.retrieve(principal, project_id, limit=30)
-        # What the project's runs really did, for an analysis turn. Read here so
-        # a question about progress is answered from the database, not guessed.
-        run_facts = self._run_facts(principal, project_id) if turn_mode == "analysis" else None
-        # What this turn may read of the repository. Asked of GitHub now, for
-        # the turns that answer in words: they read files instead of guessing.
-        access = (self.app.repository_access(project_id, conversation)
-                  if turn_mode in ("ask", "analysis", "plan") else None)
+            self.app.conversations.set_state(principal, project_id, conversation_id, "thinking")
         # A generation is opened for an answer that asks a model (ask, analysis,
         # plan). It is what "stop generation" acts on: the answer carries a
         # token, and a cancel trips it, aborting the live provider call at once.
@@ -3630,23 +3685,33 @@ class Handler(BaseHTTPRequestHandler):
         # no generation - stopping it is a run/task action, not a generation one.
         token = None
         generation_id = None
+        context = None
+        memory: list[dict] = []
         if turn_mode in ("ask", "analysis", "plan"):
             try:
-                generation = self.app.conversations.start_generation(
-                    principal, project_id, conversation_id, mode=turn_mode)
+                generation, context, memory = (
+                    self.app.conversations.start_generation_with_context(
+                        principal, project_id, conversation_id, mode=turn_mode,
+                        memory_limit=30)
+                )
             except ValueError:
                 # One answer at a time per conversation. A second request while
                 # one is generating is refused with 409 rather than run in
                 # parallel, and the conversation is left idle (not stuck in
                 # "thinking") so the person can stop the first and ask again.
-                self.app.conversations.set_state(principal, project_id,
-                                                 conversation_id, "idle")
                 self._json(409, {"error": "ответ уже генерируется; сначала остановите его",
                                  "messages": appended})
                 return
             generation_id = str(generation["id"])
             token = GenerationToken(generation_id)
             self.app.generations.register(token)
+        # What the project's runs really did, for an analysis turn. Read here so
+        # a question about progress is answered from the database, not guessed.
+        run_facts = self._run_facts(principal, project_id) if turn_mode == "analysis" else None
+        # What this turn may read of the repository. Asked of GitHub now, for
+        # the turns that answer in words: they read files instead of guessing.
+        access = (self.app.repository_access(project_id, conversation)
+                  if turn_mode in ("ask", "analysis", "plan") else None)
         try:
             try:
                 produced = self.app.chat.respond(
@@ -3684,11 +3749,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             except ChatError as e:
                 self._finish_generation(generation_id, "failed")
-                self.app.conversations.set_state(principal, project_id,
-                                                 conversation_id, "error")
                 err = self.app.conversations.add_message(
                     principal, project_id, conversation_id, role="system",
-                    content=f"Не удалось получить ответ: {e}", meta={"error": True})
+                    content=f"Не удалось получить ответ: {e}", meta={"error": True},
+                    state="error")
                 self._json(502, {"error": str(e), "messages": appended + [err]})
                 return
         finally:
@@ -3697,19 +3761,21 @@ class Handler(BaseHTTPRequestHandler):
         self._finish_generation(generation_id, "finished")
         # Persist each produced message, attaching any run/task ids to the
         # conversation so the agent panel can follow it.
+        linked_run_id = next(
+            (str((m.get("meta") or {}).get("run_id"))
+             for m in produced
+             if m["role"] == "assistant" and (m.get("meta") or {}).get("run_id")),
+            None,
+        )
+        stored_msgs = self.app.conversations.add_messages(
+            principal, project_id, conversation_id, produced,
+            run_id=linked_run_id, state="idle")
+        appended.extend(stored_msgs)
         for msg in produced:
-            stored = self.app.conversations.add_message(
-                principal, project_id, conversation_id, role=msg["role"],
-                content=msg["content"], meta=msg.get("meta"))
-            appended.append(stored)
             meta = msg.get("meta") or {}
             if meta.get("workflow_id") and msg["role"] == "assistant":
                 self._record_agent_session(principal, project_id, conversation_id,
                                            meta, msg)
-            if meta.get("run_id") and msg["role"] == "assistant":
-                self.app.conversations.link_run(
-                    principal, project_id, conversation_id, str(meta["run_id"]))
-        self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
         self._json(200, {"messages": appended})
 
     def _finish_generation(self, generation_id: str | None, state: str) -> bool:
@@ -3732,12 +3798,12 @@ class Handler(BaseHTTPRequestHandler):
     def _record_stopped(self, principal: str, project_id: str, conversation_id: str,
                         generation_id: str, mode: str, partial: str) -> dict:
         """Save what a stopped answer produced, marked as stopped."""
-        self.app.conversations.set_state(principal, project_id, conversation_id, "idle")
         return self.app.conversations.add_message(
             principal, project_id, conversation_id, role="assistant",
             content=partial or "Генерация остановлена.",
             meta={"mode": mode, "cancelled": True, "generation_id": generation_id,
-                  "partial": bool(partial)})
+                  "partial": bool(partial)},
+            state="idle")
 
     def _cancel_generation(self, principal: str, project_id: str,
                            conversation_id: str, body: dict) -> None:
@@ -4980,10 +5046,13 @@ class Handler(BaseHTTPRequestHandler):
                 project = (self.app.projects.restore(principal, parsed[0])
                            if not body["deleted"]
                            else self.app.projects.delete(principal, parsed[0]))
-            if set(body) & {"name", "description"}:
+            if set(body) & {"name", "description", "quality_gate"}:
+                # ``quality_gate`` is validated in the service (auto|on|off), so
+                # a wrong value is a 400 with the allowed set, not a 500.
                 project = self.app.projects.update(principal, parsed[0], body)
             if project is None:
-                raise ValueError("provide name, description, archived and/or deleted")
+                raise ValueError("provide name, description, quality_gate, "
+                                 "archived and/or deleted")
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})
@@ -5076,7 +5145,9 @@ class WebServer:
 
     def start(self) -> None:
         self.app.start()
-        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:

@@ -34,6 +34,7 @@ from typing import Any, Callable
 from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
 from .github_client import GitHubClient
+from .nexus_binding import ProjectRepositoryService
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import (
     GitVerifier, LabScheduler, OpenHandsExecutor, git_credential_for, project_github,
@@ -72,13 +73,21 @@ def build_evidence_service(store: PostgresStore) -> Any | None:
 def active_run_ids(store: PostgresStore) -> list[str]:
     """Every run the worker should service, across all projects.
 
-    A run is serviced while it is active; a paused or waiting run is included so
-    a resume is picked up without a restart, but the scheduler itself decides
-    what is claimable.
+    A running run is always serviced; a paused, waiting, or blocked run is
+    serviced while it still has in-flight work or an abandoned conversation to
+    stop, and is picked up immediately as soon as it returns to ``running``.
     """
     with store._tx() as cur:
-        cur.execute("SELECT id FROM nexus_runs WHERE state = ANY(%s) "
-                    "ORDER BY created_at", (list(ACTIVE_RUN_STATES),))
+        cur.execute(
+            "SELECT r.id FROM nexus_runs r "
+            "WHERE r.state = 'running' "
+            "   OR (r.state = ANY(%s) AND EXISTS ("
+            "         SELECT 1 FROM nexus_run_tasks t WHERE t.run_id = r.id "
+            "            AND (t.state IN ('dispatched','running','verifying') "
+            "                 OR (t.abandoned <> '[]'::jsonb "
+            "                     AND jsonb_array_length(t.abandoned) > 0)))) "
+            "ORDER BY r.created_at",
+            (list(ACTIVE_RUN_STATES - {"running"}),))
         return [str(r["id"]) for r in cur.fetchall()]
 
 
@@ -91,6 +100,7 @@ class LabWorker:
                  github_accounts: GitHubAccountService | None = None,
                  heartbeat_seconds: int = 60, account_router: Any | None = None,
                  evidence: Any | None = None, discover_router: bool = True,
+                 quality_gate: Any | None = None,
                  stopping: Callable[[], bool] | None = None):
         self.store = store
         self.lab = LabStore(store)
@@ -111,11 +121,19 @@ class LabWorker:
         # environment by ``main`` (a signer only when the key is configured),
         # so a deployment without one keeps the loop exactly as it was.
         self.evidence = evidence
+        # The QUALITY GATE: when given a ``SelfQa``, a task the Git verifier
+        # accepted is then run against the project's own checks at that exact
+        # commit; a failing required check reworks it. Off by default - a
+        # deployment that has not opted in keeps the loop exactly as it was.
+        self.quality_gate = quality_gate
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
+        exec_poll = min(2.0, max(0.01, float(poll_interval)))
+        exec_attempts = max(150, int(round(300.0 / exec_poll)))
         self.executor = OpenHandsExecutor(
             self.client, specs=SpecService(store), router=account_router,
-            client_factory=self._client_for_account if account_router else None)
+            client_factory=self._client_for_account if account_router else None,
+            poll_interval=exec_poll, start_poll_attempts=exec_attempts)
         # A conversation is deleted with the key it was started with, whether
         # or not that connection is still given work (``OpenHandsExecutor.remove``).
         self.executor.account_client = self._client_for_account
@@ -146,6 +164,7 @@ class LabWorker:
         #: diagnostics; it is written on register and every tick.
         self.heartbeat_seconds = heartbeat_seconds
         self._stop = threading.Event()
+        self._wake = threading.Event()
         #: The owner of the loop is stopping (the web server runs this worker
         #: inside its own process and has its own stop). Asked together with
         #: ``_stop`` by a start that is on its way: see ``LabScheduler``.
@@ -176,7 +195,8 @@ class LabWorker:
         return LabScheduler(self.lab, self.executor, self.verifier,
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
                             router=self.account_router, reports=self.reports,
-                            evidence=self.evidence, stopping=self.stopping)
+                            evidence=self.evidence, quality_gate=self.quality_gate,
+                            stopping=self.stopping)
 
     def stopping(self) -> bool:
         """Whether this worker has been told to stop."""
@@ -307,9 +327,21 @@ class LabWorker:
                     summary = {"runs": 0, "advanced": 0, "errors": []}
                 if summary["advanced"] or summary["errors"]:
                     log.info("tick: %s", summary)
-                self._stop.wait(self.poll_interval)
+                self.wait(self.poll_interval)
         finally:
             self._stop_worker_best_effort()
+
+    def wake(self) -> None:
+        """Wake the worker loop immediately when new work is ready."""
+        self._wake.set()
+
+    def wait(self, timeout: float | None = None) -> None:
+        """Wait for *timeout* seconds, or until woken or told to stop."""
+        if self._stop.is_set():
+            return
+        self._wake.wait(timeout)
+        if not self._stop.is_set():
+            self._wake.clear()
 
     def run_once(self) -> dict[str, Any]:
         """One pass, registered so the pass is visible to the diagnostics.
@@ -340,6 +372,144 @@ class LabWorker:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+
+def build_quality_gate(store: PostgresStore | None = None, *,
+                       github: GitHubClient | None = None,
+                       github_accounts: GitHubAccountService | None = None,
+                       fallback_token: str | None = None) -> Any | None:
+    """The Self-QA gate for this deployment.
+
+    **Per project by default.** Each project carries its own mode
+    (``nexus_projects.quality_gate``, migration 0042): ``auto`` (the default -
+    run only when the repository declares ``.nexus-qa.json``), ``on`` (always)
+    or ``off`` (never). So a project that declares its checks is gated without
+    any deployment-wide switch, which is what the roadmap asks for; a project
+    that declares nothing is not slowed down by a default run it did not ask
+    for.
+
+    ``NEXUS_SELFQA_GATE`` remains an explicit *deployment-wide override*: set
+    to a true value it forces every project's checks to run (mode ``on``),
+    regardless of the project's own mode; set to a false value it turns the
+    gate off everywhere. This keeps an operator's existing switch meaningful
+    while the per-project setting becomes the default.
+
+    Without a *store* the gate cannot read a project's mode, so it falls back
+    to the old behaviour: ``SelfQa`` only when ``NEXUS_SELFQA_GATE`` is set.
+    That is the single-project caller (a test, the CLI) and is deliberately
+    unchanged.
+
+    Running a project's checks clones its repository and runs arbitrary
+    commands inside it; the engine strips NEXUS secrets from the child
+    environment (``nexus_selfqa._child_env``), and a Git credential for a
+    private repository is resolved per project and handed to git through the
+    environment only, never argv or the URL.
+    """
+    from .nexus_selfqa import ProjectQualityGate, SelfQa
+
+    def _seconds(name: str, default: float) -> float:
+        """A positive timeout from the environment, or the default.
+
+        A junk or non-positive value is the default, never zero: a zero timeout
+        would fail every check and call it the project's fault.
+        """
+        try:
+            value = float(os.environ.get(name, "").strip())
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _engine() -> SelfQa:
+        from .nexus_selfqa import DEFAULT_CHECK_TIMEOUT, DEFAULT_TOTAL_TIMEOUT
+        return SelfQa(
+            check_timeout=_seconds("NEXUS_SELFQA_CHECK_TIMEOUT", DEFAULT_CHECK_TIMEOUT),
+            total_timeout=_seconds("NEXUS_SELFQA_TOTAL_TIMEOUT", DEFAULT_TOTAL_TIMEOUT),
+        )
+
+    raw = os.environ.get("NEXUS_SELFQA_GATE", "").strip().lower()
+    forced_on = raw in ("1", "true", "yes", "on")
+    forced_off = raw in ("0", "false", "no", "off")
+    if store is None:
+        return _engine() if forced_on else None
+    if forced_off:
+        return None
+
+    accounts = github_accounts
+    fallback = (fallback_token or os.environ.get("GITHUB_TOKEN", "")).strip()
+    reader = github if github is not None else GitHubClient()
+    links = ProjectRepositoryService(store)
+    # The same per-repository identity the Git verifier uses, built once.
+    identity_for = project_github(store, reader, accounts=accounts)
+
+    def mode_for(project_id: str) -> str:
+        if forced_on:
+            return "on"
+        return quality_gate_mode(store, project_id)
+
+    def declares(repository: str, *, branch: str | None = None,
+                 project_id: str = "") -> bool | None:
+        """Read the declaration with the identity that reads the repository.
+
+        So a private repository is read with an account that can see it, and a
+        revoked one is an error rather than a silent read as somebody else.
+        """
+        from .nexus_selfqa import declares_checks
+
+        client = reader
+        if project_id:
+            try:
+                client = identity_for({"project_id": project_id,
+                                       "repository": repository})
+            except Exception as e:  # noqa: BLE001 - read as the server, honestly
+                log.debug("no project identity to read %s: %s", repository,
+                          type(e).__name__)
+        return declares_checks(repository, branch=branch, client=client)
+
+    def token_for(project_id: str) -> str:
+        """A Git credential for cloning the project's repository, or ""."""
+        if accounts is None or not project_id:
+            return fallback
+        try:
+            with store._tx() as cur:
+                full_name = links.primary_repository(project_id, cur=cur) or ""
+                if not full_name:
+                    return fallback
+                principal, account_id = links.account_for_repository(
+                    project_id, full_name, cur=cur)
+            if account_id is None or principal is None:
+                return fallback
+            return accounts.resolve_token(principal, account_id) or fallback
+        except Exception as e:  # noqa: BLE001 - an anonymous clone is not fatal
+            log.debug("no quality-gate credential for %s: %s", project_id,
+                      type(e).__name__)
+            return fallback
+
+    return ProjectQualityGate(_engine(), mode_for=mode_for, declares=declares,
+                              token_for=token_for)
+
+
+def quality_gate_mode(store: PostgresStore, project_id: str) -> str:
+    """A project's quality-gate mode, or ``auto`` when it cannot be read.
+
+    Read straight from the table rather than through ``ProjectService``: the
+    worker is not a project member and must not be made to pretend to be one to
+    read a policy that belongs to the project itself.
+    """
+    from .nexus_selfqa import normalise_mode
+
+    if not project_id:
+        return "auto"
+    try:
+        with store._tx() as cur:
+            cur.execute("SELECT quality_gate FROM nexus_projects WHERE id=%s",
+                        (project_id,))
+            row = cur.fetchone()
+    except Exception as e:  # noqa: BLE001 - an unreadable mode is the default
+        log.debug("could not read the quality-gate mode of %s: %s", project_id,
+                  type(e).__name__)
+        return "auto"
+    return normalise_mode(row["quality_gate"] if row else None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,13 +528,21 @@ def main(argv: list[str] | None = None) -> int:
     # the worker uses the pool; None (the pre-existing path) when it has none.
     from .openhands_router import build_account_router
     router = build_account_router(store, principal="machine:default")
+    # The GitHub identity the quality gate reads a declaration with and clones
+    # with: the stored accounts, falling back to the server's own token.
+    github = GitHubClient()
+    github_accounts = GitHubAccountService(store)
     worker = LabWorker(store, worker_id=args.worker_id,
                        poll_interval=args.poll_interval, lease_seconds=args.lease_seconds,
-                       account_router=router, evidence=build_evidence_service(store))
+                       account_router=router, evidence=build_evidence_service(store),
+                       quality_gate=build_quality_gate(
+                           store, github=github, github_accounts=github_accounts))
     if router is not None:
         log.info("OpenHands account pool is active")
     if worker.evidence is not None:
         log.info("Evidence Trust Engine is active: task results are signed")
+    if worker.quality_gate is not None:
+        log.info("Self-QA gate is active: accepted commits are checked")
 
     def _stop(signum, frame):  # graceful shutdown
         log.info("signal %s: stopping after the current pass", signum)
