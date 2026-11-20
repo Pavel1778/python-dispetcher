@@ -1,5 +1,8 @@
 # NEXUS MCP — Architecture (design)
 
+**Candidate implementation:** [project-bound, expiring verification grant](nexus-3.0/OPERATIONS.md#qa-evidence-and-an-independent-reader). This restricted HTTP credential is separate from the legacy owner bearer and from the client architecture below.
+
+
 Status: **partly implemented.** The **server** is implemented
 (`orchestration/mcp_server.py`) over two transports: stdio
 (`python -m orchestration.mcp_server`) and Streamable HTTP at `POST /mcp`,

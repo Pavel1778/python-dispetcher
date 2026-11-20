@@ -2206,14 +2206,19 @@
       function (error) { S.executionProfiles[path] = {error: error.message}; });
   }
 
+  var executionProfileFields = [
+    {name: 'provider', label: 'Провайдер', hint: 'openai'},
+    {name: 'model', label: 'Модель с префиксом', hint: 'openai/gpt-4o-mini'},
+    {name: 'base_url', label: 'Base URL модели (не URL OpenHands)', hint: 'HTTPS-адрес API провайдера'},
+    {name: 'key_ref', label: 'ID учётных данных модели (не ключ)', hint: 'ID provider connection в agent-server'},
+    {name: 'agent_profile_id', label: 'ID профиля агента', hint: 'UUID'},
+    {name: 'connection_id', label: 'ID подключения NEXUS', hint: 'пусто — подключение сервера'},
+    {name: 'params', label: 'Параметры модели (JSON)', hint: '{}'}
+  ];
+
   function executionProfileForm(path) {
     var data = (S.executionProfiles || {})[path] || {};
     var row = data.profile || {}, cfg = row.desired || {}, obs = row.observation || {};
-    var fields = [['provider', 'Провайдер', 'openai'], ['model', 'Модель с префиксом', 'openai/gpt-4o-mini'],
-      ['base_url', 'Base URL модели (не URL OpenHands)', 'https://…/v1'],
-      ['key_ref', 'ID учётных данных модели (не ключ)', 'ID provider connection в agent-server'],
-      ['agent_profile_id', 'ID профиля агента', 'UUID'], ['connection_id', 'ID подключения NEXUS', 'пусто — подключение сервера'],
-      ['params', 'Параметры модели (JSON)', '{}']];
     return '<details class="section execution-profile"><summary>Модель исполнителя OpenHands</summary>' +
       '<p class="section-note">Для новых сессий. Смена ключа выполняется в provider connection OpenHands. Проверка конфигурации не означает, что задача выполнена.</p>' +
       '<p role="status">' + esc(data.error ? 'Ошибка чтения: ' + data.error :
@@ -2221,9 +2226,9 @@
         (row.last_sync ? ' · ' + esc(row.last_sync) : '') + (obs.reason ? ' · ' + esc(obs.reason) : '') +
         (obs.model_test ? ' · ' + esc(obs.model_test) : '') + '</p>' +
       '<form class="execution-profile-form" data-path="' + esc(path) + '" autocomplete="off"><div class="grid-2">' +
-      fields.map(function (f) { return '<label class="field"><span class="field-label">' + f[1] + '</span>' +
-        '<input class="input" name="' + f[0] + '" placeholder="' + esc(f[2]) + '" value="' +
-        esc(f[0] === 'params' ? JSON.stringify(cfg.params || {}) : cfg[f[0]] || '') + '"></label>'; }).join('') +
+      executionProfileFields.map(function (f) { return '<label class="field"><span class="field-label">' + f.label + '</span>' +
+        '<input class="input" name="' + f.name + '" placeholder="' + esc(f.hint) + '" value="' +
+        esc(f.name === 'params' ? JSON.stringify(cfg.params || {}) : cfg[f.name] || '') + '"></label>'; }).join('') +
       '</div><div class="row"><button class="btn" type="submit" value="save">Сохранить</button>' +
       '<button class="btn" type="submit" value="sync">Сверить с OpenHands</button>' +
       '<button class="btn" type="submit" value="test-model">Проверить модель</button></div>' +
@@ -2233,10 +2238,12 @@
   function submitProfile(form, action) {
     var path = form.dataset.path, message = $('.form-msg', form), body = {};
     if (action === 'save') {
-      ['provider', 'model', 'base_url', 'key_ref', 'agent_profile_id', 'connection_id'].forEach(function (key) {
-        body[key] = form.elements[key].value.trim() || null;
-      });
-      try { body.params = JSON.parse(form.elements.params.value || '{}'); }
+      try {
+        executionProfileFields.forEach(function (field) {
+          var value = form.elements[field.name].value.trim();
+          body[field.name] = field.name === 'params' ? JSON.parse(value || '{}') : (value || null);
+        });
+      }
       catch (_) { message.textContent = 'Некорректный JSON параметров.'; return; }
     }
     var buttons = Array.from(form.querySelectorAll('button'));
