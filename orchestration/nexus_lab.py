@@ -36,6 +36,7 @@ deleted there (``LabScheduler.remove_conversations``).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -49,8 +50,11 @@ from .cloud_client import (
     CloudNotFound,
     CloudRateLimited,
     CloudUnavailable,
+    CloudValidationError,
+    CloudRefused,
     DeliveryError,
 )
+from .dispatch_journal import DispatchHeld, DispatchJournal
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
 from . import nexus_retry, tracing
@@ -230,6 +234,7 @@ class OpenHandsExecutor:
                  router: Any | None = None, client_factory: Any | None = None,
                  resume_poll_attempts: int = 15):
         self.client = client
+        self.journal: DispatchJournal | None = None
         self.poll_interval = poll_interval
         self.start_poll_attempts = start_poll_attempts
         #: How many polls a continued conversation is given to be seen at work
@@ -398,8 +403,12 @@ class OpenHandsExecutor:
         conversation. Without a router or a bound account, the process client.
         """
         account_id = task.get("openhands_account_id")
-        if self.router is None or not account_id:
+        if not account_id:
             return self.client
+        if self.journal and not self._client_factory:
+            if self.account_client:
+                return self.account_client(str(account_id))
+            raise CloudUnavailable('original OpenHands connection unavailable')
         return self._client_for_account(str(account_id), task)
 
     def stop(self, account_id: str | None, conversation_id: str,
@@ -501,7 +510,7 @@ class OpenHandsExecutor:
         if continued is not None:
             return continued
         client, account_id = self._dispatch_client(task)
-        adopted = self._adopt(client, account_id, task)
+        adopted = None if self.journal else self._adopt(client, account_id, task)
         if adopted is not None:
             return adopted
         try:
@@ -558,14 +567,23 @@ class OpenHandsExecutor:
         previous = _last_account(task)
         kind = ("handoff" if self.router is not None and previous
                 and previous != str(account_id or "") else "start")
-        start = client.start_conversation(
-            initial_message=initial,
-            selected_repository=task.get("repository") or None,
-            selected_branch=task.get("branch") or None,
-            title=f"lab:{task['task_key']}",
-            tags=self._tags(task),
-            **extra,
-        )
+        scoped_id = bool(getattr(client, 'supports_dispatch_id', False))
+        if self.journal:
+            self._arm(task, account_id, kind, delivery=delivery.proof if delivery else None,
+                      needs_files=bool(delivery and delivery.files), scoped_id=scoped_id)
+            if scoped_id:
+                extra['dispatch_id'] = task['_intent_id']
+        try:
+            start = client.start_conversation(
+                initial_message=initial,
+                selected_repository=task.get("repository") or None,
+                selected_branch=task.get("branch") or None,
+                title=f"lab:{task['task_key']}", tags=self._tags(task), **extra)
+        except (CloudAuthError, CloudValidationError, CloudRefused, CloudRateLimited, DeliveryError):
+            raise  # definitive refusal, or delivery failed *before* create
+        except Exception as exc:
+            self._unknown(task, exc)
+            raise
         proof: dict[str, Any] | None = None
         if delivery is not None:
             proof = dict(delivery.proof)
@@ -574,6 +592,7 @@ class OpenHandsExecutor:
                 if len(placed) != len(delivery.files):
                     # The transport said it started the conversation and cannot
                     # show that the files are there. Not a start to build on.
+                    self._unknown(task, ValueError("delivery receipt missing"))
                     raise DeliveryError(
                         "the conversation was created, but the transport did not confirm "
                         "that the specification file is in the sandbox")
@@ -590,7 +609,9 @@ class OpenHandsExecutor:
             # sandbox is ready. From here on the start is on the task, not only
             # in this process: a worker that is replaced now does not take it
             # along (the claim would stand until its lease ran out).
-            recorded = self._start_accepted(task, {
+            if self.journal:
+                self.journal.receipt(task, start_id=str(start.id), delivery=proof)
+            recorded = self.journal is not None or self._start_accepted(task, {
                 "start_task_id": str(start.id),
                 "account_id": str(account_id) if account_id else None,
                 "kind": kind, "delivery": proof})
@@ -606,12 +627,93 @@ class OpenHandsExecutor:
                 self._sleep_start(recorded)
                 if recorded and self.stopping is not None and self.stopping():
                     raise StartLeft(f"start task {start.id} is left to the next worker")
-                nxt = client.get_start_task(current.id)
+                try:
+                    nxt = client.get_start_task(current.id)
+                except Exception as exc:
+                    self._unknown(task, exc)
+                    raise
                 if nxt is None:
+                    self._unknown(task, CloudNotFound("start receipt missing"))
                     raise CloudError("start task disappeared")
                 current = nxt
+            self._unknown(task, TimeoutError("poll budget exhausted"))
             raise CloudError("start task not READY within the poll budget")
         return Dispatched(getattr(start, "id", ""), proof, account_id, kind)
+
+    def _arm(self, task: dict, account_id: str | None, kind: str, **extra: Any) -> None:
+        self.journal.arm(task, {'account_id': account_id, 'kind': kind, 'tags': self._tags(task),
+                               'base_sha': task.get('base_sha'), 'previous_account': _last_account(task), **extra})
+
+    def _unknown(self, task: dict, error: Exception) -> None:
+        if self.journal:
+            self.journal.uncertain(task['_intent_id'])
+            raise DispatchHeld(f"uncertain OpenHands outcome ({type(error).__name__}); no resend") from error
+
+    def reconcile(self, task: dict, intent: dict) -> Dispatched | None:
+        """Read on the original account only. Absence (even a 404) proves nothing."""
+        ctx = intent['context']
+        account = ctx.get('account_id')
+        cid = intent.get('conversation_id')
+        if not cid:
+            if account and not self._client_factory:
+                return None
+            client = self._client_for_account(account, task) if account else self.client
+            if intent['start_id']:
+                try:
+                    start = client.get_start_task(intent['start_id'])
+                except CloudNotFound:
+                    start = None
+                if start is not None:
+                    if start.failed:
+                        raise DispatchError(f"start task failed: {start.detail}", account_id=account,
+                                            unavailable=False)
+                    cid = start.app_conversation_id
+                    if not cid:
+                        return None  # the known start is still in progress
+            if not cid:
+                key = str(intent['id'])
+                if ctx['kind'] == 'continue':
+                    # Evidence must be the exact *user* turn, not a previous
+                    # finished result, a matching title, or an assistant echo.
+                    cid = self._observed_turn(client, ctx)
+                elif ctx.get('scoped_id'):
+                    conv = client.get_conversation(key)
+                    if str(conv.id) == key and (conv.tags or {}).get('nexusdispatch') == key:
+                        cid = key
+                else:
+                    search = getattr(client, 'search_conversations', None)
+                    if not search:
+                        return None
+                    matches: set[str] = set()
+                    page = None
+                    seen = set()
+                    for _ in range(100):
+                        items, page = search(limit=50, page_id=page, tag=('nexusdispatch', key))
+                        matches.update(str(c.id) for c in items if c.id and
+                                       all((c.tags or {}).get(k) == v for k, v in ctx['tags'].items()))
+                        if not page:
+                            if len(matches) == 1:
+                                cid = matches.pop()
+                            break
+                        if page in seen:
+                            break
+                        seen.add(page)
+        if cid and (not ctx.get('needs_files') or (ctx.get('delivery') or {}).get('files')):
+            return Dispatched(str(cid), ctx.get('delivery'), account, ctx['kind'])
+        return None
+
+    @staticmethod
+    def _observed_turn(client: Any, ctx: dict) -> str | None:
+        read = getattr(client, 'list_events', None)
+        if read:
+            for event in read(ctx['resume']):
+                msg = event.get('llm_message') or {}
+                if event.get('kind') != 'MessageEvent' or msg.get('role') != 'user':
+                    continue
+                text = ''.join(c.get('text', '') for c in msg.get('content') or [] if isinstance(c, dict))
+                if hashlib.sha256(text.encode()).hexdigest() == ctx['turn_sha256']:
+                    return ctx['resume']
+        return None
 
     def _sleep_start(self, recorded: bool) -> None:
         if not recorded or self.stopping is None or self.poll_interval <= 0.05:
@@ -646,9 +748,8 @@ class OpenHandsExecutor:
         it is what the worker that asked would have done. ``None`` while the
         sandbox is still coming up, and when the service could not be asked
         just now: not being able to look is not the start having failed, and
-        the claim's lease bounds how long the looking goes on. A start the
-        service reports as failed, or no longer knows, raises as a dispatch
-        does.
+        a missing receipt is not permission to repeat the start. Only a
+        start the service explicitly reports as failed raises as a dispatch does.
 
         One question, no waiting: the scheduler asks again on its next pass.
         """
@@ -663,9 +764,10 @@ class OpenHandsExecutor:
             log.warning("task %s: the start left by another worker could not be asked: %s",
                         task.get("task_key"), type(e).__name__)
             return None
-        if current is None or getattr(current, "failed", False):
-            reason = ("start task disappeared" if current is None
-                      else f"start task failed: {getattr(current, 'detail', '')}")
+        if current is None:
+            return None  # lost receipt, not a terminal rejection
+        if getattr(current, "failed", False):
+            reason = f"start task failed: {getattr(current, 'detail', '')}"
             if account_id is None:
                 raise CloudError(reason)
             raise DispatchError(f"CloudError: {reason}", account_id=account_id,
@@ -680,7 +782,8 @@ class OpenHandsExecutor:
     def _tags(task: dict) -> dict[str, str]:
         """What a conversation is tagged with, so that it can be found again:
         the run, the task, and which attempt of which cycle it is."""
-        return {"nexusrun": str(task["run_id"])[:40], "nexustask": task["task_key"][:40],
+        return {**({"nexusdispatch": task["_intent_id"]} if task.get("_intent_id") else {}),
+                "nexusrun": str(task["run_id"])[:40], "nexustask": task["task_key"][:40],
                 "nexusattempt": f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"}
 
     # ------------------------------------------------- continue, adopt, stop
@@ -705,11 +808,25 @@ class OpenHandsExecutor:
         if not hasattr(client, "send_message"):
             return None
         account_id = str(task["openhands_account_id"]) if task.get("openhands_account_id") else None
+        text = self.follow_up(task)
+        if self.journal:
+            text += f"\nNEXUS dispatch reference: {task['_intent_id']}"
+            self._arm(task, account_id, 'continue', resume=str(conversation_id),
+                      turn_sha256=hashlib.sha256(text.encode()).hexdigest())
         try:
-            client.send_message(str(conversation_id), self.follow_up(task), run=True)
+            delivered = client.send_message(str(conversation_id), text, run=True)
+            if self.journal and delivered is False:
+                raise CloudError('send-message returned no confirmation')
         except CloudRateLimited:
             raise
-        except CloudError as e:
+        except CloudNotFound:
+            if self.journal:
+                raise  # this attempt was refused; do not reuse its send permit
+            return None
+        except Exception as e:
+            self._unknown(task, e)
+            if not isinstance(e, CloudError):
+                raise
             log.info("conversation %s cannot be continued (%s); task %s gets a new one",
                      conversation_id, type(e).__name__, task["task_key"])
             return None
@@ -885,7 +1002,8 @@ class OpenHandsExecutor:
             try:
                 text = client.final_response(conversation_id) or ""
             except CloudError:
-                text = ""
+                return TaskReport(state="unavailable", conversation_id=conversation_id,
+                                  detail="result could not be read")
             return TaskReport(state="finished", final_text=text,
                               conversation_id=conversation_id)
         return TaskReport(state=status, conversation_id=conversation_id)
@@ -1436,6 +1554,9 @@ class LabScheduler:
         # A start the service has accepted is kept on the task, and one that is
         # kept is not waited for by a worker that is stopping (see
         # ``_follow_starts``). An executor that knows neither is left alone.
+        self.journal = DispatchJournal(store.store) if isinstance(executor, OpenHandsExecutor) else None
+        if self.journal:
+            executor.journal = self.journal
         if hasattr(executor, "on_start"):
             executor.on_start = self._record_start
         if stopping is not None and hasattr(executor, "stopping"):
@@ -1546,23 +1667,39 @@ class LabScheduler:
         # passed / skipped / blocked: the verdict stands, unchanged.
         return Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
 
-    def _record_evidence(self, task: dict, verdict: Verification, report: TaskReport) -> None:
-        """EVIDENCE stage: sign a settled task result into the Trust Engine.
+    def _attestation(self, task: dict, verdict: Verification, report: TaskReport) -> dict | None:
+        if self.evidence is None:
+            return None
+        # Store only fields used by the signer, not task instructions or credentials.
+        fields = ('id', 'project_id', 'run_id', 'task_key', 'conversation_id', 'repository', 'branch')
+        return {'task': {k: str(task[k]) if task.get(k) is not None else None for k in fields},
+                'verdict': {**verdict.as_detail(), 'evidence': {k: verdict.evidence[k] for k in
+                            ('remote_sha', 'branch', 'named_sha', 'state') if k in verdict.evidence}},
+                'report': {'state': report.state, 'final_text': (report.final_text or '')[:2000]}}
 
-        Best effort and never fatal. The task's own verdict is already written;
-        this only *adds* a signed, re-verifiable record. A deployment without an
-        evidence key (``evidence is None``) skips it, and a signing failure is
-        logged, not raised - a broken key must not stall a run, and must not be
-        mistaken for a task failure. The record is never fabricated: when there
-        is no signer, nothing is stored.
-        """
+    def _deliver_attestations(self, run_id: str) -> None:
+        """Outbox replay. Death after signature insertion reuses that row's UUID."""
         if self.evidence is None:
             return
-        try:
-            self.evidence.record_task_result(task, verdict, report)
-        except Exception as e:  # noqa: BLE001 - evidence must not stop the loop
-            log.warning("could not record evidence for task %s: %s",
-                        task.get("task_key"), type(e).__name__)
+        with self.store.store._tx() as cur:
+            cur.execute('SELECT id,payload FROM nexus_task_attestations_due WHERE run_id=%s ORDER BY id', (run_id,))
+            due = cur.fetchall()
+        for row in due:
+            try:
+                payload = row['payload']
+                self.evidence.record_task_result({**payload['task'], '_evidence_id': str(row['id'])},
+                                                 Verification(**payload['verdict']), TaskReport(**payload['report']))
+                with self.store.store._tx() as cur:
+                    cur.execute('DELETE FROM nexus_task_attestations_due WHERE id=%s', (row['id'],))
+            except Exception as exc:  # keep the obligation; a bad key is not a task failure
+                log.warning('task attestation %s remains due (%s)', row['id'], type(exc).__name__)
+
+    def _settle(self, task: dict, verdict: Verification, report: TaskReport) -> None:
+        self.store.record_verification(task['id'], verdict=verdict.verdict,
+                                       evidence={'reason': verdict.reason, **verdict.evidence},
+                                       detail=verdict.as_detail(), lease_token=task['lease_token'],
+                                       attestation=self._attestation(task, verdict, report))
+        self._deliver_attestations(task['run_id'])
 
     def _start_refused(self, task: dict, error: Exception, refused: CloudRateLimited) -> None:
         """The service is working and will not take this start now (429).
@@ -1643,6 +1780,10 @@ class LabScheduler:
             result.finished = True
             result.note = "run not found"
             return result
+        if run.get('_has_attestations', True):
+            self._deliver_attestations(run_id)
+        if self.journal and run.get('_has_intents', True):
+            self._recover_dispatch(run, result)
         if run["state"] in TERMINAL_RUN_STATES:
             # A run an operator ended (cancelled) or one that failed is already
             # terminal, so the loop stops touching it - but its ACCEPTANCE
@@ -1689,7 +1830,8 @@ class LabScheduler:
             # through. The next process claims it.
             result.note = "stopping: nothing new is started"
             return result
-        task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds)
+        task = self.store.claim_task(run_id, self.worker_id, lease_seconds=self.lease_seconds,
+                                     dispatch_intent=self.journal is not None)
         if task is not None:
             result.claimed = task["task_key"]
             if self._start(run, durable, task, result):
@@ -1739,6 +1881,9 @@ class LabScheduler:
                               task_id=task.get("id"), conversation_id=conv,
                               attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
                 report = self.executor.poll(task, conv)
+            if report.state == "unavailable":
+                in_flight += 1
+                continue
             if report.state == "running":
                 # The agent is at work (or between turns): the first time this is
                 # seen is when the agent began, for the run's profile.
@@ -1807,17 +1952,8 @@ class LabScheduler:
                 if self._retry(task, verdict, report, result):
                     if (verdict.retry or "") == "reverify":
                         in_flight += 1
-                    else:
-                        # EVIDENCE: an attempt that was not accepted is a result
-                        # too, and the signed trail must show it - the task goes
-                        # back to work, the record of why stays.
-                        self._record_evidence(task, verdict, report)
                     continue
-            self.store.record_verification(
-                task["id"], verdict=verdict.verdict,
-                evidence={"reason": verdict.reason, **verdict.evidence},
-                detail=verdict.as_detail(), lease_token=task["lease_token"])
-            self._record_evidence(task, verdict, report)
+            self._settle(task, verdict, report)
             result.verified = task["task_key"]
             result.verdict = verdict.verdict
         return in_flight, abandoned_added
@@ -1896,7 +2032,9 @@ class LabScheduler:
             self.store.retry_task(
                 task["id"], verdict=verdict.verdict, evidence=evidence,
                 detail=verdict.as_detail(), note=note, continue_conversation=same_place,
-                outcome=outcome, lease_token=task.get("lease_token"))
+                outcome=outcome, lease_token=task.get("lease_token"),
+                attestation=self._attestation(task, verdict, report))
+            self._deliver_attestations(task['run_id'])
             result.retried = task["task_key"]
             result.note = "not verified: trying again"
             return True
@@ -1911,9 +2049,11 @@ class LabScheduler:
             task["id"], verdict=verdict.verdict, evidence=evidence,
             detail=verdict.as_detail(), continue_conversation=same_place, outcome=outcome,
             wait_seconds=wait, lease_token=task.get("lease_token"),
+            attestation=self._attestation(task, verdict, report),
             note=(f"{note} Попытки цикла исчерпаны ({task['max_attempts']}); следующий цикл "
                   f"через {_span(wait)}."))
         result.retried = task["task_key"]
+        self._deliver_attestations(task['run_id'])
         result.note = f"not verified: next cycle in {_span(wait)}"
         return True
 
@@ -1957,12 +2097,7 @@ class LabScheduler:
                 # again; nothing was started, so nothing is spent.
                 self._set_aside(task, reason, result)
                 return True
-            self.store.record_verification(
-                task["id"], verdict="blocked", evidence={"reason": reason},
-                detail={"verdict": "blocked", "reason": reason},
-                lease_token=task["lease_token"])
-            self._record_evidence(task, Verification("blocked", reason),
-                                  TaskReport(state="blocked"))
+            self._settle(task, Verification("blocked", reason), TaskReport(state="blocked"))
             applied = self.store.set_run_state_internal(
                 run_id, "blocked",
                 last_error=f"task {task['task_key']} was not started: {e}")
@@ -1997,7 +2132,15 @@ class LabScheduler:
                               task_id=task.get("id"),
                               attempt_id=f"c{int(task.get('cycle') or 0)}a{int(task.get('attempt') or 0)}"):
                 conversation_id = self.executor.dispatch(task)
+                if self.journal:
+                    self.journal.receipt(task, conversation=str(conversation_id),
+                                         delivery=getattr(conversation_id, 'delivery', None))
+        except DispatchHeld as held:
+            result.note = str(held)
+            return True
         except NoUsableAccount as e:
+            if self.journal and not self.journal.rejected(task):
+                return True
             # The pool has nothing left for this task (every account tried
             # or unusable).
             if durable:
@@ -2007,12 +2150,7 @@ class LabScheduler:
                 return True
             # That is not a transient transport error: retrying cannot succeed,
             # so the task is dead-lettered with the reason.
-            self.store.record_verification(
-                task["id"], verdict="blocked", evidence={"reason": str(e)},
-                detail={"verdict": "blocked", "reason": str(e)},
-                lease_token=task["lease_token"])
-            self._record_evidence(task, Verification("blocked", str(e)),
-                                  TaskReport(state="blocked"))
+            self._settle(task, Verification("blocked", str(e)), TaskReport(state="blocked"))
             applied = self.store.set_run_state_internal(
                 run_id, "blocked",
                 last_error=f"task {task['task_key']}: no usable OpenHands account")
@@ -2027,6 +2165,8 @@ class LabScheduler:
             result.note = f"stopping: {left}"
             return True
         except (CloudError, GitHubError) as e:
+            if self.journal and not self.journal.rejected(task):
+                return True
             if str(task["id"]) in self._recorded:
                 # The start was on the row, so another worker may have seen
                 # the same failure. One of the two deals with it.
@@ -2098,13 +2238,13 @@ class LabScheduler:
         found the start recorded and followed it (``_follow_starts``; *start*
         is then that record, and says which account the task had before).
         """
-        if (start is not None or recorded) and (
+        if not task.get("_intent_id") and (start is not None or recorded) and (
             self.store.conversation_of(task["id"]) == str(conversation_id)
         ):
             # Another worker followed the same start and was first.
             return None
         account_id = getattr(conversation_id, "account_id", None)
-        if account_id is None and task.get("openhands_account_id"):
+        if not task.get("_intent_id") and account_id is None and task.get("openhands_account_id"):
             account_id = str(task["openhands_account_id"])
         # A switch between accounts is recorded as a hand-off, with the
         # context that was passed, so the history of an executor change is
@@ -2114,20 +2254,18 @@ class LabScheduler:
         previous = (start.get("previous_account") or None) if start is not None \
             else _last_account(task)
         kind = getattr(conversation_id, "kind", "start")
+        handoff = None
         if (account_id and previous and previous != str(account_id)
                 and self.router is not None):
             context = self.router.handoff_context(task)
-            self.store.record_handoff(
-                run_id=run_id, task_id=task["id"],
-                from_account_id=previous,
-                to_account_id=str(account_id),
-                reason="previous account failed", context=context)
+            handoff = (previous, context)
             if kind == "start":
                 kind = "handoff"
         bound = self.store.mark_running(
             task["id"], conversation_id=conversation_id or None,
             delivery=getattr(conversation_id, "delivery", None),
             account_id=account_id, base_sha=base_sha, kind=kind,
+            intent_id=task.get("_intent_id"), handoff=handoff,
             lease_token=task["lease_token"])
         # The run's profile: the conversation is bound and the first message is
         # on its way, so the OpenHands start and the prompt delivery are done.
@@ -2137,6 +2275,48 @@ class LabScheduler:
                 run["conversation_ready_at"] = True
                 run["prompt_sent_at"] = True
         return bound
+
+    def _recover_dispatch(self, run: dict, result: TickResult) -> None:
+        run_id = str(run['id'])
+        for intent in self.journal.recoverable(run_id):
+            if intent['expired']:
+                try:
+                    transferred = self.journal.take_over(intent, self.worker_id, self.lease_seconds)
+                    if transferred:
+                        intent['lease_token'] += 1
+                    if intent['state'] == 'prepared' and not transferred:
+                        continue
+                except DispatchHeld:
+                    continue
+            task = self.store.get_task_internal(intent['task_id'])
+            if not task:
+                continue
+            task['_intent_id'] = str(intent['id'])
+            if intent['state'] == 'prepared':
+                if run['state'] == 'running' and task['state'] == 'dispatched' and task['lease_owner'] == self.worker_id:
+                    self._start(run, run.get('policy') == 'durable', task, result)
+                continue
+            if (intent['state'] == 'sending' and not intent['expired'] and not intent['probe_due']
+                    and task['lease_token'] == intent['lease_token']):
+                continue  # allow the live sender time to store its response
+            try:
+                cid = self.executor.reconcile(task, intent)
+            except DispatchError as exc:  # definitive start-task ERROR
+                if self.journal.rejected({**task, 'lease_token': intent['lease_token']}):
+                    self._dispatch_failed(task, exc, run.get('policy') == 'durable', result)
+                continue
+            except Exception as exc:  # a failed read never authorizes a new send
+                log.warning('dispatch %s: reconciliation unavailable (%s)', intent['id'], type(exc).__name__)
+                cid = None
+            if cid is None:
+                if intent['state'] == 'sending':
+                    self.journal.uncertain(str(intent['id']))
+                continue
+            if intent['state'] != 'identified':
+                self.journal.receipt(task, conversation=str(cid), delivery=cid.delivery)
+            ctx = intent['context']
+            self._bind(run_id, task, cid, ctx.get('base_sha'), start=ctx, run=run)
+            result.followed += 1
 
     def _record_start(self, task: dict, start: dict) -> bool:
         """Keep an accepted start on its task (the executor's ``on_start``)."""
@@ -2170,7 +2350,7 @@ class LabScheduler:
         follow = getattr(self.executor, "follow_start", None)
         if follow is None:
             return
-        for task in self.store.pending_starts(run_id):
+        for task in self.store.pending_starts(run_id, legacy_only=True):
             try:
                 conversation_id = follow(task)
             except (CloudError, GitHubError) as e:
@@ -2230,8 +2410,11 @@ class LabScheduler:
             if run is None:
                 return
             tasks = self.store.list_tasks_internal(run_id)
-            self.acceptance.accept_run(run_id=run_id, project_id=str(run["project_id"]),
-                                       state=state, tasks=tasks, last_error=last_error)
+            signed = self.acceptance.accept_run(run_id=run_id, project_id=str(run["project_id"]),
+                                                state=state, tasks=tasks, last_error=last_error)
+            if signed:
+                with self.store.store._tx() as cur:
+                    cur.execute('DELETE FROM nexus_run_attestations_due WHERE run_id=%s', (run_id,))
         except Exception:  # noqa: BLE001 - evidence is a record, not the work
             log.exception("could not record acceptance for run %s", run_id)
 

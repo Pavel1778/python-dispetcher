@@ -86,6 +86,10 @@ def active_run_ids(store: PostgresStore) -> list[str]:
             "            AND (t.state IN ('dispatched','running','verifying') "
             "                 OR (t.abandoned <> '[]'::jsonb "
             "                     AND jsonb_array_length(t.abandoned) > 0)))) "
+            " OR EXISTS (SELECT 1 FROM nexus_dispatch_intents i WHERE i.run_id=r.id "
+            "            AND i.state IN ('sending','uncertain','accepted','identified')) "
+            " OR EXISTS (SELECT 1 FROM nexus_run_attestations_due a WHERE a.run_id=r.id) "
+            " OR EXISTS (SELECT 1 FROM nexus_task_attestations_due a WHERE a.run_id=r.id) "
             "ORDER BY r.created_at",
             (list(ACTIVE_RUN_STATES - {"running"}),))
         return [str(r["id"]) for r in cur.fetchall()]

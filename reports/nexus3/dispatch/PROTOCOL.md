@@ -1,0 +1,33 @@
+# Phase 2 — Python lab dispatch and worker lifecycle
+
+Scope: the PostgreSQL lab DAG worker (including the inline lab loop). No change of scheduler, Studio assets, public routes, CLI or MCP. The Rust probe can grant/reclaim storage rows; **it cannot dispatch or run a worker**. The separate SQLite and Cloud workflow dispatchers are not implementations of this lab protocol.
+
+## The two commits before the network
+
+1. Claim locks the run and task, charges the attempt/iteration and inserts `prepared` **in the same transaction**. A process death before commit rolls back all three. No late response can exist for `prepared`.
+2. After authorization, repository checks, account selection and message preparation, `arm` compares the state, token and remaining lease under lock. It commits `sending`, original account, operation, tags, base SHA and non-secret delivery metadata. **Only its winner calls the transport.** The row is not a retry queue. No lock is held over HTTP.
+3. `sending` means "may have sent", not "did send". Positive start-task receipt → `accepted`; positive conversation receipt → `identified`. Both are durable before task binding. An expired token can report a receipt for its own intent but cannot change the task. Binding consumes `identified`, marks `running`, records execution/history and any handoff in one transaction. If the grant was revoked, it creates stop debt instead. Cancellation and binding lock run → task in the same order.
+4. On a timeout, unreadable response, poll exhaustion, missing receipt or server error, keep the claim (`uncertain`), **including the branch hold across a cancellation/switch**. Read the exact original start ID first. Without it, use the original account and the complete set of intent tags across search pages, or the supplied UUID on its pinned agent-server. No match, several matches, incomplete listing, lost file-delivery proof or unavailable original account are not proof of rejection. Never send again or silently use a reserve account in those cases. A provider-confirmed refusal / terminal start `ERROR` is different: ordinary bounded failure/refund/failover policy applies.
+5. A new Python worker can read receipts immediately. It can discover a `sending` conversation after a short grace (5 s), even before expiry. To take over an expired **prepared** send it must rotate the fence; transferring any intent does not re-charge the attempt or iteration. A receipt from before this migration also survives lease expiry. The Rust storage probe skips all of these on reclaim and observes the same branch holds.
+6. The Cloud V1 app API doesn't promise a caller-supplied idempotency key. `nexusdispatch` is a **correlation tag**, not such a key. Direct/local agent-server creates use the intent UUID and place tags and the initial `run` message on the *same* create. The Direct adapter pins its route before create; repeating a known UUID on an arbitrary fresh sandbox would not be idempotent. Follow-up sends are not idempotent either. For a lost follow-up acknowledgement, compare the hash of an intent-specific message with an actual user `MessageEvent`; don't infer delivery from the old conversation's existence or the assistant's text.
+7. Verification is still independent of the agent. The winning verdict/retry writes task evidence and, when signing is configured, a bounded signing payload into a private outbox **in its own state transaction**. The signer uses the outbox UUID as the signed row's immutable identity. Replay after insertion is a no-op, including for the chain. Terminal run acceptance also survives worker death before signing. Children depend on committed verified/no-change verdicts; delayed signatures don't fabricate success or change the existing unsigned-installation policy.
+
+## Inspect before intervening (read-only, privileged operator)
+
+```sql
+SELECT i.id, i.task_id, i.state, i.context->>'account_id' AS connection,
+       i.start_id, i.conversation_id, t.state AS task_state,
+       i.lease_token, t.lease_owner, i.updated_at
+FROM nexus_dispatch_intents i JOIN nexus_run_tasks t ON t.id=i.task_id
+WHERE i.state IN ('sending','uncertain','accepted','identified') ORDER BY i.updated_at;
+SELECT run_id, count(*) FROM nexus_task_attestations_due GROUP BY run_id;
+SELECT run_id FROM nexus_run_attestations_due;
+```
+
+Investigate on the originating provider/account, including its tag index and start history. Restore access to that account / the signer. Do **not** clear the intent, refund the budget by hand, requeue on another account, or assume that "not found" is a negative acknowledgement. An armed send killed just before the POST may remain uncertain with **zero** remote executions. This deliberate loss of liveness is preferable to a duplicate writer. A human escalation/negative-proof protocol is a separate approval gate; this change does not add an unsafe "retry anyway" button.
+
+Migration `0043_lab_dispatch.sql` is additive, checksum-versioned, and grants no new client access. Before any future rollout/rollback: quiesce **all** worker processes (including inline), reconcile pre-journal unbound grants and drain all open intents/stop/signing debt. Do not run an old binary against an active new journal: it doesn't know the new claim/branch predicate. Leave the tables in place on rollback. No production migration or deployment in this phase.
+
+## Reproduce on disposable services
+
+`tools/with_disposable_postgres.sh pytest tests/test_dispatch_durability.py -q` exercises both application transactions and the external HTTP side (including real process death); `tests/dispatch_crash_worker.py` installs faults **only inside the test child**. `tests/test_rust_claim.py` requires the release `claim_probe` and `tests/test_rust_parity.py` the release `nexus-rs`; see the separate required CI job, which rejects skips. For timing run `tools/with_disposable_postgres.sh python benchmarks/dispatch_lifecycle.py --tasks 100 --rounds 3 --out /tmp/lifecycle.json`. Never use a shared DSN for these tests/benchmarks.

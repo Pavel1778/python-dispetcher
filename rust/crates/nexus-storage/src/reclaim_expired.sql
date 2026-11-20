@@ -2,9 +2,12 @@
 -- All RHS expressions see the OLD row. The recovery marker must record the
 -- lost attempt/cycle, not the reset attempt from the next durable cycle.
 WITH expired AS (
-    SELECT id FROM nexus_run_tasks
+    SELECT t.id FROM nexus_run_tasks t
     WHERE run_id=$1 AND project_id=$2 AND state IN ('dispatched','running')
       AND conversation_id IS NULL AND lease_expires < now()
+      AND t.pending_start IS NULL AND NOT EXISTS (
+          SELECT 1 FROM nexus_dispatch_intents d WHERE d.task_id=t.id AND d.lease_token=t.lease_token
+            AND d.state IN ('prepared','sending','uncertain','accepted','identified'))
     ORDER BY lease_expires, id LIMIT $3 FOR UPDATE SKIP LOCKED
 )
 UPDATE nexus_run_tasks t SET

@@ -110,8 +110,8 @@ pub async fn claim_task(
 
 /// Recover at most `batch` expired, unbound starts from one project's run.
 /// Return the revoked task IDs, *not* write grants. A new dispatch still needs
-/// a new claim and must try adoption first. A bound conversation is never
-/// reclaimed; polling it belongs to the ordinary recovery loop. Multiple
+/// a new claim. Never recycle a durable intent or a legacy start receipt.
+/// A bound conversation is never reclaimed; polling it belongs to the ordinary recovery loop. Multiple
 /// batches are intentional: no sweep may hold unbounded task locks/results.
 pub async fn reclaim_expired(
     pool: &PgPool,

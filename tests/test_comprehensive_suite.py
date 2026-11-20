@@ -33,6 +33,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchestration.cloud_client import (  # noqa: E402
+    CloudAuthError,
     CloudConversation,
     CloudNotFound,
     CloudUnavailable,
@@ -107,7 +108,7 @@ class AccountClient:
     def start_conversation(self, *, initial_message, title=None, tags=None,
                            selected_repository=None, selected_branch=None, **kw):
         if self.start_fails:
-            raise CloudUnavailable(f"{self.name}: sandbox unavailable")
+            raise CloudAuthError(f"{self.name}: start refused (403)")
         cid = f"{self.name}-conv-{len(self.started)}"
         self.started.append({"id": cid, "message": initial_message, "title": title})
         self._conversations[cid] = {"status": self.status, "text": self.report}
@@ -568,12 +569,19 @@ def test_a_started_conversation_is_never_reclaimed_into_a_second_start(store):
     assert task["state"] == "running" and task["conversation_id"] == "conv-live"
 
 
-def test_losing_the_connection_to_openhands_fails_over(store, service, clouds):
-    """E: потеря соединения с OpenHands -> failover, not a dead task."""
+def test_losing_the_start_response_does_not_fail_over(store, service, clouds, monkeypatch):
+    """A lost reply is not a rejected start. Do not try the reserve account."""
     a, b, _c = clouds
     va = _add(service, a, "A", make_default=True)
     vb = _add(service, b, "B")
-    client_a = AccountClient("A", start_fails=True)   # the transport is gone
+    client_a = AccountClient("A")
+    accepted = client_a.start_conversation
+
+    def lose_reply(**kwargs):
+        accepted(**kwargs)
+        raise CloudUnavailable('connection lost reading the response')
+
+    monkeypatch.setattr(client_a, 'start_conversation', lose_reply)
     client_b = AccountClient("B")
     clients = {va["id"]: client_a, vb["id"]: client_b}
     sched, lab, _pool = _scheduler(store, service, clients, verifier=StubVerifier(),
@@ -581,11 +589,14 @@ def test_losing_the_connection_to_openhands_fails_over(store, service, clouds):
     project, run, _ = _make_run(store)
     sched.tick(str(run["id"]))
     task = lab.list_tasks(PRINCIPAL, str(project["id"]), str(run["id"]))[0]
-    assert va["id"] in task["tried_accounts"]
-    sched.tick(str(run["id"]))
-    assert len(client_b.started) == 1, "the reserve account must take over"
-    assert lab.list_tasks(PRINCIPAL, str(project["id"]), str(run["id"]))[0][
-        "openhands_account_id"] == vb["id"]
+    assert task['state'] == 'dispatched' and not task['tried_accounts']
+    for _ in range(3):
+        sched.tick(str(run['id']))
+    assert len(client_a.started) == 1 and not client_b.started
+    with store._tx() as cur:
+        cur.execute('SELECT state, context FROM nexus_dispatch_intents WHERE task_id=%s', (task['id'],))
+        intent = cur.fetchone()
+        assert intent['state'] == 'uncertain' and intent['context']['account_id'] == str(va['id'])
 
 
 # =============================================================== G. E2E Failover

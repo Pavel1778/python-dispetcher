@@ -65,6 +65,7 @@ from .cloud_client import (
     CloudRateLimited,
     CloudRefused,
     CloudUnavailable,
+    CloudValidationError,
     DeliveryError,
     SandboxFile,
     StartStatus,
@@ -137,6 +138,7 @@ class CloudDirectClient:
 
     #: This transport can place a file in the sandbox before the agent starts
     #: (the agent-server's ``/api/file`` routes) and read it back to check it.
+    supports_dispatch_id = True
     supports_files = True
 
     def files_dirs(self) -> list[str]:
@@ -338,6 +340,7 @@ class CloudDirectClient:
         self,
         *,
         initial_message: str,
+        dispatch_id: str | None = None,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
         title: str | None = None,
@@ -388,7 +391,10 @@ class CloudDirectClient:
         initial_message = self._apply_repository_mode(
             initial_message, selected_repository, selected_branch
         )
-        route = self._new_sandbox(
+        # A supplied conversation UUID is idempotent only on its ORIGINAL
+        # sandbox. The lab serializes send permits; a recovery is a read.
+        known = self.store.conversation_route(dispatch_id) if dispatch_id else None
+        route = self._route_for(dispatch_id) if known else self._new_sandbox(
             force_new=client_tools is not None,  # an Sr gets its own sandbox
             workspace=self.workspace_key(selected_repository, selected_branch),
         )
@@ -400,7 +406,7 @@ class CloudDirectClient:
             # A message that points at files nobody delivered would start an
             # agent on a task it cannot read.
             raise DeliveryError("the message refers to delivered files, but none were sent")
-        conversation_id = self._conversation_id(initial_message, title)
+        conversation_id = dispatch_id or self._conversation_id(initial_message, title)
         agent_settings = self._sandbox_agent_settings(route)
         body: dict[str, Any] = {
             "conversation_id": conversation_id,
@@ -429,11 +435,15 @@ class CloudDirectClient:
                 "content": [{"type": "text", "text": initial_message}],
                 "run": True,
             }
+        if dispatch_id and not known:
+            self.store.save_conversation_route(dispatch_id, sandbox_id=route.sandbox_id,
+                                              agent_server_url=route.agent_server_url,
+                                              session_api_key=route.session_api_key)
         status, payload = self._send(route, "POST", "/api/conversations", body)
         if status == 429:
             raise CloudRateLimited("sandbox conversation capacity full")
         if status == 422:
-            raise CloudError(
+            raise CloudValidationError(
                 f"create on sandbox rejected: {str(payload)[:300]}"
             )
         if status not in (200, 201):

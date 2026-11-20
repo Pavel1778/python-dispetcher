@@ -335,11 +335,14 @@ def test_a_start_is_kept_for_the_claim_that_asked_and_only_while_it_holds(env): 
     assert lab.pending_starts(run_id) == []
     assert lab.record_start(claim["id"], start=RECORD, lease_token=claim["lease_token"]) is True
 
-    # The claim runs out with nothing to show: the start is followed no longer,
-    # and the task is taken back as it always was.
+    # An accepted start is evidence of an external effect, not empty work.
+    # Even a legacy receipt must survive the lease it was written under.
     sql(env, "UPDATE nexus_run_tasks SET lease_expires = now() - interval '1 second' "
              "WHERE id=%s", claim["id"])
-    assert lab.pending_starts(run_id) == []
+    assert lab.pending_starts(run_id)[0]['pending_start']['start_task_id'] == 'start-task-1'
+    assert lab.reclaim_expired(run_id) == []
+    assert lab.claim_task(run_id, 'second') is None
+    assert lab.take_start(claim['id'], lease_token=claim['lease_token'])  # confirmed ERROR
     [taken_back] = lab.reclaim_expired(run_id)
     assert taken_back["state"] == "pending"
     assert lab.pending_starts(run_id) == []

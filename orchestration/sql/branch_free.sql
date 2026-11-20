@@ -5,6 +5,9 @@
     AND NOT EXISTS (SELECT 1 FROM nexus_run_tasks a
                     WHERE a.repository=t.repository AND a.branch=t.branch
                       AND jsonb_array_length(a.abandoned)>0)
+    AND NOT EXISTS (SELECT 1 FROM nexus_dispatch_intents d
+                    WHERE d.repository=t.repository AND d.branch=t.branch
+                      AND d.state IN ('sending','uncertain','accepted','identified'))
     AND NOT EXISTS (SELECT 1 FROM nexus_executor_stops s
                     WHERE s.repository=t.repository AND s.branch=t.branch AND s.state='requested')
 ))

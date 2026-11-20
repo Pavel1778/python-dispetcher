@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from orchestration.cloud_client import (  # noqa: E402
     CloudConversation,
     CloudNotFound,
-    CloudUnavailable,
+    CloudAuthError,
     StartStatus,
     StartTask,
 )
@@ -78,7 +78,7 @@ class AccountClient:
     def start_conversation(self, *, initial_message, title=None, tags=None,
                            selected_repository=None, selected_branch=None, **kw):
         if self.start_fails:
-            raise CloudUnavailable(f"{self.name}: sandbox unavailable")
+            raise CloudAuthError(f"{self.name}: start refused (403)")
         cid = f"{self.name}-conv-{len(self.started)}"
         self.started.append({"id": cid, "message": initial_message, "title": title})
         self._conversations[cid] = {"status": self.status, "text": "commit deadbeef0"}
