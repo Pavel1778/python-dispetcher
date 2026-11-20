@@ -210,3 +210,25 @@ median of four rounds:
 **No throughput advantage** to switching; Rust's driver is ~13× lighter in
 memory and ~10× lighter in user CPU. This is one transaction's cost, not the
 worker's, and not a dedicated host.
+
+### Acceptance evidence for this revision
+
+| Item | Result |
+| --- | --- |
+| Exact candidate HEAD | `4aae9f08da2cd8dde1a9bb76d132ca0fd6262d75` (branch `nexus/phase2-dispatch-durability`, draft PR #56) |
+| CI on that head (run `44805364105`) | **2111 passed, 19 skipped, 0 failed** in 10m45s; Chromium ran |
+| Local full suite | 2070 passed, 60 skipped, 0 failed in 6m22s |
+| Local vs CI counts | **same 2130 collected**; CI runs 41 more (38 browser + 3 Rust-claim) because Chromium and the claim probe are present there |
+| Rust build (locked) | `cargo build --locked --release` OK; `cargo test --locked --release` 30 tests pass |
+| Python↔Rust | 9 parity + 13 claim = **22 checks, zero skips** (probe + isolated DB) |
+| Evidence integrity | 37 passed (`test_evidence_trust`, `test_lab_evidence`, `test_dispatch_durability`) |
+| DB statements per cycle | **claim_task 4, mark_running (bind) 5 — 9 total** (driver-level count) |
+| Claim throughput | Python 465.85 vs Rust 465.35 grants/s (median of 4, isolated cluster) |
+| p50/p95/p99 | Python 2.05/2.51/2.82 ms; Rust 2.13/2.51/3.07 ms |
+| Peak RSS (driver) | Python 39.6 MiB; Rust 3.0 MiB |
+| CPU (driver, user) | Python 0.32 s; Rust 0.03 s |
+
+**Recommendation: keep Python authoritative.** The dispatch is already durable
+for every crash window tested, the claim transaction shows no throughput gain
+from Rust, and the remaining Rust work (API, worker, MCP) is unbuilt. Switching
+now would move the scheduler to a component that has only two of its operations.
