@@ -34,8 +34,14 @@ origin  https://github.com/Pavel1778/python-dispetcher.git
 
 | Fact | Value |
 | --- | --- |
-| `origin/main` SHA | `e866666fb69a13e0edc0c7670b9f56e3561b34c0` |
-| `origin/main` subject | `Merge pull request #54 from Pavel1778/arena/6f80793e-python-dispetcher` |
+| `origin/main` SHA (at first inspection) | `e866666fb69a13e0edc0c7670b9f56e3561b34c0` |
+| `origin/main` SHA (current — PR #55 merged during the audit) | `20eb8bffc…` (`Merge pull request #55 from Pavel1778/arena/75afb703-python-dispetcher`) |
+| `origin/main` subject (at first inspection) | `Merge pull request #54 from Pavel1778/arena/6f80793e-python-dispetcher` |
+
+**The baseline moved during the audit.** PR #55 landed a durable dispatch
+journal (`orchestration/dispatch_journal.py`, `migrations/0043_lab_dispatch.sql`)
+and closed the point-C gap described below. The audit branch was rebased onto
+that commit and the findings re-verified; see §9.
 | Local branches | `main`, `release/nexus-2.0-pr-ready`, `nexus/phase2-dispatch-durability`, `nexus/3.0-audit` (this one) |
 | Remote branches | 11 (listed below) |
 | Worktrees | 1 (the clone itself) |
@@ -173,3 +179,25 @@ test that failed. No audit result in this package was invented to fill a gap.
    brief's baseline predates PR #54's merge.
 3. Until then, this audit covers **what exists** (the Python orchestrator and the
    four Rust crates), and states plainly what could not be audited.
+
+---
+
+## 9. Baseline moved mid-audit (PR #55), and what it changed
+
+While this audit was running, PR #55 merged into `main` (`20eb8bf`). It added a
+real durable dispatch journal:
+
+| File | What it is |
+| --- | --- |
+| `orchestration/dispatch_journal.py` | `DispatchJournal` + `DispatchHeld`; intent states `prepared → sending → uncertain → accepted → identified → bound`, plus `rejected` and `stop_owed` |
+| `migrations/0043_lab_dispatch.sql` | `nexus_dispatch_intents`, `UNIQUE (task_id, lease_token)`, a recovery index and a branch index |
+| `orchestration/nexus_lab.py` | `_arm`/`_unknown`/`reconcile`; `DispatchHeld("uncertain OpenHands outcome …; no resend")` |
+
+**This closes the point-C gap** that an earlier reading of the code had
+recorded as open: an uncertain outcome is now *held*, not resent, and
+reconciliation refuses ambiguity ("no unambiguous conversation"). The audit
+branch was rebased on `20eb8bf` and the affected findings re-verified
+(35 audit tests + 57 dispatch tests pass on the new base).
+
+The three defects and the CI gap reported below are still real on `20eb8bf` and
+are fixed by this branch.

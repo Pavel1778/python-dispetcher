@@ -13,7 +13,8 @@ nothing is carried over from the previous report without re-checking.
 | Fact | Value |
 | --- | --- |
 | Remote | `github.com/Pavel1778/python-dispetcher` |
-| `origin/main` | `e866666fb69a13e0edc0c7670b9f56e3561b34c0` |
+| `origin/main` at first inspection | `e866666fb69a13e0edc0c7670b9f56e3561b34c0` |
+| `origin/main` at final verification | `20eb8bf` — PR #55 merged **during** the audit (durable dispatch journal, `0043_lab_dispatch.sql`) |
 | Audit branch | `nexus/3.0-audit` (created from `origin/main`, isolated) |
 | Worktrees | 1 · Stashes: none · Tags: 10 `preservation/*` |
 | Phase 2 candidate `nexus/3.0-foundation` | **does not exist** (404) |
@@ -75,7 +76,7 @@ CONDITIONS**. Details: `PHASE2_ACCEPTANCE_REPORT.md`.
 | 5 | No concurrency test at the widths the brief requires | `tests/` | **added** 1–64 + 128 |
 | 6 | No SQL-injection regression test | `tests/` | **added** |
 | 7 | The brief's performance numbers (194.2/170.3 tasks/s) have no source in the repo | — | **documented NOT VERIFIED** |
-| 8 | Point C can duplicate if the tag search fails | `nexus_lab.py:_adopt` | **documented as an open gap** (fix designed, not implemented) |
+| 8 | Point C could duplicate if the tag search failed | `nexus_lab.py:_adopt` | **closed on `main` by PR #55** during this audit (dispatch journal: `DispatchHeld("… no resend")`) — re-verified on the rebased branch |
 
 Defects 1–6 were fixed on the audit branch with regression coverage. Defects 7–8
 cannot be "fixed" by code alone: 7 is a missing measurement source, 8 is a design
@@ -109,7 +110,8 @@ No `#[allow]` suppressions, no skipped tests, no weakened assertions.
 
 | Run | Result |
 | --- | --- |
-| Full suite (this audit, PostgreSQL 17.11) | **2074 passed, 61 skipped, 0 failed** in 6m33s |
+| Full suite (first base `e866666`, PostgreSQL 17.11) | **2074 passed, 61 skipped, 0 failed** in 6m33s |
+| Full suite (rebased on `20eb8bf`, PR #55 included) | **2098 passed, 67 skipped, 0 failed** in 8m01s |
 | Rust (`cargo test --workspace --locked --release`) | **30 passed** |
 | Rust clippy (`-D warnings`) | **clean** |
 | Rust fmt (`--check`) | **clean** |
@@ -226,7 +228,7 @@ See `CI_RELEASE_READINESS.md`.
 4. **`cargo audit` / `cargo deny` has not been run** — dependency vulnerabilities
    are an open item.
 5. **Cross-platform Rust build is unverified** (CI is Ubuntu only).
-6. **Point C duplication risk** when the tag search fails.
+6. ~~Point C duplication risk~~ — **closed by PR #55** mid-audit; re-verified after rebase.
 
 ---
 

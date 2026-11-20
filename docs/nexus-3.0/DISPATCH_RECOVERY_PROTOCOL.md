@@ -73,7 +73,15 @@ whether a conversation can be duplicated. All are tested in
 | **F. Evidence collected, not settled** | verdict in memory only; task still `running`/`verifying` | re-poll and re-verify | yes (idempotent verification) | no |
 | **G. Settled, notification not sent** | task verdict + evidence durable | the report outbox redelivers (`deliver_due`) | yes | no |
 
-### The one window that is *not* fully closed
+### UPDATE (PR #55 merged during this audit)
+
+The gap below **is now closed** by the durable dispatch journal: a locally
+generated correlation id (`nexusdispatch`) is written before the request, an
+uncertain outcome raises `DispatchHeld("… no resend")`, and reconciliation
+refuses to guess ("no unambiguous conversation"). The paragraph is kept because
+it explains why the journal exists.
+
+### The window as it was before PR #55
 
 If the tag search itself fails (service unavailable) at point C, `_adopt` logs
 and returns `None`, and the executor **starts a new conversation**. That is a
