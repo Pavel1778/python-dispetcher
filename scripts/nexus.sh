@@ -51,16 +51,17 @@ db_url() {
 # Replace the database name in a DSN, whether it is a URL
 # (postgresql://u:p@h:5432/db) or libpq key=value (host=h dbname=db ...).
 with_dbname() {
-  local dsn="$1" name="$2"
-  if printf '%s' "$dsn" | grep -q '://'; then
-    printf '%s' "$dsn" | sed -E "s#/[^/?]+(\\?|\$)#/$name\\1#"
-  else
-    if printf '%s' "$dsn" | grep -q 'dbname='; then
-      printf '%s' "$dsn" | sed -E "s#dbname=[^ ]+#dbname=$name#"
-    else
-      printf '%s dbname=%s' "$dsn" "$name"
-    fi
-  fi
+  # A URL query may override the path's dbname; libpq conninfo values may be
+  # quoted. A regexp substitution cannot safely choose a restore target.
+  # Keep input off the Python command line and never echo parser errors/DSNs.
+  printf '%s' "$1" | python3 -c '
+import sys
+from psycopg.conninfo import make_conninfo
+try:
+    sys.stdout.write(make_conninfo(sys.stdin.read(), dbname=sys.argv[1]))
+except Exception:
+    sys.exit("invalid PostgreSQL connection parameters")
+' "$2"
 }
 
 # The DSN pointing at the maintenance database (for CREATE/DROP DATABASE).
@@ -151,6 +152,7 @@ cmd_logs() {
 }
 
 cmd_backup() {
+  umask 077
   load_env
   mkdir -p "$BACKUP_DIR"
   local stamp dump
@@ -172,22 +174,33 @@ cmd_restore() {
   local dump="${1:-}"
   [ -n "$dump" ] || die "usage: $0 restore <dump-file>"
   [ -f "$dump" ] || die "no such dump: $dump"
+  if [ -f "$dump.sha256" ]; then
+    # Verify the selected dump, not a different pathname from the sidecar.
+    local expected actual
+    read -r expected _ < "$dump.sha256" || die "invalid dump checksum file"
+    actual="$(sha256sum < "$dump")"
+    [[ "$expected" =~ ^[a-f0-9]{64}$ && "$expected" = "${actual%% *}" ]] || die "dump checksum mismatch"
+  else
+    warn "no checksum sidecar: testing an unverified external dump"
+  fi
   local testdb="nexus_restore_test_$(date +%s)"
   local admin test_url
   admin="$(admin_url)"
   say "Restoring $dump into a fresh database $testdb (the live database is untouched)"
-  psql "$admin" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$testdb\""
+  psql -X "$admin" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$testdb\""
   test_url="$(with_dbname "$(db_url)" "$testdb")"
+  [ "$(psql -X "$test_url" -v ON_ERROR_STOP=1 -Atc 'select current_database()')" = "$testdb" ] \
+    || die "scratch database identity mismatch; refusing restore"
   if pg_restore --no-owner --exit-on-error -d "$test_url" "$dump"; then
     local n
-    n="$(psql "$test_url" -tAc 'select count(*) from information_schema.tables where table_schema=current_schema()')"
+    n="$(psql -X "$test_url" -tAc 'select count(*) from information_schema.tables where table_schema=current_schema()')"
     ok "restored; $n tables present in the scratch database"
     ok "the dump loads — the live database was not modified"
   else
     warn "restore reported errors; the scratch database $testdb was kept for inspection"
     return 1
   fi
-  psql "$admin" -c "DROP DATABASE \"$testdb\"" >/dev/null 2>&1 || warn "could not drop $testdb"
+  psql -X "$admin" -c "DROP DATABASE \"$testdb\"" >/dev/null 2>&1 || warn "could not drop $testdb"
 }
 
 cmd_update() {

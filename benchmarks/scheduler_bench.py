@@ -15,11 +15,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import statistics
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -59,6 +59,8 @@ def main() -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--repeat", type=int, default=50)
     args = ap.parse_args()
+    if not 1 <= args.repeat <= 500:
+        ap.error("--repeat must be between 1 and 500 (run iteration limit)")
 
     dsn = os.environ.get("TEST_SUPABASE_DB_URL")
     if not dsn:
@@ -70,93 +72,61 @@ def main() -> int:
     projects = ProjectService(store)
     lab = LabStore(store)
 
-    # Seed a project, a goal, and a run with 40 independent tasks.
     project = projects.create(PRINCIPAL, "Bench", "")["id"]
-    with store._tx() as cur:
-        cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, state) "
-                    "VALUES (%s,%s,%s,'draft') RETURNING id",
-                    (project, "goal", PRINCIPAL))
-        cur.fetchone()
 
-    out: dict = {"environment": {"python": sys.version.split()[0]}, "measurements": {}}
-    m = out["measurements"]
-
-    # 1. run creation (with a 40-task plan)
-    def start():
+    def start(n):
         with store._tx() as cur:
             cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, state) "
                         "VALUES (%s,%s,%s,'draft') RETURNING id", (project, "g", PRINCIPAL))
-            g = cur.fetchone()["id"]
-        lab.start_run(PRINCIPAL, project, g, plan=_plan(40), repository="", branch="")
-    m["start_run_40_tasks_ms"] = _pct([(lambda t0: (start(), (time.perf_counter()-t0)*1000)[1])(time.perf_counter()) for _ in range(10)])
+            goal = cur.fetchone()["id"]
+        return lab.start_run(PRINCIPAL, project, goal, plan=_plan(n), max_iterations=n,
+                             repository="", branch="")
 
-    # 2. atomic claim of one task (fresh run, many tasks)
-    with store._tx() as cur:
-        cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, state) "
-                    "VALUES (%s,%s,%s,'draft') RETURNING id", (project, "g", PRINCIPAL))
-        g = cur.fetchone()["id"]
-    run = lab.start_run(PRINCIPAL, project, g, plan=_plan(200), repository="", branch="")
-    claim_times = []
-    for _ in range(100):
-        t0 = time.perf_counter()
-        task = lab.claim_task(run["id"], "w1")
-        claim_times.append((time.perf_counter() - t0) * 1000.0)
-        if task is None:
-            break
-    m["claim_task_ms"] = _pct(claim_times)
+    def times(operation):
+        samples = []
+        for _ in range(args.repeat):
+            t0 = time.perf_counter()
+            operation()
+            samples.append((time.perf_counter() - t0) * 1000)
+        return _pct(samples)
 
-    # 3. concurrent claim throughput: N workers, one run with many tasks
-    with store._tx() as cur:
-        cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, state) "
-                    "VALUES (%s,%s,%s,'draft') RETURNING id", (project, "g", PRINCIPAL))
-        g = cur.fetchone()["id"]
-    run2 = lab.start_run(PRINCIPAL, project, g, plan=_plan(500), repository="", branch="")
+    out = {"environment": {"python": sys.version.split()[0], "repeat": args.repeat}, "measurements": {}}
+    m = out["measurements"]
+    m["start_run_40_tasks_ms"] = times(lambda: start(40))
+    run = start(max(200, args.repeat))
+
+    def claim():
+        if lab.claim_task(run["id"], "w1") is None:
+            raise RuntimeError("expected a successful claim, not an empty poll")
+
+    m["claim_task_ms"] = times(claim)
+
+    # A fresh 500-task run per level. Count successful distinct IDs, not poll
+    # attempts, and propagate thread errors instead of timing a partial queue.
+    def drain(run_id, owner):
+        ids = []
+        while (task := lab.claim_task(run_id, owner)) is not None:
+            ids.append(task["id"])
+        return ids
+
     conc = {}
     for workers in (1, 5, 10, 25):
-        # A fresh run per level: claiming consumes tasks, so each level needs
-        # its own run or the later levels would find nothing left to claim.
-        with store._tx() as cur:
-            cur.execute("INSERT INTO nexus_goals(project_id, text, created_by, state) "
-                        "VALUES (%s,%s,%s,'draft') RETURNING id", (project, "g", PRINCIPAL))
-            g = cur.fetchone()["id"]
-        r = lab.start_run(PRINCIPAL, project, g, plan=_plan(500), repository="", branch="", max_iterations=500)
-        claimed = [0]
-        lock = threading.Lock()
-        def w():
-            n = 0
-            while True:
-                t = lab.claim_task(r["id"], f"w-{threading.get_ident()}")
-                if t is None:
-                    break
-                n += 1
-            with lock:
-                claimed[0] += n
-        th = [threading.Thread(target=w) for _ in range(workers)]
+        run_id = start(500)["id"]
         t0 = time.perf_counter()
-        for t in th:
-            t.start()
-        for t in th:
-            t.join()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = [pool.submit(drain, run_id, f"w-{i}") for i in range(workers)]
+            ids = [task_id for job in jobs for task_id in job.result()]
         wall = time.perf_counter() - t0
-        conc[str(workers)] = {"workers": workers, "claimed": claimed[0],
-                              "wall_s": round(wall, 4),
-                              "claims_per_s": round(claimed[0] / wall, 1) if wall else 0.0}
+        if len(ids) != 500 or len(set(ids)) != 500:
+            raise RuntimeError(f"{workers} workers: expected 500 distinct claims, "
+                               f"got {len(ids)} claims of {len(set(ids))} tasks")
+        conc[str(workers)] = {"workers": workers, "claimed": len(ids),
+                              "wall_s": round(wall, 4), "claims_per_s": round(len(ids) / wall, 1)}
     m["concurrent_claim"] = conc
-
-    # 4. reclaim_expired (no expired leases -> the empty scan cost)
-    m["reclaim_expired_scan_ms"] = _pct([
-        (lambda t0: (lab.reclaim_expired(run2["id"]), (time.perf_counter()-t0)*1000)[1])(time.perf_counter())
-        for _ in range(20)])
-
-    # 5. queue_cleanups (the worker's retention scan)
-    m["queue_cleanups_ms"] = _pct([
-        (lambda t0: (lab.queue_cleanups(retention_seconds=0), (time.perf_counter()-t0)*1000)[1])(time.perf_counter())
-        for _ in range(20)])
-
-    # 6. store dashboard counts (aggregate query)
-    m["dashboard_counts_ms"] = _pct([
-        (lambda t0: (store.dashboard_counts(), (time.perf_counter()-t0)*1000)[1])(time.perf_counter())
-        for _ in range(50)])
+    empty = start(500)
+    m["reclaim_expired_scan_ms"] = times(lambda: lab.reclaim_expired(empty["id"]))
+    m["queue_cleanups_ms"] = times(lambda: lab.queue_cleanups(retention_seconds=0))
+    m["dashboard_counts_ms"] = times(store.dashboard_counts)
 
     store.close()
     payload = json.dumps(out, indent=2, ensure_ascii=False)

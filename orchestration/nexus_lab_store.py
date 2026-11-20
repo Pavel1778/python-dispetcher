@@ -2345,6 +2345,7 @@ class LabStore:
                 if task["attempt"] >= task["max_attempts"] and durable:
                     cur.execute(
                         "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
+                        "lease_owner=NULL, lease_token=lease_token+1, "
                         "attempt=0, cycle=cycle+1, tried_accounts='[]'::jsonb, "
                         "evidence = evidence || jsonb_build_array(jsonb_build_object("
                         "  'reclaimed', true, 'attempt', attempt, 'cycle', cycle)), "

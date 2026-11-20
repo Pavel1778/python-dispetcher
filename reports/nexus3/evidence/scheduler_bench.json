@@ -1,0 +1,79 @@
+{
+  "environment": {
+    "python": "3.11.2",
+    "repeat": 40
+  },
+  "measurements": {
+    "start_run_40_tasks_ms": {
+      "n": 40,
+      "p50": 4.757,
+      "p90": 5.342,
+      "p95": 5.466,
+      "p99": 9.093,
+      "mean": 4.872,
+      "max": 9.093
+    },
+    "claim_task_ms": {
+      "n": 40,
+      "p50": 2.672,
+      "p90": 3.171,
+      "p95": 3.459,
+      "p99": 4.659,
+      "mean": 2.768,
+      "max": 4.659
+    },
+    "concurrent_claim": {
+      "1": {
+        "workers": 1,
+        "claimed": 500,
+        "wall_s": 1.5831,
+        "claims_per_s": 315.8
+      },
+      "5": {
+        "workers": 5,
+        "claimed": 500,
+        "wall_s": 1.4543,
+        "claims_per_s": 343.8
+      },
+      "10": {
+        "workers": 10,
+        "claimed": 500,
+        "wall_s": 1.5103,
+        "claims_per_s": 331.1
+      },
+      "25": {
+        "workers": 25,
+        "claimed": 500,
+        "wall_s": 1.605,
+        "claims_per_s": 311.5
+      }
+    },
+    "reclaim_expired_scan_ms": {
+      "n": 40,
+      "p50": 0.863,
+      "p90": 0.991,
+      "p95": 1.083,
+      "p99": 1.275,
+      "mean": 0.888,
+      "max": 1.275
+    },
+    "queue_cleanups_ms": {
+      "n": 40,
+      "p50": 3.36,
+      "p90": 4.406,
+      "p95": 4.855,
+      "p99": 6.013,
+      "mean": 3.553,
+      "max": 6.013
+    },
+    "dashboard_counts_ms": {
+      "n": 40,
+      "p50": 0.559,
+      "p90": 0.655,
+      "p95": 0.682,
+      "p99": 0.981,
+      "mean": 0.572,
+      "max": 0.981
+    }
+  }
+}

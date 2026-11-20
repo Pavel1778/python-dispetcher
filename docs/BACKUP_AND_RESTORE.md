@@ -54,22 +54,27 @@ scratch database, checks the tables load, then drops the scratch database:
 ./scripts/nexus.sh restore backups/nexus-20261119T000000Z.dump
 ```
 
-To actually replace a live database (a real recovery), do it deliberately:
+`restore` verifies the selected file against its adjacent SHA-256 when present;
+for an external dump without a sidecar it explicitly warns. A checksum is not a
+signature: keep a trusted copy of the digest separately. The script checks
+`current_database()` against the database it just created **before** it runs
+`pg_restore`. Use a `pg_dump` at least as new as the server, and restore only
+trusted dumps (restoring SQL is privileged).
 
-```bash
-# 1. Stop the app so nothing writes during the swap
-./scripts/nexus.sh stop
+For a real recovery **do not clean or overwrite the live database**. Restore to
+a new database/instance with the required roles and grants, without starting
+any workers or contacting providers. Keep the original read-only. Check the
+full migration filenames and checksums, project membership, task/lease state,
+execution history, file bytes and evidence signatures with the separately
+backed-up trusted public keys. Verify encrypted accounts with the separately
+held encryption key, without printing their values. `pg_dump` of one database
+does not back up cluster roles, host files or Git repositories.
 
-# 2. Restore into the real database (you are overwriting it on purpose)
-pg_restore --clean --if-exists --no-owner -d "$SUPABASE_DB_URL" backups/<dump>
-
-# 3. Start and confirm
-./scripts/nexus.sh start
-curl -fsS http://127.0.0.1:8080/readyz
-```
-
-`--clean` drops objects before recreating them, so this is destructive to the
-current database. Take a fresh backup first if you are unsure.
+Switch endpoints only after owner acceptance, a write freeze, reconciliation of
+remote conversations/branch locks, and a final consistent backup. Never run
+both sets of workers during a switch. Before new writes, rollback can select
+the untouched original; after writes, first freeze and reconcile the delta.
+Rolling back a binary is not a reason to discard committed database history.
 
 ## The automated drill
 

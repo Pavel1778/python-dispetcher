@@ -325,3 +325,26 @@ def test_register_worker_rejects_an_unknown_kind(lab):
     with pytest.raises(ValueError):
         lab["lab"].register_worker("w1", kind="bogus")
 
+
+
+def test_reclaim_of_last_durable_attempt_fences_a_late_conversation(lab):
+    service = lab["lab"]
+    run = service.start_run("user:alice", lab["project"], lab["goal"], policy="durable",
+                            max_attempts_per_task=1, repository="acme/repo", branch="main",
+                            plan=[{"id": "build", "title": "Build"}])
+    grant = service.claim_task(run['id'], "lost-worker")
+    with lab['store']._tx() as cur:
+        cur.execute("UPDATE nexus_run_tasks SET lease_expires=now() - interval '1 second' "
+                    "WHERE id=%s", (grant['id'],))
+    (renewed,) = service.reclaim_expired(run['id'])
+    assert (renewed['cycle'], renewed['attempt'], renewed['state']) == (1, 0, 'pending')
+    # The old start arrives *before* another worker claims the next cycle.
+    late = service.mark_running(grant['id'], conversation_id="late-start", lease_token=grant['lease_token'])
+    assert late['conversation_id'] is None
+    assert renewed['lease_owner'] is None and renewed['lease_token'] > grant['lease_token']
+    stop = service.stop_for("late-start")
+    assert stop['state'] == 'requested'
+    assert service.claim_task(run['id'], "replacement") is None
+    service.stop_result(stop['id'], confirmed=True, observed="paused")
+    following = service.claim_task(run['id'], "replacement")
+    assert following['id'] == grant['id'] and following['lease_token'] > renewed['lease_token']
