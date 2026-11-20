@@ -303,7 +303,8 @@ class App:
     def __init__(self, dsn: str, *, worker_id: str = "web", poll_interval: float = 5.0,
                  token: str | None = None, agent_profile_id: str | None = None,
                  plugins: list[dict[str, Any]] | None = None,
-                 auth: AuthService | None = None, lab_inline: bool | None = None):
+                 auth: AuthService | None = None, lab_inline: bool | None = None,
+                 github: GitHubClient | None = None):
         self.store = PostgresStore(dsn)
         self.execution_profiles = ExecutionProfiles(self.store)
         self.projects = ProjectService(self.store)
@@ -414,7 +415,7 @@ class App:
         self.client = build_cloud_client(self.store)
         # Repository discovery for the allowlist. Reads GITHUB_TOKEN; the value
         # is never exposed through the API or the UI, only its presence.
-        self.github = GitHubClient()
+        self.github = github if github is not None else GitHubClient()
         # The guarded write path. Kept separate from ``self.github`` so nothing
         # that only needs to read can reach a write, and every call happens
         # inside a confirmed-action handler (see ``_github_*`` routes).

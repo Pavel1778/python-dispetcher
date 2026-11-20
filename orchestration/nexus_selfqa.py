@@ -170,9 +170,9 @@ def _declared_checks(root: Path) -> list[QaCheck] | None:
     defaults; an empty ``checks`` list is honoured (the repository said so).
     """
     path = root / ".nexus-qa.json"
-    if not path.is_file():
+    if not path.exists() and not path.is_symlink():
         return None
-    if path.is_symlink() or path.stat().st_size > 65536:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
         raise ValueError('invalid Self-QA declaration')
     data = json.loads(path.read_text(encoding='utf-8'))
     raw = data.get('checks') if isinstance(data, dict) else None
@@ -589,11 +589,13 @@ class ProjectQualityGate:
 
     def run(self, *, repository: str, commit: str = "", project_id: str = "",
             branch: str | None = None, checks: list[QaCheck] | None = None, binding: dict | None = None) -> QaReport:
+        begin = time.time()
         mode = self.mode(project_id)
         now = time.monotonic()
         if mode == "off":
             return QaReport(verdict="skipped",
                             reason="the project turned the quality gate off", policy_skip=True,
+                            binding=dict(binding or {}), started_utc=begin, finished_utc=time.time(),
                             repository=repository, commit=commit,
                             started_at=now, finished_at=now)
         if mode == "auto":
@@ -606,6 +608,7 @@ class ProjectQualityGate:
                 why = ("the repository declares no checks (auto)" if declared is False
                        else "the repository's checks could not be read (auto)")
                 return QaReport(verdict="skipped" if declared is False else "blocked", reason=why, policy_skip=declared is False,
+                                binding=dict(binding or {}), started_utc=begin, finished_utc=time.time(),
                                 repository=repository, commit=commit,
                                 started_at=now, finished_at=now)
         if self._allow_revision is not None and not self._allow_revision(repository, commit):
@@ -621,7 +624,10 @@ def checked_receipt(qa: QaReport, binding: dict, repository: str, commit: str, b
     if qa.repository != repository or qa.commit != commit:
         raise ValueError('wrong evidence subject')
     if qa.policy_skip and qa.verdict == 'skipped' and not qa.checks:
-        return {'verdict': 'skipped', 'reason': qa.reason, 'policy_skip': True}
+        if qa.binding != binding or not before <= qa.started_utc <= qa.finished_utc <= after:
+            raise ValueError('stale policy skip')
+        return {'verdict': 'skipped', 'reason': qa.reason, 'policy_skip': True, 'binding': binding,
+                'started_utc': qa.started_utc, 'finished_utc': qa.finished_utc}
     if qa.verdict != 'passed':
         return {'verdict': 'failed' if qa.verdict == 'failed' else 'blocked', 'reason': redact_text(qa.reason)[:300]}
     if (not all(binding.values()) or qa.binding != binding or not re.fullmatch('[0-9a-f]{40}', commit)

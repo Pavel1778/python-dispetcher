@@ -120,12 +120,12 @@ def _stack(monkeypatch, **app_options):
     threading.Thread(target=llm.serve_forever, daemon=True).start()
 
     with FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server:
-        app = App(DSN, poll_interval=0.2, token="machine-token", **app_options)
+        app = App(DSN, poll_interval=0.2, token="machine-token",
+                  github=GitHubClient(base_url=github_server.base_url, token="server-github-token"), **app_options)
         app.client = CloudClient(cloud.base_url, api_key="test-key", timeout=10.0)
         app.dispatcher.client = app.client
         app.runtime.client = app.client
         app.verifier.client = app.client
-        app.github = GitHubClient(base_url=github_server.base_url, token="server-github-token")
         app.github_accounts._client_factory = lambda token: GitHubClient(
             base_url=github_server.base_url, token=token)
         app.providers = ProviderCascade([GroqProvider(
