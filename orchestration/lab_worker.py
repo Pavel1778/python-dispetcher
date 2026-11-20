@@ -72,13 +72,21 @@ def build_evidence_service(store: PostgresStore) -> Any | None:
 def active_run_ids(store: PostgresStore) -> list[str]:
     """Every run the worker should service, across all projects.
 
-    A run is serviced while it is active; a paused or waiting run is included so
-    a resume is picked up without a restart, but the scheduler itself decides
-    what is claimable.
+    A running run is always serviced; a paused, waiting, or blocked run is
+    serviced while it still has in-flight work or an abandoned conversation to
+    stop, and is picked up immediately as soon as it returns to ``running``.
     """
     with store._tx() as cur:
-        cur.execute("SELECT id FROM nexus_runs WHERE state = ANY(%s) "
-                    "ORDER BY created_at", (list(ACTIVE_RUN_STATES),))
+        cur.execute(
+            "SELECT r.id FROM nexus_runs r "
+            "WHERE r.state = 'running' "
+            "   OR (r.state = ANY(%s) AND EXISTS ("
+            "         SELECT 1 FROM nexus_run_tasks t WHERE t.run_id = r.id "
+            "            AND (t.state IN ('dispatched','running','verifying') "
+            "                 OR (t.abandoned <> '[]'::jsonb "
+            "                     AND jsonb_array_length(t.abandoned) > 0)))) "
+            "ORDER BY r.created_at",
+            (list(ACTIVE_RUN_STATES - {"running"}),))
         return [str(r["id"]) for r in cur.fetchall()]
 
 
@@ -113,9 +121,12 @@ class LabWorker:
         self.evidence = evidence
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
+        exec_poll = min(2.0, max(0.01, float(poll_interval)))
+        exec_attempts = max(150, int(round(300.0 / exec_poll)))
         self.executor = OpenHandsExecutor(
             self.client, specs=SpecService(store), router=account_router,
-            client_factory=self._client_for_account if account_router else None)
+            client_factory=self._client_for_account if account_router else None,
+            poll_interval=exec_poll, start_poll_attempts=exec_attempts)
         # A conversation is deleted with the key it was started with, whether
         # or not that connection is still given work (``OpenHandsExecutor.remove``).
         self.executor.account_client = self._client_for_account
@@ -146,6 +157,7 @@ class LabWorker:
         #: diagnostics; it is written on register and every tick.
         self.heartbeat_seconds = heartbeat_seconds
         self._stop = threading.Event()
+        self._wake = threading.Event()
         #: The owner of the loop is stopping (the web server runs this worker
         #: inside its own process and has its own stop). Asked together with
         #: ``_stop`` by a start that is on its way: see ``LabScheduler``.
@@ -307,9 +319,21 @@ class LabWorker:
                     summary = {"runs": 0, "advanced": 0, "errors": []}
                 if summary["advanced"] or summary["errors"]:
                     log.info("tick: %s", summary)
-                self._stop.wait(self.poll_interval)
+                self.wait(self.poll_interval)
         finally:
             self._stop_worker_best_effort()
+
+    def wake(self) -> None:
+        """Wake the worker loop immediately when new work is ready."""
+        self._wake.set()
+
+    def wait(self, timeout: float | None = None) -> None:
+        """Wait for *timeout* seconds, or until woken or told to stop."""
+        if self._stop.is_set():
+            return
+        self._wake.wait(timeout)
+        if not self._stop.is_set():
+            self._wake.clear()
 
     def run_once(self) -> dict[str, Any]:
         """One pass, registered so the pass is visible to the diagnostics.
@@ -340,6 +364,7 @@ class LabWorker:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
 
 def main(argv: list[str] | None = None) -> int:

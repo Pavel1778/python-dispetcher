@@ -374,7 +374,7 @@ class ProjectRepositoryService:
                      "label": link["label"]}
                     for link in self._links(cur, project_id) if link["usable"]]
 
-    def primary_repository(self, project_id: str) -> str | None:
+    def primary_repository(self, project_id: str, *, cur: Any = None) -> str | None:
         """The project's primary repository (``owner/name``), or ``None``.
 
         The one a task that names no repository runs against. When the operator
@@ -382,22 +382,27 @@ class ProjectRepositoryService:
         that one is the primary in effect: a project with a single repository
         needs no ceremony to use it.
         """
-        with self.store._tx() as cur:
-            cur.execute(
+        def _read(c: Any) -> str | None:
+            c.execute(
                 "SELECT r.full_name FROM nexus_project_repositories pr "
                 "JOIN repositories r ON r.id = pr.repository_id "
                 "WHERE pr.project_id=%s AND pr.is_primary LIMIT 1", (project_id,))
-            row = cur.fetchone()
+            row = c.fetchone()
             if row is not None:
                 return row["full_name"]
-            cur.execute(
+            c.execute(
                 "SELECT r.full_name FROM nexus_project_repositories pr "
                 "JOIN repositories r ON r.id = pr.repository_id "
                 "WHERE pr.project_id=%s ORDER BY r.full_name LIMIT 2", (project_id,))
-            rows = cur.fetchall()
+            rows = c.fetchall()
             return rows[0]["full_name"] if len(rows) == 1 else None
 
-    def primary_branch(self, project_id: str, repository: str = "") -> str:
+        if cur is not None:
+            return _read(cur)
+        with self.store._tx() as c:
+            return _read(c)
+
+    def primary_branch(self, project_id: str, repository: str = "", *, cur: Any = None) -> str:
         """The branch a task that names none runs on.
 
         The project's own ``selected_branch`` (what the studio's "connect
@@ -407,21 +412,26 @@ class ProjectRepositoryService:
         default branch instead, or a task that pushed to the bound branch is
         read as "the branch did not move" - a false negative.
         """
-        with self.store._tx() as cur:
-            cur.execute("SELECT selected_branch FROM nexus_projects WHERE id=%s",
-                        (project_id,))
-            row = cur.fetchone()
+        def _read(c: Any) -> str:
+            c.execute("SELECT selected_branch FROM nexus_projects WHERE id=%s",
+                      (project_id,))
+            row = c.fetchone()
             if row is not None and row["selected_branch"]:
                 return str(row["selected_branch"])
             if repository:
-                cur.execute(
+                c.execute(
                     "SELECT pr.branch FROM nexus_project_repositories pr "
                     "JOIN repositories r ON r.id = pr.repository_id "
                     "WHERE pr.project_id=%s AND r.full_name=%s", (project_id, repository))
-                link = cur.fetchone()
+                link = c.fetchone()
                 if link is not None and link["branch"]:
                     return str(link["branch"])
-        return ""
+            return ""
+
+        if cur is not None:
+            return _read(cur)
+        with self.store._tx() as c:
+            return _read(c)
 
     def account_for_repository(self, project_id: str, repository_full_name: str
                                ) -> tuple[str | None, str | None]:

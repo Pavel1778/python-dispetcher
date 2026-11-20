@@ -331,7 +331,9 @@ class FakeGitHubServer:
         self._srv.gh = self.gh  # type: ignore[attr-defined]
         import threading
 
-        self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
 
     @property
     def base_url(self) -> str:

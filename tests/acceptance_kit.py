@@ -25,14 +25,9 @@ def reset_schema(dsn: str) -> None:
     Every file in ``migrations/`` is applied in lexical order, the way the
     runner does it, so a new migration cannot silently go unapplied.
     """
-    import psycopg
+    from tests._test_db import reset_schema as _reset_schema
 
-    with psycopg.connect(dsn, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
-            for name in sorted(os.listdir(MIGRATIONS)):
-                if name.endswith(".sql"):
-                    cur.execute(open(os.path.join(MIGRATIONS, name)).read())
+    _reset_schema(dsn)
 
 
 class ConfigurableCloud:
@@ -125,7 +120,9 @@ class ConfigurableCloudServer:
         self.cloud = ConfigurableCloud()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _ConfigurableHandler)
         self._server.cloud = self.cloud  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
 
     @property
     def base_url(self) -> str:
@@ -178,8 +175,12 @@ class RedirectServer:
 
         self._redirect = ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
         self._threads = [
-            threading.Thread(target=self._sink.serve_forever, daemon=True),
-            threading.Thread(target=self._redirect.serve_forever, daemon=True),
+            threading.Thread(
+                target=self._sink.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+            ),
+            threading.Thread(
+                target=self._redirect.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+            ),
         ]
 
     @property

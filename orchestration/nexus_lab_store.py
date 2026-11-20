@@ -361,19 +361,24 @@ class LabStore:
             run = self._run_view(cur.fetchone())
             cur.execute("UPDATE nexus_goals SET state='running', active_run_id=%s, updated_at=now() "
                         "WHERE id=%s", (run["id"], goal_id))
+            prepared: list[dict[str, Any]] = []
             for position, task in enumerate(plan or []):
                 named = task.get("repository") or ""
                 elsewhere = bool(named) and named in (repositories or {})
-                self._insert_task(
-                    cur, run["id"], project_id, task_key=task["id"], title=task["title"],
-                    description=task.get("description") or "",
-                    acceptance=task.get("acceptance") or [],
-                    dependencies=task.get("dependencies") or [],
-                    repository=named if elsewhere else repository,
-                    branch=(repositories or {})[named] if elsewhere else branch,
-                    max_attempts=max_attempts_per_task, position=position,
-                    spec_ref=task.get("spec_ref"),
-                    kind=task.get("kind") or "implementation")
+                prepared.append({
+                    "task_key": task["id"],
+                    "title": task["title"],
+                    "description": task.get("description") or "",
+                    "acceptance": task.get("acceptance") or [],
+                    "dependencies": task.get("dependencies") or [],
+                    "repository": named if elsewhere else repository,
+                    "branch": (repositories or {})[named] if elsewhere else branch,
+                    "max_attempts": max_attempts_per_task,
+                    "position": position,
+                    "spec_ref": task.get("spec_ref"),
+                    "kind": task.get("kind") or "implementation",
+                })
+            self._insert_tasks(cur, run["id"], project_id, prepared)
             ProjectService._event(cur, project_id, principal, "run.started", run["id"])
             self._notify(cur, project_id, "goal_started", "Цель запущена", run["id"])
             if also is not None:
@@ -440,6 +445,39 @@ class LabStore:
             row = cur.fetchone()
             return self._run_view(row) if row else None
 
+    def _tick_run_row(self, run_id: str) -> dict | None:
+        """The run row plus fast existence flags for ``LabScheduler.tick``.
+
+        Computing these four flags alongside ``SELECT r.* FROM nexus_runs``
+        saves up to four extra round-trips on every tick when no expired
+        unclaimed tasks, pending starts, abandoned conversations, or in-flight
+        tasks exist for the run.
+        """
+        with self.store._tx() as cur:
+            cur.execute(
+                "SELECT r.*, "
+                "EXISTS (SELECT 1 FROM nexus_run_tasks t WHERE t.run_id=r.id "
+                "  AND t.state IN ('dispatched','running') AND t.conversation_id IS NULL "
+                "  AND t.lease_expires IS NOT NULL AND t.lease_expires < now()) "
+                "  AS _has_expired_unclaimed, "
+                "EXISTS (SELECT 1 FROM nexus_run_tasks t WHERE t.run_id=r.id "
+                "  AND t.state='dispatched' AND t.conversation_id IS NULL "
+                "  AND t.pending_start IS NOT NULL "
+                "  AND t.pending_start->>'start_task_id' <> '' "
+                "  AND (t.pending_start->>'lease_token')::bigint = t.lease_token "
+                "  AND t.lease_expires IS NOT NULL AND t.lease_expires > now()) "
+                "  AS _has_pending_starts, "
+                "EXISTS (SELECT 1 FROM nexus_run_tasks t WHERE t.run_id=r.id "
+                "  AND t.abandoned <> '[]'::jsonb AND jsonb_array_length(t.abandoned) > 0) "
+                "  AS _has_abandoned, "
+                "EXISTS (SELECT 1 FROM nexus_run_tasks t WHERE t.run_id=r.id "
+                "  AND t.state = ANY(%s) AND t.conversation_id IS NOT NULL) "
+                "  AS _has_in_flight "
+                "FROM nexus_runs r WHERE r.id=%s",
+                (list(IN_FLIGHT_TASK_STATES), run_id))
+            row = cur.fetchone()
+            return self._run_view(row) if row else None
+
     #: The milestone columns the profiler reads (migration ``0040``). A name
     #: outside this set is refused, so a caller cannot write an arbitrary
     #: column through ``record_run_milestone``.
@@ -450,8 +488,8 @@ class LabStore:
         "completed_at",
     })
 
-    def record_run_milestone(self, run_id: str, milestone: str) -> None:
-        """Stamp one milestone on a run, once, at the moment it happens.
+    def record_run_milestone(self, run_id: str, *milestones: str) -> None:
+        """Stamp one or more milestones on a run, once, at the moment they happen.
 
         ``COALESCE(col, now())`` is what makes it *once*: the first writer sets
         it and a later re-claim, retry or second worker leaves it alone, so the
@@ -459,12 +497,17 @@ class LabStore:
         a known milestone is refused (``ValueError``), so this is not a way to
         write an arbitrary column.
         """
-        if milestone not in self._MILESTONES:
-            raise ValueError(f"unknown run milestone: {milestone!r}")
+        if not milestones:
+            return
+        for milestone in milestones:
+            if milestone not in self._MILESTONES:
+                raise ValueError(f"unknown run milestone: {milestone!r}")
+        unique = list(dict.fromkeys(milestones))
+        sets = ", ".join(f"{m}=COALESCE({m}, now())" for m in unique)
+        cond = " OR ".join(f"{m} IS NULL" for m in unique)
         with self.store._tx() as cur:
             cur.execute(
-                f"UPDATE nexus_runs SET {milestone}=COALESCE({milestone}, now()) "
-                "WHERE id=%s", (run_id,))
+                f"UPDATE nexus_runs SET {sets} WHERE id=%s AND ({cond})", (run_id,))
 
     def run_profile(self, run_id: str, *, now: Any = None) -> dict[str, Any]:
         """The run-time profile of one run (stages, idle, bottleneck)."""
@@ -484,6 +527,131 @@ class LabStore:
             if row is None:
                 raise NotFound("run not found")
             return self._run_view(row)
+
+    def get_run_detail(self, principal: str, project_id: str, run_id: str, *,
+                       retention_seconds: float | None = None,
+                       reports: Any = None, event_limit: int = 100) -> dict[str, Any]:
+        """Everything the run progress view reads, in one database transaction.
+
+        Replaces eight separate transactions on ``GET /api/v1/projects/{id}/runs/{run_id}``
+        with a single transaction and one membership check.
+        """
+        from .nexus_profiler import idle_ratio, profile_run
+
+        event_limit = max(1, min(int(event_limit), 500))
+        with self.store._tx() as cur:
+            ProjectService._project(cur, principal, project_id)
+            cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s",
+                        (run_id, project_id))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("run not found")
+            run = self._run_view(row)
+
+            cur.execute("SELECT * FROM nexus_run_tasks WHERE run_id=%s AND project_id=%s "
+                        "ORDER BY created_at, id", (run_id, project_id))
+            tasks = [self._task_row(r) for r in cur.fetchall()]
+
+            report_svc = reports if reports is not None else self.reports
+            report = report_svc.for_run(run_id, cur=cur) if report_svc is not None else None
+
+            cur.execute(
+                "SELECT id, run_id, task_id, task_key, cycle, attempt, kind, "
+                "  openhands_account_id, executor_label, conversation_id, repository, branch, "
+                "  base_sha, head_sha, started_at, ended_at, outcome, reason "
+                "FROM nexus_task_executions WHERE run_id=%s ORDER BY started_at, id",
+                (run_id,))
+            executions: list[dict] = []
+            for r in cur.fetchall():
+                item = dict(r)
+                for key in ("id", "run_id", "task_id", "openhands_account_id"):
+                    if item.get(key) is not None:
+                        item[key] = str(item[key])
+                executions.append(item)
+
+            cur.execute(
+                "SELECT h.id, h.task_id, t.task_key, h.from_account_id, h.to_account_id, "
+                "  fa.label AS from_label, ta.label AS to_label, h.reason, h.created_at "
+                "FROM nexus_task_handoffs h "
+                "LEFT JOIN nexus_run_tasks t ON t.id = h.task_id "
+                "LEFT JOIN nexus_openhands_accounts fa ON fa.id = h.from_account_id "
+                "LEFT JOIN nexus_openhands_accounts ta ON ta.id = h.to_account_id "
+                "WHERE h.run_id=%s ORDER BY h.created_at, h.id", (run_id,))
+            switches: list[dict] = []
+            for r in cur.fetchall():
+                item = dict(r)
+                for key in ("id", "task_id", "from_account_id", "to_account_id"):
+                    if item.get(key) is not None:
+                        item[key] = str(item[key])
+                switches.append(item)
+
+            cur.execute(
+                "SELECT kind, created_at AS at, actor FROM nexus_project_events "
+                "WHERE project_id=%s AND resource_id=%s ORDER BY seq DESC LIMIT %s",
+                (project_id, str(run_id), event_limit))
+            event_rows = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("SELECT * FROM nexus_executor_stops WHERE run_id=%s "
+                        "ORDER BY created_at, id", (run_id,))
+            stops = [self._stop_row(r) for r in cur.fetchall()]
+
+            cleanup: dict[str, Any] = {
+                "enabled": retention_seconds is not None,
+                "due_at": (
+                    run["updated_at"] + timedelta(seconds=max(0.0, float(retention_seconds)))
+                    if (retention_seconds is not None and run.get("updated_at") is not None
+                        and run.get("state") in CLEANUP_RUN_STATES)
+                    else None
+                ),
+                "requested": 0, "deleted": 0, "missing": 0, "abandoned": 0,
+                "last_error": None,
+            }
+            cur.execute(
+                "SELECT state, count(*) AS n FROM nexus_conversation_cleanups "
+                "WHERE run_id=%s GROUP BY state", (run_id,))
+            for r in cur.fetchall():
+                cleanup[r["state"]] = int(r["n"])
+            if cleanup["requested"] or cleanup["abandoned"]:
+                cur.execute(
+                    "SELECT last_error FROM nexus_conversation_cleanups "
+                    "WHERE run_id=%s AND state IN ('requested','abandoned') "
+                    "AND last_error IS NOT NULL ORDER BY next_attempt_at DESC, id LIMIT 1",
+                    (run_id,))
+                err_row = cur.fetchone()
+                cleanup["last_error"] = err_row["last_error"] if err_row else None
+
+        events = [{"at": r["at"], "kind": r["kind"],
+                   "detail": {"actor": r["actor"]} if r.get("actor") else {}}
+                  for r in event_rows]
+        for r in executions[-event_limit:]:
+            base = {"task": r["task_key"]}
+            if r.get("executor_label"):
+                base["account"] = r["executor_label"]
+            if r.get("conversation_id"):
+                base["conversation_id"] = str(r["conversation_id"])
+            events.append({"at": r["started_at"], "kind": f"attempt.{r['kind']}",
+                           "detail": dict(base)})
+            if r.get("ended_at"):
+                settled = dict(base)
+                if r.get("outcome"):
+                    settled["outcome"] = r["outcome"]
+                if r.get("reason"):
+                    settled["reason"] = r["reason"]
+                events.append({"at": r["ended_at"],
+                               "kind": f"attempt.{r['kind']}.ended", "detail": settled})
+        events.sort(key=lambda e: e["at"], reverse=True)
+        profile = profile_run(run)
+        return {
+            "run": run,
+            "tasks": tasks,
+            "report": report,
+            "executions": executions,
+            "switches": switches,
+            "events": events[:event_limit],
+            "stops": stops,
+            "profile": {**profile, "idle_ratio": idle_ratio(profile)},
+            "cleanup": cleanup,
+        }
 
     def list_runs(self, principal: str, project_id: str, *, limit: int = 50,
                   include_hidden: bool = False) -> list[dict]:
@@ -643,17 +811,23 @@ class LabStore:
         run = self._run_view(cur.fetchone())
         cur.execute("UPDATE nexus_goals SET state='running', active_run_id=%s, updated_at=now() "
                     "WHERE id=%s", (run["id"], goal_id))
-        for position, task in enumerate(plan):
-            self._insert_task(
-                cur, run["id"], project_id, task_key=task["id"], title=task["title"],
-                description=task.get("description") or "",
-                acceptance=task.get("acceptance") or [],
-                dependencies=task.get("dependencies") or [],
-                repository=task.get("repository") or "",
-                branch=task.get("branch") or "",
-                max_attempts=source["max_attempts_per_task"], position=position,
-                spec_ref=task.get("spec_ref"),
-                kind=task.get("kind") or "implementation")
+        prepared = [
+            {
+                "task_key": task["id"],
+                "title": task["title"],
+                "description": task.get("description") or "",
+                "acceptance": task.get("acceptance") or [],
+                "dependencies": task.get("dependencies") or [],
+                "repository": task.get("repository") or "",
+                "branch": task.get("branch") or "",
+                "max_attempts": source["max_attempts_per_task"],
+                "position": position,
+                "spec_ref": task.get("spec_ref"),
+                "kind": task.get("kind") or "implementation",
+            }
+            for position, task in enumerate(plan)
+        ]
+        self._insert_tasks(cur, run["id"], project_id, prepared)
         return run
 
     def restart_run(self, principal: str, project_id: str, run_id: str) -> dict:
@@ -915,7 +1089,8 @@ class LabStore:
             # moment it is cancelled, and everything it recorded stays.
             cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
                         "resume_at=NULL, wait_reason=NULL, cancelled_at=now(), cancelled_by=%s, "
-                        "hidden_at=COALESCE(hidden_at, now()), updated_at=now() "
+                        "hidden_at=COALESCE(hidden_at, now()), "
+                        "completed_at=COALESCE(completed_at, now()), updated_at=now() "
                         "WHERE id=%s RETURNING *", (state, last_error, actor, run_id))
         elif state == "completed":
             # A run that completed successfully and was accepted leaves the
@@ -926,21 +1101,19 @@ class LabStore:
             # *blocked* run is deliberately NOT hidden: it needs attention.
             cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
                         "resume_at=NULL, wait_reason=NULL, "
-                        "hidden_at=COALESCE(hidden_at, now()), updated_at=now() "
+                        "hidden_at=COALESCE(hidden_at, now()), "
+                        "completed_at=COALESCE(completed_at, now()), updated_at=now() "
+                        "WHERE id=%s RETURNING *", (state, last_error, run_id))
+        elif state == "failed":
+            cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
+                        "resume_at=NULL, wait_reason=NULL, "
+                        "completed_at=COALESCE(completed_at, now()), updated_at=now() "
                         "WHERE id=%s RETURNING *", (state, last_error, run_id))
         else:
             cur.execute("UPDATE nexus_runs SET state=%s, last_error=COALESCE(%s, last_error), "
                         "resume_at=NULL, wait_reason=NULL, updated_at=now() "
                         "WHERE id=%s RETURNING *", (state, last_error, run_id))
         run = self._run_view(cur.fetchone())
-        if state in ("completed", "failed", "cancelled"):
-            # The profiler's end of the clock: the run reached a terminal state.
-            # ``COALESCE`` keeps the first terminal stamp if a settle is retried.
-            # Done after the row is read so it does not consume the RETURNING row;
-            # the value is put on the view so a caller sees the same row the DB has.
-            cur.execute("UPDATE nexus_runs SET completed_at=COALESCE(completed_at, now()) "
-                        "WHERE id=%s RETURNING completed_at", (run_id,))
-            run["completed_at"] = cur.fetchone()["completed_at"]
         if state == "cancelled":
             ProjectService._event(cur, project_id, actor or "system", "run.cancelled", run_id)
         # A run that ends *without* completing owes its chat a report too, and
@@ -1073,6 +1246,63 @@ class LabStore:
              _jsonb(dependencies), repository, branch, timeout_seconds,
              max_attempts, executor, _jsonb(spec_ref) if spec_ref else None, kind, position))
         return self._task_row(cur.fetchone())
+
+    def _insert_tasks(self, cur: Any, run_id: Any, project_id: str,
+                      rows: list[dict[str, Any]]) -> None:
+        """Insert a list of prepared task dicts into ``nexus_run_tasks`` in one statement."""
+        if not rows:
+            return
+        default_timeout = task_timeout_seconds()
+        task_keys: list[str] = []
+        titles: list[str] = []
+        descriptions: list[str] = []
+        acceptances: list[str] = []
+        dependencies: list[str] = []
+        repositories: list[str] = []
+        branches: list[str] = []
+        timeouts: list[int] = []
+        max_attempts_arr: list[int] = []
+        executors: list[str] = []
+        spec_refs: list[str | None] = []
+        kinds: list[str] = []
+        positions: list[int] = []
+        for idx, item in enumerate(rows):
+            kind = item.get("kind") or "implementation"
+            if kind not in TASK_KINDS:
+                raise ValueError("invalid task kind")
+            task_keys.append(item["task_key"])
+            titles.append(item["title"])
+            descriptions.append(item.get("description") or "")
+            acceptances.append(_jsonb(item.get("acceptance") or []))
+            dependencies.append(_jsonb(item.get("dependencies") or []))
+            repositories.append(item.get("repository") or "")
+            branches.append(item.get("branch") or "")
+            timeouts.append(
+                int(item["timeout_seconds"])
+                if item.get("timeout_seconds") is not None else default_timeout
+            )
+            max_attempts_arr.append(int(item.get("max_attempts", 3)))
+            executors.append(item.get("executor") or "openhands")
+            spec_ref = item.get("spec_ref")
+            spec_refs.append(_jsonb(spec_ref) if spec_ref else None)
+            kinds.append(kind)
+            positions.append(int(item.get("position", idx)))
+        cur.execute(
+            "INSERT INTO nexus_run_tasks(run_id, project_id, task_key, title, description, "
+            "  acceptance, dependencies, repository, branch, timeout_seconds, max_attempts, "
+            "  executor, spec_ref, kind, created_at) "
+            "SELECT %s, %s, u.task_key, u.title, u.description, "
+            "  u.acceptance::jsonb, u.dependencies::jsonb, u.repository, u.branch, "
+            "  u.timeout_seconds, u.max_attempts, u.executor, u.spec_ref::jsonb, u.kind, "
+            "  now() + u.pos * interval '1 microsecond' "
+            "FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[], %s::text[], "
+            "            %s::text[], %s::text[], %s::int[], %s::int[], %s::text[], "
+            "            %s::text[], %s::text[], %s::int[]) "
+            "  AS u(task_key, title, description, acceptance, dependencies, repository, branch, "
+            "       timeout_seconds, max_attempts, executor, spec_ref, kind, pos)",
+            (run_id, project_id, task_keys, titles, descriptions, acceptances, dependencies,
+             repositories, branches, timeouts, max_attempts_arr, executors, spec_refs, kinds,
+             positions))
 
     def tasks_internal(self, run_id: str) -> list[dict]:
         """Every task of a run, in plan order, for the scheduler (which is not
@@ -1856,7 +2086,8 @@ class LabStore:
         with self.store._tx() as cur:
             cur.execute(
                 "SELECT id, task_key, project_id, abandoned FROM nexus_run_tasks "
-                "WHERE run_id=%s AND jsonb_array_length(abandoned) > 0 "
+                "WHERE run_id=%s AND abandoned <> '[]'::jsonb "
+                "AND jsonb_array_length(abandoned) > 0 "
                 "ORDER BY created_at, id", (run_id,))
             out = []
             for row in cur.fetchall():
@@ -2022,7 +2253,8 @@ class LabStore:
                 out.append(item)
             return out
 
-    def run_events(self, run_id: str, *, limit: int = 100) -> list[dict]:
+    def run_events(self, run_id: str, *, limit: int = 100,
+                   project_id: str | None = None) -> list[dict]:
         """The run's recent events, newest first, for the progress view.
 
         Two real sources are merged, both with a real timestamp: the project
@@ -2033,9 +2265,17 @@ class LabStore:
         """
         limit = max(1, min(int(limit), 500))
         with self.store._tx() as cur:
-            cur.execute(
-                "SELECT kind, created_at AS at, actor FROM nexus_project_events "
-                "WHERE resource_id=%s ORDER BY seq DESC LIMIT %s", (run_id, limit))
+            if project_id is not None:
+                cur.execute(
+                    "SELECT kind, created_at AS at, actor FROM nexus_project_events "
+                    "WHERE project_id=%s AND resource_id=%s ORDER BY seq DESC LIMIT %s",
+                    (project_id, str(run_id), limit))
+            else:
+                cur.execute(
+                    "SELECT kind, created_at AS at, actor FROM nexus_project_events "
+                    "WHERE project_id = (SELECT project_id FROM nexus_runs WHERE id=%s) "
+                    "AND resource_id=%s ORDER BY seq DESC LIMIT %s",
+                    (run_id, str(run_id), limit))
             rows = [dict(r) for r in cur.fetchall()]
             cur.execute(
                 "SELECT e.task_key, e.kind, e.started_at, e.ended_at, "

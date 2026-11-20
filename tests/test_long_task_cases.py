@@ -286,8 +286,13 @@ def _gone():
     from orchestration import cloud_store
 
     def detach(store):
-        store._pool.close()
         dead = "postgresql://127.0.0.1:1/nexus-gone"
+        store.dsn = dead
+        store.pool_min = 0
+        store.pool_max = 1
+        store.pool_timeout = 0.5
+        store._connect_timeout = 0.5
+        store._pool.close()
         store._pool = psycopg_pool.ConnectionPool(
             dead, kwargs=store._connect_kwargs, min_size=0, max_size=1,
             open=True, timeout=0.5, reconnect_timeout=0.5,

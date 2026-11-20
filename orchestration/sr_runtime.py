@@ -343,14 +343,18 @@ class SrRuntime:
         self._retry_sr_starts(report)
         self._redeliver(report)
         for workflow in self.store.list_workflows():
-            workflow_id = workflow["id"]
-            sr = self.store.sr_for(workflow_id)
-            if not sr or not sr.get("sr_conversation_id"):
-                continue
             if workflow.get("state") in ("completed", "cancelled", "failed"):
                 continue
+            workflow_id = workflow["id"]
+            if "sr_conversation_id" in workflow:
+                sr_conv = workflow.get("sr_conversation_id")
+            else:
+                sr = self.store.sr_for(workflow_id)
+                sr_conv = sr.get("sr_conversation_id") if sr else None
+            if not sr_conv:
+                continue
             try:
-                events = self.client.list_events(sr["sr_conversation_id"])
+                events = self.client.list_events(sr_conv)
             except CloudNotFound:
                 report.unavailable.append(workflow_id)
                 continue
@@ -358,7 +362,7 @@ class SrRuntime:
                 report.unavailable.append(workflow_id)
                 continue
             for event in events:
-                self._maybe_handle(workflow_id, sr["sr_conversation_id"], event, report)
+                self._maybe_handle(workflow_id, sr_conv, event, report)
         return report
 
     def _redeliver(self, report: SrTickReport) -> None:

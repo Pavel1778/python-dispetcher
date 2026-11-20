@@ -125,24 +125,49 @@ class ConversationService:
             include_deleted: bool = False) -> dict:
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
-            cur.execute(
-                "SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
-                "  c.pinned, c.pinned_at, c.deleted_at, "
-                "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
-                "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
-                "  c.plan_approved_at, c.plan_approved_by, "
-                "  c.created_at, c.updated_at, "
-                "  p.repository_id, p.selected_branch, r.full_name AS repository "
-                "FROM nexus_conversations c "
-                "JOIN nexus_projects p ON p.id = c.project_id "
-                "LEFT JOIN repositories r ON r.id = p.repository_id "
-                "WHERE c.id=%s AND c.project_id=%s"
-                + ("" if include_deleted else " AND c.deleted_at IS NULL"),
-                (conversation_id, project_id))
-            row = cur.fetchone()
-            if row is None:
-                raise NotFound("conversation not found")
-            return dict(row)
+            return self._get_row(cur, project_id, conversation_id,
+                                 include_deleted=include_deleted)
+
+    @staticmethod
+    def _get_row(cur: Any, project_id: str, conversation_id: str, *,
+                 include_deleted: bool = False) -> dict:
+        cur.execute(
+            "SELECT c.id, c.project_id, c.title, c.mode, c.state, c.archived, "
+            "  c.pinned, c.pinned_at, c.deleted_at, "
+            "  c.run_id, c.workflow_state, c.workflow_goal_id, c.workflow_spec_id, "
+            "  c.plan_hash, c.workflow_plan, c.plan_approved_hash, "
+            "  c.plan_approved_at, c.plan_approved_by, "
+            "  c.created_at, c.updated_at, "
+            "  p.repository_id, p.selected_branch, r.full_name AS repository "
+            "FROM nexus_conversations c "
+            "JOIN nexus_projects p ON p.id = c.project_id "
+            "LEFT JOIN repositories r ON r.id = p.repository_id "
+            "WHERE c.id=%s AND c.project_id=%s"
+            + ("" if include_deleted else " AND c.deleted_at IS NULL"),
+            (conversation_id, project_id))
+        row = cur.fetchone()
+        if row is None:
+            raise NotFound("conversation not found")
+        return dict(row)
+
+    def turn_context(self, principal: str, project_id: str, conversation_id: str, *,
+                     limit: int = 500) -> tuple[dict, dict | None, list[dict]]:
+        """Read ``(conversation, linked_run, messages)`` in a single transaction."""
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            conversation = self._get_row(cur, project_id, conversation_id,
+                                         include_deleted=False)
+            active_run = None
+            if conversation.get("run_id") is not None:
+                cur.execute(
+                    "SELECT id, state FROM nexus_runs WHERE id=%s",
+                    (conversation["run_id"],),
+                )
+                rrow = cur.fetchone()
+                if rrow is not None:
+                    active_run = {"id": str(rrow["id"]), "state": rrow["state"]}
+            messages = self._fetch_messages(cur, conversation_id, limit=limit)
+            return conversation, active_run, messages
 
     def rename(self, principal: str, project_id: str, conversation_id: str,
                title: str) -> dict:
@@ -287,8 +312,8 @@ class ConversationService:
         a message never stores a key (the API key is read from the environment),
         and the fields exported are exactly the ones the chat surface reads.
         """
-        conversation = self.get(principal, project_id, conversation_id)
-        messages = self.list_messages(principal, project_id, conversation_id)
+        conversation, _active_run, messages = self.turn_context(
+            principal, project_id, conversation_id)
         return {
             "exported_from": "NEXUS",
             "conversation": {
@@ -323,17 +348,68 @@ class ConversationService:
                         "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
             if cur.fetchone() is None:
                 raise NotFound("conversation not found")
-            try:
+            cur.execute(
+                "INSERT INTO nexus_generations(conversation_id, project_id, mode, "
+                "  created_by) VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT (conversation_id) WHERE state = 'running' DO NOTHING "
+                "RETURNING id, conversation_id, project_id, state, mode, created_at",
+                (conversation_id, project_id, mode, principal))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("a generation is already running")
+            return dict(row)
+
+    def start_generation_with_context(
+        self, principal: str, project_id: str, conversation_id: str, *,
+        mode: str, memory_limit: int = 30
+    ) -> tuple[dict, dict | None, list[dict]]:
+        """Open a generation and read project ``(context, memory)`` in one transaction.
+
+        If a generation is already running, resets the conversation state to
+        ``idle`` in the same transaction before raising ``ValueError``.
+        """
+        busy = False
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT 1 FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            if cur.fetchone() is None:
+                raise NotFound("conversation not found")
+            cur.execute(
+                "INSERT INTO nexus_generations(conversation_id, project_id, mode, "
+                "  created_by) VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT (conversation_id) WHERE state = 'running' DO NOTHING "
+                "RETURNING id, conversation_id, project_id, state, mode, created_at",
+                (conversation_id, project_id, mode, principal))
+            row = cur.fetchone()
+            if row is None:
                 cur.execute(
-                    "INSERT INTO nexus_generations(conversation_id, project_id, mode, "
-                    "  created_by) VALUES (%s,%s,%s,%s) "
-                    "RETURNING id, conversation_id, project_id, state, mode, created_at",
-                    (conversation_id, project_id, mode, principal))
-            except Exception as e:  # UniqueViolation: a generation is already running
-                if "uq_nexus_generations_running" in str(e):
-                    raise ValueError("a generation is already running") from None
-                raise
-            return dict(cur.fetchone())
+                    "UPDATE nexus_conversations SET state='idle', updated_at=now() "
+                    "WHERE id=%s AND project_id=%s",
+                    (conversation_id, project_id),
+                )
+                busy = True
+            else:
+                gen = dict(row)
+                cur.execute(
+                    "SELECT id, project_id, repository, revision, summary, state, created_at "
+                    "FROM nexus_project_context WHERE project_id=%s AND state='current' "
+                    "ORDER BY created_at DESC, id LIMIT 1",
+                    (project_id,),
+                )
+                ctx_row = cur.fetchone()
+                context = dict(ctx_row) if ctx_row else None
+                cur.execute(
+                    "SELECT id, project_id, kind, content, provenance, confidence, source, "
+                    "created_at, updated_at FROM nexus_memory "
+                    "WHERE (project_id=%s OR project_id IS NULL) AND superseded_by IS NULL "
+                    "ORDER BY created_at DESC, id LIMIT %s",
+                    (project_id, max(1, min(int(memory_limit), 200))),
+                )
+                memory = [dict(r) for r in cur.fetchall()]
+        if busy:
+            raise ValueError("a generation is already running")
+        return gen, context, memory
 
     def finish_generation(self, generation_id: str, state: str) -> bool:
         """Mark a generation terminal; ``True`` if this call moved it.
@@ -687,9 +763,17 @@ class ConversationService:
 
     # ---------------------------------------------------------------- messages
     def add_message(self, principal: str, project_id: str, conversation_id: str, *,
-                    role: str, content: str, meta: dict | None = None) -> dict:
+                    role: str, content: str, meta: dict | None = None,
+                    run_id: str | None = None, state: str | None = None,
+                    title: str | None = None, mode: str | None = None) -> dict:
         if role not in ("user", "assistant", "tool", "system"):
             raise ValueError("role must be user, assistant, tool or system")
+        if state is not None and state not in ("idle", "thinking", "error"):
+            raise ValueError("state must be idle, thinking or error")
+        if title is not None:
+            title = _text(title, "title", maximum=200)
+        if mode is not None:
+            self.check_mode(mode)
         content = _text(content, "content", maximum=MESSAGE_CHARS, required=False)
         with self.store._tx() as cur:
             self._project(cur, principal, project_id)
@@ -703,12 +787,48 @@ class ConversationService:
                 # message appended behind the scenes would be invisible work.
                 raise ValueError("conversation is deleted; restore it before adding messages")
             return self.append_internal(cur, conversation_id, role=role, content=content,
-                                        meta=meta)
+                                        meta=meta, run_id=run_id, state=state,
+                                        title=title, mode=mode)
+
+    def add_messages(self, principal: str, project_id: str, conversation_id: str,
+                     messages: list[dict[str, Any]], *,
+                     run_id: str | None = None, state: str | None = None) -> list[dict]:
+        """Append one or more messages in a single transaction, optionally
+        updating the conversation's ``run_id`` and ``state`` at the same time."""
+        if not messages:
+            return []
+        if state is not None and state not in ("idle", "thinking", "error"):
+            raise ValueError("state must be idle, thinking or error")
+        prepared: list[tuple[str, str, dict | None]] = []
+        for item in messages:
+            role = item["role"]
+            if role not in ("user", "assistant", "tool", "system"):
+                raise ValueError("role must be user, assistant, tool or system")
+            body = _text(item["content"], "content", maximum=MESSAGE_CHARS, required=False)
+            prepared.append((role, body, item.get("meta")))
+        with self.store._tx() as cur:
+            self._project(cur, principal, project_id)
+            cur.execute("SELECT id, deleted_at FROM nexus_conversations "
+                        "WHERE id=%s AND project_id=%s", (conversation_id, project_id))
+            found = cur.fetchone()
+            if found is None:
+                raise NotFound("conversation not found")
+            if found["deleted_at"] is not None:
+                raise ValueError("conversation is deleted; restore it before adding messages")
+            out: list[dict] = []
+            last_idx = len(prepared) - 1
+            for idx, (role, body, meta) in enumerate(prepared):
+                out.append(self.append_internal(
+                    cur, conversation_id, role=role, content=body, meta=meta,
+                    run_id=run_id if idx == last_idx else None,
+                    state=state if idx == last_idx else None))
+            return out
 
     @staticmethod
     def append_internal(cur: Any, conversation_id: str, *, role: str, content: str,
                         meta: dict | None = None, run_id: str | None = None,
-                        state: str | None = None) -> dict:
+                        state: str | None = None, title: str | None = None,
+                        mode: str | None = None) -> dict:
         """Append a message inside the caller's transaction. No membership check.
 
         For work that finishes after the request that asked for it has returned
@@ -733,8 +853,9 @@ class ConversationService:
             (conversation_id, role, content, _json(meta or {}), conversation_id))
         row = dict(cur.fetchone())
         cur.execute("UPDATE nexus_conversations SET updated_at=now(), "
-                    "run_id=COALESCE(%s, run_id), state=COALESCE(%s, state) WHERE id=%s",
-                    (run_id, state, conversation_id))
+                    "run_id=COALESCE(%s, run_id), state=COALESCE(%s, state), "
+                    "title=COALESCE(%s, title), mode=COALESCE(%s, mode) WHERE id=%s",
+                    (run_id, state, title, mode, conversation_id))
         return row
 
     def post_internal(self, conversation_id: str, messages: list[dict], *,
@@ -757,32 +878,36 @@ class ConversationService:
                         (conversation_id, project_id))
             if cur.fetchone() is None:
                 raise NotFound("conversation not found")
-            cur.execute(
-                "SELECT m.id, m.conversation_id, m.role, m.content, m.meta, m.created_at, "
-                "  a.file_id, a.kind AS attachment_kind, a.filename AS attachment_filename, "
-                "  a.content_type AS attachment_content_type, a.size AS attachment_size "
-                "FROM nexus_conversation_messages m "
-                "LEFT JOIN nexus_conversation_attachments a ON a.message_id = m.id "
-                "WHERE m.conversation_id=%s ORDER BY m.created_at, m.id LIMIT %s",
-                (conversation_id, limit))
-            out: list[dict] = []
-            by_id: dict[str, dict] = {}
-            for row in cur.fetchall():
-                mid = str(row["id"])
-                msg = by_id.get(mid)
-                if msg is None:
-                    msg = {"id": mid, "role": row["role"], "content": row["content"],
-                           "meta": row["meta"], "created_at": row["created_at"],
-                           "attachments": []}
-                    by_id[mid] = msg
-                    out.append(msg)
-                if row["file_id"] is not None:
-                    msg["attachments"].append({
-                        "file_id": str(row["file_id"]), "kind": row["attachment_kind"],
-                        "filename": row["attachment_filename"],
-                        "content_type": row["attachment_content_type"],
-                        "size": row["attachment_size"]})
-            return out
+            return self._fetch_messages(cur, conversation_id, limit=limit)
+
+    @staticmethod
+    def _fetch_messages(cur: Any, conversation_id: str, *, limit: int = 500) -> list[dict]:
+        cur.execute(
+            "SELECT m.id, m.conversation_id, m.role, m.content, m.meta, m.created_at, "
+            "  a.file_id, a.kind AS attachment_kind, a.filename AS attachment_filename, "
+            "  a.content_type AS attachment_content_type, a.size AS attachment_size "
+            "FROM nexus_conversation_messages m "
+            "LEFT JOIN nexus_conversation_attachments a ON a.message_id = m.id "
+            "WHERE m.conversation_id=%s ORDER BY m.created_at, m.id LIMIT %s",
+            (conversation_id, limit))
+        out: list[dict] = []
+        by_id: dict[str, dict] = {}
+        for row in cur.fetchall():
+            mid = str(row["id"])
+            msg = by_id.get(mid)
+            if msg is None:
+                msg = {"id": mid, "role": row["role"], "content": row["content"],
+                       "meta": row["meta"], "created_at": row["created_at"],
+                       "attachments": []}
+                by_id[mid] = msg
+                out.append(msg)
+            if row["file_id"] is not None:
+                msg["attachments"].append({
+                    "file_id": str(row["file_id"]), "kind": row["attachment_kind"],
+                    "filename": row["attachment_filename"],
+                    "content_type": row["attachment_content_type"],
+                    "size": row["attachment_size"]})
+        return out
 
     def set_state(self, principal: str, project_id: str, conversation_id: str,
                   state: str) -> None:
