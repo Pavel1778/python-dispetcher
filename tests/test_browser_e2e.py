@@ -664,6 +664,10 @@ def test_a_phone_gets_one_column_and_nothing_wider_than_the_screen(stack, chromi
         assert page.locator("#sidebar").bounding_box()["x"] == 0
         assert page.evaluate(shadow) != "none", "the open drawer is lifted off the page"
         # Without hover the per-chat menu has to be visible to be reachable.
+        # Wait for the list first: on a slow runner the history can still be
+        # drawing, and querying a selector that is not there yet is a null
+        # getComputedStyle, not the property this case is about.
+        page.wait_for_selector(".sb-item .icon-btn")
         assert page.evaluate("() => getComputedStyle(document.querySelector('.sb-item .icon-btn')).opacity") == "1"
         assert _overflow(page) <= 0
         page.tap(".sb-link")
