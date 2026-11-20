@@ -1,0 +1,53 @@
+{
+  "revision": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+  "harness_sha256": "e82604df016385cfd2fc2b1d3f6d3c52eb035f1893c1b59d413fe2ae9aa865f1",
+  "fault": "SIGKILL after HTTP acceptance, before reading body; force private lease expiry; one replacement tick with search HTTP 503, then one with search available",
+  "killed_returncode": -9,
+  "states": {
+    "after_sigkill": {
+      "state": "dispatched",
+      "attempt": 1,
+      "lease_token": 1,
+      "iteration": 1,
+      "total_iterations": 1,
+      "bound": false,
+      "bound_to_first": false,
+      "start_posts": 1,
+      "search_reads": 0,
+      "distinct_remote_conversations": 1,
+      "remote_initial_runs": 1,
+      "local_execution_rows": 0,
+      "intent_states": null
+    },
+    "search_unavailable": {
+      "state": "running",
+      "attempt": 2,
+      "lease_token": 3,
+      "iteration": 2,
+      "total_iterations": 2,
+      "bound": true,
+      "bound_to_first": false,
+      "start_posts": 2,
+      "search_reads": 1,
+      "distinct_remote_conversations": 2,
+      "remote_initial_runs": 2,
+      "local_execution_rows": 1,
+      "intent_states": null
+    },
+    "search_restored": {
+      "state": "running",
+      "attempt": 2,
+      "lease_token": 3,
+      "iteration": 2,
+      "total_iterations": 2,
+      "bound": true,
+      "bound_to_first": false,
+      "start_posts": 2,
+      "search_reads": 1,
+      "distinct_remote_conversations": 2,
+      "remote_initial_runs": 2,
+      "local_execution_rows": 1,
+      "intent_states": null
+    }
+  }
+}

@@ -1,0 +1,436 @@
+{
+  "scope": "Base push CI, first candidate (red), final product. Local: private PostgreSQL 16.2 and local Chromium. Hosted: Python and separate SQLx/parity PG17 jobs. Do not add job counts. CI skipped notices count summary lines, not parameter instances.",
+  "hosted": [
+    {
+      "id": 44797124264,
+      "head_sha": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+      "head_branch": "main",
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44797124264",
+      "jobs": {
+        "test": {
+          "id": 136499449472,
+          "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44797124264/job/136499449472",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T18:54:15Z",
+          "completed_at": "2026-11-20T19:04:34Z",
+          "steps": {
+            "Set up job": "success",
+            "Initialize containers": "success",
+            "Run actions/checkout@v4": "success",
+            "Run actions/setup-python@v5": "success",
+            "Runner image": "success",
+            "Install Python packages": "success",
+            "Download Chromium": "success",
+            "Start Chromium once": "success",
+            "Install Chromium system libraries (only when it did not start)": "skipped",
+            "Lint": "success",
+            "Test": "success",
+            "Test report": "success",
+            "Post Run actions/setup-python@v5": "success",
+            "Post Run actions/checkout@v4": "success",
+            "Stop containers": "success",
+            "Complete job": "success"
+          },
+          "notices": [
+            {
+              "title": "skipped",
+              "message": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "title": "skipped",
+              "message": "      9 requires SQLx claim probe and isolated PostgreSQL"
+            },
+            {
+              "title": "skipped",
+              "message": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "title": "skipped",
+              "message": "      3 mingw-w64 is not installed"
+            },
+            {
+              "title": "skipped",
+              "message": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "title": "pytest",
+              "message": "2102 passed, 19 skipped, 1 warning in 571.07s (0:09:31)"
+            },
+            {
+              "title": "Chromium",
+              "message": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "title": "Playwright",
+              "message": "Version 1.65.2"
+            },
+            {
+              "title": "Runner image",
+              "message": "Ubuntu 26.04.1 LTS (image ubuntu26 20261116.202.1); pg_dump (PostgreSQL) 18.7 (Ubuntu 18.7-1.pgdg26.04+2)"
+            }
+          ],
+          "annotations_url": "https://api.github.com/repos/Pavel1778/python-dispetcher/check-runs/136499449472/annotations"
+        },
+        "rust": {
+          "id": 136499449899,
+          "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44797124264/job/136499449899",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T18:54:15Z",
+          "completed_at": "2026-11-20T18:56:17Z",
+          "steps": {
+            "Set up job": "success",
+            "Initialize containers": "success",
+            "Run actions/checkout@v4": "success",
+            "Install Rust (stable)": "success",
+            "Build the Rust workspace": "success",
+            "Rust tests": "success",
+            "Run actions/setup-python@v5": "success",
+            "Install Python packages for the parity test": "success",
+            "Python/Rust parity": "success",
+            "Measure successful storage grants": "success",
+            "Parity report": "success",
+            "Post Run actions/setup-python@v5": "success",
+            "Post Run actions/checkout@v4": "success",
+            "Stop containers": "success",
+            "Complete job": "success"
+          },
+          "notices": [
+            {
+              "title": "parity",
+              "message": "22 passed in 1.92s"
+            },
+            {
+              "title": "Rust toolchain",
+              "message": "rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05)"
+            }
+          ],
+          "annotations_url": "https://api.github.com/repos/Pavel1778/python-dispetcher/check-runs/136499449899/annotations",
+          "bench_checkout_and_pr_head": "e866666fb69a13e0edc0c7670b9f56e3561b34c0"
+        }
+      }
+    },
+    {
+      "id": 44800690361,
+      "head_sha": "419e2a846e9912897d1a2d77658e0d5c3a8e5cdc",
+      "head_branch": "arena/75afb703-python-dispetcher",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44800690361",
+      "jobs": {
+        "rust": {
+          "id": 136511741841,
+          "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44800690361/job/136511741841",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T19:17:11Z",
+          "completed_at": "2026-11-20T19:19:13Z",
+          "steps": {
+            "Set up job": "success",
+            "Initialize containers": "success",
+            "Run actions/checkout@v4": "success",
+            "Verify tested revision": "success",
+            "Install Rust (stable)": "success",
+            "Build the Rust workspace": "success",
+            "Rust tests": "success",
+            "Run actions/setup-python@v5": "success",
+            "Install Python packages for the parity test": "success",
+            "Python/Rust parity": "success",
+            "Measure successful storage grants": "success",
+            "Parity report": "success",
+            "Post Run actions/setup-python@v5": "success",
+            "Post Run actions/checkout@v4": "success",
+            "Stop containers": "success",
+            "Complete job": "success"
+          },
+          "notices": [
+            {
+              "title": "parity",
+              "message": "28 passed in 2.50s"
+            },
+            {
+              "title": "Rust toolchain",
+              "message": "rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05)"
+            },
+            {
+              "title": "Tested commit",
+              "message": "419e2a846e9912897d1a2d77658e0d5c3a8e5cdc"
+            }
+          ],
+          "annotations_url": "https://api.github.com/repos/Pavel1778/python-dispetcher/check-runs/136511741841/annotations",
+          "bench_checkout_and_pr_head": "419e2a846e9912897d1a2d77658e0d5c3a8e5cdc"
+        },
+        "test": {
+          "id": 136511742531,
+          "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44800690361/job/136511742531",
+          "status": "completed",
+          "conclusion": "failure",
+          "started_at": "2026-11-20T19:17:11Z",
+          "completed_at": "2026-11-20T19:25:21Z",
+          "steps": {
+            "Set up job": "success",
+            "Initialize containers": "success",
+            "Run actions/checkout@v4": "success",
+            "Verify tested revision": "success",
+            "Run actions/setup-python@v5": "success",
+            "Runner image": "success",
+            "Install Python packages": "success",
+            "Download Chromium": "success",
+            "Start Chromium once": "success",
+            "Install Chromium system libraries (only when it did not start)": "skipped",
+            "Lint": "success",
+            "Test": "failure",
+            "Test report": "success",
+            "Post Run actions/setup-python@v5": "skipped",
+            "Post Run actions/checkout@v4": "success",
+            "Stop containers": "success",
+            "Complete job": "success"
+          },
+          "notices": [
+            {
+              "title": "skipped",
+              "message": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "title": "skipped",
+              "message": "     10 requires SQLx claim probe and isolated PostgreSQL"
+            },
+            {
+              "title": "skipped",
+              "message": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "title": "skipped",
+              "message": "      3 mingw-w64 is not installed"
+            },
+            {
+              "title": "skipped",
+              "message": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "title": "test",
+              "message": "FAILED tests/test_openhands_connections.py::test_a_backup_takes_over_while_the_primary_is_down_and_gives_work_back - AssertionError: assert {} == {'first': 'B'}"
+            },
+            {
+              "title": "pytest",
+              "message": "1 failed, 2119 passed, 25 skipped, 1 warning in 454.63s (0:07:34)"
+            },
+            {
+              "title": "Chromium",
+              "message": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "title": "Playwright",
+              "message": "Version 1.65.2"
+            },
+            {
+              "title": "Runner image",
+              "message": "Ubuntu 26.04.1 LTS (image ubuntu26 20261111.196.1); pg_dump (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg26.04+2)"
+            },
+            {
+              "title": "Tested commit",
+              "message": "419e2a846e9912897d1a2d77658e0d5c3a8e5cdc"
+            }
+          ],
+          "annotations_url": "https://api.github.com/repos/Pavel1778/python-dispetcher/check-runs/136511742531/annotations"
+        }
+      }
+    },
+    {
+      "id": 44802716516,
+      "head_sha": "a5983a3562ee61bcf49358dbd30289b7629e8e39",
+      "head_branch": "arena/75afb703-python-dispetcher",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44802716516",
+      "jobs": {
+        "rust": {
+          "id": 136518714922,
+          "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44802716516/job/136518714922",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T19:30:16Z",
+          "completed_at": "2026-11-20T19:32:15Z",
+          "steps": {
+            "Set up job": "success",
+            "Initialize containers": "success",
+            "Run actions/checkout@v4": "success",
+            "Verify tested revision": "success",
+            "Install Rust (stable)": "success",
+            "Build the Rust workspace": "success",
+            "Rust tests": "success",
+            "Run actions/setup-python@v5": "success",
+            "Install Python packages for the parity test": "success",
+            "Python/Rust parity": "success",
+            "Measure successful storage grants": "success",
+            "Parity report": "success",
+            "Post Run actions/setup-python@v5": "success",
+            "Post Run actions/checkout@v4": "success",
+            "Stop containers": "success",
+            "Complete job": "success"
+          },
+          "notices": [
+            {
+              "title": "parity",
+              "message": "28 passed in 3.52s"
+            },
+            {
+              "title": "Rust toolchain",
+              "message": "rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05)"
+            },
+            {
+              "title": "Tested commit",
+              "message": "a5983a3562ee61bcf49358dbd30289b7629e8e39"
+            }
+          ],
+          "annotations_url": "https://api.github.com/repos/Pavel1778/python-dispetcher/check-runs/136518714922/annotations",
+          "bench_checkout_and_pr_head": "a5983a3562ee61bcf49358dbd30289b7629e8e39"
+        },
+        "test": {
+          "id": 136518715243,
+          "html_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44802716516/job/136518715243",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T19:30:17Z",
+          "completed_at": "2026-11-20T19:38:59Z",
+          "steps": {
+            "Set up job": "success",
+            "Initialize containers": "success",
+            "Run actions/checkout@v4": "success",
+            "Verify tested revision": "success",
+            "Run actions/setup-python@v5": "success",
+            "Runner image": "success",
+            "Install Python packages": "success",
+            "Download Chromium": "success",
+            "Start Chromium once": "success",
+            "Install Chromium system libraries (only when it did not start)": "skipped",
+            "Lint": "success",
+            "Test": "success",
+            "Test report": "success",
+            "Post Run actions/setup-python@v5": "success",
+            "Post Run actions/checkout@v4": "success",
+            "Stop containers": "success",
+            "Complete job": "success"
+          },
+          "notices": [
+            {
+              "title": "skipped",
+              "message": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "title": "skipped",
+              "message": "     10 requires SQLx claim probe and isolated PostgreSQL"
+            },
+            {
+              "title": "skipped",
+              "message": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "title": "skipped",
+              "message": "      3 mingw-w64 is not installed"
+            },
+            {
+              "title": "skipped",
+              "message": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "title": "pytest",
+              "message": "2126 passed, 25 skipped, 1 warning in 471.25s (0:07:51)"
+            },
+            {
+              "title": "Chromium",
+              "message": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "title": "Playwright",
+              "message": "Version 1.65.2"
+            },
+            {
+              "title": "Runner image",
+              "message": "Ubuntu 26.04.1 LTS (image ubuntu26 20261116.88.1); pg_dump (PostgreSQL) 18.7 (Ubuntu 18.7-1.pgdg26.04+2)"
+            },
+            {
+              "title": "Tested commit",
+              "message": "a5983a3562ee61bcf49358dbd30289b7629e8e39"
+            }
+          ],
+          "annotations_url": "https://api.github.com/repos/Pavel1778/python-dispetcher/check-runs/136518715243/annotations"
+        }
+      }
+    }
+  ],
+  "local": [
+    {
+      "revision": "419e2a846e9912897d1a2d77658e0d5c3a8e5cdc",
+      "tests": 2145,
+      "failures": 2,
+      "errors": 0,
+      "skipped": 38,
+      "passed": 2105,
+      "junit_wall_seconds": 451.727,
+      "junit_sha256": "d020da60a05b99d571d4e7bfc458d48803877138d912c08216708e5234b7f512",
+      "pytest_summary": "2 failed, 2105 passed, 38 skipped in 451.74s (0:07:31)",
+      "skip_reasons": {
+        "Android SDK build-tools are not installed": 4,
+        "BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids.": 1,
+        "mingw-w64 is not installed": 3,
+        "no Rust toolchain (set NEXUS_RUST_BIN to an already-built nexus-rs)": 9,
+        "no local agent-server on :60000 in this environment": 1,
+        "requires SQLx claim probe and isolated PostgreSQL": 19,
+        "set TEST_POOLER_DSN to a transaction-mode pooler to run this": 1
+      },
+      "failed_cases": [
+        "tests.test_connection_concurrency::test_concurrent_access_does_not_error_or_leak_connections[10]",
+        "tests.test_openhands_connections::test_a_backup_takes_over_while_the_primary_is_down_and_gives_work_back"
+      ]
+    },
+    {
+      "revision": "a5983a3562ee61bcf49358dbd30289b7629e8e39",
+      "tests": 2151,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 38,
+      "passed": 2113,
+      "junit_wall_seconds": 443.801,
+      "junit_sha256": "f923a104c8620171cd48349b04acf2565ec3c5dd1ba104e71f58d9d3d78b887c",
+      "pytest_summary": "2113 passed, 38 skipped in 443.81s (0:07:23)",
+      "skip_reasons": {
+        "Android SDK build-tools are not installed": 4,
+        "BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids.": 1,
+        "mingw-w64 is not installed": 3,
+        "no Rust toolchain (set NEXUS_RUST_BIN to an already-built nexus-rs)": 9,
+        "no local agent-server on :60000 in this environment": 1,
+        "requires SQLx claim probe and isolated PostgreSQL": 19,
+        "set TEST_POOLER_DSN to a transaction-mode pooler to run this": 1
+      },
+      "failed_cases": []
+    }
+  ],
+  "uncommitted_regressions_run_on_archive_of_first_candidate_before_fix": {
+    "expected_red": [
+      "delayed_reverify_does_not_hold_a_replacement_attempt: retry_at set on replacement",
+      "timeout_at_cycle_ceiling_settles_failure_with_durable_stop: parent remained running",
+      "two_result_observers_report_one_account_recovery: 2 recovered events, expected 1"
+    ],
+    "summary": "3 failed, 31 deselected in 2.20s"
+  },
+  "focused_before_product_commit": {
+    "summary": "197 passed in 44.30s",
+    "tests": [
+      "test_dispatch_durability",
+      "test_openhands_connections",
+      "test_openhands_failover",
+      "test_start_handover",
+      "test_durable_runs",
+      "test_lab_evidence",
+      "test_conversation_cleanup",
+      "test_lab_worker_process"
+    ]
+  }
+}

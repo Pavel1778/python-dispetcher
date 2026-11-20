@@ -1,0 +1,47 @@
+{
+  "reference": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+  "candidate": "a5983a3562ee61bcf49358dbd30289b7629e8e39",
+  "studio_tree": "103e6acfe8cec5220b7f1c318bb885e938e2a107",
+  "chromium": "153.0.8010.0",
+  "playwright": "1.65.2",
+  "comparison": "same viewport and fixture; ImageChops.difference on decoded RGB and exact SHA-256 of source assets and PNG files",
+  "decoded_rgb_identical": [
+    "desktop-agent.png",
+    "desktop-chat.png",
+    "desktop-files.png",
+    "desktop-home.png",
+    "desktop-login.png",
+    "desktop-settings.png",
+    "phone-chat.png",
+    "phone-history.png",
+    "phone-home.png"
+  ],
+  "png_sha256": {
+    "desktop-agent.png": "6e01207d58c1ea31206959b118fb1e8dee67180f636677bbfc3a3fa89296f4ac",
+    "desktop-chat.png": "dc616595bd7736988350b8c02f1ee22e6b4fc687a477aae94c13c44cfaf1ca0f",
+    "desktop-files.png": "f81187ee8c6a28384eeb6ab47e3b05dbb1bb98db691c98631927773b8f6c39fa",
+    "desktop-home.png": "4bfdbd1cc154f1178e2a5b9a00c160771eb5266b4221b02dadea102c216475bb",
+    "desktop-login.png": "aa40b5e2d5a8a10f87ed87b2168afeed20b7afb4a1581ed8fdb8fc1a965abd76",
+    "desktop-settings.png": "1d102d5b1ddddb1ead70a8edf06a8c060ce20ad6b9612da72978b932ad22d3b9",
+    "phone-chat.png": "2f50f9db48353942436c01820ead3cf90f2213a859badeff56f41e2dc83f5a12",
+    "phone-history.png": "e285d15c8ea7d0a0253494762af517aca7626557e36a38a7d3a888bce839d2d3",
+    "phone-home.png": "d40adef3ee45402146aae84ef92c1119cc158207c737f3783b5d6ad8052bd694"
+  },
+  "assets_sha256": {
+    "app.css": "7f415c48605543c01d41a35a4a03a2c1e5a9d868adfc0dac0b00b22c6181d657",
+    "app.js": "449dc599777997c7369a2aad4c51a13f3b0b8d670412c210fb9a0ffdea98c598",
+    "boot.js": "526b66b39e72b084e25bcb96df6e0e73a5f1b643e0c1c1d9bd92eb1d8dacbba5",
+    "favicon.svg": "26788f05d1b092449d5cccc9828541906c15a7f985ea80d6cb6cdcb8656fcae3",
+    "fonts/OFL-Inter.txt": "3b0a5fca3d17942cde889069889dedbbbd075e9b599968c82a95f4d944e9b345",
+    "fonts/OFL-JetBrainsMono.txt": "403581b69dac5cff4079205e01c6b467e56af449ecbd7247693ddb1baafa005b",
+    "fonts/inter-cyrillic.woff2": "71d5ee93cc1e9f1d520a3a8b66456de18c7879d8df09d57fcd2eaff75fef0075",
+    "fonts/inter-latin.woff2": "3100e775e8616cd2611beecfa23a4263d7037586789b43f035236a2e6fbd4c62",
+    "fonts/jetbrains-mono-cyrillic.woff2": "d274604c40757f98f07df623a8b8fb5194508a6fa4f5413a7a107f09e3b7452a",
+    "fonts/jetbrains-mono-latin.woff2": "18be452724bfdc236c074ca94a249a7f41a86752c7d04ab258ce9ed5651f6a7e",
+    "highlight.js": "93819ac90f4330d379b2da105f7b52fa87940f7a595c9d0acdb916d295e538a2",
+    "index.html": "47917cad2f940f23b01f56efe475b4caa2342077985bdba4214d3c7ee139f424",
+    "login.html": "0d2e24ac5c82f958f624dac763b5de7292c4cbc071c7174fb6aefd1937653245",
+    "login.js": "3fdd51a41b6ce21a247850d3a54d6cd30d33f0810a20431fa79ff01c3218a24a",
+    "markdown.js": "280025877e617a6c0495844e49b3dbf943182102869fbf9bd3b886dfb750b213"
+  }
+}

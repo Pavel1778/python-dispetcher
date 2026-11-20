@@ -1,0 +1,38 @@
+{
+  "scope": "Snapshot of base and measured product, before report-only commit",
+  "merge": {
+    "pr": "https://github.com/Pavel1778/python-dispetcher/pull/54",
+    "head": "992391667689f4906650dbd5b607258fd701b3a8",
+    "base_branch": "main",
+    "merge_sha": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+    "parents": [
+      "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "992391667689f4906650dbd5b607258fd701b3a8"
+    ],
+    "tree": "4073e19727a3ffac8e0ec9c88f22da0af279e70a"
+  },
+  "candidate": {
+    "pr": "https://github.com/Pavel1778/python-dispetcher/pull/55",
+    "number": 55,
+    "state": "open",
+    "draft": true,
+    "base_branch": "main",
+    "base_sha": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+    "head_branch": "arena/75afb703-python-dispetcher",
+    "head_sha": "a5983a3562ee61bcf49358dbd30289b7629e8e39"
+  },
+  "remote_heads_queried": [
+    "refs/heads/main",
+    "refs/heads/nexus/3.0-foundation",
+    "refs/heads/arena/75afb703-python-dispetcher"
+  ],
+  "remote_heads_returned": {
+    "refs/heads/arena/75afb703-python-dispetcher": "a5983a3562ee61bcf49358dbd30289b7629e8e39",
+    "refs/heads/main": "e866666fb69a13e0edc0c7670b9f56e3561b34c0"
+  },
+  "old_studio_tree": "103e6acfe8cec5220b7f1c318bb885e938e2a107",
+  "product_studio_tree": "103e6acfe8cec5220b7f1c318bb885e938e2a107",
+  "migrations_diff": [
+    "A\tmigrations/0043_lab_dispatch.sql"
+  ]
+}

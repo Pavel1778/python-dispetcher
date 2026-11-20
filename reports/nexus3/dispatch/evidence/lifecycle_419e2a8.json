@@ -1,0 +1,55 @@
+{
+  "revision": "419e2a846e9912897d1a2d77658e0d5c3a8e5cdc",
+  "harness_sha256": "a8bb6743594aa4f833592604916b82cf2ce66216fd8ab38db75aaee398471cb5",
+  "python": "3.11.2",
+  "pg": 160002,
+  "trials": [
+    {
+      "tasks": 100,
+      "wall_s": 2.2905,
+      "tasks_s": 43.66,
+      "p50_ms": 21.485,
+      "p95_ms": 26.033,
+      "p99_ms": 37.452,
+      "worker_peak_rss_kib": 52672,
+      "cpu_user_s": 0.7012,
+      "cpu_sys_s": 0.168,
+      "store_execute_calls": 5243,
+      "transactions": 2527,
+      "provider_executions": 100,
+      "signatures_checked": 101
+    },
+    {
+      "tasks": 100,
+      "wall_s": 2.4426,
+      "tasks_s": 40.94,
+      "p50_ms": 22.501,
+      "p95_ms": 31.375,
+      "p99_ms": 36.218,
+      "worker_peak_rss_kib": 52752,
+      "cpu_user_s": 0.6986,
+      "cpu_sys_s": 0.1982,
+      "store_execute_calls": 5243,
+      "transactions": 2527,
+      "provider_executions": 100,
+      "signatures_checked": 101
+    },
+    {
+      "tasks": 100,
+      "wall_s": 2.3885,
+      "tasks_s": 41.87,
+      "p50_ms": 22.079,
+      "p95_ms": 30.466,
+      "p99_ms": 37.637,
+      "worker_peak_rss_kib": 52600,
+      "cpu_user_s": 0.6819,
+      "cpu_sys_s": 0.2065,
+      "store_execute_calls": 5243,
+      "transactions": 2527,
+      "provider_executions": 100,
+      "signatures_checked": 101
+    }
+  ],
+  "scope": "Sequential dependent no-change audits; HTTP doubles; verified head, signed task result and run; one new worker process per round. Tight tick_once loop, no QA build or live provider latency.",
+  "metrics": "Nearest-rank claim entry to task signature commit; throughput and CPU across ticks including confirmation/maintenance; peak RSS whole worker process, not PG/fixture servers. Count worker Store cursor.execute calls, exclude transaction protocol/pool housekeeping."
+}

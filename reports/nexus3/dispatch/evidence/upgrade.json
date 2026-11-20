@@ -1,0 +1,91 @@
+{
+  "base": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+  "candidate": "a5983a3562ee61bcf49358dbd30289b7629e8e39",
+  "postgres": "16.2",
+  "base_counts": {
+    "columns": 603,
+    "indexes": 164,
+    "foreign_keys": 89,
+    "tables": 51,
+    "migrations": 43
+  },
+  "candidate_counts": {
+    "columns": 621,
+    "indexes": 172,
+    "foreign_keys": 94,
+    "tables": 54,
+    "migrations": 44
+  },
+  "base_catalog_matches_reference": true,
+  "existing_table_shapes_and_migration_hashes_unchanged": true,
+  "first_apply": [
+    "0043_lab_dispatch.sql"
+  ],
+  "second_apply": [],
+  "verify_schema_missing": [],
+  "migration_sha256": "60a61b99d474a5c8801ca2ebb7d692f09528e1ecee11a6f3c0503fd39f29a215",
+  "new_tables": {
+    "nexus_dispatch_intents": {
+      "rls": true,
+      "columns": 12,
+      "indexes": 4,
+      "force_rls": false,
+      "foreign_keys": 2,
+      "shape_sha256": "6f871118ee0a89cdb5e7fe6ed6147e4bcc124b42a85a45bf6ee8d1bef67adeef"
+    },
+    "nexus_run_attestations_due": {
+      "rls": true,
+      "columns": 1,
+      "indexes": 1,
+      "force_rls": false,
+      "foreign_keys": 1,
+      "shape_sha256": "e212922be6c63a3a6ca6af4244d62838a9441b776dcee62137aef33d640dda38"
+    },
+    "nexus_task_attestations_due": {
+      "rls": true,
+      "columns": 5,
+      "indexes": 3,
+      "force_rls": false,
+      "foreign_keys": 2,
+      "shape_sha256": "acafd66d8b1915ccd890456ae202e28068a9a14d6d3ced76da2c297def4d0eb2"
+    }
+  },
+  "role_checks": [
+    {
+      "role": "anon",
+      "rel": "nexus_dispatch_intents",
+      "any_privilege": false
+    },
+    {
+      "role": "anon",
+      "rel": "nexus_run_attestations_due",
+      "any_privilege": false
+    },
+    {
+      "role": "anon",
+      "rel": "nexus_task_attestations_due",
+      "any_privilege": false
+    },
+    {
+      "role": "authenticated",
+      "rel": "nexus_dispatch_intents",
+      "any_privilege": false
+    },
+    {
+      "role": "authenticated",
+      "rel": "nexus_run_attestations_due",
+      "any_privilege": false
+    },
+    {
+      "role": "authenticated",
+      "rel": "nexus_task_attestations_due",
+      "any_privilege": false
+    }
+  ],
+  "old_expired_pending_start": {
+    "seen_by_recovery": true,
+    "reclaimed": false,
+    "second_grant": false,
+    "state_lease_attempt_budget_and_receipt_unchanged": true
+  }
+}

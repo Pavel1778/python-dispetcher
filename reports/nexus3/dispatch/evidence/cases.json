@@ -1,0 +1,132 @@
+{
+  "source": "filtered completed local full-suite JUnit testcase records (not extra independent test runs)",
+  "revision": "a5983a3562ee61bcf49358dbd30289b7629e8e39",
+  "junit_sha256": "f923a104c8620171cd48349b04acf2565ec3c5dd1ba104e71f58d9d3d78b887c",
+  "cases": [
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[before_intent_commit-None-0]",
+      "result": "passed",
+      "seconds": 0.829
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[prepared_before_send-prepared-0]",
+      "result": "passed",
+      "seconds": 0.889
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[accepted_before_read-sending-1]",
+      "result": "passed",
+      "seconds": 0.842
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[id_before_receipt-sending-1]",
+      "result": "passed",
+      "seconds": 0.79
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[receipt_before_bind-identified-1]",
+      "result": "passed",
+      "seconds": 0.882
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[bind_before_running-identified-1]",
+      "result": "passed",
+      "seconds": 0.86
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[verdict_before_signature-bound-1]",
+      "result": "passed",
+      "seconds": 0.886
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[signature_before_ack-bound-1]",
+      "result": "passed",
+      "seconds": 0.813
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_worker_crash_and_two_replacements_finish_one_signed_dag[terminal_before_acceptance-bound-2]",
+      "result": "passed",
+      "seconds": 0.855
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_armed_but_not_sent_is_uncertain_not_a_license_to_post",
+      "result": "passed",
+      "seconds": 0.683
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_late_response_after_takeover_and_concurrent_reconcile",
+      "result": "passed",
+      "seconds": 0.458
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_missing_async_receipt_search_outage_and_late_visibility",
+      "result": "passed",
+      "seconds": 0.439
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_revoked_unknown_keeps_branch_until_late_receipt_owes_a_stop",
+      "result": "passed",
+      "seconds": 0.479
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_lost_continuation_ack_requires_exact_user_event_not_the_old_result",
+      "result": "passed",
+      "seconds": 0.458
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_scoped_create_has_one_external_execution_after_lost_reply[direct]",
+      "result": "passed",
+      "seconds": 0.185
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_scoped_create_has_one_external_execution_after_lost_reply[local]",
+      "result": "passed",
+      "seconds": 0.18
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_verified_failure_is_signed_and_child_stays_gated",
+      "result": "passed",
+      "seconds": 0.453
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_expired_prepared_grant_cannot_send_or_disarm_its_successor",
+      "result": "passed",
+      "seconds": 0.482
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_delayed_reverify_does_not_hold_a_replacement_attempt",
+      "result": "passed",
+      "seconds": 0.442
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_timeout_at_cycle_ceiling_settles_failure_with_durable_stop",
+      "result": "passed",
+      "seconds": 0.448
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_broken_signer_keeps_both_obligations_until_task_signature_is_written",
+      "result": "passed",
+      "seconds": 0.478
+    },
+    {
+      "case": "tests.test_dispatch_durability::test_result_read_on_wrong_endpoint_or_malformed_response_does_not_advance_dag",
+      "result": "passed",
+      "seconds": 0.478
+    },
+    {
+      "case": "tests.test_openhands_connections::test_a_backup_takes_over_while_the_primary_is_down_and_gives_work_back",
+      "result": "passed",
+      "seconds": 0.176
+    },
+    {
+      "case": "tests.test_openhands_connections::test_503_from_start_never_fails_over_without_proof",
+      "result": "passed",
+      "seconds": 0.116
+    },
+    {
+      "case": "tests.test_openhands_failover::test_two_result_observers_report_one_account_recovery",
+      "result": "passed",
+      "seconds": 0.085
+    }
+  ]
+}
