@@ -169,6 +169,22 @@ the user turn is still stored. That is correct — a missing provider is said, n
 faked — but it means a "write latency" measured without keys is the failure
 path, not a turn. Measure a turn only with a working provider (as above).
 
+### Re-measured on the merged build (same session)
+
+After PR #53 was merged into `main` and `main` merged back into this branch, the
+same read mix was measured again with the same instrument on the merged code:
+
+| clients | throughput | p50 | p90 | p99 | errors |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 1 224 req/s | 3.16 ms | 4.85 ms | 7.31 ms | 0 |
+| 16 | 1 074 req/s | 6.22 ms | 9.47 ms | 14.15 ms | 0 |
+
+That is the same band as the pre-merge run (1 340 / 1 069 req/s) within
+run-to-run noise on a shared 4-core box. **The merge did not regress the read
+paths**, and this instrument shows no measurable speedup from it either — the
+optimisations in section 6 are measured by `benchmarks/`, not by this mix, and
+no claim is made here that the two agree.
+
 ## What was not done, and why
 
 - **No language migration.** A Go/Rust rewrite of the API would not move these
