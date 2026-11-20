@@ -25,7 +25,10 @@ fn run_no_op_is_allowed_and_unknown_target_is_refused() {
         RunState::Completed,
         RunState::Cancelled,
     ] {
-        assert!(can_transition_run(s, s), "a no-op must be allowed for {s:?}");
+        assert!(
+            can_transition_run(s, s),
+            "a no-op must be allowed for {s:?}"
+        );
     }
     assert!(can_transition_run(RunState::Running, RunState::Cancelled));
     assert!(can_transition_run(RunState::Blocked, RunState::Running));
@@ -74,8 +77,14 @@ fn executing_is_reachable_only_from_awaiting_approval() {
 #[test]
 fn control_plane_terminal_states_have_no_exit() {
     assert!(can_transition_task(TaskState::Queued, TaskState::Assigned));
-    assert!(!can_transition_task(TaskState::Completed, TaskState::Queued));
-    assert!(!can_transition_task(TaskState::Cancelled, TaskState::Queued));
+    assert!(!can_transition_task(
+        TaskState::Completed,
+        TaskState::Queued
+    ));
+    assert!(!can_transition_task(
+        TaskState::Cancelled,
+        TaskState::Queued
+    ));
     assert!(can_transition_task(
         TaskState::Recovering,
         TaskState::Completed
@@ -163,7 +172,7 @@ fn cycle_wait_doubles_and_is_capped() {
     assert_eq!(cycle_wait(3, "", 60, 3600), 240.0);
     assert_eq!(cycle_wait(40, "", 60, 3600), 3600.0);
     let with_seed = cycle_wait(1, "task-1", 60, 3600);
-    assert!(with_seed >= 60.0 && with_seed < 66.0, "{with_seed}");
+    assert!((60.0..66.0).contains(&with_seed), "{with_seed}");
 }
 
 #[test]

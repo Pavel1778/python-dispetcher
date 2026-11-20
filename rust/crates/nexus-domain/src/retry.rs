@@ -109,7 +109,7 @@ pub fn refused_wait(retry_after: Option<f64>, daily: bool, refusals: i64) -> f64
     } else {
         REFUSED_BASE_SECONDS
     };
-    let exponent = refusals.max(0).min(20) as i32;
+    let exponent = refusals.clamp(0, 20) as i32;
     ((first as f64) * 2f64.powi(exponent)).min(REFUSED_MAX_SECONDS as f64)
 }
 
