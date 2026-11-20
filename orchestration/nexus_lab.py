@@ -41,10 +41,12 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from .execution_profiles import ProfileBlocked
 from .cloud_client import (
     CloudAuthError,
     CloudError,
@@ -383,6 +385,11 @@ class OpenHandsExecutor:
         """
         if self.router is None:
             return self.client, None
+        profiles = getattr(self.client, 'execution_profiles', None)
+        if profiles is not None:
+            row = profiles.effective(task.get('project_id'), task.get('id'))
+            if row and row['desired']['connection_id']:
+                task = {**task, 'preferred_account_id': row['desired']['connection_id']}
         account = self.router.select_for_task(task)
         if account is None:
             # No stored executor serves this project: the server's own key.
@@ -514,6 +521,12 @@ class OpenHandsExecutor:
           and adopted, so the same work is not started twice;
         * otherwise a **new conversation** is started.
         """
+        last = (task.get('evidence') or [None])[-1]
+        if self.journal and isinstance(last, dict) and last.get('reclaimed') and not last.get('proven_unsent'):
+            # Already-pending pre-upgrade row. No original endpoint/attempt receipt persisted.
+            self.journal.arm(task, {'legacy_no_receipt': True})
+            self.journal.uncertain(task['_intent_id'])
+            raise DispatchHeld('legacy dispatch held: original receipt required')
         continued = self._continue(task)
         if continued is not None:
             return continued
@@ -532,7 +545,7 @@ class OpenHandsExecutor:
                 # conversation that would only fail inside the sandbox.
                 self.router.ensure_authorized(task, account_id, client)
             return self._dispatch_with(client, account_id, task)
-        except DispatchError:
+        except (DispatchError, ProfileBlocked):
             raise
         except CloudError as e:
             if account_id is None:
@@ -556,6 +569,8 @@ class OpenHandsExecutor:
         # rather than restarts: the new executor is told what is done.
         initial = self._initial_message(task, delivery, account_id)
         extra: dict[str, Any] = {}
+        if getattr(client, 'execution_profiles', None) is not None:
+            extra['profile_scope'] = (str(task['project_id']), str(task['id']))
         if delivery is not None and delivery.files:
             extra["files"] = delivery.files
         # The Git credential, when one can be resolved: without it a task that
@@ -777,9 +792,9 @@ class OpenHandsExecutor:
         except CloudError as e:
             log.warning("task %s: the start left by another worker could not be asked: %s",
                         task.get("task_key"), type(e).__name__)
-            return None
-        if current is None:
-            return None  # lost receipt, not a terminal rejection
+            raise DispatchHeld('legacy receipt unavailable; not sending') from e
+        if current is None or str(current.id) != str(start['start_task_id']):
+            raise DispatchHeld('legacy receipt not found; not sending')
         if getattr(current, "failed", False):
             reason = f"start task failed: {getattr(current, 'detail', '')}"
             if account_id is None:
@@ -890,28 +905,21 @@ class OpenHandsExecutor:
         last = evidence[-1] if evidence else None
         if not (isinstance(last, dict) and last.get("reclaimed")):
             return None
-        search = getattr(client, "search_conversations", None)
-        if search is None:
-            return None
+        search = getattr(client, 'search_conversations', None)
+        if search is None or self.router or self._client_factory:
+            raise DispatchHeld('cannot establish the original legacy connection')
+        expected = {'nexusrun': str(task['run_id'])[:40], 'nexustask': task['task_key'][:40],
+                    'nexusattempt': f"c{last['cycle']}a{last['attempt']}"}
+        known = {str(e.get('conversation_id')) for e in evidence if isinstance(e, dict)}
         try:
-            found, _next = search(limit=50, tag=("nexusrun", str(task["run_id"])[:40]))
-        except CloudError as e:
-            log.warning("could not look for an orphaned conversation of task %s: %s",
-                        task["task_key"], type(e).__name__)
-            return None
-        known = {str(item.get("conversation_id")) for item in evidence
-                 if isinstance(item, dict) and item.get("conversation_id")}
-        for conversation in found:
-            if (conversation.tags or {}).get("nexustask") != task["task_key"][:40]:
-                continue
-            if str(conversation.id) in known:
-                continue                   # an attempt that is already over
-            if conversation.execution_status in _STOPPED - {"finished"}:
-                continue
-            log.info("task %s: adopted conversation %s started by a lost worker",
-                     task["task_key"], conversation.id)
-            return Dispatched(str(conversation.id), None, account_id, "adopted")
-        return None
+            found, more = search(limit=50, tag=('nexusrun', expected['nexusrun']))
+        except CloudError as exc:
+            raise DispatchHeld('legacy discovery unavailable; not sending') from exc
+        candidates = {str(c.id) for c in found if c.id and str(c.id) not in known
+                      and all((c.tags or {}).get(k) == v for k, v in expected.items())}
+        if more or len(candidates) != 1:
+            raise DispatchHeld('legacy discovery incomplete or ambiguous; not sending')
+        return Dispatched(candidates.pop(), None, account_id, 'adopted')
 
     def conversation_state(self, target: dict) -> str:
         """What *target*'s conversation is doing: its execution status,
@@ -1607,8 +1615,7 @@ class LabScheduler:
         #: project's own checks against the exact commit the Git verifier just
         #: accepted. It can only *downgrade* a ``completed_verified`` verdict -
         #: a failing required check makes the task ``completed_unverified`` so it
-        #: is reworked; a skipped or blocked run never upgrades anything and
-        #: never turns a pass into a failure (the tooling may simply be absent).
+        #: reworked. An unavailable required check cannot attest a pass.
         #: ``None`` (the default) leaves the loop exactly as it was.
         self.quality_gate = quality_gate
 
@@ -1633,55 +1640,32 @@ class LabScheduler:
             return float(self.start_wait(refused))
 
     def _apply_quality_gate(self, task: dict, verdict: Verification) -> Verification:
-        """QUALITY GATE: run the project's own checks against the accepted commit.
-
-        This is the one stage that separates "a commit landed" (what
-        ``GitVerifier`` proves) from "the project still works". It runs the
-        deterministic ``SelfQa`` engine on the exact ``remote_sha`` the Git
-        verifier just read, and can only make a verdict *weaker*:
-
-        * ``failed`` (a required check exited non-zero) downgrades
-          ``completed_verified`` to ``completed_unverified`` with
-          ``retry="followup"``, so the scheduler reworks it;
-        * ``passed`` leaves the verdict as it was;
-        * ``skipped``/``blocked`` (no tooling, no network) leave it as it was -
-          an absent check is never a pass and never a failure.
-
-        It only runs when a gate is configured *and* the verdict is a verified
-        one with a readable commit; anything else is returned untouched. A gate
-        that raises is logged and ignored: the task's own verdict stands, and a
-        broken checker must not stall a run. The gate never sees a credential -
-        ``SelfQa`` strips NEXUS secrets from the child environment.
-        """
+        """Only the current verifier invocation may attest successful required checks."""
+        from .nexus_selfqa import QaReport, checked_receipt
         gate = self.quality_gate
         if gate is None or verdict.verdict not in VERIFIED_VERDICTS:
             return verdict
-        commit = str(verdict.evidence.get("remote_sha") or "")
-        repository = task.get("repository") or ""
-        if not commit or not repository:
+        commit = str(verdict.evidence.get('remote_sha') or '')
+        repository = task.get('repository') or ''
+        if not repository:
             return verdict
+        binding = {k: str(task.get(k) or '') for k in ('project_id', 'run_id', 'id', 'lease_token')}
+        binding['invocation'] = str(uuid.uuid4())
+        before = time.time()
         try:
-            qa = gate.run(repository=repository, commit=commit,
-                          project_id=str(task.get("project_id") or ""),
-                          branch=task.get("branch") or None)
-        except Exception as e:  # noqa: BLE001 - the gate must not stall a run
-            log.warning("quality gate failed for task %s: %s",
-                        task.get("task_key"), type(e).__name__)
-            return verdict
-        summary = qa.as_dict() if hasattr(qa, "as_dict") else dict(qa)
-        evidence = {**verdict.evidence, "self_qa": {
-            "verdict": summary.get("verdict"), "reason": summary.get("reason"),
-            "checks": [{"name": c.get("name"), "status": c.get("status"),
-                        "exit_code": c.get("exit_code")}
-                       for c in summary.get("checks", [])],
-        }}
-        if summary.get("verdict") == "failed":
-            return Verification(
-                "completed_unverified",
-                f"self-QA failed: {summary.get('reason') or 'a required check failed'}",
-                evidence, retry="followup")
-        # passed / skipped / blocked: the verdict stands, unchanged.
-        return Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
+            qa = gate.run(repository=repository, commit=commit, project_id=binding['project_id'],
+                          branch=task.get('branch') or None, binding=binding)
+            if not isinstance(qa, QaReport):
+                raise ValueError('untrusted QA source')
+            summary = checked_receipt(qa, binding, repository, commit, before, time.time())
+        except Exception as exc:  # never sign an exception or a malformed report as a pass
+            log.warning('quality gate unavailable for task %s (%s)', task.get('id'), type(exc).__name__)
+            summary = {'verdict': 'blocked', 'reason': 'missing or inconsistent check evidence'}
+        evidence = {**verdict.evidence, 'self_qa': summary}
+        if summary.get('verdict') == 'passed' or summary.get('policy_skip'):
+            return Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
+        return Verification('completed_unverified', f"self-QA {summary['verdict']}: {summary['reason']}",
+                            evidence, retry='followup')
 
     def _attestation(self, task: dict, verdict: Verification, report: TaskReport) -> dict | None:
         if self.evidence is None and not os.environ.get('NEXUS_EVIDENCE_PRIVATE_KEY', '').strip():
@@ -1691,7 +1675,7 @@ class LabScheduler:
         fields = ('id', 'project_id', 'run_id', 'task_key', 'conversation_id', 'repository', 'branch')
         return {'task': {k: str(task[k]) if task.get(k) is not None else None for k in fields},
                 'verdict': {**verdict.as_detail(), 'evidence': {k: verdict.evidence[k] for k in
-                            ('remote_sha', 'branch', 'named_sha', 'state') if k in verdict.evidence}},
+                            ('remote_sha', 'branch', 'named_sha', 'state', 'self_qa') if k in verdict.evidence}},
                 'report': {'state': report.state, 'final_text': (report.final_text or '')[:2000]}}
 
     def _deliver_attestations(self, run_id: str) -> None:
@@ -1824,7 +1808,7 @@ class LabScheduler:
             return result
         durable = run.get("policy") == "durable"
         if run.get("_has_expired_unclaimed", True):
-            result.reclaimed = len(self.store.reclaim_expired(run_id))
+            result.reclaimed = len(self.store.reclaim_expired(run_id, **({'quarantine_legacy': True} if self.journal else {})))
         # A start that was accepted before the worker that asked for it was
         # replaced: its conversation is bound here, by whoever runs now.
         if run.get("_has_pending_starts", True):
@@ -2151,6 +2135,15 @@ class LabScheduler:
         except DispatchHeld as held:
             result.note = str(held)
             return True
+        except ProfileBlocked as e:
+            if self.journal and not self.journal.rejected(task):
+                return True
+            if durable:
+                self._set_aside(task, f'execution profile blocked: {e}', result)
+            else:
+                self._settle(task, Verification('blocked', str(e)), TaskReport(state='blocked'))
+                result.note = f'execution profile blocked: {e}'
+            return True
         except NoUsableAccount as e:
             if self.journal and not self.journal.rejected(task):
                 return True
@@ -2295,6 +2288,9 @@ class LabScheduler:
     def _recover_dispatch(self, run: dict, result: TickResult) -> None:
         run_id = str(run['id'])
         for intent in self.journal.recoverable(run_id):
+            if intent['context'].get('legacy_no_receipt'):
+                result.note = 'legacy send held: original route and receipt required'
+                continue
             if intent['state'] == 'prepared' and (run['state'] != 'running' or (self._stopping and self._stopping())):
                 continue  # never renew a send lease only to leave it idle
             if intent['expired']:
@@ -2372,6 +2368,9 @@ class LabScheduler:
         for task in self.store.pending_starts(run_id, legacy_only=True):
             try:
                 conversation_id = follow(task)
+            except DispatchHeld as exc:
+                result.note = str(exc)
+                continue
             except (CloudError, GitHubError) as e:
                 # The worker that asked may be alive and see the same failure:
                 # whoever takes the start off the row deals with it.

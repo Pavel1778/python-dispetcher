@@ -183,7 +183,7 @@ def test_auto_does_not_run_when_the_declaration_cannot_be_read():
     gate, engine = _gate("auto")
     gate._declares = _Declared(None)
     report = gate.run(repository="o/n", commit="abc", project_id="p1")
-    assert report.verdict == "skipped"
+    assert report.verdict == "blocked" and not report.policy_skip
     assert "could not be read" in report.reason
     assert engine.calls == []
 
@@ -202,12 +202,13 @@ def test_the_wrapper_passes_the_project_and_branch_through():
     assert engine.calls[0]["branch"] == "feature"
 
 
-def test_an_unreadable_mode_reads_as_auto():
+def test_an_unreadable_mode_does_not_choose_a_less_restrictive_policy():
     def boom(project_id):
         raise RuntimeError("database is down")
 
     gate = ProjectQualityGate(_Engine(), mode_for=boom, declares=_Declared(True))
-    assert gate.mode("p1") == "auto"
+    with pytest.raises(RuntimeError):
+        gate.mode("p1")
 
 
 def test_declares_checks_reads_the_file_through_the_github_client():

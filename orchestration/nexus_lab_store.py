@@ -67,6 +67,7 @@ from typing import Any
 from .dispatch_journal import DispatchJournal, IN_DOUBT
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
 
+from .nexus_policy import SCOPE_RUN_CONTROL
 from .nexus_projects import IdempotencyConflict, ProjectService
 
 log = logging.getLogger("nexus_lab_store")
@@ -666,7 +667,7 @@ class LabStore:
         for attempt in (1, 2):
             try:
                 with self.store._tx() as cur:
-                    ProjectService._project(cur, principal, project_id)
+                    ProjectService.require_scope(cur, principal, project_id, SCOPE_RUN_CONTROL)
                     run = self._apply_run_state(cur, project_id, run_id, state,
                                                 last_error, strict=True,
                                                 actor=principal)
@@ -684,7 +685,7 @@ class LabStore:
         """Take a finished run out of the lists, or put it back. Only a run
         that is over can be hidden: one that is at work has to stay in sight."""
         with self.store._tx() as cur:
-            ProjectService._project(cur, principal, project_id)
+            ProjectService.require_scope(cur, principal, project_id, SCOPE_RUN_CONTROL)
             cur.execute("SELECT state FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
                         (run_id, project_id))
             row = cur.fetchone()
@@ -717,7 +718,7 @@ class LabStore:
         rather than silently moved to ``running`` to do nothing.
         """
         with self.store._tx() as cur:
-            ProjectService._project(cur, principal, project_id)
+            ProjectService.require_scope(cur, principal, project_id, SCOPE_RUN_CONTROL)
             cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
                         (run_id, project_id))
             row = cur.fetchone()
@@ -830,7 +831,7 @@ class LabStore:
         to run a goal twice at once.
         """
         with self.store._tx() as cur:
-            ProjectService._project(cur, principal, project_id)
+            ProjectService.require_scope(cur, principal, project_id, SCOPE_RUN_CONTROL)
             cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
                         (run_id, project_id))
             source = cur.fetchone()
@@ -867,7 +868,7 @@ class LabStore:
         key returns the goal and run it already made instead of making another.
         """
         with self.store._tx() as cur:
-            ProjectService._project(cur, principal, project_id)
+            ProjectService.require_scope(cur, principal, project_id, SCOPE_RUN_CONTROL)
             cur.execute("SELECT * FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
                         (run_id, project_id))
             source = cur.fetchone()
@@ -938,7 +939,7 @@ class LabStore:
         Returns ``{"deleted": run_id, "tasks": n}``.
         """
         with self.store._tx() as cur:
-            ProjectService._project(cur, principal, project_id)
+            ProjectService.require_scope(cur, principal, project_id, SCOPE_RUN_CONTROL)
             cur.execute("SELECT state FROM nexus_runs WHERE id=%s AND project_id=%s FOR UPDATE",
                         (run_id, project_id))
             row = cur.fetchone()
@@ -2337,7 +2338,7 @@ class LabStore:
         events.sort(key=lambda e: e["at"], reverse=True)
         return events[:limit]
 
-    def reclaim_expired(self, run_id: str) -> list[dict]:
+    def reclaim_expired(self, run_id: str, *, quarantine_legacy: bool = False) -> list[dict]:
         """Requeue tasks a worker claimed and never started (it died in between).
 
         Only a task with **no bound conversation, live intent or receipt** is taken back. Polling is
@@ -2374,15 +2375,29 @@ class LabStore:
                 (run_id,))
             for row in cur.fetchall():
                 task = self._task_row(row)
+                if quarantine_legacy:
+                    # A pre-journal grant can have crossed the wire. Only a *proven*
+                    # rejection on this very grant is a license to spend another.
+                    cur.execute("INSERT INTO nexus_dispatch_intents(task_id,run_id,lease_token,repository,branch,state,context) "
+                                "VALUES (%s,%s,%s,%s,%s,'uncertain',jsonb_build_object('legacy_no_receipt',true)) "
+                                "ON CONFLICT(task_id,lease_token) DO NOTHING RETURNING id",
+                                (task['id'], run_id, task['lease_token'], task['repository'], task['branch']))
+                    held = cur.fetchone()
+                    if held:
+                        cur.execute('UPDATE nexus_dispatch_intents SET lease_token=lease_token+1 WHERE id=%s', (held['id'],))
+                        cur.execute("UPDATE nexus_run_tasks SET lease_token=lease_token+1, lease_expires=NULL, last_error=%s WHERE id=%s",
+                                    ('Legacy dispatch has no authoritative receipt; operator reconciliation required', task['id']))
+                        continue  # the in-doubt intent now holds the branch even after cancel
                 if task["attempt"] >= task["max_attempts"] and durable:
                     cur.execute(
                         "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
                         "lease_owner=NULL, lease_token=lease_token+1, "
                         "attempt=0, cycle=cycle+1, tried_accounts='[]'::jsonb, "
                         "evidence = evidence || jsonb_build_array(jsonb_build_object("
-                        "  'reclaimed', true, 'attempt', attempt, 'cycle', cycle)), "
+                        "  'reclaimed', true, 'attempt', attempt, 'cycle', cycle) || "
+                        "  CASE WHEN %s::boolean THEN jsonb_build_object('proven_unsent',true) ELSE '{}'::jsonb END), "
                         "last_error='lease expired', updated_at=now() WHERE id=%s RETURNING *",
-                        (task["id"],))
+                        (quarantine_legacy, task["id"]))
                 elif task["attempt"] >= task["max_attempts"]:
                     cur.execute("UPDATE nexus_run_tasks SET state='failed', lease_expires=NULL, "
                                 "lease_owner=NULL, lease_token=lease_token+1, "
@@ -2393,9 +2408,10 @@ class LabStore:
                         "UPDATE nexus_run_tasks SET state='pending', lease_expires=NULL, "
                         "lease_owner=NULL, lease_token=lease_token+1, "
                         "evidence = evidence || jsonb_build_array(jsonb_build_object("
-                        "  'reclaimed', true, 'attempt', attempt, 'cycle', cycle)), "
+                        "  'reclaimed', true, 'attempt', attempt, 'cycle', cycle) || "
+                        "  CASE WHEN %s::boolean THEN jsonb_build_object('proven_unsent',true) ELSE '{}'::jsonb END), "
                         "last_error='lease expired', updated_at=now() WHERE id=%s RETURNING *",
-                        (task["id"],))
+                        (quarantine_legacy, task["id"]))
                 out.append(self._task_row(cur.fetchone()))
             return out
 

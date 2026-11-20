@@ -47,6 +47,7 @@ so :class:`~orchestration.cloud_dispatcher.CloudDispatcher`,
 from __future__ import annotations
 
 import hashlib
+import json
 import io
 import logging
 import os
@@ -114,6 +115,8 @@ class CloudDirectClient:
         timeout: float = 60.0,
         scope: str = "",
     ):
+        from .execution_profiles import ExecutionProfiles
+        self.execution_profiles = ExecutionProfiles(store)
         self.cloud = cloud
         self.store = store
         #: Whose sandboxes this client may reuse: the id of the OpenHands
@@ -352,6 +355,7 @@ class CloudDirectClient:
         agent_type: str | None = None,
         plugins: list[dict[str, Any]] | None = None,
         files: list[SandboxFile] | None = None,
+        profile_scope=(None, None),
     ) -> StartTask:
         """Provision a sandbox (or reuse one) and create the conversation on it.
 
@@ -388,16 +392,28 @@ class CloudDirectClient:
         replaced by the directory that was verified. If they cannot be placed
         exactly, nothing is created and :class:`DeliveryError` says why.
         """
-        initial_message = self._apply_repository_mode(
-            initial_message, selected_repository, selected_branch
-        )
+        profile = self.execution_profiles.select(profile_scope, self.scope, 'direct')
+        if not profile:
+            initial_message = self._apply_repository_mode(initial_message, selected_repository, selected_branch)
+        elif selected_repository and not os.getenv('NEXUS_MANAGED_CHECKOUT_ROOT'):
+            self.execution_profiles.block(profile, 'managed checkout root not configured')
         # A supplied conversation UUID is idempotent only on its ORIGINAL
         # sandbox. The lab serializes send permits; a recovery is a read.
         known = self.store.conversation_route(dispatch_id) if dispatch_id else None
+        workspace = self.workspace_key(selected_repository, selected_branch)
+        if profile:
+            # Never warm-reuse across projects, including a shared account and branch.
+            workspace = 'managed:' + hashlib.sha256(json.dumps([profile_scope[0], profile['scope'], workspace]).encode()).hexdigest()
         route = self._route_for(dispatch_id) if known else self._new_sandbox(
-            force_new=client_tools is not None,  # an Sr gets its own sandbox
-            workspace=self.workspace_key(selected_repository, selected_branch),
+            force_new=client_tools is not None or bool(profile and not selected_repository),
+            workspace=workspace,
         )
+        source = (self.profile_source(profile, route=route, requested_agent=agent_profile_id) if profile
+                  else {'agent_settings': self._sandbox_agent_settings(route)})
+        working_dir = self.working_dir
+        if profile and selected_repository:
+            working_dir = self.execution_profiles.checkout(profile, profile_scope, dispatch_id, selected_repository,
+                                                          selected_branch, lambda m,p,b: self._send(route,m,p,b))
         delivered: tuple[dict[str, Any], ...] = ()
         if files:
             directory, delivered = self._deliver_files(route, files)
@@ -407,13 +423,12 @@ class CloudDirectClient:
             # agent on a task it cannot read.
             raise DeliveryError("the message refers to delivered files, but none were sent")
         conversation_id = dispatch_id or self._conversation_id(initial_message, title)
-        agent_settings = self._sandbox_agent_settings(route)
         body: dict[str, Any] = {
             "conversation_id": conversation_id,
-            "workspace": {"kind": "LocalWorkspace", "working_dir": self.working_dir},
+            "workspace": {"kind": "LocalWorkspace", "working_dir": working_dir},
             "max_iterations": self.max_iterations,
             "confirmation_policy": {"kind": "NeverConfirm"},
-            "agent_settings": agent_settings,
+            **source,
         }
         if title:
             body["title"] = title
@@ -443,9 +458,7 @@ class CloudDirectClient:
         if status == 429:
             raise CloudRateLimited("sandbox conversation capacity full")
         if status == 422:
-            raise CloudValidationError(
-                f"create on sandbox rejected: {str(payload)[:300]}"
-            )
+            raise CloudValidationError("create on sandbox rejected (422)")
         if status not in (200, 201):
             raise CloudError(f"create on sandbox -> {status}")
         actual_id = str((payload or {}).get("id") or conversation_id)
@@ -540,6 +553,16 @@ class CloudDirectClient:
         )
         log.info("direct transport: repository task for %s via instruction", ref)
         return prefix + message
+
+    def profile_source(self, profile, *, route=None, test_model=False, requested_agent=None):
+        if route is None:
+            # A connection can own multiple project sandboxes. There is no authoritative
+            # target until dispatch: don't mutate whichever sandbox happens to be newest.
+            self.execution_profiles.block(profile, 'sandbox not assigned; reconcile on the selected create target')
+        return self.execution_profiles.reconcile(
+            profile, lambda m, p, b: self._send(route, m, p, b), test_model=test_model,
+            target='sandbox:' + hashlib.sha256(route.sandbox_id.encode()).hexdigest()[:16],
+            requested_agent=requested_agent)
 
     def _sandbox_agent_settings(self, route: SandboxRoute) -> dict[str, Any]:
         """The agent-settings document from the sandbox's own ``/api/settings``.
@@ -1046,9 +1069,16 @@ def build_cloud_client(
 
     choice = (transport or os.environ.get("OPENHANDS_TRANSPORT") or "direct").lower()
     if choice in ("app", "app-conversations", "legacy"):
-        return CloudClient()
+        from .execution_profiles import ExecutionProfiles
+        client = CloudClient()
+        client.execution_profiles = ExecutionProfiles(store)
+        return client
+    if choice == 'local':
+        from .local_runtime import LocalCloudClient, DEFAULT_WORKSPACE_ROOT
+        return LocalCloudClient(os.environ['LOCAL_AGENT_SERVER_URL'], store=store,
+                                workspace_root=os.environ.get('OHP_WORKSPACE_ROOT', DEFAULT_WORKSPACE_ROOT))
     if choice not in ("direct", "sandbox", "sandboxes"):
         raise ValueError(
-            f"unknown OPENHANDS_TRANSPORT {choice!r} (expected 'direct' or 'app')"
+            f"unknown OPENHANDS_TRANSPORT {choice!r} (expected 'direct', 'app' or 'local')"
         )
     return build_direct_client(store, **kwargs)

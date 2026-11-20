@@ -378,6 +378,7 @@ class OpenHandsClient:
         agent_settings: dict[str, Any] | None = None,
         client_tools: list[dict[str, Any]] | None = None,
         initial_message: str | None = None, tags: dict[str, str] | None = None,
+        agent_profile_id: str | None = None, agent_launch_additions: dict | None = None,
     ) -> tuple[ConversationView, bool]:
         """Create a conversation, or return the existing one.
 
@@ -406,6 +407,8 @@ class OpenHandsClient:
             body["title"] = title
         if max_iterations is not None:
             body["max_iterations"] = max_iterations
+        if agent_profile_id is not None:
+            body.update(agent_profile_id=agent_profile_id, agent_launch_additions=agent_launch_additions)
         if agent_settings is not None:
             body["agent_settings"] = agent_settings
         if client_tools is not None:
@@ -420,10 +423,7 @@ class OpenHandsClient:
             raise ApiUnavailable("conversation capacity full")
         if status == 422:
             # A validation error is a programming error, not a transient one.
-            raise ValueError(
-                "create_conversation rejected: "
-                + json.dumps(payload)[:300]
-            )
+            raise ValueError("create_conversation rejected (422)")
         if status not in (200, 201):
             raise ApiUnavailable(f"create_conversation -> {status}")
         return self._view(payload), status == 201

@@ -49,6 +49,7 @@ PUBLIC_GET = {"/login", "/login/state", "/static/login.js",
 
 # Endpoints that must require a session or bearer. Method + path.
 PROTECTED_GET = [
+    "/api/openhands/execution-profile", f"/api/v1/projects/{UUID}/execution-profile",
     "/", "/api/session", "/api/studio", "/api/dashboard", "/api/system",
     "/api/migrations", "/api/config",
     "/api/repositories", "/api/github/status", "/api/github/repositories",
@@ -96,6 +97,7 @@ PROTECTED_GET = [
     "/static/app.js.map", "/static/index.html",
 ]
 PROTECTED_POST = [
+    "/api/openhands/execution-profile", f"/api/v1/projects/{UUID}/tasks/{UUID}/execution-profile/test-model",
     "/mcp",
     "/api/repositories", "/api/repositories/sync", "/api/repositories/remove",
     "/api/workflows", f"/api/workflows/{UUID}/cancel",

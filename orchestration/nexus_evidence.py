@@ -145,7 +145,7 @@ class EvidenceService:
             "run_id": str(task.get("run_id") or ""),
             "conversation_id": task.get("conversation_id"),
             "final_text": (getattr(report, "final_text", "") or "")[:2000],
-            **{k: evidence[k] for k in ("branch", "named_sha", "state") if k in evidence},
+            **{k: evidence[k] for k in ("branch", "named_sha", "state", "self_qa") if k in evidence},
         }
         fields = dict(
             subject_kind="task",

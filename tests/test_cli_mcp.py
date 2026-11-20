@@ -156,7 +156,7 @@ def test_mcp_initialize_and_tool_list(app):
         "list_evidence", "verify_evidence",
         "list_runs", "get_run", "cancel_run", "restart_run", "duplicate_run",
         "list_run_task_outputs", "get_run_task_output",
-        "list_project_executors", "assign_project_executor",
+        "list_project_executors", "assign_project_executor", "get_execution_profile",
     }
 
 
@@ -233,7 +233,7 @@ def test_mcp_stdio_round_trip(app):
     serve(server, stdin=stdin, stdout=stdout)
     lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nexus"
-    assert len(lines[1]["result"]["tools"]) == 19
+    assert len(lines[1]["result"]["tools"]) == 20
 
 
 def test_mcp_parse_error_is_reported(app):
@@ -271,7 +271,7 @@ def test_mcp_http_initialize_and_tools(base):
     assert status == 200
     assert body["result"]["serverInfo"]["name"] == "nexus"
     status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert len(body["result"]["tools"]) == 19
+    assert len(body["result"]["tools"]) == 20
 
 
 def test_mcp_http_project_isolation(base, app):
@@ -326,3 +326,16 @@ def test_mcp_registers_restart_and_duplicate(app):
     from orchestration.nexus_policy import MCP_TOOL_SCOPES, SCOPE_RUN_CONTROL
     assert MCP_TOOL_SCOPES["restart_run"] == SCOPE_RUN_CONTROL
     assert MCP_TOOL_SCOPES["duplicate_run"] == SCOPE_RUN_CONTROL
+
+
+def test_profile_cli_uses_authenticated_http_and_distinguishes_blocked(base, monkeypatch, capsys):
+    from tests.test_execution_profile_barriers import desired
+    monkeypatch.setenv('NEXUS_URL', base)
+    monkeypatch.setenv('NEXUS_TOKEN', TOKEN)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps(desired())))
+    assert cli.main(['openhands','profile','save','--json']) == 0
+    assert json.loads(capsys.readouterr().out)['profile']['revision'] == 1
+    assert cli.main(['openhands','profile','sync','--json']) == cli.EXIT['conflict']
+    assert TOKEN not in capsys.readouterr().out
+    assert cli.main(['openhands','profile','show','--json']) == 0
+    assert json.loads(capsys.readouterr().out)['profile']['observation']['state'] == 'blocked'

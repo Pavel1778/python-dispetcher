@@ -83,6 +83,7 @@ class McpServer:
             "duplicate_run": self._duplicate_run,
             "list_run_task_outputs": self._list_run_task_outputs,
             "get_run_task_output": self._get_run_task_output,
+            "get_execution_profile": self._get_execution_profile,
             "list_project_executors": self._list_project_executors,
             "assign_project_executor": self._assign_project_executor,
         }
@@ -140,6 +141,8 @@ class McpServer:
                   {"project_id": _s("string"), "run_id": _s("string"),
                    "task_id": _s("string"), "event_id": _s("string")},
                   ["project_id", "run_id", "task_id", "event_id"]),
+            _tool("get_execution_profile", "Read the effective model and sync status for a member's project or task.",
+                  {"project_id": _s("string"), "task_id": _s("string")}, ["project_id"]),
             _tool("list_project_executors",
                   "List the OpenHands executors assigned to a project.",
                   {"project_id": _s("string")}, ["project_id"]),
@@ -210,7 +213,7 @@ class McpServer:
 
     def _dispatch_task(self, args: dict) -> Any:
         task = self.store.try_get_task(args["task_id"])
-        if task is None:
+        if task is None or not task.project_id:
             raise McpError(-32004, "not found")
         if task.project_id:
             self._member(task.project_id)
@@ -297,6 +300,15 @@ class McpServer:
         from .cloud_direct import build_cloud_client
 
         return build_cloud_client(self.store)
+
+    def _get_execution_profile(self, args: dict) -> Any:
+        from .execution_profiles import ExecutionProfiles
+        row = ExecutionProfiles(self.store).view(self.principal, project_id=args['project_id'], task_id=args.get('task_id'))
+        if not row:
+            return {'profile': None}
+        # No runtime credential handle or connection ID in the agent-facing projection.
+        return {'profile': {**{k: row['desired'][k] for k in ('model', 'provider', 'base_url', 'params')},
+                            'revision': row['revision'], 'status': row['observation']['state']}}
 
     def _list_project_executors(self, args: dict) -> Any:
         pid = args["project_id"]
@@ -413,6 +425,9 @@ def serve(server: McpServer, stdin: Any = None, stdout: Any = None) -> None:
         except json.JSONDecodeError:
             _write(stdout, {"jsonrpc": "2.0", "id": None,
                             "error": {"code": -32700, "message": "parse error"}})
+            continue
+        if not isinstance(message, dict):
+            _write(stdout, {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32600, 'message': 'invalid request'}})
             continue
         msg_id = message.get("id")
         method = message.get("method")

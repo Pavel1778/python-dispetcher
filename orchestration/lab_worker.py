@@ -317,6 +317,8 @@ class LabWorker:
                 if not registered:
                     try:
                         self.lab.register_worker(self.worker_id, kind="worker")
+                        from .execution_profiles import startup_sync
+                        startup_sync(self.store, self.client, self._client_for_account)
                         registered = True
                     except Exception:  # noqa: BLE001 - retried next pass
                         log.exception("could not register worker %s; will retry", self.worker_id)
@@ -363,6 +365,8 @@ class LabWorker:
             log.warning("could not register worker %s: %s: %s",
                         self.worker_id, type(e).__name__, e)
         try:
+            from .execution_profiles import startup_sync
+            startup_sync(self.store, self.client, self._client_for_account)
             return self.tick_once()
         finally:
             self._stop_worker_best_effort()
@@ -465,32 +469,32 @@ def build_quality_gate(store: PostgresStore | None = None, *,
             try:
                 client = identity_for({"project_id": project_id,
                                        "repository": repository})
-            except Exception as e:  # noqa: BLE001 - read as the server, honestly
+            except Exception as e:  # noqa: BLE001 - do not switch identities on an error
                 log.debug("no project identity to read %s: %s", repository,
                           type(e).__name__)
+                return None
         return declares_checks(repository, branch=branch, client=client)
 
-    def token_for(project_id: str) -> str:
-        """A Git credential for cloning the project's repository, or ""."""
+    def token_for(project_id: str, repository: str) -> str:
         if accounts is None or not project_id:
             return fallback
-        try:
-            with store._tx() as cur:
-                full_name = links.primary_repository(project_id, cur=cur) or ""
-                if not full_name:
-                    return fallback
-                principal, account_id = links.account_for_repository(
-                    project_id, full_name, cur=cur)
-            if account_id is None or principal is None:
-                return fallback
-            return accounts.resolve_token(principal, account_id) or fallback
-        except Exception as e:  # noqa: BLE001 - an anonymous clone is not fatal
-            log.debug("no quality-gate credential for %s: %s", project_id,
-                      type(e).__name__)
+        with store._tx() as cur:
+            principal, account_id = links.account_for_repository(project_id, repository, cur=cur)
+        if account_id is None:
             return fallback
+        # A revoked bound credential is not permission to use the server identity.
+        return accounts.resolve_token(principal, account_id) or ''
+
+    def allow_revision(repository: str, commit: str) -> bool:
+        # A scratch directory is not an OS sandbox. Never run candidate code as
+        # the web/worker uid solely because an agent or project owner requested it.
+        import re
+        return (re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository) is not None
+                and re.fullmatch('[0-9a-f]{40}', commit) is not None
+                and f'{repository}@{commit}' in os.getenv('NEXUS_SELFQA_TRUSTED_REVISIONS', '').split())
 
     return ProjectQualityGate(_engine(), mode_for=mode_for, declares=declares,
-                              token_for=token_for)
+                              token_for=token_for, allow_revision=allow_revision)
 
 
 def quality_gate_mode(store: PostgresStore, project_id: str) -> str:
@@ -504,15 +508,9 @@ def quality_gate_mode(store: PostgresStore, project_id: str) -> str:
 
     if not project_id:
         return "auto"
-    try:
-        with store._tx() as cur:
-            cur.execute("SELECT quality_gate FROM nexus_projects WHERE id=%s",
-                        (project_id,))
-            row = cur.fetchone()
-    except Exception as e:  # noqa: BLE001 - an unreadable mode is the default
-        log.debug("could not read the quality-gate mode of %s: %s", project_id,
-                  type(e).__name__)
-        return "auto"
+    with store._tx() as cur:
+        cur.execute('SELECT quality_gate FROM nexus_projects WHERE id=%s', (project_id,))
+        row = cur.fetchone()
     return normalise_mode(row["quality_gate"] if row else None)
 
 

@@ -182,6 +182,8 @@ class SrRuntime:
             client_tools=SrTools.tool_schemas(),
             agent_profile_id=self.agent_profile_id,
             plugins=self.plugins,
+            **({'profile_scope': ((existing or {}).get('project_id'), None)}
+               if getattr(self.client, 'execution_profiles', None) else {}),
         )
         # Record the start task before polling so a crash here is recoverable.
         self.store.bind_sr(workflow_id, start_task_id=start.id, status="starting")

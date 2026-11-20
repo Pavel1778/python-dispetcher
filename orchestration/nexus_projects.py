@@ -362,7 +362,7 @@ class ProjectService:
     def role(cur: Any, principal: str, project_id: str) -> str:
         """The caller's role in a project, or ``NotFound`` if not a member."""
         cur.execute("SELECT role FROM nexus_project_members "
-                    "WHERE project_id=%s AND principal=%s", (project_id, principal))
+                    "WHERE project_id=%s AND principal=%s FOR SHARE", (project_id, principal))
         row = cur.fetchone()
         if row is None:
             raise NotFound("project not found")
