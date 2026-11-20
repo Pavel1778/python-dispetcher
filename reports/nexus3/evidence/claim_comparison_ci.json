@@ -1,0 +1,107 @@
+{
+  "head": "0e0c82ceb93ddf35bed1bd22d365cd05f0944acd",
+  "pr_head": "fa1dae8d387a5e0a9a66de8fd447dd743c042be7",
+  "postgres": 170012,
+  "python": "3.12.16",
+  "dataset": "same cloned UUIDs; independent tasks, empty repo, no global active cap; one warm connection, statement caches off; SQL transaction only. Rust returns id/token, Python full task row.",
+  "resources": "GNU time of whole fresh driver process including startup/teardown, not PG or the host",
+  "trials": [
+    {
+      "round": 1,
+      "driver": "python",
+      "grants": 200,
+      "grants_s": 462.8,
+      "p50_ms": 1.995,
+      "p95_ms": 2.285,
+      "p99_ms": 5.331,
+      "child_cpu_user_s": 0.19,
+      "child_cpu_system_s": 0.05,
+      "child_max_rss_kib": 43640
+    },
+    {
+      "round": 1,
+      "driver": "rust",
+      "grants": 200,
+      "grants_s": 344.8,
+      "p50_ms": 2.201,
+      "p95_ms": 2.915,
+      "p99_ms": 13.444,
+      "child_cpu_user_s": 0.01,
+      "child_cpu_system_s": 0.04,
+      "child_max_rss_kib": 2936
+    },
+    {
+      "round": 2,
+      "driver": "rust",
+      "grants": 200,
+      "grants_s": 363.3,
+      "p50_ms": 2.29,
+      "p95_ms": 2.586,
+      "p99_ms": 20.347,
+      "child_cpu_user_s": 0.01,
+      "child_cpu_system_s": 0.04,
+      "child_max_rss_kib": 3044
+    },
+    {
+      "round": 2,
+      "driver": "python",
+      "grants": 200,
+      "grants_s": 112.9,
+      "p50_ms": 2.011,
+      "p95_ms": 44.185,
+      "p99_ms": 112.165,
+      "child_cpu_user_s": 0.21,
+      "child_cpu_system_s": 0.05,
+      "child_max_rss_kib": 43640
+    },
+    {
+      "round": 3,
+      "driver": "python",
+      "grants": 200,
+      "grants_s": 446.6,
+      "p50_ms": 1.94,
+      "p95_ms": 2.291,
+      "p99_ms": 12.061,
+      "child_cpu_user_s": 0.19,
+      "child_cpu_system_s": 0.05,
+      "child_max_rss_kib": 43700
+    },
+    {
+      "round": 3,
+      "driver": "rust",
+      "grants": 200,
+      "grants_s": 271.0,
+      "p50_ms": 2.222,
+      "p95_ms": 10.629,
+      "p99_ms": 29.362,
+      "child_cpu_user_s": 0.01,
+      "child_cpu_system_s": 0.04,
+      "child_max_rss_kib": 3048
+    },
+    {
+      "round": 4,
+      "driver": "rust",
+      "grants": 200,
+      "grants_s": 226.4,
+      "p50_ms": 2.245,
+      "p95_ms": 6.89,
+      "p99_ms": 52.375,
+      "child_cpu_user_s": 0.02,
+      "child_cpu_system_s": 0.04,
+      "child_max_rss_kib": 3048
+    },
+    {
+      "round": 4,
+      "driver": "python",
+      "grants": 200,
+      "grants_s": 366.1,
+      "p50_ms": 2.002,
+      "p95_ms": 5.104,
+      "p99_ms": 20.735,
+      "child_cpu_user_s": 0.21,
+      "child_cpu_system_s": 0.05,
+      "child_max_rss_kib": 43696
+    }
+  ],
+  "source": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44785548428/job/136459321657"
+}

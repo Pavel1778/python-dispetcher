@@ -1,0 +1,557 @@
+{
+  "source_sha": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+  "contract": {
+    "http": {
+      "/": {
+        "status": 303,
+        "headers": {
+          "Location": "/login"
+        },
+        "body": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "/login/state": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "signed_in": false
+        }
+      },
+      "/healthz": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "status": "ok"
+        }
+      },
+      "/readyz": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "status": "ready",
+          "database": true
+        }
+      },
+      "/static/app.css": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/css; charset=utf-8",
+          "Cache-Control": "public, max-age=300",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "bytes": 56848,
+          "sha256": "7f415c48605543c01d41a35a4a03a2c1e5a9d868adfc0dac0b00b22c6181d657"
+        }
+      },
+      "projects_no_auth": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "error": "unauthorized"
+        }
+      },
+      "foreign_project": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "error": "not found"
+        }
+      },
+      "mcp_no_auth": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "error": "unauthorized"
+        }
+      },
+      "mcp_parse_error": {
+        "status": 400,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "parse error"
+          }
+        }
+      }
+    },
+    "mcp_http": [
+      {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+              "tools": {
+                "listChanged": false
+              }
+            },
+            "serverInfo": {
+              "name": "nexus",
+              "version": "2.0.0"
+            }
+          }
+        }
+      },
+      {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "tools": [
+              {
+                "name": "list_projects",
+                "description": "List projects the caller is a member of.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {}
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "get_project",
+                "description": "Get one project by id.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "list_repositories",
+                "description": "List repositories linked to a project.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "list_tasks",
+                "description": "List tasks in a project.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "get_task",
+                "description": "Get one task with its events.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "task_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "create_task",
+                "description": "Create a task in a project and start its workflow.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "goal": {
+                      "type": "string"
+                    },
+                    "repository": {
+                      "type": "string"
+                    },
+                    "branch": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "goal"
+                  ]
+                },
+                "scope": "project:write"
+              },
+              {
+                "name": "dispatch_task",
+                "description": "Requeue a task for another attempt.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "task_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "task_id"
+                  ]
+                },
+                "scope": "task:dispatch"
+              },
+              {
+                "name": "get_execution_status",
+                "description": "Report execution/component status (no secrets).",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {}
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "list_evidence",
+                "description": "List project evidence records.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "verify_evidence",
+                "description": "Re-verify one evidence record.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "evidence_id": {
+                      "type": "string"
+                    },
+                    "expected_commit": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "evidence_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "list_runs",
+                "description": "List a project's autonomous runs (cancelled ones are hidden).",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "get_run",
+                "description": "Get one autonomous run with its tasks and its report.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "run_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "run_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "cancel_run",
+                "description": "Stop an autonomous run for good (terminal, idempotent).",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "run_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "run_id"
+                  ]
+                },
+                "scope": "run:control"
+              },
+              {
+                "name": "restart_run",
+                "description": "Re-run a finished run's whole plan as a new run under the same goal.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "run_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "run_id"
+                  ]
+                },
+                "scope": "run:control"
+              },
+              {
+                "name": "duplicate_run",
+                "description": "Copy a finished run into a new goal and run (independent of the original).",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "run_id": {
+                      "type": "string"
+                    },
+                    "idempotency_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "run_id"
+                  ]
+                },
+                "scope": "run:control"
+              },
+              {
+                "name": "list_run_task_outputs",
+                "description": "List the terminal outputs of a run task's conversation that the agent-server cut off (full output is fetched per event).",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "run_id": {
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "run_id",
+                    "task_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "get_run_task_output",
+                "description": "Fetch the complete terminal output whose preview one event showed.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "run_id": {
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "type": "string"
+                    },
+                    "event_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "run_id",
+                    "task_id",
+                    "event_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "list_project_executors",
+                "description": "List the OpenHands executors assigned to a project.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id"
+                  ]
+                },
+                "scope": "project:read"
+              },
+              {
+                "name": "assign_project_executor",
+                "description": "Assign an OpenHands account to a project (primary or fallback).",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": {
+                      "type": "string"
+                    },
+                    "account_id": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "project_id",
+                    "account_id"
+                  ]
+                },
+                "scope": "project:admin"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32004,
+            "message": "not found"
+          }
+        }
+      },
+      {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32601,
+            "message": "unknown method: not_a_method"
+          }
+        }
+      },
+      {
+        "status": 202,
+        "headers": {},
+        "body": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    ],
+    "stdio_matches_http_ids": [
+      1,
+      2,
+      3,
+      4
+    ]
+  }
+}

@@ -71,10 +71,18 @@ def test_a_missing_env_file_is_refused(tmp_path):
 
 @requires_db
 @requires_pg
-def test_backup_then_restore_round_trip_leaves_the_live_database_alone(tmp_path):
+@pytest.mark.parametrize("repeated_dbname", [False, True])
+def test_backup_then_restore_round_trip_leaves_the_live_database_alone(tmp_path, repeated_dbname):
     # The session may have rewritten the DSN to an isolated per-process database
     # (tests/_test_db), so read it now, not at import time.
     live_dsn = os.environ.get("TEST_SUPABASE_DB_URL") or DSN
+    if repeated_dbname:
+        # Valid libpq input: the last dbname wins. Replacing only the first
+        # occurrence used to leave pg_restore pointed at the source database.
+        from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+        params = conninfo_to_dict(live_dsn)
+        live_dsn = make_conninfo(**params) + " " + make_conninfo(dbname=params['dbname'])
     env_file = tmp_path / ".env"
     env_file.write_text(
         f'SUPABASE_DB_URL="{live_dsn}"\nWEB_AUTH_TOKEN=x\nAUTH_USERNAME=owner\n'
@@ -151,3 +159,17 @@ def _table_count(dsn: str) -> int:
             cur.execute("SELECT count(*) FROM information_schema.tables "
                         "WHERE table_schema = current_schema()")
             return cur.fetchone()[0]
+
+
+def test_restore_refuses_wrong_checksum_before_connecting(tmp_path):
+    dump = tmp_path / "incomplete.dump"
+    dump.write_bytes(b"not the expected backup")
+    (tmp_path / "incomplete.dump.sha256").write_text("0" * 64 + "  incomplete.dump\n")
+    env_file = tmp_path / "test.env"
+    env_file.touch()
+    # No database is needed: the file check must precede even CREATE DATABASE.
+    out = subprocess.run([_SCRIPT, "restore", str(dump)], capture_output=True, text=True,
+                         env={"PATH": os.environ["PATH"], "NEXUS_ENV_FILE": str(env_file)})
+    assert out.returncode != 0
+    assert "dump checksum mismatch" in out.stderr
+    assert "Restoring" not in out.stdout

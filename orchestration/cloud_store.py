@@ -2375,25 +2375,38 @@ class PostgresStore:
         }
 
     # --------------------------------------------------------------- evidence
-    def evidence_chain_tail(self, project_id: str | None) -> str | None:
-        """The ``entry_hash`` of the newest evidence entry in a project scope.
-
-        ``None`` (no rows, or all legacy) means the next entry starts a chain.
-        A project-scoped chain and the unscoped chain are separate.
-        """
-        with self._tx() as cur:
-            if project_id is None:
-                cur.execute("SELECT entry_hash FROM nexus_evidence "
-                            "WHERE project_id IS NULL ORDER BY seq DESC LIMIT 1")
-            else:
-                cur.execute("SELECT entry_hash FROM nexus_evidence "
-                            "WHERE project_id=%s ORDER BY seq DESC LIMIT 1", (project_id,))
-            row = cur.fetchone()
+    @staticmethod
+    def _chain_tail(cur: Any, project_id: str | None) -> str | None:
+        if project_id is None:
+            cur.execute("SELECT entry_hash FROM nexus_evidence "
+                        "WHERE project_id IS NULL ORDER BY seq DESC LIMIT 1")
+        else:
+            cur.execute("SELECT entry_hash FROM nexus_evidence "
+                        "WHERE project_id=%s ORDER BY seq DESC LIMIT 1", (project_id,))
+        row = cur.fetchone()
         return row["entry_hash"] if row else None
 
-    def insert_evidence(self, record: dict[str, Any]) -> dict[str, Any]:
-        """Append one signed evidence record. Returns the stored row (with seq)."""
+    def evidence_chain_tail(self, project_id: str | None) -> str | None:
+        """Observe the chain head for a scope. This is not a reservation."""
         with self._tx() as cur:
+            return self._chain_tail(cur, project_id)
+
+    def insert_evidence(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Allocate the position and append the signed body in one transaction.
+
+        Lock the scope, not its last row: two writers can race on an EMPTY
+        chain as well. Hash links are over the existing canonical body format;
+        we do not modify signatures, renumber seq or repair historic links.
+        """
+        from .evidence_trust import entry_hash
+
+        project_id = record.get("project_id")
+        with self._tx() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                        "'nexus-evidence:' || COALESCE(%s::uuid::text, 'unscoped'), 0))", (project_id,))
+            prev = self._chain_tail(cur, project_id)  # fresh snapshot after the lock wait
+            link = entry_hash(prev, record.get("format_version", 2), record["body"])
             cur.execute(
                 """
                 INSERT INTO nexus_evidence(
@@ -2416,8 +2429,8 @@ class PostgresStore:
                     record.get("subject_id"), json.dumps(record["body"]),
                     record["signed_payload"], record["key_id"], record["signature"],
                     record["verdict"], json.dumps(record.get("verification_detail", {})),
-                    record.get("verified_at"), record.get("prev_hash"),
-                    record["entry_hash"], record.get("created_by", "system"),
+                    record.get("verified_at"), prev,
+                    link, record.get("created_by", "system"),
                 ),
             )
             return _evidence_row(cur.fetchone())

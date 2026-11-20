@@ -1,0 +1,16 @@
+[package]
+name = "nexus-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.89"
+publish = false
+description = "NEXUS PostgreSQL scheduler transactions (migration candidate)"
+
+[dependencies]
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+uuid = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+serde_json.workspace = true

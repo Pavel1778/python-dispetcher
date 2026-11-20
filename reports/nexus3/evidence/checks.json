@@ -1,0 +1,357 @@
+{
+  "local_full_suites": [
+    {
+      "source_head": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "environment": "worktree at source HEAD, no-locale/C LC_CTYPE",
+      "tests": 2103,
+      "skipped": 19,
+      "failures": 3,
+      "errors": 0,
+      "passed": 2081,
+      "affected_nodes": [
+        "tests.test_browser_e2e::test_rename_archive_restore_and_search_a_chat",
+        "tests.test_conversation_management::test_search_by_title",
+        "tests.test_conversations::test_create_list_and_restore_conversations"
+      ],
+      "skipped_by_module": {
+        "tests.test_acceptance_dev_task": 1,
+        "tests.test_android_apk": 4,
+        "tests.test_comprehensive_suite": 1,
+        "tests.test_rust_parity": 9,
+        "tests.test_schema_bootstrap": 1,
+        "tests.test_windows_exe": 3
+      },
+      "pytest_summary": "3 failed, 2081 passed, 19 skipped in 479.05s (0:07:59)"
+    },
+    {
+      "source_head": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "environment": "pristine checkout, C.UTF-8, setup umask leaked into DEB fixture",
+      "tests": 2103,
+      "skipped": 19,
+      "failures": 0,
+      "errors": 2,
+      "passed": 2082,
+      "affected_nodes": [
+        "tests.test_deb_package::test_control_metadata",
+        "tests.test_deb_package::test_payload_contains_launcher_desktop_and_icons"
+      ],
+      "skipped_by_module": {
+        "tests.test_acceptance_dev_task": 1,
+        "tests.test_android_apk": 4,
+        "tests.test_comprehensive_suite": 1,
+        "tests.test_rust_parity": 9,
+        "tests.test_schema_bootstrap": 1,
+        "tests.test_windows_exe": 3
+      },
+      "pytest_summary": "2082 passed, 19 skipped, 2 errors in 461.81s (0:07:41)"
+    },
+    {
+      "source_head": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "environment": "pristine checkout, C.UTF-8, corrected wrapper",
+      "tests": 2103,
+      "skipped": 19,
+      "failures": 0,
+      "errors": 0,
+      "passed": 2084,
+      "affected_nodes": [],
+      "skipped_by_module": {
+        "tests.test_acceptance_dev_task": 1,
+        "tests.test_android_apk": 4,
+        "tests.test_comprehensive_suite": 1,
+        "tests.test_rust_parity": 9,
+        "tests.test_schema_bootstrap": 1,
+        "tests.test_windows_exe": 3
+      },
+      "pytest_summary": "2084 passed, 19 skipped in 442.05s (0:07:22)"
+    },
+    {
+      "source_head": "a59c00c0ae17117b01b0b6b3da699b6bd0b06261",
+      "environment": "full worktree suite; no local Rust binaries",
+      "tests": 2110,
+      "skipped": 23,
+      "failures": 0,
+      "errors": 0,
+      "passed": 2087,
+      "affected_nodes": [],
+      "skipped_by_module": {
+        "tests.test_acceptance_dev_task": 1,
+        "tests.test_android_apk": 4,
+        "tests.test_comprehensive_suite": 1,
+        "tests.test_rust_claim": 4,
+        "tests.test_rust_parity": 9,
+        "tests.test_schema_bootstrap": 1,
+        "tests.test_windows_exe": 3
+      },
+      "pytest_summary": "2087 passed, 23 skipped in 442.08s (0:07:22)"
+    },
+    {
+      "source_head": "170eaf96e23b56a89adca0a3c0c168eb3261b142",
+      "environment": "full worktree suite; no local Rust binaries; final executable changes",
+      "tests": 2121,
+      "skipped": 32,
+      "failures": 0,
+      "errors": 0,
+      "passed": 2089,
+      "affected_nodes": [],
+      "skipped_by_module": {
+        "tests.test_acceptance_dev_task": 1,
+        "tests.test_android_apk": 4,
+        "tests.test_comprehensive_suite": 1,
+        "tests.test_rust_claim": 13,
+        "tests.test_rust_parity": 9,
+        "tests.test_schema_bootstrap": 1,
+        "tests.test_windows_exe": 3
+      },
+      "pytest_summary": "2089 passed, 32 skipped in 464.82s (0:07:44)"
+    }
+  ],
+  "hosted_ci": [
+    {
+      "run_id": 44762662171,
+      "url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44762662171",
+      "event": "push",
+      "head_sha": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "test",
+          "job_id": 136378955258,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44762662171/job/136378955258",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T15:22:46Z",
+          "completed_at": "2026-11-20T15:33:04Z",
+          "annotations": [
+            {
+              "skipped": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "skipped": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "skipped": "      3 mingw-w64 is not installed"
+            },
+            {
+              "skipped": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "pytest": "2097 passed, 6 skipped, 1 warning in 567.09s (0:09:27)"
+            },
+            {
+              "Chromium": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "Playwright": "Version 1.65.2"
+            },
+            {
+              "Runner image": "Ubuntu 26.04.1 LTS (image ubuntu26 20261116.202.1); pg_dump (PostgreSQL) 18.7 (Ubuntu 18.7-1.pgdg26.04+2)"
+            }
+          ]
+        },
+        {
+          "name": "rust",
+          "job_id": 136378955839,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44762662171/job/136378955839",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T15:22:46Z",
+          "completed_at": "2026-11-20T15:24:05Z",
+          "annotations": [
+            {
+              "parity": "9 passed in 0.71s"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": 44783858567,
+      "url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44783858567",
+      "event": "pull_request",
+      "head_sha": "a59c00c0ae17117b01b0b6b3da699b6bd0b06261",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "rust",
+          "job_id": 136453398748,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44783858567/job/136453398748",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T17:30:02Z",
+          "completed_at": "2026-11-20T17:32:15Z",
+          "annotations": [
+            {
+              "parity": "13 passed in 1.33s"
+            }
+          ]
+        },
+        {
+          "name": "test",
+          "job_id": 136453398918,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44783858567/job/136453398918",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T17:30:02Z",
+          "completed_at": "2026-11-20T17:39:49Z",
+          "annotations": [
+            {
+              "skipped": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "skipped": "      4 requires SQLx claim probe and isolated PostgreSQL"
+            },
+            {
+              "skipped": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "skipped": "      3 mingw-w64 is not installed"
+            },
+            {
+              "skipped": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "pytest": "2100 passed, 10 skipped, 1 warning in 546.21s (0:09:06)"
+            },
+            {
+              "Chromium": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "Playwright": "Version 1.65.2"
+            },
+            {
+              "Runner image": "Ubuntu 26.04.1 LTS (image ubuntu26 20261116.202.1); pg_dump (PostgreSQL) 18.7 (Ubuntu 18.7-1.pgdg26.04+2)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": 44785548428,
+      "url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44785548428",
+      "event": "pull_request",
+      "head_sha": "fa1dae8d387a5e0a9a66de8fd447dd743c042be7",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "rust",
+          "job_id": 136459321657,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44785548428/job/136459321657",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T17:40:34Z",
+          "completed_at": "2026-11-20T17:42:30Z",
+          "annotations": [
+            {
+              "parity": "18 passed in 1.96s"
+            },
+            {
+              "Rust toolchain": "rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05)"
+            }
+          ]
+        },
+        {
+          "name": "test",
+          "job_id": 136459322350,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44785548428/job/136459322350",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T17:40:34Z",
+          "completed_at": "2026-11-20T17:50:58Z",
+          "annotations": [
+            {
+              "skipped": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "skipped": "      6 requires SQLx claim probe and isolated PostgreSQL"
+            },
+            {
+              "skipped": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "skipped": "      3 mingw-w64 is not installed"
+            },
+            {
+              "skipped": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "pytest": "2102 passed, 15 skipped, 1 warning in 555.21s (0:09:15)"
+            },
+            {
+              "Chromium": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "Playwright": "Version 1.65.2"
+            },
+            {
+              "Runner image": "Ubuntu 26.04.1 LTS (image ubuntu26 20261116.202.1); pg_dump (PostgreSQL) 18.7 (Ubuntu 18.7-1.pgdg26.04+2)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "run_id": 44786382445,
+      "url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44786382445",
+      "event": "pull_request",
+      "head_sha": "170eaf96e23b56a89adca0a3c0c168eb3261b142",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "rust",
+          "job_id": 136462233575,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44786382445/job/136462233575",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T17:45:51Z",
+          "completed_at": "2026-11-20T17:49:03Z",
+          "annotations": [
+            {
+              "parity": "22 passed in 2.22s"
+            },
+            {
+              "Rust toolchain": "rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05)"
+            }
+          ]
+        },
+        {
+          "name": "test",
+          "job_id": 136462234027,
+          "job_url": "https://github.com/Pavel1778/python-dispetcher/actions/runs/44786382445/job/136462234027",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-20T17:45:51Z",
+          "completed_at": "2026-11-20T17:55:51Z",
+          "annotations": [
+            {
+              "skipped": "      1 set TEST_POOLER_DSN to a transaction-mode pooler to run this"
+            },
+            {
+              "skipped": "      9 requires SQLx claim probe and isolated PostgreSQL"
+            },
+            {
+              "skipped": "      1 no local agent-server on :60000 in this environment"
+            },
+            {
+              "skipped": "      3 mingw-w64 is not installed"
+            },
+            {
+              "skipped": "      1 BLOCKED: section F (a real development task driven through NEXUS) needs a live OpenHands key and a sandbox. This environment has no working LLM key (see AGENTS.md), so the real switch cannot be exercised; simulating it would be the one thing the request forbids."
+            },
+            {
+              "pytest": "2102 passed, 19 skipped, 1 warning in 564.65s (0:09:24)"
+            },
+            {
+              "Chromium": "159.0.8154.6 (Playwright's own build)"
+            },
+            {
+              "Playwright": "Version 1.65.2"
+            },
+            {
+              "Runner image": "Ubuntu 26.04.1 LTS (image ubuntu26 20261116.202.1); pg_dump (PostgreSQL) 18.7 (Ubuntu 18.7-1.pgdg26.04+2)"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

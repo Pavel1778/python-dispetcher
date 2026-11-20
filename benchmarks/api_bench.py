@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import statistics
@@ -54,6 +55,21 @@ def _pct(samples: list[float]) -> dict:
             "max": round(max(s), 3) if s else 0.0}
 
 
+@contextmanager
+def _process_window():
+    """Linux: whole benchmark process (server, clients and fakes), excluding PG."""
+    def rss_mib():
+        return round(int(Path("/proc/self/statm").read_text().split()[1])
+                     * os.sysconf("SC_PAGE_SIZE") / 2**20, 2)
+
+    result = {"rss_mib_before": rss_mib()}
+    wall, cpu = time.perf_counter(), time.process_time()
+    yield result
+    elapsed = time.perf_counter() - wall
+    result.update(wall_s=round(elapsed, 4), cpu_pct_one_core=round(
+        100 * (time.process_time() - cpu) / elapsed, 2), rss_mib_after=rss_mib())
+
+
 def _get(base: str, path: str) -> float:
     req = urllib.request.Request(base + path)
     req.add_header("Authorization", f"Bearer {TOKEN}")
@@ -92,6 +108,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="")
     ap.add_argument("--repeat", type=int, default=50)
+    ap.add_argument("--resources", action="store_true",
+                    help="sample idle and per-level process CPU and RSS on Linux")
     args = ap.parse_args()
 
     dsn = os.environ.get("TEST_SUPABASE_DB_URL")
@@ -177,9 +195,19 @@ def main() -> int:
 
         # concurrency sweep on one read path
         conc = {}
+        windows = {}
+        if args.resources:
+            with _process_window() as windows["idle"]:
+                time.sleep(3)
         for c in (1, 5, 10, 25, 50):
-            conc[str(c)] = _level(base, f"/api/v1/projects/{pid}/conversations?archived=1",
-                                  c, max(10, args.repeat // 2))
+            path = f"/api/v1/projects/{pid}/conversations?archived=1"
+            if args.resources:
+                with _process_window() as windows[str(c)]:
+                    conc[str(c)] = _level(base, path, c, max(10, args.repeat // 2))
+            else:
+                conc[str(c)] = _level(base, path, c, max(10, args.repeat // 2))
+        if args.resources:
+            out["process_windows"] = windows
         out["results"]["concurrency_list_conversations"] = conc
 
         server.stop()

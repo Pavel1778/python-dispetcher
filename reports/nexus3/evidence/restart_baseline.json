@@ -1,0 +1,35 @@
+{
+  "implementation_sha": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+  "python": "3.11.2",
+  "postgres": 160002,
+  "case": "restart",
+  "results": {
+    "worker_poll_seconds": 0.3,
+    "observed_poll_seconds": 0.05,
+    "trials": [
+      {
+        "first_bound_ms": 258.12,
+        "relaunch_to_child_bound_ms": 205.0,
+        "request_to_signed_acceptance_s": 0.831,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      },
+      {
+        "first_bound_ms": 258.15,
+        "relaunch_to_child_bound_ms": 204.16,
+        "request_to_signed_acceptance_s": 0.8257,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      },
+      {
+        "first_bound_ms": 253.98,
+        "relaunch_to_child_bound_ms": 204.4,
+        "request_to_signed_acceptance_s": 0.8201,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      }
+    ],
+    "fixture_verified_tasks_per_hour_extrapolated": 8720.9,
+    "scope": "two-task fixture DAG with SIGKILL; socket doubles, no live cloud time or project SelfQA"
+  }
+}

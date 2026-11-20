@@ -1,0 +1,458 @@
+{
+  "repository": "Pavel1778/python-dispetcher",
+  "baseline_branch": "arena/6f80793e-python-dispetcher",
+  "baseline_commit": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+  "remote_refs": {
+    "refs/heads/arena/3a132869-python-dispetcher": "397e1de00caf64df59f74355903a5cb56503aa03",
+    "refs/heads/arena/71f72168-python-dispetcher": "8ddd29d435bf4d60a3cb6a915177ca5c004e1548",
+    "refs/heads/arena/aa1abcbc-python-dispetcher": "d2cf513382a134802074cdca90393cb492f377e7",
+    "refs/heads/arena/e1a9f455-python-dispetcher": "60eba442ee9e2fb18781899a369cdd87abe50c77",
+    "refs/heads/feat/run-restart-duplicate": "f6e77c9682eb7df296a68f6720e85d89de01f5c7",
+    "refs/heads/main": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+    "refs/heads/release/acceptance": "2cefae5e85fef5e6fedce65bf17d3a412c88bcc3",
+    "refs/heads/release/nexus-2.0-pr-ready": "5c001f90f5b90b25dadd1cb2412dc85df3b62015",
+    "refs/tags/preservation/arena-06dcb2d2": "16efad12002bdba867a7a312008f5b8011218c6f",
+    "refs/tags/preservation/arena-1d4f42a1": "5c1eea3ad561923f8b29f9607510e2ef01882d52",
+    "refs/tags/preservation/arena-22525405": "82d34285d9165c5c6d81d633b11a5463ee1c5294",
+    "refs/tags/preservation/arena-5a479709": "bfa5b4fade1cbf27cbf0474f3254471c09ccc8d1",
+    "refs/tags/preservation/arena-60148d7e": "e386e3c33f6287fb958c48c380380664899e6dc0",
+    "refs/tags/preservation/autonomous-completion": "0bdabcce49184f4d4d31d0b2c1e4753cd2d8d11d",
+    "refs/tags/preservation/docs-branch-topology": "dff2966c202f666758b9fbf20f02e5c8b1ee2bdc",
+    "refs/tags/preservation/fix-ci-python-version": "de16b34f987ce8c699715aa83c04bfba22d59e0e",
+    "refs/tags/preservation/laboratory-files-github": "9287a442a0630ff908c518d645d7033b38f44d4b",
+    "refs/tags/preservation/mvp-baseline-main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+    "refs/tags/preservation/mvp-integration-tip": "7d2ecf63d2a33d492982fd373a73fe7f2dc96403",
+    "refs/tags/preservation/mvp-nexus-tip": "9287a442a0630ff908c518d645d7033b38f44d4b",
+    "refs/tags/preservation/mvp-phase0-tip": "ba04467c9c7b1d6d13edabf61d57694d70831d63",
+    "refs/tags/preservation/pre-autonomous-main": "556734732eddeb6029c394aeabf28480092ac744",
+    "refs/tags/preservation/pre-integration-main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+    "refs/tags/preservation/pre-openhands-integration": "42529e35a8d369984b6398d169f35cebf200df66",
+    "refs/tags/v2.0.0": "7f0294bd5d47110a9f243958555fd7d15a5a3e59"
+  },
+  "pull_requests": [
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/e1a9f455-python-dispetcher",
+      "headRefOid": "60eba442ee9e2fb18781899a369cdd87abe50c77",
+      "number": 53,
+      "state": "MERGED",
+      "merge": "2edf3aa70eefb0628fa88997a1d1c095b133e007"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "release/nexus-2.0-pr-ready",
+      "headRefOid": "5c001f90f5b90b25dadd1cb2412dc85df3b62015",
+      "number": 52,
+      "state": "OPEN",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/aa1abcbc-python-dispetcher",
+      "headRefOid": "d2cf513382a134802074cdca90393cb492f377e7",
+      "number": 51,
+      "state": "MERGED",
+      "merge": "70a86db8a8b069426e21dfe761e042edabcb7107"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/71f72168-python-dispetcher",
+      "headRefOid": "8ddd29d435bf4d60a3cb6a915177ca5c004e1548",
+      "number": 50,
+      "state": "MERGED",
+      "merge": "c0f49fcfb91e5ced07d372c2a8743503d3bfde1e"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "release/acceptance",
+      "headRefOid": "2cefae5e85fef5e6fedce65bf17d3a412c88bcc3",
+      "number": 49,
+      "state": "MERGED",
+      "merge": "6e5c2b410d531379c3599baa53492c83244551e5"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/approval-notification",
+      "headRefOid": "640c273d32c63d08bf6206cfbf01ba7db95be17b",
+      "number": 48,
+      "state": "MERGED",
+      "merge": "25bd484d80a7292ed7211a203bb91190d23816f2"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "feat/run-restart-duplicate",
+      "headRefOid": "f6e77c9682eb7df296a68f6720e85d89de01f5c7",
+      "number": 47,
+      "state": "MERGED",
+      "merge": "e48861f846b204424bb5fffe28aed2631bf64aa7"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/3a132869-python-dispetcher",
+      "headRefOid": "397e1de00caf64df59f74355903a5cb56503aa03",
+      "number": 46,
+      "state": "MERGED",
+      "merge": "66291614ac2c47b33e825312c9f165f7b38de5cd"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "consolidate/final",
+      "headRefOid": "73f3a0f6cac8a126ac627c2c5ea6629426a0735d",
+      "number": 45,
+      "state": "MERGED",
+      "merge": "42824896e388c97e218a8915cab56a8498a28473"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/phase34-consolidation",
+      "headRefOid": "c9c10d9d0d642689d23e2019e0f26a3be874c0df",
+      "number": 44,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/b10d2a83-python-dispetcher",
+      "headRefOid": "31bd3ecfd11e217e034ba51575d770f927d5c3a0",
+      "number": 43,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/1038b6bd-python-dispetcher",
+      "headRefOid": "935ebfe79b08d9ebcd031f26a067c274949474fb",
+      "number": 42,
+      "state": "MERGED",
+      "merge": "28aa026b0d22b82a0befd9a36492aabc09aabc49"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/bafa7522-python-dispetcher",
+      "headRefOid": "afbca3fe4f2e8ed60ffb17c7bb65bc1fbba80eae",
+      "number": 41,
+      "state": "MERGED",
+      "merge": "20214587b64490cabff9860bba955943dfd1dc8c"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/production-recovery-migration-0037",
+      "headRefOid": "f41f08f657b5209469337e3a39d52caf56d0dadd",
+      "number": 40,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/perf-reliability-lifecycle",
+      "headRefOid": "fc0de5b336daba05bb71324d5e43272eb85412e2",
+      "number": 39,
+      "state": "MERGED",
+      "merge": "5ebbcec9b69a245c2458fbe131fd75039d103da2"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/ab0d7665-python-dispetcher",
+      "headRefOid": "c2bce1242e36a53f706a38dd9d13a3c9ac39dba5",
+      "number": 38,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/a54ad8b6-python-dispetcher",
+      "headRefOid": "bf148199cd06ca3668f379344afb81557b539ee1",
+      "number": 37,
+      "state": "MERGED",
+      "merge": "42609a41252d8ef5ed9593d84be510fd07f367fa"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/8b83d99f-python-dispetcher",
+      "headRefOid": "6b4f061009683c3a7355f7a447b0432493cb8bf8",
+      "number": 36,
+      "state": "MERGED",
+      "merge": "7d7c545aafce95c31bcdde9a79f31b60b2bf6ff0"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/chat-first-workflow",
+      "headRefOid": "f2a9b12448c937a62dd5ae1a8b9a65e9652d6bb4",
+      "number": 35,
+      "state": "MERGED",
+      "merge": "65b20a46b009a8ee3f05ebd6e60abadc836dfe06"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/c56cbbf3-python-dispetcher",
+      "headRefOid": "e86627714a9d92fd978478db61d669913a164b2c",
+      "number": 34,
+      "state": "MERGED",
+      "merge": "fcf7d672c884531dd71686b401f1cfdd6fcf08ab"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "docs/intent-and-env",
+      "headRefOid": "42f79387d248add21326f8cbad01db6cd151d8b6",
+      "number": 33,
+      "state": "MERGED",
+      "merge": "ea2dd71ed04dc74b003fafe58101b9a6dcc11658"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/2161f211-python-dispetcher",
+      "headRefOid": "33bc91cbaa39f9052d40284c19165d0a8ac91374",
+      "number": 32,
+      "state": "MERGED",
+      "merge": "b9e5aabc4432afe7aec9f6b34ddfee7bc335ac4d"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/44b9ec6d-python-dispetcher",
+      "headRefOid": "1b0829787d22f58fc1edacc4b7d6509eceb0af55",
+      "number": 31,
+      "state": "MERGED",
+      "merge": "10b2657181734fc8694809dafc991693542c1ef9"
+    },
+    {
+      "baseRefName": "nexus/durable-autonomy-multiconn",
+      "headRefName": "audit/pr29",
+      "headRefOid": "6a98402be096e4c48ae77e1c8065072e34052a17",
+      "number": 30,
+      "state": "MERGED",
+      "merge": "312f0275027566a289c7a765cd15c0351a8174ed"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/durable-autonomy-multiconn",
+      "headRefOid": "56ba0854e682ff83bb2732e2f3494f3fceb12601",
+      "number": 29,
+      "state": "MERGED",
+      "merge": "45df4c404d14d0f8ab09a52efb6d4c517b59c8d8"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/dcb992a2-python-dispetcher",
+      "headRefOid": "607ce2ff4db974e3d4e49e1ccc9ed9ea57137680",
+      "number": 28,
+      "state": "MERGED",
+      "merge": "51b7afcdd5e6b9ca8ed83f9dad47cd65fc66902b"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/78a1a036-python-dispetcher",
+      "headRefOid": "5a361772d3f800c15d17f48cc15806f1ed65bf8e",
+      "number": 27,
+      "state": "MERGED",
+      "merge": "0ef606e61fe05fb98495ff61399b314318687a47"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/5ee71838-python-dispetcher",
+      "headRefOid": "6d38b819ff05d3044843c6d3974834ef56f50a3b",
+      "number": 26,
+      "state": "MERGED",
+      "merge": "7edf63a91849535f9399a18af30c0edfda317463"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/4f942c7f-python-dispetcher",
+      "headRefOid": "a5be7c86661f342a429d857f9ad34551ae2cd552",
+      "number": 25,
+      "state": "MERGED",
+      "merge": "a142d841ed9885760c720a7d04e4e0092646ac03"
+    },
+    {
+      "baseRefName": "nexus/mainline-hardening",
+      "headRefName": "arena/d7bb7e3c-python-dispetcher",
+      "headRefOid": "6b7ea4a726ddd825bb49fe340aa67d60808ed64a",
+      "number": 24,
+      "state": "MERGED",
+      "merge": "56c71fb3b1c961bcb77091eae51910653b6f18ed"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/mainline-hardening",
+      "headRefOid": "56c71fb3b1c961bcb77091eae51910653b6f18ed",
+      "number": 23,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/gap-analysis",
+      "headRefOid": "25179c3ef8959951a60e5f0a7e16e3e864dba3e9",
+      "number": 22,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/ground-truth-verify",
+      "headRefOid": "968bcd29d24fe93545afe500a4f3d1e4577db5d4",
+      "number": 21,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/ci-python-version",
+      "headRefOid": "de16b34f987ce8c699715aa83c04bfba22d59e0e",
+      "number": 20,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "docs/branch-topology-env-table",
+      "headRefOid": "dff2966c202f666758b9fbf20f02e5c8b1ee2bdc",
+      "number": 19,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/60148d7e-python-dispetcher",
+      "headRefOid": "e386e3c33f6287fb958c48c380380664899e6dc0",
+      "number": 18,
+      "state": "MERGED",
+      "merge": "bd3138171740e4e3608fa035d179c1579d720a2e"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "nexus/laboratory-files-github",
+      "headRefOid": "9287a442a0630ff908c518d645d7033b38f44d4b",
+      "number": 17,
+      "state": "MERGED",
+      "merge": "3228a7985def699a4fcb2c82b3372828c7fe95d8"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/5a479709-python-dispetcher",
+      "headRefOid": "bfa5b4fade1cbf27cbf0474f3254471c09ccc8d1",
+      "number": 16,
+      "state": "MERGED",
+      "merge": "f372811fd85b0a6ed662e284608a0afdd0b7c8bf"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/1d4f42a1-python-dispetcher",
+      "headRefOid": "5c1eea3ad561923f8b29f9607510e2ef01882d52",
+      "number": 15,
+      "state": "MERGED",
+      "merge": "ecdd4a874f6128807a52ae5f0a0e7db30e133e3a"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/22525405-python-dispetcher",
+      "headRefOid": "82d34285d9165c5c6d81d633b11a5463ee1c5294",
+      "number": 14,
+      "state": "MERGED",
+      "merge": "3c60b814e00f5259944b39d34787d84ffd83ff30"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "arena/06dcb2d2-python-dispetcher",
+      "headRefOid": "16efad12002bdba867a7a312008f5b8011218c6f",
+      "number": 13,
+      "state": "MERGED",
+      "merge": "6965512f7aa428ea26d193dad025668a6719d21f"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/conversation-naming-and-slow-start",
+      "headRefOid": "6229127923f68d6c01fd31ce16c911eaa7fd6ce3",
+      "number": 12,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "test/sr-lifecycle-drop-cloud-tables",
+      "headRefOid": "bd6f3c9860d89ca4021de6dd82c78eb3fdde05c6",
+      "number": 11,
+      "state": "CLOSED",
+      "merge": null
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/sr-lifecycle-duplicate-and-wedge",
+      "headRefOid": "2db256147741421ea2717fbcd339371d4848cc1a",
+      "number": 10,
+      "state": "MERGED",
+      "merge": "7cffe543527951a188c44172996dd14e98946dd0"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "hotfix/prepared-statement-pooler",
+      "headRefOid": "67c9172aa1b7dba423021e5f023d02927bd4220d",
+      "number": 9,
+      "state": "MERGED",
+      "merge": "363f20fb9ba12d5f8bc7cbc1ef62b38df703b986"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "docs/render-deploy-truth",
+      "headRefOid": "b04ccb60cb23e2a401fea27efbb7783da85a7169",
+      "number": 8,
+      "state": "MERGED",
+      "merge": "75eaf686cc40083c0c4c05e7995a7a914bc5b8ce"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/invalid-id-404",
+      "headRefOid": "b7f9a8cc7d8c4f66875a5d888c7fd37fc27eff6c",
+      "number": 7,
+      "state": "MERGED",
+      "merge": "6ed943b759bb52345358ffcd2cdf69d6a1123b97"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "docs/agents-operator-controls",
+      "headRefOid": "97f244e63a9452f24469fef15fc55ef765428ad3",
+      "number": 6,
+      "state": "MERGED",
+      "merge": "d279f53e8593671079b9e1a780af6cfd7dbaf559"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/security-ci-main",
+      "headRefOid": "b3a72f45151300cc5c1e1cc9b3cd21f2e6b3aea6",
+      "number": 5,
+      "state": "MERGED",
+      "merge": "3363fa51e2a15ad5dfe8c6830af8e5bdbafa2738"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "feat/operator-controls",
+      "headRefOid": "d867e0147b6cad7267127d88ac62fc0daf404543",
+      "number": 4,
+      "state": "MERGED",
+      "merge": "b564b38ba9789c55bcddfb91bd0a6861d944aaed"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/schema-guard",
+      "headRefOid": "28134a1f030a73f0e1af8d060548d129248d8a64",
+      "number": 3,
+      "state": "MERGED",
+      "merge": "e57a0a6889ddcf56a05ea325ac666fcceabd4648"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "render-free-deploy",
+      "headRefOid": "f8b2e4943b1cfe190e89b639726321bfcd861b3a",
+      "number": 2,
+      "state": "MERGED",
+      "merge": "4b914f8c02672fa804df747f4d3fa9c08d62ac4f"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "python-dispetcher",
+      "headRefOid": "e78df9c8215dfad92f7a8b1d4347329703e570d1",
+      "number": 1,
+      "state": "CLOSED",
+      "merge": null
+    }
+  ]
+}

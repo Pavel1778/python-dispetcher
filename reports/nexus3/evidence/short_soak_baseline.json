@@ -1,0 +1,130 @@
+{
+  "minutes": 2.0,
+  "readers": 5,
+  "samples": [
+    {
+      "t": 20.0,
+      "rss_mb": 58.4,
+      "threads": 21,
+      "fds": 28,
+      "db_conns": 7,
+      "reads": 12253,
+      "errors": 0,
+      "pool": {
+        "available": true,
+        "min": 1,
+        "max": 8,
+        "size": 6,
+        "idle": 3,
+        "waiting": 0,
+        "requests": 12641,
+        "wait_ms": 12
+      }
+    },
+    {
+      "t": 40.0,
+      "rss_mb": 58.8,
+      "threads": 21,
+      "fds": 27,
+      "db_conns": 7,
+      "reads": 24406,
+      "errors": 0,
+      "pool": {
+        "available": true,
+        "min": 1,
+        "max": 8,
+        "size": 6,
+        "idle": 4,
+        "waiting": 0,
+        "requests": 25145,
+        "wait_ms": 12
+      }
+    },
+    {
+      "t": 60.0,
+      "rss_mb": 59.6,
+      "threads": 22,
+      "fds": 29,
+      "db_conns": 7,
+      "reads": 36838,
+      "errors": 0,
+      "pool": {
+        "available": true,
+        "min": 1,
+        "max": 8,
+        "size": 6,
+        "idle": 5,
+        "waiting": 0,
+        "requests": 37931,
+        "wait_ms": 12
+      }
+    },
+    {
+      "t": 80.1,
+      "rss_mb": 59.9,
+      "threads": 21,
+      "fds": 28,
+      "db_conns": 7,
+      "reads": 49435,
+      "errors": 0,
+      "pool": {
+        "available": true,
+        "min": 1,
+        "max": 8,
+        "size": 6,
+        "idle": 4,
+        "waiting": 0,
+        "requests": 50879,
+        "wait_ms": 12
+      }
+    },
+    {
+      "t": 100.1,
+      "rss_mb": 60.3,
+      "threads": 22,
+      "fds": 28,
+      "db_conns": 7,
+      "reads": 61618,
+      "errors": 0,
+      "pool": {
+        "available": true,
+        "min": 1,
+        "max": 8,
+        "size": 6,
+        "idle": 5,
+        "waiting": 0,
+        "requests": 63416,
+        "wait_ms": 12
+      }
+    },
+    {
+      "t": 122.1,
+      "rss_mb": 61.7,
+      "threads": 22,
+      "fds": 29,
+      "db_conns": 8,
+      "reads": 74969,
+      "errors": 1,
+      "pool": {
+        "available": true,
+        "min": 1,
+        "max": 8,
+        "size": 7,
+        "idle": 4,
+        "waiting": 0,
+        "requests": 77150,
+        "wait_ms": 14
+      }
+    }
+  ],
+  "errors": [],
+  "faults": 1,
+  "latency_ms": {
+    "n": 74985,
+    "p50": 7.79,
+    "p95": 12.77,
+    "p99": 16.73
+  },
+  "reads": 74985,
+  "errors_total": 1
+}

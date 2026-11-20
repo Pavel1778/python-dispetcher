@@ -15,8 +15,10 @@ focus is the engine itself.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import threading
 
 import pytest
 
@@ -240,6 +242,29 @@ class TestEvidenceService:
         assert r1["verdict"] == VERIFIED
         assert r2["prev_hash"] == r1["entry_hash"]
         assert svc.index_integrity(project_id=pid)["intact"] is True
+
+    @pytest.mark.parametrize("scoped", [True, False], ids=["project-v2", "unscoped-v1"])
+    def test_concurrent_signers_append_one_chain(self, store, monkeypatch, scoped):
+        svc = self._service(store)
+        pid = self._project(store) if scoped else None
+        writers = 4
+        barrier = threading.Barrier(writers, timeout=10)
+        append = store.insert_evidence
+
+        def synchronized_insert(record):
+            # All signatures are ready before the first INSERT. On the former
+            # path all four producers had also read the same chain tail here.
+            barrier.wait()
+            return append(record)
+
+        monkeypatch.setattr(store, "insert_evidence", synchronized_insert)
+        with ThreadPoolExecutor(max_workers=writers) as pool:
+            rows = list(pool.map(lambda i: svc.record(subject_kind="manual", subject_id=None,
+                                                      project_id=pid, summary=f"result {i}"), range(writers)))
+        rows.sort(key=lambda r: r["seq"])
+        assert len({r["id"] for r in rows}) == writers
+        assert all(svc.engine.verify(r).verdict == VERIFIED for r in rows)
+        assert svc.engine.index_integrity(rows) == {"checked": writers, "intact": True, "broken_at": []}
 
     def test_legacy_unscoped_record_stays_unscoped(self, store):
         svc = self._service(store)

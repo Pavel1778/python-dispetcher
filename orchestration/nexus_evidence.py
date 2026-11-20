@@ -29,7 +29,6 @@ from .evidence_trust import (
     LEGACY_FORMAT_VERSION,
     EvidenceTrustEngine,
     Keyring,
-    entry_hash,
     signer_from_env,
 )
 
@@ -95,20 +94,10 @@ class EvidenceService:
             body["project_id"] = str(project_id)
 
         fmt, payload, key_id, signature = self.engine.sign_body(body)
-        prev_hash = self.store.evidence_chain_tail(project_id)
-        ehash = entry_hash(prev_hash, fmt, body)
 
-        # Verify what we are about to store, with the same engine a reader uses,
-        # so a misconfigured keyring fails here rather than at read time.
-        provisional = {
-            "project_id": project_id, "format_version": fmt,
-            "repository_full_name": repository_full_name, "commit_sha": commit_sha,
-            "branch": branch, "subject_kind": subject_kind, "subject_id": subject_id,
-            "signed_payload": payload, "key_id": key_id, "signature": signature,
-            "prev_hash": prev_hash, "entry_hash": ehash,
-        }
-        verdict = self.engine.verify(provisional, prev_expected_hash=prev_hash)
-
+        # Sign and verify outside the store lock. A link is not part of the
+        # Ed25519 input; insert_evidence allocates it only after locking this
+        # chain, not from a snapshot another producer could invalidate.
         record = {
             "id": record_id,
             "project_id": project_id,
@@ -123,13 +112,11 @@ class EvidenceService:
             "signed_payload": payload,
             "key_id": key_id,
             "signature": signature,
-            "verdict": verdict.verdict,
-            "verification_detail": verdict.as_dict(),
             "verified_at": None,
-            "prev_hash": prev_hash,
-            "entry_hash": ehash,
             "created_by": created_by,
         }
+        verdict = self.engine.verify(record)
+        record.update(verdict=verdict.verdict, verification_detail=verdict.as_dict())
         stored = self.store.insert_evidence(record)
         if project_id is not None:
             self._event(project_id, created_by, "evidence.recorded", stored["id"])

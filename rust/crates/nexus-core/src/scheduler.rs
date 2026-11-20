@@ -3,9 +3,9 @@
 //!
 //! This mirrors the conditions `LabStore.claim_task` evaluates in SQL
 //! (`_TASK_DUE`, `_DEPS_VERIFIED`, `_BRANCH_FREE`) and the run-level gate on
-//! the locked run row. The SQL stays in Python until the whole claim path is
-//! migrated; this module is the **decision**, as a pure function of a snapshot,
-//! so it can be compared against Python over the same inputs.
+//! the locked run row. This is only a **run-local prediction**, not authority
+//! to start work. The Python store and the SQLx candidate in `nexus-storage`
+//! arbitrate across runs using committed PostgreSQL state.
 //!
 //! The snapshot types are plain data, so a test (Python or Rust) can build one
 //! without a database.
@@ -54,7 +54,7 @@ pub struct RunSnapshot {
     pub max_iterations: i64,
     /// Whether the run is pausing (`resume_at` in the future).
     pub pausing: bool,
-    /// For a `bounded` run, whether `now() <= deadline_at`.
+    /// For a `bounded` run, whether `now() < deadline_at`.
     pub within_deadline: bool,
 }
 
@@ -142,22 +142,18 @@ pub fn dependencies_verified(task: &TaskSnapshot, tasks: &[TaskSnapshot]) -> boo
     })
 }
 
-/// `_BRANCH_FREE`: no other task of the run is in flight on the same
-/// repository and branch, no task of the run records an abandoned conversation
-/// for it, and no requested executor stop names it. A repository-less task
-/// never contends.
+/// Run-local projection of `_BRANCH_FREE`. An abandoned conversation (even
+/// this task's own) holds the branch. This snapshot cannot see other runs or
+/// requested stops; only the storage transaction can authorize a claim.
 pub fn branch_free(task: &TaskSnapshot, tasks: &[TaskSnapshot]) -> bool {
     if task.repository.is_empty() {
         return true;
     }
     for other in tasks {
-        if other.id == task.id {
-            continue;
-        }
         if other.repository != task.repository || other.branch != task.branch {
             continue;
         }
-        if other.is_in_flight() || other.abandoned {
+        if (other.id != task.id && other.is_in_flight()) || other.abandoned {
             return false;
         }
     }

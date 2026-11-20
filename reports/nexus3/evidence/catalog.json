@@ -1,0 +1,458 @@
+{
+    "tables": {
+        "tasks": {
+            "rls": true,
+            "columns": 24,
+            "indexes": 11,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "97dcd1b35e8b35f909ba5bd3b3a2170e8468400e934e775bfbe8d0bbdf0ba606"
+        },
+        "sessions": {
+            "rls": true,
+            "columns": 6,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "6ccb51215de41a33e80d95f7aa6e95ca6b5dc1d80870a8d14f483437c992eda0"
+        },
+        "workflows": {
+            "rls": true,
+            "columns": 18,
+            "indexes": 6,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "28b3cffba000bca7f5dad8f530b5f99d223feed7a7a00639a9047cfc1b9b2712"
+        },
+        "nexus_runs": {
+            "rls": true,
+            "columns": 33,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "370566957ba6c28889506310f1a93745ff26a19495810e8ad04357a954ad618a"
+        },
+        "nexus_files": {
+            "rls": true,
+            "columns": 13,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "a191e96f0fb5970dd519d36c9083c2659894ee1719caced68bff8a71c9b90cab"
+        },
+        "nexus_goals": {
+            "rls": true,
+            "columns": 10,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "a14d3e098adaa89e0cf1657c6781e3301ff1343e47ad38f2ec9c10a3b8de9649"
+        },
+        "nexus_plans": {
+            "rls": true,
+            "columns": 11,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "374f7c1e4e2807013429aab3a8acd82c2bd27d60c21ac3d362631f4a1d8cabcd"
+        },
+        "nexus_specs": {
+            "rls": true,
+            "columns": 21,
+            "indexes": 4,
+            "force_rls": false,
+            "foreign_keys": 3,
+            "shape_sha256": "f9bd70dc0b466641839c60670f0db28d3a8f42e61a7063b0427b888817329566"
+        },
+        "task_events": {
+            "rls": true,
+            "columns": 7,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "f3d852229d600fb9ca47d88dc542c3eb3dd29356ba890878209f388343be0976"
+        },
+        "nexus_memory": {
+            "rls": true,
+            "columns": 12,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "19749829b650b8a4c14630a66db8b8ceee321e4449db16992e6c731b71e25466"
+        },
+        "repositories": {
+            "rls": true,
+            "columns": 7,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "7c116a8a1af0f6915e761f9210f0d0b3e94c16e5602fd181cdb2a0368b4a904b"
+        },
+        "conversations": {
+            "rls": true,
+            "columns": 9,
+            "indexes": 4,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "159e5095a7cfd03f60ca0732eedcdf26629b510b342edc0b092be0c7df98c6d9"
+        },
+        "sr_tool_calls": {
+            "rls": true,
+            "columns": 12,
+            "indexes": 4,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "885cafbae1ed7029fef69ee950b78bd5bb36185d66ab6e58136b53c4ac8a8489"
+        },
+        "login_attempts": {
+            "rls": true,
+            "columns": 4,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "9027bf735d02562111864c8de89dfbf777fae946355c96a41aaf034cb17968bf"
+        },
+        "nexus_evidence": {
+            "rls": true,
+            "columns": 21,
+            "indexes": 6,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "cf3b5f034b73a74b22bf7fc50cfb3f5474d1e4e003da2d899c174b5817c54693"
+        },
+        "nexus_projects": {
+            "rls": true,
+            "columns": 13,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 3,
+            "shape_sha256": "be2daeebdda42501259c92392cd0fdf759a1fd772cfead530d945bc94b3a0ab7"
+        },
+        "cloud_sandboxes": {
+            "rls": true,
+            "columns": 8,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "5e94d0d09d9ac67dba90d34da046bb541d1f5eb0e619315272e64b6a8a9efca0"
+        },
+        "nexus_run_tasks": {
+            "rls": true,
+            "columns": 42,
+            "indexes": 9,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "98c364344a45f1b66b57b8bc3eff8eb67748688b9eadd555e932e185b5f84465"
+        },
+        "nexus_plan_tasks": {
+            "rls": true,
+            "columns": 7,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "4a1a3674970209dae185573237e5d5fc6104016eb947fecfeeb95224de013534"
+        },
+        "nexus_spec_links": {
+            "rls": true,
+            "columns": 5,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "9d5cc8b07e5e4f3bac27eca076325737a5a3ddf0a69ab13fb0283cf00a69fc57"
+        },
+        "nexus_workspaces": {
+            "rls": true,
+            "columns": 7,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "482622a6b54c9203f71bb0395739003eec110f91fc5f8ca95030d1e829a589bc"
+        },
+        "nexus_generations": {
+            "rls": true,
+            "columns": 8,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "a01cbaf5bd3c81ec078c9f00cd6734849a965e857b777e6424610741d49b2b29"
+        },
+        "nexus_lab_workers": {
+            "rls": true,
+            "columns": 6,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "07c861a4d3035d56a83f2c6ec027754e8663c2439a3cd72d5bfb2cecaa9d7996"
+        },
+        "nexus_run_reports": {
+            "rls": true,
+            "columns": 13,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "1653c8d20fa634e512b99abd64c27b76f74b8463b8a8828f04c6afd1e5e2967e"
+        },
+        "nexus_spec_stages": {
+            "rls": true,
+            "columns": 18,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "336d48c48f28bfc7574db6414a6c016314a7a9b50e9c5c5a143f79f2d0f4c55f"
+        },
+        "nexus_voice_notes": {
+            "rls": true,
+            "columns": 10,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "e62a96d1b934ca8c399c3067ca75c39b43ac9d1c1b3cc4565bfa4036258a6941"
+        },
+        "schema_migrations": {
+            "rls": false,
+            "columns": 3,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "72b9ec017543dd6f2bee686b7b5face8303824da6d9314197b1303112e86a718"
+        },
+        "conversation_routes": {
+            "rls": true,
+            "columns": 5,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "93a280b3777f4315a1449853c6a88cdba8e8dedb60c2baba225af7f3219bf59a"
+        },
+        "nexus_conversations": {
+            "rls": true,
+            "columns": 21,
+            "indexes": 6,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "3eb49a42254e97685a46c25ef1170a643bf748a661515d55aa5f5e9cacba3133"
+        },
+        "nexus_notifications": {
+            "rls": true,
+            "columns": 8,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "bdeaeb45f33f9bf5b8d74654f44c9520e16fce3cd9a9d1cfe6f025508cc9ebdb"
+        },
+        "nexus_spec_sections": {
+            "rls": true,
+            "columns": 12,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "66e0915c01cd32e6dce62b2b8e469668f1329902ab41e13a8337328c75a6622f"
+        },
+        "nexus_task_handoffs": {
+            "rls": true,
+            "columns": 8,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "1e4dd6af3299fc9a117feba1c78fc0a8d6c68be3e42c0427107dce7c19af932a"
+        },
+        "nexus_agent_sessions": {
+            "rls": true,
+            "columns": 14,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 5,
+            "shape_sha256": "ea58b8b3ae2bcec1974d9ad6d224d4dfaa6303cfb1d6cc9904762e1143761152"
+        },
+        "nexus_executor_stops": {
+            "rls": true,
+            "columns": 18,
+            "indexes": 6,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "d4ed5e694244af7abb1206fbdbce2d4b6f32ed37b94df21542da23e761697854"
+        },
+        "nexus_openhands_pool": {
+            "rls": true,
+            "columns": 4,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "44b526870b49fe2ac8820611909e138e352f2882d11bee6d1f03986165a48b24"
+        },
+        "nexus_project_events": {
+            "rls": true,
+            "columns": 6,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "a02a6185d44607e2cb3711edcd65e8fb4a2c79848543c972ee966dc70df2044b"
+        },
+        "nexus_github_accounts": {
+            "rls": true,
+            "columns": 11,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "6e1d82ec9d992efc1cfa233bc934ae9fe2fb0894177b3386b913069ef111863f"
+        },
+        "nexus_pending_actions": {
+            "rls": true,
+            "columns": 11,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "7825a58c996d3fbaff2ed1dd46f79dcf5e9c4ba9acfd6a79314951faa17db463"
+        },
+        "nexus_project_context": {
+            "rls": true,
+            "columns": 8,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "09436cdf2f2b5076b95a2d58567d70a4e10f9678ed40c9929db1c85dfef86845"
+        },
+        "nexus_project_members": {
+            "rls": true,
+            "columns": 4,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "58ee9658905c64281ab6b38f228d05ce90c953dcb77a5ce6c9720792f4fde327"
+        },
+        "nexus_task_executions": {
+            "rls": true,
+            "columns": 19,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 4,
+            "shape_sha256": "6b2d965b8b1cfa2db7fd3793313e1cf838033b44df8499d030a5ccb2d6f1923c"
+        },
+        "nexus_workspace_files": {
+            "rls": true,
+            "columns": 7,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "a2f4efbe83fc6b50ab40569d1fb95d169e19b8af5d0de71e039e9be4366fc6fd"
+        },
+        "nexus_plan_dependencies": {
+            "rls": true,
+            "columns": 3,
+            "indexes": 1,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "32c3d1614c32067d4a77119eccb9e1e967027e913df71c012b8bc62db8b50eaf"
+        },
+        "nexus_project_executors": {
+            "rls": true,
+            "columns": 7,
+            "indexes": 3,
+            "force_rls": false,
+            "foreign_keys": 2,
+            "shape_sha256": "354fa628ceeef33467adb6be3bdfa46da737164200476981379ed6812f1e533e"
+        },
+        "nexus_spec_requirements": {
+            "rls": true,
+            "columns": 11,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "6dae658a08734b6e232a0e5bd3292c8021ff3206f527084256b332e59f27d818"
+        },
+        "nexus_openhands_accounts": {
+            "rls": true,
+            "columns": 30,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 0,
+            "shape_sha256": "e1e97dfa5141915cd257b87195ecdb5b5a71619db3ddc02989f43853d21bff1f"
+        },
+        "nexus_project_repositories": {
+            "rls": true,
+            "columns": 13,
+            "indexes": 4,
+            "force_rls": false,
+            "foreign_keys": 3,
+            "shape_sha256": "118ed8e586efcb90c12a2c95d0341a35e1148fa09cc6b5958d7b8383ab330fe8"
+        },
+        "nexus_conversation_cleanups": {
+            "rls": true,
+            "columns": 15,
+            "indexes": 5,
+            "force_rls": false,
+            "foreign_keys": 5,
+            "shape_sha256": "19ddc6367471e75353791632283392a412baae780982bca0d88169b8735b9171"
+        },
+        "nexus_conversation_messages": {
+            "rls": true,
+            "columns": 6,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "9da2152aebfcc2d697d8456c1900523c561f333b51490039fb628987bb0fafc5"
+        },
+        "nexus_conversation_attachments": {
+            "rls": true,
+            "columns": 9,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 3,
+            "shape_sha256": "694258e4b088b23462efbe2e49dd1b7a2fced16033b56b29280e51cb5530ab72"
+        },
+        "nexus_openhands_account_events": {
+            "rls": true,
+            "columns": 5,
+            "indexes": 2,
+            "force_rls": false,
+            "foreign_keys": 1,
+            "shape_sha256": "7ed01703c57dcff7507cb0b3de52b5abc1a2983ac782e5f525a49bbf20783d8e"
+        }
+    },
+    "postgres": "16.2",
+    "migrations": {
+        "0001_init.sql": "89050d1cbb4a026feee88756ab4b41f095fc5fe5b511a1f6f40868cc6578c3dc",
+        "0004_auth.sql": "6ec5f9e8aba435c45f23e15ebcf4d42006614f7cdd0b40c3a5cd7e8bef6cb73c",
+        "0037_task_kind.sql": "f722a5c8e715cd9e03ce712f0349072f9fe5e5639f80126a7826688ab58d6beb",
+        "0038_lifecycle.sql": "871f44e97940387db68c26e6ed5fa5d4a30b3ebfa43b86090ae88b066dbe6234",
+        "0002_sr_runtime.sql": "9e7acb41b8e04b7593cc4ec98ccc900b385a6850105fce2eb20ba5da03d30cbc",
+        "0010_nexus_plans.sql": "ba3ef26b46ca3be90585684b23ae376d68db3668f18cdefeb515f84fb82e4c14",
+        "0011_nexus_files.sql": "61c0eed9f20fbee7c3b255877cd128cb8e69bcaf20227617246306e44800ed78",
+        "0021_nexus_specs.sql": "e69cac23392a2e403ed99c78eba7721eaccd3ff6d11e36776662b747fa41850c",
+        "0033_chat_intent.sql": "cdf7ef605fd97377f20434f4d36e8c5333e19bd577ecba4d094ffa47d3d9c28e",
+        "0007_cloud_direct.sql": "5a1752a6f850ee2212f7840096ea3b2c86fd6070e4ad05146a3a488a6610ef3d",
+        "0008_sr_lifecycle.sql": "693841151f1fc1f93a5c1ea1ba9e7cb493a5e54c689f9e0608f5b7da563d4d43",
+        "0020_nexus_ai_ide.sql": "dc1d9f92fa45376d4b63f074b3e86a49e519bb306bd3c7b6fd426b03ec88b074",
+        "0030_durable_runs.sql": "41844b48b9997488908859a29df27c5c6310e7f37ff8c8a24447e9ac970291fb",
+        "0040_run_profiler.sql": "7d4146917a274018dedc45b3b68fdab4349541b3d79566433ff12c51ee0741a5",
+        "0034_pending_start.sql": "cb500de80dce63a1dad6576a218207edb2b3537d7a6f67111d273f0eaf9265f8",
+        "0035_chat_workflow.sql": "bb35d437aff5ab091f179d22f26ea87c47ee2a4c189414bb9ead0aa846bb1b2d",
+        "0005_sr_start_retry.sql": "036b6cc879cdc7e96a2378077f783d5aa6a5696faeae148ff3091f74af2bb06e",
+        "0009_nexus_projects.sql": "b64f227b371d6f48618922beb1ab06ba915f1c77f02a6397160fef92ebaad2b7",
+        "0018_nexus_lab_runs.sql": "65a57f18133d45ac7062682b0d9877e88714c26ab3cd30fd4cdafa0e829e59cb",
+        "0029_task_abandoned.sql": "a53b70bde57550f98544022647de6dd6e4ce88a143eb56a95d48c1973b367d2f",
+        "0025_task_time_limit.sql": "ca0dadb6ae3fd5db30ea0c0830b0a16179433d20b1b11a2a4a138eeaf5ccd20d",
+        "0039_conversation_pin.sql": "4229290152a27bd736c957e257fe04ebe282062229fdf284cef0189c5f04a0b5",
+        "0016_secret_tables_rls.sql": "bc72af1b24af9cd4f1cbba4b70f1595db96c3559b2998c752568201750b56539",
+        "0038_project_lifecycle.sql": "9b099cd3da7ce1f36cc5739ad0a95d01e4ba3a8419acc618cc3ae572c3cde9c0",
+        "0003_tool_call_recovery.sql": "a17fadc5f51f185bb465f05c38372d53e9f8cea4cf272d7fc85efd5576a696bb",
+        "0028_task_lease_fencing.sql": "6cacc5ff9d4c3fbe5284ce880e1df158ed87cbcbbbd01a95a89c78352db0f59f",
+        "0015_task_workspace_lock.sql": "c5f451f33b718ec774888f28c4efa7ca3da2477b56b6510d2d3f1717d73f0e62",
+        "0006_workflow_idempotency.sql": "ca9bb8b27abaf31aa0fdbb0fb42f9c82048fd6ead9fa485362ba2ef35d6c80ac",
+        "0017_nexus_context_memory.sql": "7be62ccb656ebf38eedf8e8e7d3fa2bde5eafa0ad1901063af7814c968345312",
+        "0023_lab_worker_heartbeat.sql": "349b80cef24bbbf5048b725b84c368c98f24e8314bb9f97efb8814e906302d54",
+        "0024_task_account_handoff.sql": "1304aa189fed61ee3f238d568194c52509986d01ec27583f0210a09a79307e9a",
+        "0032_project_repositories.sql": "c19d42e4901c3839b88f70db1d049d54b7c24784be71293d2f44747fbaaed91a",
+        "0036_conversation_cleanup.sql": "84114212ce5afc0d8e99b48c022d0aefd521eb193f841ff697c3b54f72ca4895",
+        "0041_branch_claim_indexes.sql": "0a37a5598dc0d5307a1a5628523bc459313c3a4c855c310dd16fb3e0da72eff0",
+        "0042_project_quality_gate.sql": "e699c3f7e80319806e30b9de8bfdaa932d4588718793e405cbcb5df5b8b062fa",
+        "0014_nexus_project_binding.sql": "4c069bb79f90410086bfe5d94c59e21206ea70c1427974b2f40184c1dd3f7c8d",
+        "0019_nexus_github_accounts.sql": "d6f32027bc94ff4939d7fe67c66b0aa96422a872625f10bd6062994a47fafcbf",
+        "0031_openhands_connections.sql": "952e9f87a41be28fc8cc6636ea0cf240ee1020a534da5af307854dc139591bf8",
+        "0022_openhands_account_pool.sql": "55ac499e59cf96da0de2a72fd088f224b64e214874862f8b8ffb0709fbf41458",
+        "0025_task_preferred_account.sql": "1c7a3568ca8ff48a4abf8484bc7434049e32680c235f044d3e3802c2aef8ce90",
+        "0037_conversation_management.sql": "f3b5d9fe87fd990841b61658ca98be99db3a43682ec62dc02e1eaa587c44e6a5",
+        "0026_openhands_account_limits.sql": "264a5be4769b182b6cdb48ceda110a62e6b2d6c1ae7e0d5fef01f44d2f0fc8fc",
+        "0027_openhands_account_error_history.sql": "93a4ba3e3d988644010ff5faac3e8f03cab0aca5b523642f38eba657bf58063c"
+    }
+}
