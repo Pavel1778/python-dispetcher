@@ -44,12 +44,14 @@ jobs:
       - name: Build the Rust workspace
         timeout-minutes: 10
         working-directory: rust
-        run: cargo build --release
+        run: |
+          cargo build --workspace --release --locked
+          cargo build -p nexus-storage --example claim_probe --release --locked
 
       - name: Rust tests
         timeout-minutes: 10
         working-directory: rust
-        run: cargo test
+        run: cargo test --workspace --locked
 
       - uses: actions/setup-python@v5
         with:
@@ -66,9 +68,10 @@ jobs:
         timeout-minutes: 8
         env:
           NEXUS_RUST_BIN: ${{ github.workspace }}/rust/target/release/nexus-rs
+          NEXUS_CLAIM_PROBE: ${{ github.workspace }}/rust/target/release/examples/claim_probe
         run: |
           set -o pipefail
-          pytest tests/test_rust_parity.py -q -p no:cacheprovider -rfEs 2>&1 | tee /tmp/parity.log
+          pytest tests/test_rust_parity.py tests/test_rust_claim.py -q -p no:cacheprovider -rfEs 2>&1 | tee /tmp/parity.log
 
       - name: Parity report
         if: always()

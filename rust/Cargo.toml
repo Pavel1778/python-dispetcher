@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nexus-domain",
     "crates/nexus-core",
+    "crates/nexus-storage",
     "crates/nexus-cli",
 ]
 

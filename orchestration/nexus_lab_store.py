@@ -61,6 +61,7 @@ import logging
 import os
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from .cloud_store import InvalidTransition, NotFound, PostgresStore
@@ -193,35 +194,12 @@ RUN_POLICIES = ("durable", "bounded")
 #: And while a conversation that was told to stop for another reason (its run
 #: was cancelled, it ran out of time) has not been seen to stop: until then it
 #: may push, so its branch is not handed to another task either.
-_BRANCH_FREE = (
-    "(t.repository = '' OR ("
-    "  NOT EXISTS ("
-    "    SELECT 1 FROM nexus_run_tasks o "
-    "    WHERE o.repository = t.repository AND o.branch = t.branch AND o.id <> t.id "
-    "      AND o.state IN ('dispatched','running','verifying')) "
-    "  AND NOT EXISTS ("
-    "    SELECT 1 FROM nexus_run_tasks a "
-    "    WHERE a.repository = t.repository AND a.branch = t.branch "
-    "      AND jsonb_array_length(a.abandoned) > 0) "
-    "  AND NOT EXISTS ("
-    "    SELECT 1 FROM nexus_executor_stops s "
-    "    WHERE s.repository = t.repository AND s.branch = t.branch "
-    "      AND s.state = 'requested'))) ")
-
-#: "This task may be taken now": it is pending with no live lease, or it has
-#: waited until its ``retry_at``.
-_TASK_DUE = (
-    "((t.state = 'pending' AND (t.lease_expires IS NULL OR t.lease_expires < now())) "
-    " OR (t.state = 'waiting' AND (t.retry_at IS NULL OR t.retry_at <= now()))) ")
-
-#: "Every task this one depends on has verified."
-_DEPS_VERIFIED = (
-    "NOT EXISTS ("
-    "  SELECT 1 FROM jsonb_array_elements_text(t.dependencies) AS d(dep) "
-    "  WHERE NOT EXISTS ("
-    "    SELECT 1 FROM nexus_run_tasks dep "
-    "    WHERE dep.run_id = t.run_id AND dep.task_key = d.dep "
-    "      AND dep.state = ANY(ARRAY['completed_verified','completed_no_changes']))) ")
+# These predicates are also compiled into the Rust storage candidate. Load
+# once, never from a request and never while holding a transaction/row lock.
+_SQL = Path(__file__).with_name("sql")
+_BRANCH_FREE = (_SQL / "branch_free.sql").read_text(encoding="utf-8")
+_TASK_DUE = (_SQL / "task_due.sql").read_text(encoding="utf-8")
+_DEPS_VERIFIED = (_SQL / "dependencies_verified.sql").read_text(encoding="utf-8")
 
 #: How long one task's conversation may run before the task is given up, in
 #: seconds, unless ``NEXUS_TASK_TIMEOUT_SECONDS`` says otherwise. It was thirty

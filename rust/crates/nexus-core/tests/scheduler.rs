@@ -171,3 +171,10 @@ fn run_complete_requires_every_task_verified() {
     ]));
     assert!(!run_complete(&[]));
 }
+
+#[test]
+fn a_tasks_own_abandoned_writer_holds_its_branch() {
+    let mut t = task("retry", "pending");
+    t.abandoned = true;
+    assert!(!claimable(&run(), &[t], "retry").claimable);
+}
