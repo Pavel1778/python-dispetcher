@@ -2920,3 +2920,34 @@ eleven in turn, asserts it is named). Both fail if a column is removed from the
 map **or** if the guard reverts to the eight-table tuple. Do not narrow the
 guard back to a hand-kept subset: a table the map names but the loop skips is a
 schema contract that is not enforced.
+
+### The Self-QA gate, and why `/api/studio`'s `lab` dict is asserted four times
+
+`LabScheduler(quality_gate=…)` runs the project's own checks at the exact
+`remote_sha` the Git verifier accepted, and can only *weaken* a verdict: a
+failing required check downgrades `completed_verified` → `completed_unverified`
+(so the task is reworked); `passed` leaves it; `skipped`/`blocked` never turns a
+pass into a failure; a gate that raises is logged and ignored. Off by default
+(`NEXUS_SELFQA_GATE=1`), wired in `lab_worker.main` and the server's inline loop,
+and reported as `lab.selfqa_gate` in `/api/studio` (shown on the Settings
+screen as «Самопроверка (Self-QA)»).
+
+**Trap.** The `lab` object in `/api/studio` is compared **whole** in four
+places, so adding a field breaks all four at once and only some are obvious:
+`tests/test_lab_inline.py` (three assertions) and
+`tests/test_studio_api.py::test_status_says_what_is_configured_and_never_the_values`.
+The fix each time was to add the new key to the expected dict, never to loosen
+the comparison to a subset — a subset check would stop catching a removed
+field. When you add to `lab`, grep for `"cleanup_hours": 24.0` and update every
+hit.
+
+### One-command self-hosting
+
+`scripts/nexus.sh` (setup/start/stop/restart/status/logs/backup/restore/update/
+tunnel) is the operator entry point. It waits for `/healthz` before reporting
+started, never deletes user data, and `restore` proves a dump loads into a
+**scratch** database it drops — the live database is untouched
+(`tests/test_self_hosting.py` asserts this over a real pg_dump/pg_restore).
+`backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
+both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
+per-process isolation passes the latter.
