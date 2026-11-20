@@ -219,3 +219,28 @@ def test_the_gate_is_off_by_default(monkeypatch):
         assert isinstance(build_quality_gate(), SelfQa)
     monkeypatch.setenv("NEXUS_SELFQA_GATE", "0")
     assert build_quality_gate() is None
+
+
+def test_the_studio_reports_whether_the_gate_is_on(monkeypatch):
+    """``/api/studio`` must say honestly whether accepted commits are checked.
+
+    A user reading the settings has to know whether NEXUS proves the project
+    still works or only that a commit landed. The value is read from the real
+    ``App`` the operator would run, in both states.
+    """
+    from orchestration.web_server import App
+
+    monkeypatch.delenv("NEXUS_SELFQA_GATE", raising=False)
+    app_off = App(DSN, token="t")
+    try:
+        assert app_off.studio_status()["lab"]["selfqa_gate"] is False
+    finally:
+        app_off.stop()
+
+    monkeypatch.setenv("NEXUS_SELFQA_GATE", "1")
+    app_on = App(DSN, token="t")
+    try:
+        assert app_on.quality_gate is not None
+        assert app_on.studio_status()["lab"]["selfqa_gate"] is True
+    finally:
+        app_on.stop()

@@ -2323,6 +2323,9 @@
         ? 'включено' : 'NEXUS_SECRET_KEY не задан — аккаунты не сохранятся') +
       '<dt>Автономные прогоны</dt>' + line(lab.inline, lab.inline
         ? 'ведёт сам сервер' : 'выключено (NEXUS_LAB_INLINE=0) — нужен процесс lab_worker') +
+      '<dt>Самопроверка (Self-QA)</dt>' + line(!!lab.selfqa_gate, lab.selfqa_gate
+        ? 'включена — принятый коммит проверяется тестами проекта'
+        : 'выключена (NEXUS_SELFQA_GATE) — проверяется только Git') +
       '<dt>Версия</dt><dd>' + esc(status.version || '—') + '</dd></dl></div>';
   }
 

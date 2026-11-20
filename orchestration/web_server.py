@@ -777,7 +777,11 @@ class App:
             # and the page says so instead of showing a run that never moves.
             # ``cleanup_hours``: how long after a run is over its OpenHands
             # conversations are deleted; ``None`` when they are kept for ever.
-            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours()},
+            # ``selfqa_gate``: whether a task the Git verifier accepts is also
+            # run against the project's own checks at that commit. Off unless
+            # the operator opted in (NEXUS_SELFQA_GATE); the studio says which.
+            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours(),
+                    "selfqa_gate": self.quality_gate is not None},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {
