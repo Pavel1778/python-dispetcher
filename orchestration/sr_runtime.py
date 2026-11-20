@@ -33,7 +33,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .cloud_client import (
     CloudAuthError,
@@ -109,10 +109,20 @@ class SrRuntime:
         plugins: list[dict[str, Any]] | None = None,
         sr_start_max_attempts: int = 5,
         sr_start_backoff_base: float = 5.0,
+        client_for_workflow: Callable[[str], Any] | None = None,
     ):
         self.store = store
         self.client = client
         self.tools = tools
+        #: Resolves the Cloud client for a workflow's own project connection.
+        #: When given, Sr is started and driven on the account the project is
+        #: bound to (its stored base URL and model), not on the process-wide
+        #: client. Without it the process-wide client is used, exactly as before
+        #: - a single-key deployment keeps its behaviour. A resolver that raises
+        #: ``NotFound`` (no account bound) falls back to ``self.client``; any
+        #: other error propagates, because a broken stored connection must be
+        #: reported rather than silently replaced with a different identity.
+        self.client_for_workflow = client_for_workflow
         self.worker_id = worker_id
         self.start_poll_attempts = start_poll_attempts
         self.start_poll_interval = start_poll_interval
@@ -140,6 +150,22 @@ class SrRuntime:
         self._tool_names = set(self._ops)
 
     # ------------------------------------------------------------------ start
+    def _client_for(self, workflow_id: str) -> Any:
+        """The Cloud client to drive one workflow's Sr with.
+
+        A workflow whose project is bound to a stored connection runs on *that*
+        connection (its base URL and model). With no resolver, or with no
+        account bound to the project, the process-wide client is used, exactly
+        as before. A stored connection that has become unusable raises, so the
+        caller sees a real error instead of a silent switch to another identity.
+        """
+        if self.client_for_workflow is None:
+            return self.client
+        try:
+            return self.client_for_workflow(workflow_id)
+        except NotFound:
+            return self.client
+
     def ensure_sr(self, workflow_id: str, *, repository: str | None = None) -> str:
         """Start the Sr conversation for a workflow, or return the existing one.
 
@@ -173,7 +199,8 @@ class SrRuntime:
 
         goal = (existing or {}).get("goal") or "workflow"
         repos = self.store.list_repositories()
-        start = self.client.start_conversation(
+        client = self._client_for(workflow_id)
+        start = client.start_conversation(
             initial_message=SR_INSTRUCTION.format(
                 goal=goal, repositories=_repositories_clause(repos)
             ),
@@ -206,13 +233,14 @@ class SrRuntime:
         start_task_id = existing.get("sr_start_task_id")
         if not start_task_id:
             return None
-        start = self.client.get_start_task(start_task_id)
+        client = self._client_for(workflow_id)
+        start = client.get_start_task(start_task_id)
         if start is None or start.failed:
             return None
         if not start.app_conversation_id:
             # Not READY yet; poll it the same way a fresh start is polled.
             try:
-                conversation_id = self._await_start(start)
+                conversation_id = self._await_start(start, client)
             except CloudError:
                 return None
             self.store.bind_sr(
@@ -251,7 +279,7 @@ class SrRuntime:
         conversation yields ``None``.
         """
         value = workflow_id.replace("-", "")
-        items, _ = self.client.search_conversations(
+        items, _ = self._client_for(workflow_id).search_conversations(
             limit=50, tag=("orchestratorsr", value)
         )
         for conv in items:
@@ -259,7 +287,8 @@ class SrRuntime:
                 return conv.id
         return None
 
-    def _await_start(self, start) -> str:
+    def _await_start(self, start, client: Any | None = None) -> str:
+        client = client or self.client
         current = start
         for _ in range(self.start_poll_attempts):
             if current.app_conversation_id:
@@ -267,7 +296,7 @@ class SrRuntime:
             if current.failed:
                 raise CloudError(f"Sr start failed: {current.detail or current.status}")
             time.sleep(self.start_poll_interval)
-            nxt = self.client.get_start_task(current.id)
+            nxt = client.get_start_task(current.id)
             if nxt is None:
                 raise CloudUnavailable("Sr start task disappeared")
             current = nxt
@@ -354,7 +383,7 @@ class SrRuntime:
             if not sr_conv:
                 continue
             try:
-                events = self.client.list_events(sr_conv)
+                events = self._client_for(workflow_id).list_events(sr_conv)
             except CloudNotFound:
                 report.unavailable.append(workflow_id)
                 continue
@@ -379,7 +408,8 @@ class SrRuntime:
                 f"{json.dumps(row['result'], default=str)}"
             )
             try:
-                self.client.send_message(row["sr_conversation_id"], text)
+                self._client_for(row["workflow_id"]).send_message(
+                    row["sr_conversation_id"], text)
             except CloudError as e:
                 report.errors.append({"name": row["name"], "error": str(e)})
                 continue
@@ -413,7 +443,7 @@ class SrRuntime:
             is_error=not result.ok,
             task_id=result.data.get("task_id"),
         )
-        self._deliver(event_id, conversation_id, name, result, report)
+        self._deliver(workflow_id, event_id, conversation_id, name, result, report)
 
     def _execute(
         self, name: str, args: dict[str, Any], workflow_id: str, event_id: str
@@ -450,6 +480,7 @@ class SrRuntime:
 
     def _deliver(
         self,
+        workflow_id: str,
         event_id: str,
         conversation_id: str,
         name: str,
@@ -458,7 +489,7 @@ class SrRuntime:
     ) -> None:
         text = f"[{name} result]\n{json.dumps(result.as_dict(), default=str)}"
         try:
-            self.client.send_message(conversation_id, text)
+            self._client_for(workflow_id).send_message(conversation_id, text)
         except CloudError as e:
             # Execution is recorded; delivery is retried by ``_redeliver`` on the
             # next tick, so a transient failure does not stall Sr.

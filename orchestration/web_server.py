@@ -445,6 +445,10 @@ class App:
             self.store, self.client, SrTools(self.store, self.dispatcher),
             worker_id=worker_id, start_poll_interval=2.0, start_poll_attempts=40,
             agent_profile_id=profile, plugins=plugins,
+            # Sr runs on the connection the workflow's project is bound to, so a
+            # "code" turn gets the stored model and base URL. A project with no
+            # bound account falls back to the process client (NotFound).
+            client_for_workflow=self._workflow_client,
         )
         self.verifier = WorkflowVerifier(self.store, self.client)
         self.poll_interval = poll_interval
@@ -723,6 +727,30 @@ class App:
             raise
         return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id,
                 "reused": not created}
+
+    def _workflow_client(self, workflow_id: str) -> Any:
+        """The Cloud client to drive one workflow's Sr with.
+
+        The workflow's project may be bound to a stored OpenHands connection;
+        when it is, Sr runs on *that* connection (its base URL and model) instead
+        of the process-wide client, so a ``code`` turn gets the model the
+        operator configured. ``NotFound`` (no project, no bound account) is
+        raised for the runtime to fall back to the process client; a stored
+        connection that has become unusable raises ``ValueError`` and is not
+        silently replaced by a different identity.
+        """
+        row = self.store.sr_for(workflow_id)
+        project_id = (row or {}).get("project_id")
+        if not project_id:
+            raise NotFound("workflow has no project")
+        account_id = self.openhands_accounts.bound_account_id(project_id)
+        if not account_id:
+            raise NotFound("project has no OpenHands account bound")
+        principal = self.openhands_accounts.owner_of(str(account_id))
+        if principal is None:
+            raise NotFound("account not found")
+        return self.openhands_accounts.execution_client_for_account(
+            principal, str(account_id))
 
     def _chat_dispatch_code(self, request: dict) -> dict[str, Any]:
         """Chat "Code" mode: start a real OpenHands workflow for the request.
@@ -4712,7 +4740,9 @@ class Handler(BaseHTTPRequestHandler):
                         self._project_principal(),
                         label=body.get("label"), api_key=body.get("api_key"),
                         base_url=(body.get("base_url") or None),
-                        transport=(body.get("transport") or "direct"),
+                        # A reconnect that does not name a transport must keep the
+                        # stored one; only an explicit value changes it.
+                        transport=(body.get("transport") or None),
                         default_model=(body.get("default_model") or None),
                         make_default=bool(body.get("make_default")),
                         max_concurrent_tasks=body.get("max_concurrent_tasks"),

@@ -1608,7 +1608,7 @@ class PostgresStore:
         with self._tx() as cur:
             cur.execute(
                 "SELECT sr_conversation_id, sr_start_task_id, sr_status, goal, state, "
-                "sr_attempt, sr_last_error, sr_next_attempt_at, sr_started_at "
+                "sr_attempt, sr_last_error, sr_next_attempt_at, sr_started_at, project_id "
                 "FROM workflows WHERE id=%s",
                 (workflow_id,),
             )
