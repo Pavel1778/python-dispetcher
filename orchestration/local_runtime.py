@@ -156,7 +156,8 @@ class LocalCloudClient(OpenHandsClient):
             source = {'agent_settings': agent_settings}
         if not (profile and selected_repository):
             os.makedirs(working_dir, exist_ok=True)
-        _view, created = self.create_conversation(
+        expected = self.execution_profiles.session_expectation(profile, profile_scope, dispatch_id, working_dir) if profile else None
+        view, created = self.create_conversation(
             conversation_id=conversation_id,
             working_dir=working_dir,
             title=(title or initial_message[:60] or None),
@@ -167,6 +168,10 @@ class LocalCloudClient(OpenHandsClient):
             # are one provider operation. Never POST another events/run on 200.
             **({'initial_message': initial_message, 'tags': tags} if dispatch_id else {}),
         )
+        if dispatch_id and view.conversation_id != conversation_id:
+            raise CloudUnavailable('ambiguous conversation receipt')
+        if expected:
+            self.confirm_session(conversation_id, expected, tags if dispatch_id else None)
         if not dispatch_id and tags and created:
             self._patch_tags(conversation_id, tags)
         if initial_message and not dispatch_id:
@@ -181,6 +186,9 @@ class LocalCloudClient(OpenHandsClient):
             sandbox_id=conversation_id,
             agent_server_url=self.base_url,
         )
+
+    def confirm_session(self, cid, expected, tags):
+        self.execution_profiles.check_session(self._request('GET', '/api/conversations/' + str(uuid.UUID(cid))), cid, expected, tags)
 
     def profile_source(self, profile, *, test_model=False, requested_agent=None):
         return self.execution_profiles.reconcile(profile, self._request, test_model=test_model,

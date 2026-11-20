@@ -101,7 +101,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise CloudError(f"refusing to follow redirect ({code}) to {newurl!r}")
+        raise CloudError(f"refusing to follow redirect ({code})")
 
 
 class CloudAuthError(CloudError):
@@ -320,9 +320,12 @@ class CloudClient:
                     retry_after: float | None = float(e.headers.get("Retry-After", ""))
                 except (TypeError, ValueError):
                     retry_after = None       # absent, or an HTTP date: not used
+                # Keep actionable, known reasons without echoing arbitrary response bodies or codes.
+                daily = code == 'daily_conversation_limit_reached'
+                reason = 'daily conversation limit' if daily else ('capacity full' if detail == 'capacity full' else 'rate limited')
                 raise CloudRateLimited(
-                    f"{method} {path} -> 429",
-                    code=code if isinstance(code, str) else None, retry_after=retry_after,
+                    f"{method} {path} -> 429: {reason}",
+                    code='daily_conversation_limit_reached' if daily else None, retry_after=retry_after,
                 ) from e
             if e.code >= 500:
                 raise CloudUnavailable(f"{method} {path} -> {e.code}") from e

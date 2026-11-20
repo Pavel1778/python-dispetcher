@@ -239,7 +239,9 @@ class EvidenceTrustEngine:
         key_id = record.get("key_id") or ""
         signature = record.get("signature") or ""
         signed_payload = record.get("signed_payload")
-        version = int(record.get("format_version") or LEGACY_FORMAT_VERSION)
+        version = record.get("format_version", LEGACY_FORMAT_VERSION)
+        if type(version) is not int or version not in (LEGACY_FORMAT_VERSION, FORMAT_VERSION):
+            return Verdict(UNVERIFIED, "unknown evidence format", checks)
         checks["format_version"] = version
 
         if not signed_payload:
@@ -262,6 +264,9 @@ class EvidenceTrustEngine:
         except Exception:  # noqa: BLE001
             return Verdict(FAILED, "signed payload is not valid JSON", checks)
 
+        if (not isinstance(body, dict) or body.get('format_version', LEGACY_FORMAT_VERSION) != version
+                or ('body' in record and canonical_bytes(record['body']) != canonical_bytes(body))):
+            return Verdict(FAILED, 'stored body differs from signed evidence', checks)
         recomputed_payload = canonical_bytes(body).decode("utf-8")
         if recomputed_payload != signed_payload:
             checks["payload_canonical"] = False
@@ -273,8 +278,6 @@ class EvidenceTrustEngine:
         for col in ("project_id", "repository_full_name", "commit_sha", "branch",
                     "subject_kind", "subject_id"):
             signed_value = body.get(col)
-            if signed_value is None:
-                continue
             if _norm(record.get(col)) != _norm(signed_value):
                 checks["column_mismatch"] = col
                 return Verdict(FAILED,
@@ -285,7 +288,7 @@ class EvidenceTrustEngine:
         try:
             key.public_key.verify(_b64d(signature), _signing_input(version, body))
             checks["signature_valid"] = True
-        except InvalidSignature:
+        except (InvalidSignature, TypeError, ValueError, AttributeError):
             checks["signature_valid"] = False
             return Verdict(FAILED, "signature does not verify", checks)
 
@@ -303,6 +306,11 @@ class EvidenceTrustEngine:
         if prev_expected_hash is not None and (claimed_prev or None) != (prev_expected_hash or None):
             checks["chain_broken"] = True
             return Verdict(FAILED, "hash chain is broken (prev_hash mismatch)", checks)
+        if 'entry_hash' in record or prev_expected_hash is not None:
+            if (claimed_prev is not None and (not isinstance(claimed_prev, str) or not claimed_prev.isascii())
+                    or record.get('entry_hash') != entry_hash(claimed_prev, version, body)):
+                checks['chain_broken'] = True
+                return Verdict(FAILED, 'stored entry hash does not match the signed body and predecessor', checks)
         if chain_tail is not None:
             checks["chain_tail"] = chain_tail
 

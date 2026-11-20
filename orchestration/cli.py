@@ -405,7 +405,7 @@ def cmd_evidence_verify(args: argparse.Namespace) -> int:
     rec = out.get("evidence", {})
     verdict = rec.get("verdict")
     _emit(args, out, human=f"{args.evidence_id}: {verdict}")
-    return EXIT["ok"]
+    return EXIT["ok"] if verdict == "VERIFIED" else EXIT["conflict"]
 
 
 def cmd_agent_status(args: argparse.Namespace) -> int:
@@ -830,12 +830,18 @@ def cmd_qa_verify(args: argparse.Namespace) -> int:
     client = _client(args)
     if not args.project_id:
         raise CliError("--project is required", EXIT["usage"])
-    evidence = client.get(f"/api/v1/projects/{args.project_id}/evidence").get("evidence", [])
+    root = f'/api/v1/projects/{args.project_id}/evidence'
+    evidence = client.get(root).get('evidence', [])
     verdicts: dict[str, int] = {}
-    for e in evidence:
-        verdicts[e["verdict"]] = verdicts.get(e["verdict"], 0) + 1
-    ok = verdicts.get("FAILED", 0) == 0
-    data = {"count": len(evidence), "verdicts": verdicts, "ok": ok}
+    for entry in evidence:
+        rec = client.post(f"{root}/{entry['id']}/verify", {}).get('evidence', {})
+        value = rec.get('verdict') or 'UNVERIFIED'
+        verdicts[value] = verdicts.get(value, 0) + 1
+    # list_evidence is a window, not an unbounded or atomic chain scan. Do
+    # not attest completeness at its cap, or turn an empty list into proof.
+    complete = 0 < len(evidence) < 100
+    ok = complete and set(verdicts) == {'VERIFIED'}
+    data = {'count': len(evidence), 'verdicts': verdicts, 'ok': ok, 'complete_window': complete}
     _emit(args, data, human=f"{len(evidence)} record(s): {verdicts}")
     return EXIT["ok"] if ok else EXIT["conflict"]
 

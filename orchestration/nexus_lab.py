@@ -672,7 +672,7 @@ class OpenHandsExecutor:
 
     def _arm(self, task: dict, client: Any, account_id: str | None, kind: str, **extra: Any) -> None:
         self.journal.arm(task, {'account_id': account_id, 'kind': kind, 'tags': self._tags(task),
-                               'endpoint': self._endpoint(client),
+                               'endpoint': self._endpoint(client), 'armed_lease': str(task['lease_token']),
                                'base_sha': task.get('base_sha'), 'previous_account': _last_account(task), **extra})
 
     def _unknown(self, task: dict, error: Exception) -> None:
@@ -685,6 +685,7 @@ class OpenHandsExecutor:
         ctx = intent['context']
         account = ctx.get('account_id')
         cid = intent.get('conversation_id')
+        client = None
         if not cid:
             client = self._client_for_task({**task, '_dispatch_origin': ctx})
             if intent['start_id']:
@@ -693,6 +694,8 @@ class OpenHandsExecutor:
                 except CloudNotFound:
                     start = None
                 if start is not None:
+                    if str(start.id) != str(intent['start_id']):
+                        raise DispatchHeld('start receipt does not match original request')
                     if start.failed:
                         raise DispatchError(f"start task failed: {start.detail}", account_id=account,
                                             unavailable=False)
@@ -707,7 +710,7 @@ class OpenHandsExecutor:
                     cid = self._observed_turn(client, ctx)
                 elif ctx.get('scoped_id'):
                     conv = client.get_conversation(key)
-                    if str(conv.id) == key and (conv.tags or {}).get('nexusdispatch') == key:
+                    if str(conv.id) == key and all((conv.tags or {}).get(k) == v for k, v in ctx['tags'].items()):
                         cid = key
                 else:
                     search = getattr(client, 'search_conversations', None)
@@ -727,6 +730,11 @@ class OpenHandsExecutor:
                         if page in seen:
                             break
                         seen.add(page)
+        if cid and ctx.get('expected_session'):
+            client = client or self._client_for_task({**task, '_dispatch_origin': ctx})
+            if str(cid) != str(intent['id']) or not hasattr(client, 'confirm_session'):
+                raise DispatchHeld('original managed session not established')
+            client.confirm_session(str(cid), ctx['expected_session'], ctx['tags'])
         if cid and (not ctx.get('needs_files') or (ctx.get('delivery') or {}).get('files')):
             return Dispatched(str(cid), ctx.get('delivery'), account, ctx['kind'])
         raise DispatchHeld('no unambiguous conversation and delivery receipt')
@@ -2113,8 +2121,8 @@ class LabScheduler:
         # from, and what "changed" is later measured against.
         head = getattr(self.verifier, "head", None)
         base_sha = head(task) if head is not None else None
-        if base_sha:
-            task = {**task, "base_sha": base_sha}
+        # An unavailable head is not the base of a previous attempt.
+        task = {**task, "base_sha": base_sha}
         if task.get("repository"):
             # A project with several repositories: the agent is told which they
             # are and which one is its own.

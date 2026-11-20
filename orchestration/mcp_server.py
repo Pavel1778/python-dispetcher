@@ -45,6 +45,7 @@ log = logging.getLogger("mcp_server")
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "nexus"
 SERVER_VERSION = "2.0.0"
+VERIFY_TOOLS = frozenset({"list_evidence", "verify_evidence", "get_execution_profile"})
 
 
 class McpError(Exception):
@@ -57,13 +58,14 @@ class McpServer:
     """The tool surface. One instance per process; ``principal`` is the caller."""
 
     def __init__(self, store: PostgresStore, principal: str, *,
-                 role: str = ROLE_OWNER):
+                 role: str = ROLE_OWNER, verify_project: str | None = None):
         self.store = store
         self.principal = principal
         #: The caller's role, which decides which tool scopes it carries. The
         #: stdio/HTTP entry points pass the authenticated user's role; the
         #: default is the owner, matching the owner-level machine bearer.
         self.role = role
+        self.verify_project = verify_project
         self.projects = ProjectService(store)
         self.tools: dict[str, Callable[[dict], Any]] = {
             "list_projects": self._list_projects,
@@ -338,7 +340,15 @@ class McpServer:
     def _list_evidence(self, args: dict) -> Any:
         pid = args["project_id"]
         self._member(pid)
-        return {"evidence": self.store.list_evidence(project_id=pid)}
+        rows = self.store.list_evidence(project_id=pid)
+        if self.verify_project:
+            return {'evidence': [self._receipt_view(r) for r in rows]}
+        return {'evidence': rows}
+
+    @staticmethod
+    def _receipt_view(row):
+        # No command output, task text, paths, transcripts, key material, or write capability.
+        return {k: row.get(k) for k in ('id', 'project_id', 'subject_kind', 'subject_id', 'commit_sha', 'verdict')}
 
     def _verify_evidence(self, args: dict) -> Any:
         from .evidence_trust import EvidenceTrustEngine, Keyring, signer_from_env
@@ -348,14 +358,16 @@ class McpServer:
         self._member(pid)
         service = EvidenceService(
             self.store,
-            EvidenceTrustEngine(Keyring.from_env(), signer_from_env()),
+            EvidenceTrustEngine(Keyring.from_env(), None if self.verify_project else signer_from_env()),
         )
         rec = service.reverify(args["evidence_id"], project_id=pid,
-                               expected_commit=args.get("expected_commit"))
-        return {"evidence": rec}
+                               expected_commit=args.get("expected_commit"), persist=not self.verify_project)
+        return {"evidence": self._receipt_view(rec) if self.verify_project else rec}
 
     # ------------------------------------------------------------ dispatch
     def handle(self, method: str, params: dict) -> Any:
+        if not isinstance(params, dict):
+            raise McpError(-32602, 'params must be an object')
         if method == "initialize":
             return {
                 "protocolVersion": PROTOCOL_VERSION,
@@ -363,10 +375,14 @@ class McpServer:
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             }
         if method == "tools/list":
-            return {"tools": self.tool_schemas()}
+            return {"tools": [s for s in self.tool_schemas() if not self.verify_project or s['name'] in VERIFY_TOOLS]}
         if method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments") or {}
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                raise McpError(-32602, 'invalid tool arguments')
+            if self.verify_project and (name not in VERIFY_TOOLS or arguments.get('project_id') != self.verify_project):
+                raise McpError(-32003, 'not authorized by verification grant')
             fn = self.tools.get(name)
             if fn is None:
                 raise McpError(-32601, f"unknown tool: {name}")

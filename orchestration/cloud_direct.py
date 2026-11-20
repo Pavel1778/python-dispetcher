@@ -454,6 +454,7 @@ class CloudDirectClient:
             self.store.save_conversation_route(dispatch_id, sandbox_id=route.sandbox_id,
                                               agent_server_url=route.agent_server_url,
                                               session_api_key=route.session_api_key)
+        expected = self.execution_profiles.session_expectation(profile, profile_scope, dispatch_id, working_dir) if profile else None
         status, payload = self._send(route, "POST", "/api/conversations", body)
         if status == 429:
             raise CloudRateLimited("sandbox conversation capacity full")
@@ -461,7 +462,11 @@ class CloudDirectClient:
             raise CloudValidationError("create on sandbox rejected (422)")
         if status not in (200, 201):
             raise CloudError(f"create on sandbox -> {status}")
+        if dispatch_id and (not isinstance(payload, dict) or str(payload.get('id')) != dispatch_id):
+            raise CloudUnavailable('ambiguous conversation receipt')
         actual_id = str((payload or {}).get("id") or conversation_id)
+        if expected:
+            self._confirm_session(route, conversation_id, expected, tags)
         self.store.save_conversation_route(
             actual_id,
             sandbox_id=route.sandbox_id,
@@ -553,6 +558,16 @@ class CloudDirectClient:
         )
         log.info("direct transport: repository task for %s via instruction", ref)
         return prefix + message
+
+    def _confirm_session(self, route, cid, expected, tags):
+        try:
+            reply = self._send(route, 'GET', '/api/conversations/' + str(uuid.UUID(cid)))
+        except CloudError:
+            raise CloudUnavailable('created session not confirmed on original route') from None
+        self.execution_profiles.check_session(reply, cid, expected, tags)
+
+    def confirm_session(self, cid, expected, tags):
+        self._confirm_session(self._route_for(cid), cid, expected, tags)
 
     def profile_source(self, profile, *, route=None, test_model=False, requested_agent=None):
         if route is None:

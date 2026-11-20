@@ -319,3 +319,16 @@ class TestEvidenceService:
                         (other, rec["id"]))
         out = svc.reverify(rec["id"], project_id=other)
         assert out["verdict"] == FAILED
+
+
+@pytest.mark.parametrize('fault', ['body', 'entry_hash', 'malformed_signature', 'legacy_reassigned', 'null_commit_changed'])
+def test_invalid_stored_receipts_do_not_verify(fault):
+    engine, _ = _engine()
+    body = _body(None if fault == 'legacy_reassigned' else '11111111-1111-1111-1111-111111111111')
+    if fault == 'null_commit_changed':
+        body['commit_sha'] = None
+    record = _record(engine, body)
+    field, value = {'body': ('body', {**body, 'detail': {'tests': 100}}), 'entry_hash': ('entry_hash', 'f' * 64),
+                    'legacy_reassigned': ('project_id', '11111111-1111-1111-1111-111111111111'),
+                    'malformed_signature': ('signature', 'x'), 'null_commit_changed': ('commit_sha', 'abc')}[fault]
+    assert engine.verify({**record, field: value}).verdict == FAILED

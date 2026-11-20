@@ -11,7 +11,7 @@ The four claims under test:
 
 * a passing gate leaves a verified task verified;
 * a failing required check downgrades it to ``completed_unverified`` (rework);
-* a skipped/blocked gate (no tooling) never turns a pass into a failure;
+* missing required tooling cannot be reported as a verified result;
 * with no gate configured the loop is exactly as before.
 """
 from __future__ import annotations
@@ -155,12 +155,16 @@ def test_a_failing_required_check_downgrades_the_task(lab, tmp_path):
     assert _settled(lab, run) != "completed_verified"
 
 
-def test_the_gate_records_its_verdict_as_evidence(lab, tmp_path):
+def test_the_gate_records_its_verdict_as_evidence(lab, tmp_path, monkeypatch):
+    from orchestration.lab_worker import build_evidence_service
+    from tests.test_lab_evidence import _signer_env
+    _signer_env(monkeypatch)
+    service = build_evidence_service(lab['store'])
     repo = _repo_with_tests(tmp_path, tests_pass=True)
     head = _git(repo, "rev-parse", "HEAD")
     run = _one_task_run(lab, repository=repo)
     sched = LabScheduler(lab["lab"], _Executor(), _Verifier(commit=head),
-                         quality_gate=SelfQa())
+                         quality_gate=SelfQa(), evidence=service)
     sched.run_until_done(str(run["id"]))
     task = lab["lab"].list_tasks("user:alice", lab["project"], run["id"])[0]
     entries = task.get("evidence") or []
@@ -171,6 +175,10 @@ def test_the_gate_records_its_verdict_as_evidence(lab, tmp_path):
     assert receipt['binding']['id'] == str(task['id']) and receipt['binding']['run_id'] == str(run['id'])
     assert receipt['checked_sha'] == head and receipt['checks'][0]['argv'] == ['python', 'check.py']
     assert receipt['checks'][0]['exit_code'] == 0 and len(receipt['checks'][0]['output_sha256']) == 64
+    signed, = [e for e in service.list(project_id=lab['project']) if e['subject_id'] == str(task['id'])]
+    assert signed['body']['detail']['self_qa'] == receipt
+    assert service.reverify(signed['id'], project_id=lab['project'], expected_commit=head)['verdict'] == 'VERIFIED'
+    assert service.index_integrity(project_id=lab['project'])['intact']
 
 
 def test_no_gate_means_no_self_qa_evidence(lab, tmp_path):

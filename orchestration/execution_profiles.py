@@ -184,18 +184,24 @@ class ExecutionProfiles:
         subject = (permit, task, project, repository, branch)
         where = (" WHERE i.id=%s AND i.task_id=t.id AND t.id=%s AND t.project_id=%s "
                  "AND t.repository=%s AND t.branch=%s AND t.state='dispatched' AND i.state='sending' "
-                 "AND i.lease_token=t.lease_token AND t.lease_expires>clock_timestamp()")
+                 "AND i.lease_token=t.lease_token AND i.context->>'armed_lease'=t.lease_token::text "
+                 "AND t.lease_expires>clock_timestamp()")
         with self.store._tx() as cur:
             cur.execute('SELECT i.context FROM nexus_dispatch_intents i, nexus_run_tasks t' + where, subject)
             bound = cur.fetchone()
         if not bound:
             self.block(row, 'no live grant for this checkout')
+        base_sha = bound['context'].get('base_sha')
+        if not isinstance(base_sha, str) or not re.fullmatch('[0-9a-f]{40}', base_sha):
+            self.block(row, 'remote branch head not established for this grant')
         origin = shlex.quote(f'https://github.com/{repository}.git')
         # Never emit the actual remote URL (it may contain a misconfigured credential).
         command = (f'test "$(pwd -P)" = {shlex.quote(cwd)} && test "$(git rev-parse --show-toplevel)" = "$(pwd -P)" '
                    f'&& test "$(git remote get-url --all origin)" = {origin} '
                    f'&& test "$(git remote get-url --all --push origin)" = {origin} '
-                   f'&& test "$(git symbolic-ref --short HEAD)" = {shlex.quote(branch)} && git rev-parse --verify HEAD')
+                   f'&& test "$(git symbolic-ref --short HEAD)" = {shlex.quote(branch)} '
+                   '&& changes=$(git -c core.fsmonitor=false status --porcelain=v1 --untracked-files=all --ignored) '
+                   '&& test -z "$changes" && git rev-parse --verify HEAD')
         try:
             code, reply = send('POST', '/api/bash/execute_bash_command', {'cwd': cwd, 'command': command, 'timeout': 8})
         except (CloudError, ApiUnavailable, OSError, ValueError):
@@ -203,7 +209,7 @@ class ExecutionProfiles:
         sha = reply.get('stdout') if isinstance(reply, dict) else None
         if (code != 200 or not isinstance(sha, str) or type(reply.get('exit_code')) is not int or reply['exit_code'] != 0
                 or not re.fullmatch('[0-9a-f]{40}', sha.strip())
-                or (bound['context'].get('base_sha') and bound['context']['base_sha'] != sha.strip())):
+                or base_sha != sha.strip()):
             self.block(row, 'staged checkout origin, branch or HEAD not verified')
         receipt = dict(repository=repository, branch=branch, head=sha.strip(), working_dir=cwd,
                        profile_scope=row['scope'], revision=row['revision'])
@@ -214,6 +220,42 @@ class ExecutionProfiles:
         if not live:
             self.block(row, 'grant changed before checkout was recorded')
         return cwd
+
+    def session_expectation(self, row, scope, permit, cwd):
+        """Commit what this launch must read back. Later profile edits must not change recovery."""
+        d = row['desired']
+        expected = {'model': d['model'], 'base_url': d['base_url'], 'params': d['params'], 'working_dir': cwd,
+                    'scope': row['scope'], 'revision': row['revision']}
+        with self.store._tx() as cur:
+            effective = self._effective(cur, *scope)
+            if not effective or (row['scope'], row['revision']) != (effective['scope'], effective['revision']):
+                raise ProfileBlocked('profile selection changed before create')
+            if permit:
+                cur.execute("UPDATE nexus_dispatch_intents i SET context=i.context || %s::jsonb FROM nexus_run_tasks t "
+                            "WHERE i.id=%s AND i.task_id=t.id AND t.project_id=%s AND t.id=%s AND t.state='dispatched' "
+                            "AND i.state='sending' AND i.lease_token=t.lease_token AND t.lease_expires>clock_timestamp() "
+                            "AND i.context->>'armed_lease'=t.lease_token::text AND NOT i.context ? 'expected_session'",
+                            (json.dumps({'expected_session': expected}), _uuid(permit), *scope))
+                if not cur.rowcount:
+                    raise ProfileBlocked('no unused live launch grant')
+        return expected
+
+    @staticmethod
+    def check_session(reply, cid, expected, tags):
+        # This is AFTER the conversation POST: a rejection or a failed read is
+        # ambiguous, never ProfileBlocked (which would release the send permit).
+        try:
+            status, data = reply
+            llm = data['agent']['llm']
+            ok = (status == 200 and _uuid(data['id']) == _uuid(cid)
+                  and data['workspace']['working_dir'] == expected['working_dir']
+                  and llm['model'] == expected['model'] and llm['base_url'] == expected['base_url']
+                  and all(llm.get(k) == v for k, v in expected['params'].items())
+                  and all(data['tags'].get(k) == v for k, v in (tags or {}).items()))
+        except (KeyError, AttributeError, TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise CloudUnavailable('created session does not confirm the original launch receipt')
 
     def block(self, row, reason):
         self.observe(row, 'blocked', reason)

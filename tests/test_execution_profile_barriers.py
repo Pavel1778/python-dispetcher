@@ -156,3 +156,74 @@ def test_project_member_cannot_reconfigure_or_control_an_owners_run(env):  # noq
     with pytest.raises(McpError, match='not found'):
         server.handle('tools/call', {'name':'cancel_run','arguments':{'project_id':p,'run_id':run}})
     assert env['lab'].run_row(run)['state'] == 'running'
+
+
+@pytest.mark.parametrize('fault', ['absent', 'fetch_origin', 'push_origin', 'branch', 'dirty', 'sha', 'unknown_head', 'expired', 'rotated'])
+def test_staged_checkout_needs_clean_git_and_original_live_grant(env, tmp_path, monkeypatch, fault):  # noqa: F811
+    """The peer runs the actual fixed preflight, not an always-green response."""
+    import subprocess
+    from pathlib import Path
+    from orchestration.dispatch_journal import DispatchJournal
+
+    service = ExecutionProfiles(env['store'])
+    row = service.save(ALICE, desired(), operator=True)
+    repo = 'fixture/project'
+    rid = start(env, [{'task_key': 't', 'title': 'read'}], repository=repo)
+    task = env['lab'].claim_task(rid, 'original', dispatch_intent=True)
+    scope = (env['project'], str(task['id']))
+    directory = tmp_path.joinpath(*scope)
+    directory.mkdir(parents=True)
+    git = ('git', '-C', str(directory))
+    for args in [('init', '-q', '-b', 'main'), ('remote', 'add', 'origin', 'https://github.com/' + repo + '.git'),
+                 ('-c', 'user.name=Test', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'seed', '--allow-empty')]:
+        subprocess.run([*git, *args], check=True)
+    head = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
+    monkeypatch.setenv('NEXUS_MANAGED_CHECKOUT_ROOT', str(tmp_path))
+    dispatch = DispatchJournal(env['store'])
+    dispatch.arm(task, {'base_sha': {'unknown_head': None, 'sha': '0' * 40}.get(fault, head),
+                        'armed_lease': str(task['lease_token'])})
+    if fault == 'absent':
+        directory.rename(directory.with_suffix('.unused'))
+    elif fault in ('push_origin', 'fetch_origin'):
+        subprocess.run([*git, 'remote', 'set-url', *(['--push'] if fault == 'push_origin' else []),
+                        'origin', 'https://github.com/other/project.git'], check=True)
+    elif fault == 'dirty':
+        (directory / 'uncommitted').touch()
+    elif fault == 'branch':
+        subprocess.run([*git, 'switch', '-qc', 'other'], check=True)
+    elif fault in ('expired', 'rotated'):
+        sql(env,"UPDATE nexus_run_tasks SET lease_expires=now()-interval '1 second'")
+        if fault == 'rotated':
+            assert dispatch.take_over(dispatch.recoverable(rid)[0], 'replacement', 900)
+    def peer(method, path, body):
+        assert (method, path) == ('POST', '/api/bash/execute_bash_command') and Path(body['cwd']) == directory
+        if not directory.is_dir():
+            return 422, {}
+        out = subprocess.run(['sh', '-c', body['command']], cwd=directory, capture_output=True, text=True, timeout=8)
+        return 200, {'stdout': out.stdout, 'exit_code': out.returncode}
+    with pytest.raises(ProfileBlocked):
+        service.checkout(row, scope, task['_intent_id'], repo, 'main', peer)
+    assert 'checkout' not in sql(env, 'SELECT context FROM nexus_dispatch_intents')[0]['context']
+
+
+@pytest.mark.parametrize('fault', ['status', 'id', 'cwd', 'model', 'base_url', 'params', 'tags'])
+def test_post_create_drift_is_ambiguous_not_a_refused_start(fault):
+    from orchestration.cloud_client import CloudUnavailable
+
+    cid = str(uuid.uuid4())
+    expected = {'model': 'openai/test', 'base_url': 'https://model.example/v1', 'params': {'temperature': .25},
+                'working_dir': '/assigned/test'}
+    tags = {'nexusdispatch': cid, 'nexustask': 't'}
+    llm = {**expected['params'], 'model': expected['model'], 'base_url': expected['base_url']}
+    data = {'id': cid, 'agent': {'llm': llm}, 'workspace': {'working_dir': expected['working_dir']}, 'tags': tags.copy()}
+    ExecutionProfiles.check_session((200, data), cid, expected, tags)
+    if fault in ('model', 'base_url', 'params'):
+        llm['temperature' if fault == 'params' else fault] = None
+    elif fault == 'id':
+        data['id'] = str(uuid.uuid4())
+    elif fault == 'cwd':
+        data['workspace'] = {}
+    elif fault == 'tags':
+        data['tags'].pop('nexustask')
+    with pytest.raises(CloudUnavailable):
+        ExecutionProfiles.check_session((503 if fault == 'status' else 200, data), cid, expected, tags)

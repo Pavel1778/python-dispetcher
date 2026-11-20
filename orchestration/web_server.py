@@ -437,6 +437,8 @@ class App:
         # the human, the token authenticates a machine client. Neither weakens
         # the other; both are required to be present for their own path.
         self.auth = auth or AuthService(self.store)
+        from .verification_grant import VerificationGrant
+        self.verification_grant = VerificationGrant.from_env(owner_token=self.token)
         # Optional account-level selection, read from the environment. Unset
         # means "inherit the account's own active profile and MCP/skills".
         profile = agent_profile_id or os.environ.get("OPENHANDS_AGENT_PROFILE_ID")
@@ -1950,9 +1952,13 @@ class Handler(BaseHTTPRequestHandler):
         self._json(401, {"error": "unauthorized"})
         return False
 
-    def _require_write(self) -> bool:
-        """Writes need a session with a valid CSRF token, or a bearer token."""
-        if self._bearer_ok():
+    def _mcp_verification(self, path):
+        grant = self.app.verification_grant
+        return grant if path == '/mcp' and grant and grant.accepts(self.headers.get('Authorization')) else None
+
+    def _require_write(self, *, verification=None) -> bool:
+        """Only POST /mcp may pass its independently authenticated read-only grant."""
+        if verification is not None or self._bearer_ok():
             return True
         session = self._session()
         if session is None:
@@ -4197,7 +4203,7 @@ class Handler(BaseHTTPRequestHandler):
             return parts[3], parts[5]
         return None
 
-    def _mcp_http(self) -> None:
+    def _mcp_http(self, verification=None) -> None:
         """Serve one MCP Streamable-HTTP request at ``POST /mcp``.
 
         Authentication is the server's own: a session with CSRF, or the machine
@@ -4217,7 +4223,10 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return self._json(400, {"jsonrpc": "2.0", "id": None,
                                     "error": {"code": -32700, "message": "parse error"}})
-        server = McpServer(self.app.store, self._project_principal())
+        if verification and not verification.accepts(self.headers.get('Authorization')):
+            return self._json(401, {'error': 'unauthorized'})
+        server = (McpServer(self.app.store, verification.principal, role='member', verify_project=verification.project)
+                  if verification else McpServer(self.app.store, self._project_principal()))
         status, payload = handle_http(server, message)
         if status == 202:
             self.send_response(202)
@@ -4644,12 +4653,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True},
                                   cookie=cleared_cookie_header(secure=self._cookie_secure()))
             # --- writes ---
-            if not self._require_write():
+            verification = self._mcp_verification(path)
+            if not self._require_write(verification=verification):
                 return
             if self._execution_profile(path, write=True):
                 return
             if path == "/mcp":
-                return self._mcp_http()
+                return self._mcp_http(verification)
             # Raw multipart uploads are not JSON, so they are handled before the
             # JSON body is read. The content type is checked first so a plain
             # JSON body is never mistaken for an upload.
@@ -4719,6 +4729,7 @@ class Handler(BaseHTTPRequestHandler):
                 verify = self._project_evidence_verify(path)
                 if verify is not None:
                     project_id, evidence_id = verify
+                    self.app.projects.get(principal, project_id)
                     rec = self.app.evidence.reverify(
                         evidence_id, project_id=project_id,
                         expected_commit=body.get("expected_commit"))

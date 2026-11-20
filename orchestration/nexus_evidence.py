@@ -215,7 +215,7 @@ class EvidenceService:
     # ------------------------------------------------------------- re-verify
     def reverify(self, evidence_id: str, *, project_id: str | None,
                  expected_commit: str | None = None,
-                 allow_unscoped: bool = False) -> dict:
+                 allow_unscoped: bool = False, persist: bool = True) -> dict:
         """Re-run the real verifier over a stored record and persist the verdict.
 
         Uses the trusted keyring, checks the signature, the commit (when the
@@ -223,22 +223,18 @@ class EvidenceService:
         back; the signed payload is never modified.
         """
         rec = self.get(evidence_id, project_id=project_id, allow_unscoped=allow_unscoped)
-        prev_expected = None
-        if rec.get("prev_hash"):
-            # The record before this one in the same scope must hash to prev_hash.
-            with self.store._tx() as cur:
-                cur.execute(
-                    "SELECT entry_hash FROM nexus_evidence WHERE seq < "
-                    "(SELECT seq FROM nexus_evidence WHERE id=%s) "
-                    "AND project_id IS NOT DISTINCT FROM %s ORDER BY seq DESC LIMIT 1",
-                    (evidence_id, rec.get("project_id")),
-                )
-                row = cur.fetchone()
-            prev_expected = row["entry_hash"] if row else ""
+        # Check the preceding position even if this row *claims* it is a genesis.
+        with self.store._tx() as cur:
+            cur.execute("SELECT entry_hash FROM nexus_evidence WHERE seq < "
+                        "(SELECT seq FROM nexus_evidence WHERE id=%s) "
+                        "AND project_id IS NOT DISTINCT FROM %s ORDER BY seq DESC LIMIT 1",
+                        (evidence_id, rec.get('project_id')))
+            row = cur.fetchone()
         verdict = self.engine.verify(rec, expected_commit=expected_commit,
-                                     prev_expected_hash=prev_expected)
-        self.store.update_evidence_verification(
-            evidence_id, verdict=verdict.verdict, detail=verdict.as_dict())
+                                     prev_expected_hash=row['entry_hash'] if row else '')
+        if persist:
+            self.store.update_evidence_verification(
+                evidence_id, verdict=verdict.verdict, detail=verdict.as_dict())
         out = dict(rec)
         out["verdict"] = verdict.verdict
         out["verification_detail"] = verdict.as_dict()
