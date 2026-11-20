@@ -18,6 +18,7 @@ code, exercised against the local stand-ins) · **PARTIAL** · **BLOCKED**
 | Restart / duplicate a run; cancel; retry failed tasks | VERIFIED | `tests/test_run_history.py`, `test_cancel_lock_order.py` |
 | Project isolation (404, never 403, at every boundary) | VERIFIED | `tests/test_project_isolation.py`, `test_project_isolation_routes.py` |
 | Evidence Trust Engine (Ed25519, re-verifiable) | VERIFIED | `tests/test_evidence_trust.py`, `test_lab_evidence.py` |
+| Evidence viewer in the Studio (list + re-verify) | VERIFIED | `tests/test_evidence_viewer.py`, the Chromium journey in `test_browser_e2e.py` |
 | Self-QA engine (isolated checkout, real exit codes) | VERIFIED | `tests/test_selfqa.py` |
 | **Self-QA as an automatic run gate** | VERIFIED | `tests/test_quality_gate.py`, `test_quality_gate_policy.py`; per project (`auto`/`on`/`off`, default `auto`), `NEXUS_SELFQA_GATE` overrides deployment-wide |
 | Multi-account pool, failover, load balancing | IMPLEMENTED | `tests/test_openhands_pool.py`, `test_openhands_failover.py` |
@@ -53,6 +54,20 @@ is not in the request path; Python is authoritative.** See `docs/RUST_MIGRATION.
 | Temporary public URL (Cloudflare quick tunnel) | VERIFIED | `scripts/nexus.sh tunnel`, `docs/CLOUDFLARE_TUNNEL.md`, `tests/test_self_hosting.py` |
 | Named tunnel (stable hostname) | VERIFIED | `packaging/systemd/nexus-tunnel.service`, `packaging/cloudflared/config.yml.example`, `scripts/nexus.sh tunnel`, `tests/test_self_hosting.py` |
 | Resource-usage & orchestration performance baseline | VERIFIED | `docs/PERFORMANCE.md`, `benchmarks/scheduler_bench.py`, `benchmarks/e2e_scenarios.py` |
+
+## Measured live (2026-11-20, this session)
+
+A real `python -m orchestration.web_server` was started and driven over real
+sockets, with the live provider keys and the live OpenHands key. Numbers in
+`docs/PERFORMANCE.md`; the diagnostic run:
+
+| What | Result |
+|---|---|
+| `POST /api/openhands/diagnostics` (`live: true`), one registered account | **18 VERIFIED / 0 FAILED / 0 BLOCKED, `ok: true`**, in 18.1 s |
+| `conversation_create` → `message_and_events` → `run_command` → `task_completion` → `workspace_rw` | all VERIFIED — a real conversation ran a shell command, uploaded a file and read it back with a matching SHA-256, and reached `finished` |
+| read paths under load | ~1 340 req/s at 4 clients (p50 2.95 ms), 0 errors |
+| a real chat turn (live provider cascade) | p50 1 239 ms, p90 1 592 ms |
+| footprint | RSS 65–67 MB, ~1 % CPU idle, 8 threads idle |
 
 ## External blockers (not defects)
 

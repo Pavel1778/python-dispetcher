@@ -103,3 +103,166 @@ Run with `NEXUS_LAB_MAX_ACTIVE_TASKS=0` on PostgreSQL 16.2:
    in one `SELECT filename, checksum FROM schema_migrations`, and replaced
    `information_schema.columns` in `verify_schema` with `pg_class` / `pg_namespace` /
    `pg_attribute`.
+
+## A running server under concurrent load (2026-11-20, this session)
+
+The measurements above are one call at a time, in-process. This section is the
+other half: a **real** `python -m orchestration.web_server` started the way a
+deployment starts it, driven over real sockets by many concurrent clients, with
+the **live** provider keys (Gemini and OpenRouter both answered).
+
+The generator is `tools/loadtest.py` (stdlib only — there is no `wrk`/`ab` in
+this environment): a pool of threads, no sleep between requests, every latency
+recorded with `perf_counter`, every non-2xx counted.
+
+```bash
+python -m orchestration.web_server --host 127.0.0.1 --port 12000 --token TOKEN &
+python tools/loadtest.py --base http://127.0.0.1:12000 --token TOKEN \
+    --clients 16 --duration 10 --mix reads --out reads.json
+```
+
+### Read paths, 4 vs 16 concurrent clients (10 s each, 0 errors)
+
+| clients | throughput | p50 | p90 | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | **1340 req/s** | 2.95 ms | 4.21 ms | 4.75 ms | 6.03 ms |
+| 16 | 1069 req/s | 6.53 ms | 10.49 ms | 12.07 ms | 17.01 ms |
+
+The mix is what the studio polls: `/api/studio`, the project list, one project,
+the conversation list, one conversation, its messages, `/api/commands`. At 16
+clients the machine's 4 cores are shared with the client threads, so the p50
+rises while throughput stays near a thousand requests a second; the reads are
+database-bound and stay single-digit to low-double-digit milliseconds.
+
+### A real chat turn, end to end (live provider)
+
+Ten turns through the real cascade against `openrouter` (`openai/gpt-4o-mini`
+served them after `gemini`):
+
+| n | min | p50 | p90 | max | mean |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 914 ms | **1239 ms** | 1592 ms | 1667 ms | 1254 ms |
+
+This is the number a person actually feels, and it is the **provider's**, not
+NEXUS's: the same server answers a read in 3–6 ms. It is recorded so that no one
+reads the in-process `chat_turn_ms` (19.6 ms against the stand-in LLM) as a
+promise about a real turn.
+
+### Footprint (the same running process)
+
+| metric | idle | under 16-client load |
+| --- | ---: | ---: |
+| RSS | 65 MB | 67 MB |
+| CPU | 0.9 % | 10–15 % |
+| threads | 8 | 14 |
+| database | 13 MB (3 projects, 30 conversations, 40 messages each) | — |
+
+The process is a single Python interpreter with one PostgreSQL connection; the
+thread count grows by one per in-flight request under load and returns to its
+idle set afterwards. Memory is flat: nothing accumulates per request.
+
+### The write path when no provider is configured
+
+`--mix writes` against a server with **no** provider key answers every chat turn
+`502` with `no orchestrator provider succeeded (no providers configured)`, and
+the user turn is still stored. That is correct — a missing provider is said, not
+faked — but it means a "write latency" measured without keys is the failure
+path, not a turn. Measure a turn only with a working provider (as above).
+
+### Re-measured on the merged build (same session)
+
+After PR #53 was merged into `main` and `main` merged back into this branch, the
+same read mix was measured again with the same instrument on the merged code:
+
+| clients | throughput | p50 | p90 | p99 | errors |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 1 224 req/s | 3.16 ms | 4.85 ms | 7.31 ms | 0 |
+| 16 | 1 074 req/s | 6.22 ms | 9.47 ms | 14.15 ms | 0 |
+
+That is the same band as the pre-merge run (1 340 / 1 069 req/s) within
+run-to-run noise on a shared 4-core box. **The merge did not regress the read
+paths**, and this instrument shows no measurable speedup from it either — the
+optimisations in section 6 are measured by `benchmarks/`, not by this mix, and
+no claim is made here that the two agree.
+
+A **real chat turn** on the merged build (5 turns, live cascade) was faster than
+before the merge: min 645 ms, **p50 896 ms**, max 981 ms, mean 829 ms (was p50
+1 239 ms). That is consistent with section 6 item 4 (the chat turn's DB
+round-trips fell from 7–9 transactions to 2); it is a single 5-sample reading on
+a shared box, so treat it as a direction, not a precise figure.
+
+## The audit's own finding: a 140x slowdown from PostgreSQL's JIT (2026-11-20)
+
+Auditing the running system turned up a real performance defect that no test
+covered. It is fixed, and the fix is pinned by `tests/test_jit_settings.py`.
+
+**What was wrong.** `LabStore.queue_cleanups` (the worker's retention scan, run
+on every pass) unions five sources with `jsonb_array_elements` lateral joins.
+The planner prices that in the millions, so PostgreSQL's **JIT compiled the
+plan**: on a database with ~6 000 tasks the compile took **500–670 ms**, and
+the query then returned zero rows in microseconds.
+
+**Measured, with the project's own benchmark** (`benchmarks/scheduler_bench.py`,
+`--repeat 10`):
+
+| metric | before | after |
+| --- | ---: | ---: |
+| `queue_cleanups_ms` p50 | **635 ms** | **4.5 ms** |
+| p90 | 705 ms | 6.4 ms |
+
+`EXPLAIN (ANALYZE)` showed `JIT: Timing … Total 557 ms` against
+`Execution Time: 558 ms` — the whole cost was compilation. Setting `jit = off`
+on the same query took it to **3–6 ms** (a ~170× difference).
+
+**What was tried and did not work** (recorded so nobody repeats it):
+
+- **An index** on `nexus_run_tasks(conversation_id, resume_conversation_id)`:
+  581 ms → 579 ms. The predicate is not the cost.
+- **Raising `jit_above_cost`** to 10 000 000: still 600 ms. The plan's estimate
+  exceeds even that, so JIT still engaged.
+- **`ANALYZE`** made it *worse* in one direction (8 ms → 604 ms): accurate
+  statistics made the planner more confident the plan was expensive, so JIT
+  engaged where stale statistics had left it off. The benchmark still runs
+  `ANALYZE` before this measurement, so it reports the real plan.
+
+**The fix.** `PostgresStore` opens every connection with `jit = off`
+(`cloud_store._jit_options`). This is a control plane — short OLTP statements,
+no analytical scans — so JIT has nothing to win here. `NEXUS_DB_JIT=on` restores
+the server's own behaviour for a deployment that runs heavy queries through the
+same database.
+
+**Also fixed in the same audit:** `benchmarks/scheduler_bench.py` reset the
+schema on the way in but left its runs behind. A run left `running` with tasks
+still `dispatched` holds the global in-flight budget until their leases expire,
+so the next thing to use the database was refused every claim. It now resets the
+schema on the way out too, and a run leaves **0 runs, 0 tasks** behind.
+
+## What was not done, and why
+
+- **No language migration.** A Go/Rust rewrite of the API would not move these
+  numbers: the read paths are already sub-millisecond of database time and the
+  slow paths are network-bound (provider, OpenHands, GitHub). The cost — a
+  second implementation, a second test suite, the loss of the stdlib-only
+  adapters and the entire existing test corpus — is not justified by the
+  measured profile. A hybrid (a Rust streaming engine, a Go worker) would only
+  pay off under a load this deployment does not have, and would split the
+  invariants the AGENTS.md documents in one place. The evidence is the table
+  above.
+- **No `orjson` (Rust-backed JSON).** Measured ~2.8–2.9× faster than
+  `json` on a 1.3 MB trajectory-like payload (9.2 → 3.2 ms). Not adopted: the
+  repository is deliberately stdlib-only (+psycopg, +cryptography); the hot
+  paths are database and network, not JSON tokenising; and a drop-in risks
+  byte-format drift exactly where byte fidelity is load-bearing (the
+  canonical evidence encoding) — orjson would never be applied there, and a
+  partial adoption is a trap. Recorded here so the measurement is not lost.
+  Re-evaluate per release with `tools/benchmark.py`; adopt only with the
+  signing path schema-gated.
+- **No caching layer.** The read paths are cheap and correctness (project
+  isolation, a message appearing at once) matters more than a cache that could
+  serve one project's data to another. Nothing is cached between projects.
+
+## Adding a measurement
+
+Add one entry to `tools/benchmark.py`'s `results["measurements"]` and it appears
+in both the JSON and the comparison table. Keep the method: a real server, a
+real database, a real round trip — never a simulated one.

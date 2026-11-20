@@ -70,6 +70,24 @@ def main() -> int:
     projects = ProjectService(store)
     lab = LabStore(store)
 
+    try:
+        return _measure(store, projects, lab, args)
+    finally:
+        # A benchmark that leaves its runs behind is a benchmark that starves
+        # the next thing to use the database: a run left `running` with tasks
+        # still `dispatched` holds the global in-flight budget until their
+        # leases expire, and every real claim in the meantime is refused. The
+        # schema was reset on the way in, so resetting it on the way out leaves
+        # the database exactly as it was found - empty, not full of measurement
+        # debris.
+        try:
+            _reset_schema()
+        finally:
+            store.close()
+
+
+def _measure(store: PostgresStore, projects: ProjectService, lab: LabStore,
+             args) -> int:
     # Seed a project, a goal, and a run with 40 independent tasks.
     project = projects.create(PRINCIPAL, "Bench", "")["id"]
     with store._tx() as cur:
@@ -148,7 +166,14 @@ def main() -> int:
         (lambda t0: (lab.reclaim_expired(run2["id"]), (time.perf_counter()-t0)*1000)[1])(time.perf_counter())
         for _ in range(20)])
 
-    # 5. queue_cleanups (the worker's retention scan)
+    # 5. queue_cleanups (the worker's retention scan). ANALYZE first: the seed
+    #    inserts thousands of rows in one transaction and no autovacuum has run,
+    #    so the planner would work from a stale row estimate. (This call also
+    #    used to take ~500 ms here because PostgreSQL's JIT compiled the plan;
+    #    the store now opens connections with JIT off - see cloud_store.py and
+    #    tests/test_jit_settings.py.)
+    with store._tx() as cur:
+        cur.execute("ANALYZE")
     m["queue_cleanups_ms"] = _pct([
         (lambda t0: (lab.queue_cleanups(retention_seconds=0), (time.perf_counter()-t0)*1000)[1])(time.perf_counter())
         for _ in range(20)])
@@ -158,7 +183,6 @@ def main() -> int:
         (lambda t0: (store.dashboard_counts(), (time.perf_counter()-t0)*1000)[1])(time.perf_counter())
         for _ in range(50)])
 
-    store.close()
     payload = json.dumps(out, indent=2, ensure_ascii=False)
     print(payload)
     if args.out:

@@ -1562,13 +1562,114 @@
     return head + inner;
   }
 
+  /* -------------------------------------------------------------- evidence */
+  // The Evidence Trust Engine, made visible. A "verified" task is only worth
+  // something if its record can be re-checked, so this lists the project's
+  // signed records and re-verifies one against the trusted keyring on demand.
+  // Nothing here decides a verdict: the badge is the stored verdict and the
+  // re-check is the server's own answer.
+  var evidence = { open: false, items: [], loading: false, error: null,
+                   checking: {}, detail: {} };
+  var VERDICT_TONE = { VERIFIED: 'ok', UNVERIFIED: 'warn', FAILED: 'bad', BLOCKED: 'idle' };
+
+  function verdictPill(verdict) {
+    var tone = VERDICT_TONE[verdict] || 'idle';
+    return '<span class="pill is-' + tone + '">' + esc(verdict || '—') + '</span>';
+  }
+
+  function evidenceWhen(rec) {
+    var at = rec.verified_at || rec.created_at;
+    return at ? fullTime(at) : '';
+  }
+
+  function evidenceRow(rec) {
+    var id = esc(rec.id);
+    var subject = rec.repository_full_name
+      ? esc(rec.repository_full_name) + (rec.commit_sha ? ' · ' + esc(String(rec.commit_sha).slice(0, 8)) : '')
+      : esc(rec.subject_kind || '') + (rec.subject_id ? ' · ' + esc(shortId(rec.subject_id)) : '');
+    var detail = evidence.detail[rec.id];
+    return '<li class="evidence-row" data-id="' + id + '">' +
+      '<div class="evidence-line"><span class="dot is-' + (VERDICT_TONE[rec.verdict] || 'idle') + '"></span>' +
+      '<span class="evidence-subject">' + subject + '</span>' +
+      verdictPill(rec.verdict) +
+      '<span class="evidence-when">' + esc(evidenceWhen(rec)) + '</span>' +
+      '<button class="btn btn-sm" type="button" data-action="check-evidence" data-id="' + id + '">' +
+      (evidence.checking[rec.id] ? 'Проверяю…' : 'Проверить') + '</button></div>' +
+      (detail ? '<p class="step-sub evidence-detail">' + esc(detail) + '</p>' : '') +
+      '</li>';
+  }
+
+  function evidenceHtml() {
+    var head = '<div class="ws-section-head"><button class="btn btn-sm" type="button" data-action="toggle-evidence">' +
+      icon('check', 'icon-sm') + (evidence.open ? 'Скрыть доказательства' : 'Доказательства') + '</button></div>';
+    if (!evidence.open) return head;
+    var inner;
+    if (evidence.loading) inner = '<p class="step-sub">Загружаю…</p>';
+    else if (evidence.error) inner = '<p class="step-sub">' + esc(evidence.error) + '</p>';
+    else if (!evidence.items.length) {
+      // Say *why* the list is empty: with no signer nothing is ever recorded,
+      // which is not the same as "nothing was verified".
+      var signed = S.status && S.status.lab && S.status.lab.evidence;
+      inner = '<p class="step-sub">' + (signed === false
+        ? 'Подписи не настроены (NEXUS_EVIDENCE_PRIVATE_KEY), поэтому записи доказательств не создаются.'
+        : 'Записей доказательств по этому проекту пока нет.') + '</p>';
+    } else {
+      inner = '<ul class="evidence-list">' + evidence.items.map(evidenceRow).join('') + '</ul>';
+    }
+    return head + inner;
+  }
+
+  function loadEvidence() {
+    evidence.loading = true;
+    evidence.error = null;
+    renderAgent();
+    return api(projectUrl('/evidence'))
+      .then(function (data) {
+        evidence.items = (data.evidence || []);
+        evidence.loading = false;
+        renderAgent();
+      }, function (error) {
+        evidence.loading = false;
+        evidence.error = error.message;
+        renderAgent();
+      });
+  }
+
+  // Re-verify one record against the trusted keyring. The answer is the
+  // server's; the row shows its verdict and its reason, never an assumption.
+  function checkEvidence(button, id) {
+    evidence.checking[id] = true;
+    renderAgent();
+    api(projectUrl('/evidence/' + enc(id) + '/verify'), { method: 'POST', body: {} })
+      .then(function (data) {
+        var rec = data.evidence || {};
+        evidence.checking[id] = false;
+        evidence.items = evidence.items.map(function (item) {
+          return item.id === id ? rec : item;
+        });
+        var detail = rec.verification_detail || {};
+        var reason = detail.reason || (detail.checks || []).map(function (c) {
+          return (c.name || '') + ': ' + (c.ok ? 'ок' : 'нет');
+        }).join('; ');
+        evidence.detail[id] = (rec.verdict || '—') + (reason ? ' — ' + reason : '');
+        renderAgent();
+        toast('Проверено: ' + (rec.verdict || '—'),
+              rec.verdict === 'VERIFIED' ? 'ok' : 'bad');
+      }, function (error) {
+        evidence.checking[id] = false;
+        evidence.detail[id] = 'Проверить не удалось: ' + explain(error.message).text;
+        renderAgent();
+        toast(explain(error.message).text, 'bad');
+      });
+  }
+
   function renderAgent() {
     var body = $('#ws-body');
     clearTimeout(agentScroll.timer);
     if (!S.work.items.length) {
       body.innerHTML = emptyHtml('bot', 'Агент ещё не запускался',
         'Отправьте задачу в режиме «Код», «Автономно» или «Вручную» — здесь появятся ' +
-        'шаги, статусы и ссылка на сессию OpenHands.') + archiveHtml();
+        'шаги, статусы и ссылка на сессию OpenHands.') + archiveHtml() + evidenceHtml();
       return;
     }
     var html = S.work.items.map(function (entry) {
@@ -1582,7 +1683,7 @@
           '<div class="work-foot"><button class="btn btn-sm" type="button" data-action="refresh-work">Обновить</button></div></section>';
       }
       return entry.kind === 'workflow' ? workflowCard(entry, record.detail) : runCard(entry, record.detail);
-    }).join('') + archiveHtml();
+    }).join('') + archiveHtml() + evidenceHtml();
     var list = $('.work-list', body);
     if (list && list.__html === html) return;
     if (list && agentListBusy()) {
@@ -2056,8 +2157,10 @@
   var settingsTab = null;
 
   function openSettings(tab) {
-    settingsTab = tab === 'project' ? 'project' : 'connections';
-    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект']];
+    settingsTab = tab === 'project' ? 'project'
+      : tab === 'diagnostics' ? 'diagnostics' : 'connections';
+    var tabs = [['connections', 'link', 'Подключения'], ['project', 'layers', 'Проект'],
+                ['diagnostics', 'check', 'Диагностика']];
     openDialog({
       title: 'Настройки',
       className: 'is-wide is-settings',
@@ -2080,30 +2183,42 @@
     });
     if (!pane.firstChild || pane.getAttribute('data-tab') !== tab) pane.innerHTML = SKELETON;
     pane.setAttribute('data-tab', tab);
-    var load = tab === 'project'
-      ? (S.projectId
-         ? Promise.all([
-             api(projectUrl('/context')).then(function (data) { return data.context; },
-                                             function () { return null; }),
-             api(projectUrl('/executors')).then(null, function () { return {}; }),
-             api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
-                                                   function () { return []; }),
-             loadGithubAccounts().then(null, function () { S.accounts.github = []; })
-           ]).then(function (parts) {
-             return { context: parts[0], executors: parts[1], repositories: parts[2] };
-           })
-         : Promise.resolve(null))
-      : Promise.all([
-          loadGithubAccounts().catch(function () { S.accounts.github = []; }),
-          loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
-          loadOpenhandsPool().catch(function () { S.pool = null; }),
-          api('/api/studio').then(function (data) { S.status = data; }, function () {})
-        ]);
+    var load;
+    if (tab === 'project') {
+      load = S.projectId
+        ? Promise.all([
+            api(projectUrl('/context')).then(function (data) { return data.context; },
+                                            function () { return null; }),
+            api(projectUrl('/executors')).then(null, function () { return {}; }),
+            api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
+                                                  function () { return []; }),
+            loadGithubAccounts().then(null, function () { S.accounts.github = []; })
+          ]).then(function (parts) {
+            return { context: parts[0], executors: parts[1], repositories: parts[2] };
+          })
+        : Promise.resolve(null);
+    } else if (tab === 'diagnostics') {
+      load = Promise.all([
+        api('/api/openhands/diagnostics').then(function (data) { return data; },
+                                               function (error) { return { error: error.message }; }),
+        api('/api/studio').then(function (data) { S.status = data; return data; },
+                                function () { return null; })
+      ]).then(function (parts) { return { report: parts[0], status: parts[1] }; });
+    } else {
+      load = Promise.all([
+        loadGithubAccounts().catch(function () { S.accounts.github = []; }),
+        loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
+        loadOpenhandsPool().catch(function () { S.pool = null; }),
+        api('/api/studio').then(function (data) { S.status = data; }, function () {})
+      ]);
+    }
     return load.then(function (result) {
       if (settingsTab !== tab || !document.contains(pane)) return;
       if (tab === 'project') {
         S.projectSettings = result || null;
         pane.innerHTML = projectSettingsHtml(result);
+      } else if (tab === 'diagnostics') {
+        pane.innerHTML = diagnosticsHtml(result);
       } else {
         pane.innerHTML = connectionsHtml();
       }
@@ -2289,6 +2404,43 @@
       }).join('') + '</select>' +
       '<span class="field-hint">' + esc(modeNote) + '</span></label>' +
       rows + '</div>';
+  }
+
+  // The diagnostic report: every check's own status, never a summary the page
+  // invented. The four statuses are the engine's; VERIFIED means the check ran
+  // and worked, BLOCKED that it could not run (no credential/resource), FAILED
+  // that it ran and failed, UNVERIFIED that it was not run (the live probe is
+  // opt-in). A check that is BLOCKED is not a failure, and the page says so.
+  function diagnosticsHtml(result) {
+    result = result || {};
+    var report = result.report || {};
+    var checks = report.checks || [];
+    if (report.error) {
+      return '<div class="section"><h3 class="section-title">' + icon('alert', 'icon-sm') +
+        'Диагностика</h3><p class="section-note is-bad">' + esc(report.error) + '</p></div>';
+    }
+    var counts = { VERIFIED: 0, FAILED: 0, BLOCKED: 0, UNVERIFIED: 0 };
+    checks.forEach(function (c) { if (counts[c.status] !== undefined) counts[c.status] += 1; });
+    var head = '<div class="section"><h3 class="section-title">' + icon('check', 'icon-sm') +
+      'Диагностика</h3><p class="section-note">Реальный отчёт: каждый пункт либо проверен, ' +
+      'либо честно помечен «нет доступа» (BLOCKED) или «не проверялся» (UNVERIFIED). ' +
+      'BLOCKED — не ошибка, а отсутствие ключа или ресурса.</p>' +
+      '<dl class="kv"><dt>Итог</dt><dd><span class="pill is-' +
+      (report.ok ? 'ok' : 'bad') + '">' + (report.ok ? 'ok' : 'есть проблемы') + '</span></dd>' +
+      '<dt>Проверено</dt><dd>' + counts.VERIFIED + ' VERIFIED · ' + counts.FAILED +
+      ' FAILED · ' + counts.BLOCKED + ' BLOCKED · ' + counts.UNVERIFIED + ' UNVERIFIED</dd></dl>' +
+      '<div class="row"><button class="btn btn-sm" type="button" data-action="run-diagnostics">' +
+      icon('refresh', 'icon-sm') + 'Обновить</button></div></div>';
+    if (!checks.length) return head + '<p class="step-sub">Отчёт пуст.</p>';
+    return head + '<ul class="evidence-list">' + checks.map(function (c) {
+      var tone = VERDICT_TONE[c.status] || 'idle';
+      return '<li class="evidence-row"><div class="evidence-line">' +
+        '<span class="dot is-' + tone + '"></span>' +
+        '<span class="evidence-subject">' + esc(c.name || '') + '</span>' +
+        '<span class="pill is-' + tone + '">' + esc(c.status || '') + '</span></div>' +
+        (c.detail ? '<p class="step-sub evidence-detail">' + esc(c.detail) + '</p>' : '') +
+        '</li>';
+    }).join('') + '</ul>';
   }
 
   function connectionsHtml() {
@@ -3022,6 +3174,7 @@
       else if (tab) { settingsTab = tab; refreshSettings(); }
     },
     'settings-tab': function (el) { settingsTab = el.getAttribute('data-tab'); refreshSettings(); },
+    'run-diagnostics': function () { refreshSettings(); },
     'open-repo': function (el) {
       closeMenu();
       if (repoState) return;
@@ -3180,6 +3333,14 @@
       archive.open = !archive.open;
       if (archive.open && !archive.items.length && !archive.loading) loadArchive();
       else renderAgent();
+    },
+    'toggle-evidence': function () {
+      evidence.open = !evidence.open;
+      if (evidence.open && !evidence.items.length && !evidence.loading) loadEvidence();
+      else renderAgent();
+    },
+    'check-evidence': function (el) {
+      checkEvidence(el, el.getAttribute('data-id'));
     },
     // An archived run is opened the same way a live one is: the card shows its
     // tasks, its report and its history. It is not a second interface. It is

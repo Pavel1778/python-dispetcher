@@ -34,9 +34,12 @@ the value it adds to a working product, not by novelty.
    design is bounded (new tasks depend on the failure, the DAG is re-validated,
    iterations and time are capped, the run goes BLOCKED at the budget). *Not
    started:* it needs a careful safety review, and it must never loop.
-3. **Studio screens for backend-only capabilities:** File Lab uploads, evidence
-   viewer, GitHub create/visibility confirmations, the allowlist editor, the
-   diagnostics page. The routes exist and are tested; the screens are the gap.
+3. **Studio screens for backend-only capabilities:** File Lab uploads, GitHub
+   create/visibility confirmations, the allowlist editor, the diagnostics page.
+   The routes exist and are tested; the screens are the gap. **Started:** the
+   **evidence viewer** is done — the Agent tab lists a project's signed records
+   and re-verifies one against the trusted keyring (`tests/test_evidence_viewer.py`,
+   plus a Chromium journey).
 
 ## Next (P2 — operations)
 
@@ -50,7 +53,10 @@ the value it adds to a working product, not by novelty.
    several tasks) recorded in `docs/PERFORMANCE.md`.~~ **DONE.** Recorded in
    `docs/PERFORMANCE.md` (`57.45 MB` idle RSS, `57.88 MB` after 40 tasks across
    4 runs) alongside the verified scheduler, orchestration lifecycle, and E2E
-   HTTP benchmark speedups.
+   HTTP benchmark speedups. A second baseline from a **running** server under
+   concurrent load (reads ~1 340 req/s, a real chat turn p50 ≈ 1.24 s through the
+   live provider) is in the same document, "A running server under concurrent
+   load".
 6. **Android runtime testing** on a real device, and a Windows host run — both
    are build-verified only today.
 

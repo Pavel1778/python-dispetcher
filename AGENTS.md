@@ -860,9 +860,11 @@ There are no dashboards, section tabs or forms outside that.
   - an untitled conversation is named after its first message; `PATCH
     .../conversations/{id}` accepts `archived` (the only way to restore one).
 - **Features that have routes but no screen now:** lab file uploads, workspaces
-  and voice notes; evidence; plan approval; GitHub create-repository and
+  and voice notes; plan approval; GitHub create-repository and
   visibility confirmations; the legacy task form and the queue; the system
   diagnostics page; the allowlist editor; OpenHands account management.
+  Evidence is **no longer** on this list: the Agent tab lists a project's signed
+  records and re-verifies one (see "The evidence viewer" below).
 - **Limits, stated in the UI where they bite.** Stored OpenHands accounts are not
   used for execution: workflows run under the server `OPENHANDS_API_KEY`
   (nothing calls `openhands_accounts.client_for_project`). Files are read-only
@@ -3010,3 +3012,116 @@ started, never deletes user data, and `restore` proves a dump loads into a
 `backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
 both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
 per-process isolation passes the latter.
+
+## The evidence viewer: the Trust Engine made visible (this session)
+
+Roadmap P1 #3 ("studio screens for backend-only capabilities") started with the
+gap that matters most: the Evidence Trust Engine is what makes a "verified"
+result mean anything, and until now an operator could not see a record without
+the CLI. The routes existed and were tested; the screen did not.
+
+- **`GET …/evidence` and `POST …/evidence/{id}/verify` are the whole contract.**
+  The screen calls them and nothing else; it decides no verdict. The badge is the
+  record's stored `verdict`, and «Проверить» shows the **server's** answer
+  (`verification_detail.reason`) under the row.
+- **The four verdicts map to the existing pills** (`VERIFIED`→ok,
+  `UNVERIFIED`→warn, `FAILED`→bad, `BLOCKED`→idle). Do not invent a fifth
+  colour: the engine's vocabulary is `evidence_trust.VERIFIED/UNVERIFIED/
+  FAILED/BLOCKED` and a record that is merely stored is `UNVERIFIED`, never ok.
+- **An empty list says *why* it is empty.** `/api/studio` now reports
+  `lab.evidence` (a bool: signer **and** keyring present). Without a signer
+  nothing is ever recorded, so "no records" must not read as "nothing was
+  verified". Presence only — never a key, a key id or a path.
+- **`lab` gained a field, so the four whole-dict assertions had to name it**
+  (`tests/test_lab_inline.py` ×3, `tests/test_studio_api.py` ×1) — the exact trap
+  the earlier section warns about. They expect `"evidence": False` in those
+  fixtures (no signer configured), never a subset comparison.
+- **The engine is stricter than it looks.** An unknown `key_id` is `UNVERIFIED`
+  ("signing key … is not trusted"); a *trusted* `key_id` whose signature does
+  not verify is `FAILED`. Both are tested
+  (`test_a_record_signed_by_an_unknown_key_is_unverified`,
+  `test_a_trusted_key_id_with_the_wrong_key_is_failed`); do not collapse them.
+- **The row layout keeps the verdict on its line.** `.evidence-subject` is the
+  only flexible part; the badge, the time and the button are `flex: none`, so a
+  long repository name cannot push a verdict out of sight on a phone.
+- Tests: `tests/test_evidence_viewer.py` (9 cases: the list, project isolation,
+  auth, a trusted signature → VERIFIED, an unknown key → UNVERIFIED, a wrong key
+  → FAILED, a tampered row → FAILED, a foreign record → 404, and
+  `/api/studio` with and without a signer) and the Chromium journey
+  `test_the_evidence_viewer_lists_records_and_re_verifies_one`. Mutation-proven:
+  making `check-evidence` a no-op fails the journey, and hard-coding
+  `lab.evidence = True` fails the no-signer case.
+- Still backend-only after this (the rest of P1 #3): File Lab uploads,
+  workspaces and voice notes, plan approval, GitHub create/visibility
+  confirmations, the allowlist editor, the diagnostics page.
+
+## Running the server for real and measuring it (this session)
+
+The performance numbers in `docs/PERFORMANCE.md` used to be one call at a time,
+in-process. This session started a **real** `python -m orchestration.web_server`
+and drove it over real sockets, with the live provider keys. Keep the method:
+
+- **`tools/loadtest.py` is the concurrency instrument** (stdlib only; there is no
+  `wrk`/`ab` here). It seeds a project + conversation, then N threads loop over a
+  weighted mix (`reads`/`writes`/`mixed`) with **no sleep**, recording every
+  latency and every non-2xx. It reports throughput and min/p50/p90/p95/p99/max
+  per call. `tests/test_benchmark_tool.py` pins its maths and mixes; the script
+  itself needs a running server and is run by hand, like `benchmark.py`.
+- **A write latency measured without a provider is the failure path.** With no
+  `GEMINI_API_KEY`/`OPENROUTER_API_KEY`/`GROQ_API_KEY`, every chat turn is a
+  `502` "no providers configured" (correct — said, not faked) and the user turn
+  is still stored. Measure a **turn** only with a working provider; measure the
+  **read** paths any time.
+- **The live cascade serves turns** in this environment (Gemini and OpenRouter
+  both accept their key; Groq is `blocked` for want of one). A real turn is
+  ~1.0–1.7 s, dominated by the provider — do not read the in-process
+  `chat_turn_ms` (~20 ms against the stand-in LLM) as a promise about a real
+  turn.
+- **Starting the server by hand** needs `SUPABASE_DB_URL`, `WEB_AUTH_TOKEN`,
+  and (for a public bind) the three `AUTH_*` variables. On `127.0.0.1` the token
+  alone is enough. `NEXUS_LAB_INLINE=0` keeps a measurement from also running
+  the autonomous loop.
+- **The environment is reset between sessions**: `pip install -r
+  requirements.txt -r requirements-dev.txt`, then `apt-get update` **before**
+  `apt-get install postgresql` (a stale package list makes it "unable to locate
+  package"), then create the `nexus` role and a database. Re-run this before
+  trusting any "module not found" as a code defect.
+- Numbers recorded (4-core sandbox): reads ~1 340 req/s at 4 clients (p50
+  2.95 ms) and ~1 069 req/s at 16 clients (p50 6.53 ms, p99 17 ms), 0 errors;
+  RSS 65–67 MB; 0.9 % CPU idle, 10–15 % under load; 8 threads idle, 14 under
+  load. Update `docs/PERFORMANCE.md` with the same method when you re-measure;
+  never replace a measured row with an estimate.
+
+## The audit, and the JIT defect it found (2026-11-20)
+
+`docs/AUDIT-2026-11-20.md` is the dated full audit: what the product does (with
+the test behind each claim), what is left, the suite time and the performance
+numbers. Two invariants came out of it that a future change must keep.
+
+- **PostgreSQL's JIT is off on every connection** (`cloud_store._jit_options`,
+  `NEXUS_DB_JIT`). It is not a preference: `LabStore.queue_cleanups` unions five
+  sources with `jsonb_array_elements` lateral joins, the planner prices that in
+  the millions, and PostgreSQL **compiled the plan for ~500–670 ms** to then
+  return zero rows in microseconds. With `jit = off` the same call is 3–6 ms.
+  Measured with the project's own benchmark: **635 ms → 4.5 ms** p50.
+  - Do **not** "fix" this by adding an index or raising `jit_above_cost`: both
+    were tried (581 → 579 ms; still 600 ms at a threshold of 10⁷) and neither
+    works. The estimate exceeds any sane threshold.
+  - `ANALYZE` is not a fix either, and it can make it *worse*: accurate
+    statistics made the planner more confident the plan was expensive, so JIT
+    engaged where stale statistics had left it off.
+  - `tests/test_jit_settings.py` pins both directions (16 cases). Removing the
+    `options` from `connect_kwargs` fails two of them, so they are load-bearing.
+- **A benchmark must leave the database as it found it.**
+  `benchmarks/scheduler_bench.py` reset the schema on the way in but left 2 050
+  tasks `dispatched` and 5 runs `running`. Those hold the global in-flight
+  budget (`IN_FLIGHT_TASK_STATES`), so every real claim was refused until the
+  leases expired — the next thing to use the database was starved by the
+  measurement. It now resets the schema in a `finally`. Any new benchmark that
+  seeds runs must do the same, or it will starve the deployment it measures.
+- **The Studio's Диагностика tab** (settings → Диагностика) renders the real
+  diagnostic report, each check with its own status and reason. It is how the
+  queue-starvation above was found: it showed `queues_leases` FAILED with
+  "claim_task returned no task". Keep it reading `GET
+  /api/openhands/diagnostics` (read-only) and never summarise a status the
+  engine did not produce.

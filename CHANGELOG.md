@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased — full audit: a 140x JIT slowdown fixed, a diagnostics screen, the audit document
+
+### Fixed
+
+- **PostgreSQL's JIT made the worker's cleanup scan 140x slower.** `queue_cleanups`
+  unions five sources with `jsonb_array_elements` lateral joins; the planner
+  prices that in the millions, so JIT *compiled* the plan — **500-670 ms** of
+  compilation for a query returning zero rows in microseconds, on the worker's
+  hot path every pass. `PostgresStore` now opens connections with `jit = off`
+  (`NEXUS_DB_JIT=on` restores the server default). Measured with
+  `benchmarks/scheduler_bench.py`: **635 ms -> 4.5 ms** p50. An index on the
+  conversation columns and raising `jit_above_cost` to 10^7 were both tried and
+  did not help (recorded in `docs/PERFORMANCE.md`). Pinned by
+  `tests/test_jit_settings.py` (16 cases, mutation-proven).
+- **`benchmarks/scheduler_bench.py` leaked state that starved the queue.** It
+  reset the schema on the way in but left 2 050 tasks `dispatched` and 5 runs
+  `running`; those hold the global in-flight budget, so every real claim was
+  refused until their leases expired. It now resets the schema on the way out.
+
+### Added
+
+- **A Диагностика tab in the Studio's settings.** The 18-check diagnostic report
+  was CLI/API only. Every check is shown with its own status and reason
+  (VERIFIED / FAILED / BLOCKED / UNVERIFIED), and BLOCKED is explained as "no
+  key or resource", not a failure.
+- **`docs/AUDIT-2026-11-20.md`** — the full audit: what it can do (with the test
+  behind each claim), what is left, the test-suite time (2 117 passed in 8m22s,
+  per-test timings), and the performance numbers.
+
+## Unreleased — measured under real load, with a real provider
+
+### Added
+
+- **`tools/loadtest.py`** — a stdlib-only load generator for a **running**
+  server (there is no `wrk`/`ab` here). A pool of threads loops over a weighted
+  mix of the studio's own requests (`reads`/`writes`/`mixed`) with no sleep,
+  recording every latency and every non-2xx, and reports throughput plus
+  min/p50/p90/p95/p99/max per call. Tests pin its percentile maths, the weight
+  expansion, the per-call recording and the mixes (`tests/test_benchmark_tool.py`).
+- `tools/benchmark.py` gained `evidence_list_ms` (the evidence viewer's list call).
+
+### Measured (recorded in `docs/PERFORMANCE.md`)
+
+- A real `python -m orchestration.web_server` under concurrent load: **~1 340
+  req/s** on the read mix at 4 clients (p50 2.95 ms), ~1 069 req/s at 16 clients
+  (p50 6.53 ms, p99 17 ms), **0 errors**.
+- A **real chat turn** end to end through the live provider cascade (OpenRouter
+  `gpt-4o-mini` after Gemini): p50 **1 239 ms**, p90 1 592 ms over 10 turns —
+  the provider's latency, not NEXUS's, stated as such.
+- Footprint of the running process: RSS 65 MB idle / 67 MB under load, 0.9 % CPU
+  idle / 10–15 % under load, 8 threads idle / 14 under load, 13 MB database.
+- Confirmed the no-provider path is honest: every chat turn is `502` with
+  `no providers configured`, and the user turn is still stored.
+
+## Unreleased — the evidence viewer: the Trust Engine in the Studio
+
+### Added
+
+- **The Evidence Trust Engine is visible in the Studio.** The Agent tab has a
+  «Доказательства» section: it lists the project's signed records (repository,
+  short commit, verdict, time) and «Проверить» re-verifies one against the
+  trusted keyring, showing the server's own verdict and reason under the row.
+  The screen decides no verdict; it calls `GET …/evidence` and
+  `POST …/evidence/{id}/verify`, which already existed and are tested.
+  (`studio/app.js`, `studio/app.css`; tests `tests/test_evidence_viewer.py` and
+  the Chromium journey `test_the_evidence_viewer_lists_records_and_re_verifies_one`.)
+- **`/api/studio` reports whether records can be signed** (`lab.evidence`, a
+  boolean: signer and keyring present). An empty evidence list can then say
+  *why* it is empty — no signer means nothing is recorded — instead of reading
+  as "nothing was verified". Presence only; no key, key id or path is returned.
+
+### Changed
+
+- The four whole-dict assertions of `/api/studio`'s `lab` object name the new
+  `evidence` field (the trap AGENTS.md warns about): they expect `False` in
+  those fixtures, which configure no signer.
+
 ## Unreleased — the Self-QA gate is per project, and it works on a real repository
 
 ### Added

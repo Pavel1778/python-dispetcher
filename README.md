@@ -279,8 +279,11 @@ for both, with a confirmation that names what is inside. See
 `orchestration/tracing.py` times each stage NEXUS controls (dispatch, poll,
 verify) with one secret-free span shape; `GET /api/observability` reports queue
 depth, stuck tasks, worker heartbeat and per-stage latency, and the studio shows
-it under **Настройки → Диагностика**. `tools/benchmark.py` measures the queue
-path over real PostgreSQL. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and
+it under **Настройки → Диагностика**. `tools/benchmark.py` measures each request
+path once at a time, in-process; `tools/loadtest.py` drives a **running** server
+over real sockets with many concurrent clients and reports latency percentiles
+and throughput (stdlib only — no `wrk`/`ab` needed). See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) and
 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md). The "run running, task pending,
 attempt 0" symptom is answered by `queue.claimable_now` and `stuck_tasks` - a
 due task nobody claims is a missing or dead worker, and it is now visible.

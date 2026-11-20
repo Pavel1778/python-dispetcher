@@ -89,6 +89,7 @@ shell, and double every `$` (`$$`) inside a Docker Compose `env_file`.
 | `SUPABASE_DB_URL` (or `DATABASE_URL`) | — | `cloud_store.py`, `web_server.py` | PostgreSQL DSN. Required. Missing → exit code 2. |
 | `AUTO_MIGRATE` | `true` | `cloud_store.py` | Apply the idempotent migrations on first connect; `false` manages the schema out of band. |
 | `PSYCOPG_PREPARE` | off | `cloud_store.py` | Server-side prepared statements. Set to `session` only on a direct session-mode connection; never behind a pooler. |
+| `NEXUS_DB_JIT` | off | `cloud_store.py` | PostgreSQL's JIT compiler. Off by default: it spent ~500 ms compiling the cleanup scan's plan for a query returning zero rows (635 ms → 4.5 ms with it off). `on` restores the server's own behaviour. |
 | `WEB_AUTH_TOKEN` | — | `web_server.py` | Bearer token for the machine API. Required to bind a public interface. |
 | `AUTH_USERNAME` | — | `web_auth.py` | Owner login name. Required for a public bind. |
 | `AUTH_PASSWORD_HASH` | — | `web_auth.py` | PBKDF2-SHA256 hash of the owner password (`pbkdf2_sha256$<iters>$<salt>$<digest>`). Never the password. Replacing it ends every open session. |
