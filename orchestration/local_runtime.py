@@ -113,10 +113,13 @@ class LocalCloudClient(OpenHandsClient):
         self.llm_model = llm_model or os.environ.get("OHP_LOCAL_LLM_MODEL")
 
     # ------------------------------------------------------------- creation
+    supports_dispatch_id = True
+
     def start_conversation(
         self,
         *,
         initial_message: str,
+        dispatch_id: str | None = None,
         selected_repository: str | None = None,
         selected_branch: str | None = None,
         title: str | None = None,
@@ -134,7 +137,7 @@ class LocalCloudClient(OpenHandsClient):
         interface parity and ignored: a local sandbox has no Cloud repository
         provider and inherits the server's own agent settings.
         """
-        conversation_id = self._conversation_id(initial_message, title)
+        conversation_id = str(uuid.UUID(dispatch_id)) if dispatch_id else self._conversation_id(initial_message, title)
         working_dir = os.path.join(self.workspace_root, conversation_id)
         os.makedirs(working_dir, exist_ok=True)
         agent_settings = self.agent_settings()
@@ -147,10 +150,13 @@ class LocalCloudClient(OpenHandsClient):
             max_iterations=self.max_iterations,
             agent_settings=agent_settings,
             client_tools=client_tools,
+            # For durable lab sends the initial turn and the idempotent create
+            # are one provider operation. Never POST another events/run on 200.
+            **({'initial_message': initial_message, 'tags': tags} if dispatch_id else {}),
         )
-        if tags and created:
+        if not dispatch_id and tags and created:
             self._patch_tags(conversation_id, tags)
-        if initial_message:
+        if initial_message and not dispatch_id:
             try:
                 self.send_task(conversation_id, initial_message, run=True)
             except ApiUnavailable as e:

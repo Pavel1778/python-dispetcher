@@ -147,7 +147,7 @@ class EvidenceService:
             "final_text": (getattr(report, "final_text", "") or "")[:2000],
             **{k: evidence[k] for k in ("branch", "named_sha", "state") if k in evidence},
         }
-        return self.record(
+        fields = dict(
             subject_kind="task",
             subject_id=str(task["id"]),
             project_id=str(task["project_id"]) if task.get("project_id") else None,
@@ -158,6 +158,10 @@ class EvidenceService:
             detail=detail,
             created_by="lab:verifier",
         )
+
+        if task.get('_evidence_id'):
+            return self.record_once(evidence_id=task['_evidence_id'], **fields)[0]
+        return self.record(**fields)
 
     def record_once(self, *, evidence_id: str, **kwargs: Any) -> tuple[dict, bool]:
         """Record evidence under a caller-chosen id, at most once.
@@ -294,7 +298,7 @@ class LabEvidence:
     """The pipeline's ACCEPTANCE stage, on the lab loop.
 
     The task-level EVIDENCE stage is ``EvidenceService.record_task_result``,
-    called by ``LabScheduler._record_evidence`` for every settled verdict. What
+    delivered from the verdict transaction's outbox for every settled verdict. What
     was still missing is the stage after it: the run's own **ACCEPTANCE**
     decision - the pipeline names it between EVIDENCE and NOTIFICATION, and a run
     reaching ``completed`` left no signed record of *why* it was accepted, only

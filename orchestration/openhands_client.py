@@ -377,6 +377,7 @@ class OpenHandsClient:
         max_iterations: int | None = None,
         agent_settings: dict[str, Any] | None = None,
         client_tools: list[dict[str, Any]] | None = None,
+        initial_message: str | None = None, tags: dict[str, str] | None = None,
     ) -> tuple[ConversationView, bool]:
         """Create a conversation, or return the existing one.
 
@@ -409,6 +410,11 @@ class OpenHandsClient:
             body["agent_settings"] = agent_settings
         if client_tools is not None:
             body["client_tools"] = client_tools
+        if initial_message is not None:
+            body['initial_message'] = {'role': 'user', 'content': [{'type': 'text', 'text': initial_message}],
+                                       'run': True}
+        if tags is not None:
+            body['tags'] = tags
         status, payload = self._request("POST", "/api/conversations", body)
         if status == 429:
             raise ApiUnavailable("conversation capacity full")

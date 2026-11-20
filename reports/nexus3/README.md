@@ -2,7 +2,9 @@
 
 **Это не release candidate.** Предмет Phase 0 — действующая платформа при входе в миграцию, не обещания в документах 2.0. Исходный `main` и начальный HEAD ветки `arena/6f80793e-python-dispetcher`: **`2edf3aa70eefb0628fa88997a1d1c095b133e007`**. Production, его БД, аккаунты OpenHands и пользовательские репозитории не использовались. Ниже `VERIFIED` всегда ограничено указанным стендом и проверкой.
 
-**Навигация:** [ADR и контракты (Phase 1)](COMPATIBILITY.md) · [две транзакции Rust, тесты и ограничения (Phase 2)](STORAGE.md) · [draft PR #54](https://github.com/Pavel1778/python-dispetcher/pull/54). Документ различает исходный baseline, проверенные изменения в ветке и условия будущего cutover.
+**Продолжение после merge #54:** [Phase 2: надёжная отправка OpenHands, crash-тесты и стоимость Python worker](dispatch/README.md) — отдельный review gate в draft PR #55. Цифры и статусы ниже относятся к предыдущему этапу.
+
+**Навигация:** [ADR и контракты (Phase 1)](COMPATIBILITY.md) · [две транзакции Rust, тесты и ограничения (Phase 2)](STORAGE.md) · [PR #54, теперь merged](https://github.com/Pavel1778/python-dispetcher/pull/54). Документ различает исходный baseline, проверенные изменения в ветке и условия будущего cutover.
 
 **Итог на последней ревизии продукта `170eaf96e23b56a89adca0a3c0c168eb3261b142`:** локальная полная suite — **2089 passed, 32 skipped in 464.82s**; [hosted CI](https://github.com/Pavel1778/python-dispetcher/actions/runs/44786382445) — **2102 passed, 19 skipped, 1 warning in 564.65s**, отдельный Linux/PG17 Rust job — locked build, unit tests и **22 passed in 2.22s** в Python↔Rust gate. Результаты **не складываются**: отдельный job исполняет и часть ранее проверенных parity cases. Разбивка по четырём CI runs, пяти local suites, ревизиям и пропускам — [checks.json](evidence/checks.json). В Python CI job 13 из 19 skips — тесты storage probe, которые выполняет Rust job; локально дополнительно нет Rust toolchain в PATH suite и Android SDK. Не выдаём skip реального cloud task за pass.
 

@@ -446,8 +446,8 @@ class AccountRouter:
                 "UPDATE nexus_run_tasks SET tried_accounts = "
                 "  CASE WHEN tried_accounts ? %s::text THEN tried_accounts "
                 "       ELSE tried_accounts || to_jsonb(%s::text) END, "
-                "  updated_at=now() WHERE id=%s",
-                (account_id, account_id, task["id"]))
+                "  updated_at=now() WHERE id=%s AND (%s::bigint IS NULL OR lease_token=%s)",
+                (account_id, account_id, task["id"], task.get('lease_token'), task.get('lease_token')))
         self.pool.record_failure(self._owner(account_id, task), account_id, error,
                                  unavailable=unavailable)
 

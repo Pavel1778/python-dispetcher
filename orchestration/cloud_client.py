@@ -402,21 +402,26 @@ class CloudClient:
             "GET",
             f"/api/v1/app-conversations/start-tasks?ids={start_task_id}",
         )
-        if status != 200 or not isinstance(payload, list) or not payload:
+        if status != 200 or not isinstance(payload, list):
+            raise CloudError('invalid start-task lookup response')
+        if not payload or payload == [None]:
             return None
-        return _start_task(payload[0]) if payload[0] else None
+        if len(payload) != 1 or not isinstance(payload[0], dict) or payload[0].get('id') != start_task_id:
+            raise CloudError('start-task lookup did not identify the requested receipt')
+        return _start_task(payload[0])
 
     def get_conversation(self, conversation_id: str) -> CloudConversation:
         """``GET /api/v1/app-conversations?ids=<id>`` (batch of one)."""
         status, payload = self._request(
             "GET", f"/api/v1/app-conversations?ids={conversation_id}"
         )
-        if status != 200 or not isinstance(payload, list) or not payload:
+        if status != 200 or not isinstance(payload, list):
+            raise CloudError('invalid conversation lookup response')
+        if not payload or payload == [None]:
             raise CloudNotFound(conversation_id)
-        item = payload[0]
-        if not item:
-            raise CloudNotFound(conversation_id)
-        return _conversation(item)
+        if len(payload) != 1 or not isinstance(payload[0], dict) or payload[0].get('id') != conversation_id:
+            raise CloudError('lookup did not identify the requested conversation')
+        return _conversation(payload[0])
 
     def search_conversations(
         self, *, limit: int = 50, page_id: str | None = None,
@@ -435,9 +440,9 @@ class CloudClient:
             key, value = tag
             path += f"&tags__contains={key}%3D{value}"
         status, payload = self._request("GET", path)
-        if status != 200 or not isinstance(payload, dict):
-            raise CloudError(f"search_conversations -> {status}")
-        items = [_conversation(c) for c in (payload.get("items") or [])]
+        if status != 200 or not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            raise CloudError(f"invalid search_conversations page ({status})")
+        items = [_conversation(c) for c in payload['items']]
         return items, payload.get("next_page_id")
 
     def send_message(

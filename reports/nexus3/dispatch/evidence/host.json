@@ -1,0 +1,22 @@
+{
+  "scope": "local private PG, not the hosted CI runner; benchmark CPU and RSS are worker-only",
+  "os": "Debian GNU/Linux 12 (bookworm)",
+  "arch": "x86_64",
+  "python": "3.11.2",
+  "affinity": [
+    0,
+    1
+  ],
+  "MemTotal": "4034452 kB",
+  "packages": {
+    "pytest": "9.0.3",
+    "psycopg": "3.3.9",
+    "psycopg-pool": "3.3.3",
+    "pgserver": "0.1.4",
+    "playwright": "1.65.2",
+    "cryptography": "45.0.7",
+    "ruff": "0.13.1"
+  },
+  "db": "PostgreSQL 16.2; no TCP listener; default fsync. Private random socket and disposable home per wrapper invocation.",
+  "harness": "loopback HTTP doubles, same lifecycle harness for base and product; no live OpenHands/GitHub/LLM or project SelfQA build. Each repeat runs a fresh worker process."
+}

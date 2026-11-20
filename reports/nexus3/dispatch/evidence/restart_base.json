@@ -1,0 +1,49 @@
+{
+  "implementation_sha": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+  "python": "3.11.2",
+  "postgres": 160002,
+  "case": "restart",
+  "results": {
+    "worker_poll_seconds": 0.3,
+    "observed_poll_seconds": 0.05,
+    "trials": [
+      {
+        "first_bound_ms": 251.7,
+        "relaunch_to_child_bound_ms": 205.24,
+        "request_to_signed_acceptance_s": 0.8188,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      },
+      {
+        "first_bound_ms": 261.42,
+        "relaunch_to_child_bound_ms": 257.25,
+        "request_to_signed_acceptance_s": 0.8317,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      },
+      {
+        "first_bound_ms": 251.44,
+        "relaunch_to_child_bound_ms": 205.98,
+        "request_to_signed_acceptance_s": 0.8217,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      },
+      {
+        "first_bound_ms": 243.39,
+        "relaunch_to_child_bound_ms": 260.5,
+        "request_to_signed_acceptance_s": 0.8159,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      },
+      {
+        "first_bound_ms": 298.05,
+        "relaunch_to_child_bound_ms": 206.63,
+        "request_to_signed_acceptance_s": 0.8686,
+        "starts": 2,
+        "signature_checked_tasks": 2
+      }
+    ],
+    "fixture_verified_tasks_per_hour_extrapolated": 8660.7,
+    "scope": "two-task fixture DAG with SIGKILL; socket doubles, no live cloud time or project SelfQA"
+  }
+}

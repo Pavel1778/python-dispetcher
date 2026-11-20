@@ -170,7 +170,6 @@ def test_expired_attempts_match_committed_python_state(queue, policy, budget):
         pid, rid = start(store, lab, [{'id': 'a', 'title': 'A'}],
                          policy=policy, max_attempts_per_task=budget)
         task = lab.claim_task(rid, 'worker')
-        assert lab.record_start(task['id'], start={'start_task_id': 'accepted'}, lease_token=task['lease_token'])
         with store._tx() as cur:
             cur.execute("UPDATE nexus_run_tasks SET lease_expires=now()-interval '1 second', "
                         "tried_accounts='[\"fixture\"]'::jsonb WHERE id=%s", (task['id'],))
@@ -262,3 +261,32 @@ def test_legacy_null_deadline_and_pause_are_decided_on_the_db_clock(queue, polic
     with store._tx() as cur:
         cur.execute("UPDATE nexus_runs SET resume_at=now()-interval '1 second' WHERE id=%s", (rid,))
     assert (rust_claim(pid, rid) is not None) is allowed
+
+
+@pytest.mark.parametrize('kind', ['prepared', 'sending', 'uncertain', 'accepted', 'identified', 'legacy_receipt'])
+def test_neither_store_recycles_dispatch_after_expiry(queue, kind):
+    from orchestration.dispatch_journal import DispatchJournal
+
+    store, lab = queue
+    pid, rid = start(store, lab, [{'id': 'a', 'title': 'A'}], repo='org/writer')
+    task = lab.claim_task(rid, 'python', dispatch_intent=kind != 'legacy_receipt')
+    if kind == 'legacy_receipt':
+        assert lab.record_start(task['id'], start={'start_task_id': 'legacy'}, lease_token=task['lease_token'])
+    else:
+        journal = DispatchJournal(store)
+        if kind != 'prepared':
+            journal.arm(task, {'kind': 'start'})
+        if kind == 'uncertain':
+            journal.uncertain(task['_intent_id'])
+        if kind in ('accepted', 'identified'):
+            journal.receipt(task, start_id='receipt')
+        if kind == 'identified':
+            journal.receipt(task, conversation='conversation')
+    with store._tx() as cur:
+        cur.execute("UPDATE nexus_run_tasks SET lease_expires=now()-interval '1 second' WHERE id=%s", (task['id'],))
+    assert not probe('reclaim', pid, rid, 4) and not lab.reclaim_expired(rid)
+    assert not rust_claim(pid, rid) and not lab.claim_task(rid, 'python')
+    if kind in ('sending', 'uncertain', 'accepted', 'identified'):
+        lab.set_run_state_internal(rid, 'cancelled')
+        other, retry = start(store, lab, [{'id': 'b', 'title': 'B'}], repo='org/writer')
+        assert not rust_claim(other, retry) and not lab.claim_task(retry, 'python')
