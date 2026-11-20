@@ -109,6 +109,10 @@ class Client:
         status, payload = self._request("POST", path, body, idempotency_key=idempotency_key)
         return self._ok(status, payload)
 
+    def patch(self, path: str, body: dict | None = None) -> Any:
+        status, payload = self._request("PATCH", path, body)
+        return self._ok(status, payload)
+
     @staticmethod
     def _ok(status: int, payload: Any) -> Any:
         if 200 <= status < 300:
@@ -763,6 +767,23 @@ def cmd_project_executors_set(args: argparse.Namespace) -> int:
     return EXIT["ok"]
 
 
+def cmd_project_quality_gate(args: argparse.Namespace) -> int:
+    """Show or set the project's quality-gate mode (auto | on | off)."""
+    client = _client(args)
+    mode = getattr(args, "mode", None)
+    if mode is None:
+        project = client.get(f"/api/v1/projects/{args.project_id}").get("project", {})
+        current = project.get("quality_gate") or "auto"
+        _emit(args, {"project_id": args.project_id, "quality_gate": current},
+              human=f"quality gate: {current}")
+        return EXIT["ok"]
+    result = client.patch(f"/api/v1/projects/{args.project_id}",
+                          {"quality_gate": mode})
+    project = result.get("project", {})
+    _emit(args, result, human=f"quality gate: {project.get('quality_gate', mode)}")
+    return EXIT["ok"]
+
+
 def cmd_project_repos_primary(args: argparse.Namespace) -> int:
     client = _client(args)
     owner, name = args.full_name.split("/", 1)
@@ -950,6 +971,14 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("full_name")
     rp.add_argument("--project", dest="project_id", required=True)
     rp.set_defaults(func=cmd_project_repos_primary)
+
+    qg = project.add_parser("quality-gate", parents=[common],
+                            help="show or set whether the project's own checks gate a task")
+    qg.add_argument("project_id")
+    qg.add_argument("mode", nargs="?", default=None, choices=["auto", "on", "off"],
+                    help="auto: only when the repository declares .nexus-qa.json "
+                         "(default); on: always; off: never. Omit to show it.")
+    qg.set_defaults(func=cmd_project_quality_gate)
 
     execs = project.add_parser("executors", parents=[common],
                                help="assign OpenHands executors to a project").add_subparsers(

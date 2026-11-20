@@ -19,7 +19,7 @@ code, exercised against the local stand-ins) · **PARTIAL** · **BLOCKED**
 | Project isolation (404, never 403, at every boundary) | VERIFIED | `tests/test_project_isolation.py`, `test_project_isolation_routes.py` |
 | Evidence Trust Engine (Ed25519, re-verifiable) | VERIFIED | `tests/test_evidence_trust.py`, `test_lab_evidence.py` |
 | Self-QA engine (isolated checkout, real exit codes) | VERIFIED | `tests/test_selfqa.py` |
-| **Self-QA as an automatic run gate** | IMPLEMENTED (opt-in) | `tests/test_quality_gate.py`; enable with `NEXUS_SELFQA_GATE=1` |
+| **Self-QA as an automatic run gate** | VERIFIED | `tests/test_quality_gate.py`, `test_quality_gate_policy.py`; per project (`auto`/`on`/`off`, default `auto`), `NEXUS_SELFQA_GATE` overrides deployment-wide |
 | Multi-account pool, failover, load balancing | IMPLEMENTED | `tests/test_openhands_pool.py`, `test_openhands_failover.py` |
 | Two-live-account failover | BLOCKED | one OpenHands key available |
 | Bounded autonomous replanning (new corrective tasks) | PARTIAL | a durable run reworks a task; it does not yet invent new tasks |

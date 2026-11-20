@@ -1509,7 +1509,9 @@ class LabScheduler:
         if not commit or not repository:
             return verdict
         try:
-            qa = gate.run(repository=repository, commit=commit)
+            qa = gate.run(repository=repository, commit=commit,
+                          project_id=str(task.get("project_id") or ""),
+                          branch=task.get("branch") or None)
         except Exception as e:  # noqa: BLE001 - the gate must not stall a run
             log.warning("quality gate failed for task %s: %s",
                         task.get("task_key"), type(e).__name__)

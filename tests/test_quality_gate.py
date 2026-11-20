@@ -210,12 +210,55 @@ def test_the_gate_never_runs_for_a_task_without_a_repository(lab):
     assert _Counting.calls == 0
 
 
-def test_the_gate_is_off_by_default(monkeypatch):
+def test_the_gate_is_per_project_and_the_env_switch_is_an_override(monkeypatch):
+    """Without a store, the env switch alone still decides (single-project use);
+    with a store, the per-project mode is the default and the env switch only
+    overrides it."""
     from orchestration.lab_worker import build_quality_gate
+    from orchestration.nexus_selfqa import ProjectQualityGate
+
     monkeypatch.delenv("NEXUS_SELFQA_GATE", raising=False)
+    # No store: unchanged single-project behaviour.
     assert build_quality_gate() is None
     for on in ("1", "true", "yes", "on", "TRUE"):
         monkeypatch.setenv("NEXUS_SELFQA_GATE", on)
         assert isinstance(build_quality_gate(), SelfQa)
     monkeypatch.setenv("NEXUS_SELFQA_GATE", "0")
     assert build_quality_gate() is None
+
+    # With a store and no env switch the gate is present and per project: it
+    # reads each project's own mode, so it is neither always on nor always off.
+    monkeypatch.delenv("NEXUS_SELFQA_GATE", raising=False)
+    gate = build_quality_gate(store=object())
+    assert isinstance(gate, ProjectQualityGate)
+    # An explicit "off" turns it off everywhere, an explicit "on" forces it on
+    # for every project - both are the operator's deployment-wide override.
+    monkeypatch.setenv("NEXUS_SELFQA_GATE", "off")
+    assert build_quality_gate(store=object()) is None
+    monkeypatch.setenv("NEXUS_SELFQA_GATE", "1")
+    assert isinstance(build_quality_gate(store=object()), ProjectQualityGate)
+
+
+def test_the_check_timeouts_come_from_the_environment(monkeypatch):
+    """The two limits are real settings; a junk value is the default, never 0."""
+    from orchestration.lab_worker import build_quality_gate
+    from orchestration.nexus_selfqa import DEFAULT_CHECK_TIMEOUT, DEFAULT_TOTAL_TIMEOUT
+
+    monkeypatch.setenv("NEXUS_SELFQA_GATE", "1")
+    gate = build_quality_gate()          # the no-store single-project engine
+    assert gate.check_timeout == DEFAULT_CHECK_TIMEOUT
+    assert gate.total_timeout == DEFAULT_TOTAL_TIMEOUT
+
+    monkeypatch.setenv("NEXUS_SELFQA_CHECK_TIMEOUT", "12.5")
+    monkeypatch.setenv("NEXUS_SELFQA_TOTAL_TIMEOUT", "99")
+    gate = build_quality_gate()
+    assert gate.check_timeout == 12.5
+    assert gate.total_timeout == 99.0
+
+    # A junk or non-positive value is the default: a zero timeout would fail
+    # every check and blame the project.
+    monkeypatch.setenv("NEXUS_SELFQA_CHECK_TIMEOUT", "not-a-number")
+    monkeypatch.setenv("NEXUS_SELFQA_TOTAL_TIMEOUT", "0")
+    gate = build_quality_gate()
+    assert gate.check_timeout == DEFAULT_CHECK_TIMEOUT
+    assert gate.total_timeout == DEFAULT_TOTAL_TIMEOUT

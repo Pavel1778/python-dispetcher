@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — the Self-QA gate is per project, and it works on a real repository
+
+### Added
+
+- **A per-project quality-gate mode** (`nexus_projects.quality_gate`,
+  migration `0042_project_quality_gate.sql`): `auto` (the default) runs the
+  project's own checks only when its repository declares `.nexus-qa.json`;
+  `on` always; `off` never. Set from the Studio's project settings, with
+  `PATCH /api/v1/projects/{id}` and `nexus project quality-gate <id> [mode]`.
+  `NEXUS_SELFQA_GATE` remains a deployment-wide override. A project that
+  declares its checks is now gated without any operator switch — roadmap P1 #1.
+- **The two check timeouts are settings** (`NEXUS_SELFQA_CHECK_TIMEOUT`,
+  `NEXUS_SELFQA_TOTAL_TIMEOUT`); a junk or non-positive value is the default.
+
+### Fixed
+
+- **The gate never worked on a real project.** A task's `repository` is
+  `owner/name`, and the gate ran `git clone owner/name`, which git reads as a
+  *path* — every real project came back `blocked` ("repository does not
+  exist") while every test passed on a local directory. `clone_url` resolves
+  `owner/name` to its https URL; the clone fetches the exact accepted commit
+  (a shallow clone cannot check out an arbitrary SHA); a private repository is
+  cloned with the project's own account, and the token reaches git through the
+  environment only — never argv, never the URL, never a report.
+- **A failing project passed after the first task.** A fixed `workdir/checkout`
+  was reused by the next run, so the clone failed, the report was `blocked`,
+  and a `blocked` gate leaves the verdict alone. Each run now gets its own
+  scratch directory.
+
+Tests: `tests/test_quality_gate_policy.py` (33 cases; the clone, the mode
+policy and the shared-checkout fix each fail when reverted), and the updated
+`tests/test_quality_gate.py`.
+
 ## Unreleased — run-time profile (Phase 5), canonical consolidation
 
 ### Added

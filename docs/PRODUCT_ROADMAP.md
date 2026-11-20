@@ -9,7 +9,8 @@ the value it adds to a working product, not by novelty.
   evidence → accept → report.
 - Project isolation at every boundary (404, never 403).
 - Evidence Trust Engine (Ed25519, re-verify).
-- Self-QA engine (deterministic, isolated checkout).
+- Self-QA engine (deterministic, isolated checkout), per project by default
+  (auto / on / off, `nexus_projects.quality_gate`).
 - Restart / duplicate / cancel / retry of runs; cancel lock ordering.
 - Multi-account OpenHands pool with failover and load balancing (fake + real
   PostgreSQL).
@@ -19,11 +20,15 @@ the value it adds to a working product, not by novelty.
 
 ## Next (P1 — finish the product)
 
-1. **Self-QA as a default gate.** The gate exists and is opt-in
-   (`NEXUS_SELFQA_GATE=1`). The next step is to make it the default for projects
-   that declare `.nexus-qa.json`, with a per-project toggle in the Studio.
-   *Why not done yet:* running arbitrary checks clones and builds a project,
-   which is a cost and a trust decision the operator should make per project.
+1. ~~**Self-QA as a default gate.**~~ **DONE.** The gate is per project
+   (`nexus_projects.quality_gate`, migration 0042): `auto` (the default) runs
+   the checks only when the repository declares `.nexus-qa.json`, `on` always,
+   `off` never. It is set from the project settings in the Studio, with
+   `PATCH /api/v1/projects/{id}` and `nexus project quality-gate`. A deployment
+   may still override it everywhere with `NEXUS_SELFQA_GATE`. Two defects were
+   fixed on the way: the gate cloned `owner/name` as a path (so it never worked
+   on a real project), and a second run reused one checkout directory (so a
+   failing project passed after the first). `tests/test_quality_gate_policy.py`.
 2. **Bounded autonomous replanning.** A durable run reworks a task that fails
    verification; it does not yet *invent new tasks* from failure evidence. The
    design is bounded (new tasks depend on the failure, the DAG is re-validated,

@@ -239,6 +239,8 @@ def test_protected_patch_and_delete_endpoints_require_auth(base):
     """The studio renames and archives with PATCH; neither works without a credential."""
     for method, path, body in [
         ("PATCH", f"/api/v1/projects/{UUID}", {"name": "x"}),
+        # The project's quality-gate mode is the same admin route.
+        ("PATCH", f"/api/v1/projects/{UUID}", {"quality_gate": "off"}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"archived": True}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"title": "x"}),
         ("PATCH", f"/api/v1/projects/{UUID}/conversations/{UUID}", {"pinned": True}),

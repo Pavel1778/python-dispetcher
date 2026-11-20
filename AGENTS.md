@@ -2920,3 +2920,61 @@ eleven in turn, asserts it is named). Both fail if a column is removed from the
 map **or** if the guard reverts to the eight-table tuple. Do not narrow the
 guard back to a hand-kept subset: a table the map names but the loop skips is a
 schema contract that is not enforced.
+
+## The Self-QA gate is per project, and it finally works on a real repository (this session)
+
+Roadmap P1 #1 ("Self-QA as a default gate") is done, and two real defects that
+sat underneath it were found and fixed. Each is proven by a test that fails if
+the fix is undone.
+
+- **The gate is per project** (`nexus_projects.quality_gate`, migration
+  `0042_project_quality_gate.sql`). `auto` (the default) runs the project's own
+  checks only when the repository declares `.nexus-qa.json`; `on` always;
+  `off` never. `ProjectQualityGate` (`nexus_selfqa.py`) is the policy wrapper:
+  it never decides a result is a pass, it only chooses whether the engine runs,
+  and the engine's own `failed` is the one thing that weakens a verdict.
+  `build_quality_gate(store, github=, github_accounts=)` builds it by default;
+  **`NEXUS_SELFQA_GATE` is now a deployment-wide override** (`1` forces every
+  project's checks, `0` turns the gate off everywhere), not the only way in.
+  Without a store (`build_quality_gate()`), the old env-only behaviour is kept
+  for a single-project caller. Surface: `PATCH /api/v1/projects/{id}`
+  (`quality_gate`), `nexus project quality-gate <id> [auto|on|off]`, and the
+  Studio's project settings (`#quality-gate-mode`).
+- **The gate never worked on a real project.** A task's `repository` is
+  `owner/name`, and `SelfQa._clone` ran `git clone owner/name`, which git reads
+  as a *relative path* — `fatal: repository 'owner/name' does not exist`, so the
+  report was `blocked` for every real project while every existing test passed
+  on a local directory. `clone_url` maps `owner/name` to
+  `https://github.com/owner/name.git` and leaves a URL or a path alone. The
+  clone is **full**, not shallow, because the gate checks a *specific* commit
+  that a shallow clone may not contain; a missing commit is fetched by name (the
+  branch first, then the SHA). A commit that cannot be reached is `blocked`
+  ("not verified"), never a pass.
+- **A private repository is cloned with the project's own identity, and the
+  token never leaves the environment.** `_auth_env` puts the credential in
+  `GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` (an `http.<host>/.extraheader`), not in
+  argv and not in the URL: a token in the URL is written to `.git/config`, and a
+  token in argv is visible in `ps`. `SelfQa(token=...)` holds it and nothing in
+  a report or an exception carries it.
+- **A failing project passed after the first task.** `run()` reused a fixed
+  `workdir/checkout`, so the *second* run's clone failed ("already exists"), the
+  report was `blocked`, and `blocked` leaves the task verdict alone — a project
+  whose checks fail was accepted on every run after the first. Each run now gets
+  its own scratch directory under `workdir` (`tempfile.mkdtemp(dir=...)`).
+  `tests/test_quality_gate_policy.py::test_the_same_engine_checks_two_commits_in_a_row`
+  is the case that caught it; do not fold the workdir back into one directory.
+- **`SelfQa.run` takes `project_id` and `branch`** so a plain engine and the
+  policy wrapper are interchangeable to the scheduler (`_apply_quality_gate`
+  passes both). `project_id` is ignored by the engine; `branch` is used only to
+  fetch a commit the default clone depth would not contain.
+- **The two check timeouts are settings** (`NEXUS_SELFQA_CHECK_TIMEOUT`,
+  `NEXUS_SELFQA_TOTAL_TIMEOUT`); a junk or non-positive value is the default,
+  never `0` (which would fail every check and blame the project).
+- Tests: `tests/test_quality_gate_policy.py` (the clone fix, the auth env, the
+  three modes, real git repositories and real exit codes, the scheduler
+  integration, and the HTTP/CLI surface) and the updated
+  `tests/test_quality_gate.py`. Mutation-proven: reverting `clone_url`, the
+  `auto` declaration check, or the per-run scratch directory each makes a test
+  fail.
+- `REQUIRED_COLUMNS["nexus_projects"]` names `quality_gate`; the schema guard
+  fails if the column is missing.
