@@ -55,6 +55,16 @@ jobs:
           cargo build --workspace --release --locked
           cargo build -p nexus-storage --example claim_probe --release --locked
 
+      - name: Rust fmt and clippy
+        # Without this step a formatting or lint defect reaches main unnoticed:
+        # an audit found `cargo fmt --check` failing and two clippy warnings on
+        # main while CI was green, because neither was ever run here.
+        timeout-minutes: 10
+        working-directory: rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Rust tests
         timeout-minutes: 10
         working-directory: rust

@@ -89,7 +89,9 @@ pub fn validate_tasks(payload: &serde_json::Value) -> Result<Vec<PlannedTask>, D
     let mut keys: HashSet<String> = HashSet::new();
 
     for (i, item) in list.iter().enumerate() {
-        let obj = item.as_object().ok_or(DomainError::TaskNotObject { index: i })?;
+        let obj = item
+            .as_object()
+            .ok_or(DomainError::TaskNotObject { index: i })?;
 
         let key = match obj.get("id").and_then(|v| v.as_str()) {
             Some(k) => k.to_string(),
@@ -190,7 +192,10 @@ pub fn check_dag(tasks: &[PlannedTask]) -> Result<(), DomainError> {
                     dep.clone(),
                 ));
             }
-            outgoing.entry(dep.as_str()).or_default().push(t.id.as_str());
+            outgoing
+                .entry(dep.as_str())
+                .or_default()
+                .push(t.id.as_str());
             *indegree.entry(t.id.as_str()).or_insert(0) += 1;
         }
     }

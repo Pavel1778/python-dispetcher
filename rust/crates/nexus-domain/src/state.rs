@@ -70,10 +70,7 @@ impl RunState {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            RunState::Running
-                | RunState::Paused
-                | RunState::WaitingForApproval
-                | RunState::Blocked
+            RunState::Running | RunState::Paused | RunState::WaitingForApproval | RunState::Blocked
         )
     }
 
@@ -187,11 +184,47 @@ impl WorkflowState {
     pub fn allowed_targets(&self) -> Vec<WorkflowState> {
         use WorkflowState::*;
         let targets: &[WorkflowState] = match self {
-            Discovery => &[Discovery, Clarification, Planning, AwaitingApproval, Cancelled, Failed],
-            Clarification => &[Clarification, Discovery, Planning, AwaitingApproval, Cancelled, Failed],
-            Planning => &[Planning, Clarification, Discovery, AwaitingApproval, Cancelled, Failed],
-            AwaitingApproval => &[AwaitingApproval, Planning, Clarification, Discovery, Executing, Cancelled, Failed],
-            Executing => &[Executing, Reporting, Completed, Cancelled, Failed, AwaitingApproval],
+            Discovery => &[
+                Discovery,
+                Clarification,
+                Planning,
+                AwaitingApproval,
+                Cancelled,
+                Failed,
+            ],
+            Clarification => &[
+                Clarification,
+                Discovery,
+                Planning,
+                AwaitingApproval,
+                Cancelled,
+                Failed,
+            ],
+            Planning => &[
+                Planning,
+                Clarification,
+                Discovery,
+                AwaitingApproval,
+                Cancelled,
+                Failed,
+            ],
+            AwaitingApproval => &[
+                AwaitingApproval,
+                Planning,
+                Clarification,
+                Discovery,
+                Executing,
+                Cancelled,
+                Failed,
+            ],
+            Executing => &[
+                Executing,
+                Reporting,
+                Completed,
+                Cancelled,
+                Failed,
+                AwaitingApproval,
+            ],
             Reporting => &[Reporting, Completed, Cancelled, Failed, Executing],
             Completed => &[Completed, Discovery, Planning, AwaitingApproval, Executing],
             Cancelled => &[Cancelled, Discovery, Planning, AwaitingApproval, Executing],
@@ -220,7 +253,10 @@ pub fn check_transition_workflow(
         Ok(target)
     } else {
         Err(DomainError::WorkflowTransition {
-            from: current.unwrap_or(WorkflowState::Discovery).as_str().to_string(),
+            from: current
+                .unwrap_or(WorkflowState::Discovery)
+                .as_str()
+                .to_string(),
             to: target.as_str().to_string(),
         })
     }
@@ -279,8 +315,12 @@ impl TaskState {
         use TaskState::*;
         let targets: &[TaskState] = match self {
             Queued => &[Assigned, Cancelled, Blocked],
-            Assigned => &[Running, Queued, Failed, Cancelled, Recovering, Blocked, Verifying],
-            Running => &[Verifying, Failed, Blocked, Cancelled, Recovering, DeadLetter],
+            Assigned => &[
+                Running, Queued, Failed, Cancelled, Recovering, Blocked, Verifying,
+            ],
+            Running => &[
+                Verifying, Failed, Blocked, Cancelled, Recovering, DeadLetter,
+            ],
             Verifying => &[Completed, Failed, Running, Blocked, DeadLetter],
             // "From here reality decides, so every safe outcome is reachable,
             // including completion: a worker can die while its conversation
