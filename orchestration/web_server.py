@@ -782,7 +782,12 @@ class App:
             # and the page says so instead of showing a run that never moves.
             # ``cleanup_hours``: how long after a run is over its OpenHands
             # conversations are deleted; ``None`` when they are kept for ever.
-            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours()},
+            # ``selfqa_gate``: whether the Self-QA gate mechanism is active at
+            # all. It is on unless the deployment sets ``NEXUS_SELFQA_GATE=0``;
+            # whether a given project's checks actually run is that project's
+            # own ``quality_gate`` mode (auto/on/off), shown in its settings.
+            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours(),
+                    "selfqa_gate": self.quality_gate is not None},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {

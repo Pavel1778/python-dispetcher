@@ -262,3 +262,30 @@ def test_the_check_timeouts_come_from_the_environment(monkeypatch):
     gate = build_quality_gate()
     assert gate.check_timeout == DEFAULT_CHECK_TIMEOUT
     assert gate.total_timeout == DEFAULT_TOTAL_TIMEOUT
+
+
+def test_the_studio_reports_whether_the_gate_is_active(monkeypatch):
+    """``/api/studio`` must say honestly whether the gate mechanism is on.
+
+    It is now per project (``auto``/``on``/``off``), so with no override the
+    mechanism is active and each project's own mode decides; a deployment that
+    sets ``NEXUS_SELFQA_GATE=0`` turns it off everywhere and the studio says so.
+    The per-project choice is shown in the project settings, not here.
+    """
+    from orchestration.web_server import App
+
+    monkeypatch.delenv("NEXUS_SELFQA_GATE", raising=False)
+    app_default = App(DSN, token="t")
+    try:
+        assert app_default.quality_gate is not None
+        assert app_default.studio_status()["lab"]["selfqa_gate"] is True
+    finally:
+        app_default.stop()
+
+    monkeypatch.setenv("NEXUS_SELFQA_GATE", "0")
+    app_off = App(DSN, token="t")
+    try:
+        assert app_off.quality_gate is None
+        assert app_off.studio_status()["lab"]["selfqa_gate"] is False
+    finally:
+        app_off.stop()
