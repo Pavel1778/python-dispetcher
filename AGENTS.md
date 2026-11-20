@@ -3010,3 +3010,37 @@ started, never deletes user data, and `restore` proves a dump loads into a
 `backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
 both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
 per-process isolation passes the latter.
+
+## Durable dispatch: the crash windows, and why adoption is the answer (Phase 2)
+
+`tests/test_dispatch_durability.py` is the one place the crash windows of a
+dispatch are injected. Read it before changing `OpenHandsExecutor.dispatch` or
+`LabStore.mark_running`. What it pins:
+
+- **A Cloud start has no idempotency key.** `CloudClient.start_conversation`
+  posts a body with no such field, so a start whose response was lost is an
+  *uncertain* outcome. The system must never retry it blindly; it reconciles by
+  searching for the conversation by tag (`nexusrun`/`nexustask`/`nexusattempt`,
+  see `OpenHandsExecutor._tags`).
+- **`_adopt` runs before any start.** A reclaimed task (`evidence[-1].reclaimed`)
+  asks the service for its run's conversations and adopts the one whose task tag
+  matches. Removing that call turns recovery into a duplicate start and fails
+  `test_recovery_adopts_the_orphan_instead_of_starting_a_second_conversation` -
+  the mutation is the reason the test exists.
+- **`mark_running` binds and transitions in one statement.** `conversation_id`
+  and `dispatched` -> `running` are set in a single `UPDATE`, so there is no
+  "bound but not running" row to crash inside. Do not split it.
+- **Binding the conversation a task already has is a no-op** (one execution row,
+  no second stop signal). Two workers legitimately bind one start.
+- **`record_start` and every later write are fenced on `lease_token`.** A worker
+  whose claim was reclaimed cannot record a start or bind a conversation onto
+  the task another worker now holds (`LabStore.holds_lease`).
+- **A crash before the request leaves needs nothing special**: no external
+  conversation exists, so a fresh start is the correct recovery.
+
+Measured on an isolated cluster (`benchmarks/compare_claims.py` through
+`tools/with_disposable_postgres.sh`, Postgres 17.11, 400 tasks x 4 rounds): the
+claim transaction is a **tie** on throughput (Python 465.85 vs Rust 465.35
+grants/s, p50 ~2.05 vs 2.13 ms) while the Rust driver is ~13x lighter in RSS
+(3.0 vs 39.6 MiB). **There is no throughput case for switching the scheduler**;
+Python stays authoritative, as the owner required.

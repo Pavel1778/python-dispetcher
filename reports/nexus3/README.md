@@ -127,3 +127,108 @@ $WRAPPER python benchmarks/soak_test.py --minutes 2 --readers 5 --out /tmp/soak.
 Точки истории ветки: база `2edf3aa70eefb0628fa88997a1d1c095b133e007`; baseline/restore `e4eb5f309892a818fbe461a08cdb551a7811566e`; ADR `3543860d126ada14f6fdd773e41c5c6d68a07fcc`; первый SQLx gate `a59c00c0ae17117b01b0b6b3da699b6bd0b06261`; целостность evidence `1b1ebafcd95c9421fae1a4004f5bfc184fa520d6`; recovery/сравнение `fa1dae8d387a5e0a9a66de8fd447dd743c042be7`; последняя ревизия ядра и тестов продукта `170eaf96e23b56a89adca0a3c0c168eb3261b142`. Последующий commit с отчётами, reference-данными и инструментом чтения wire contract не меняет этот код. Рабочая ветка и draft PR не являются разрешением на merge, deployment или миграцию существующей БД.
 
 Отдельные блокеры нативной приёмки: в этом сеансе нет подключённого физического Android, release signing identity и Debian 13/Windows-системы с проведённой install/upgrade-проверкой. Основной CI использует **Ubuntu**, а не Windows runner. Отсутствие Tauri-кода/отдельных build jobs — ещё не выполненная работа фазы 5, **не** доказательство, что hosted runner недоступен. Ключ подписи нельзя давать непроверенному PR. Для фаз 3 и 6 нужны разрешённые тестовые внешние аккаунты/репозиторий и целевая машина; реальные пользовательские данные для измерений не брались.
+## Phase 2 — durable OpenHands dispatch (2026-11-20, this session)
+
+Full provenance first, because the hand-over report did not match the
+repository.
+
+### Provenance (verified, not taken on trust)
+
+| Report said | Repository says |
+| --- | --- |
+| PR #54 is a draft, unmerged | **Merged into `main`** as `e866666` (not draft) |
+| Candidate HEAD `9923916…` | An **ancestor of `main`** — already merged |
+| Base branch `nexus/3.0-foundation` | **Does not exist** on origin |
+| — | `release/nexus-2.0-pr-ready` (PR #52) is still open and unmerged |
+
+Local vs CI test counts differ for a mechanical reason: CI runs on
+`ubuntu-26.04` with Chromium, so the browser journeys run there and skip on a
+machine without it; the Android/mingw/pooler cases skip in both.
+
+### What was already correct (and my hypothesis was wrong)
+
+I expected a defect in the window *between* the service accepting a start and
+that start reaching the database. Reading the code and then **testing** it
+showed the system already handles it:
+
+- `OpenHandsExecutor.dispatch` looks for an orphan **before** starting anything
+  (`_adopt`), using the tags every start carries (`nexusrun`/`nexustask`/
+  `nexusattempt`). A reclaimed task therefore adopts the conversation a lost
+  worker created instead of starting beside it.
+- `LabStore.mark_running` sets `conversation_id` **and** moves `dispatched` →
+  `running` in **one** UPDATE, so the "bound but not running" window does not
+  exist to crash inside.
+- `record_start` fences on the claim's `lease_token`, so a worker that lost its
+  claim cannot record a start.
+
+No production code was changed for this: the tests proved the behaviour that is
+already there, and `tests/test_dispatch_durability.py` pins it.
+
+### Crash windows — what each one does (`tests/test_dispatch_durability.py`)
+
+| Window | Outcome | Proven by |
+| --- | --- | --- |
+| Before the intent/request leaves | nothing external exists; a fresh start is correct | `test_recovery_starts_fresh_when_no_orphan_exists` |
+| After OpenHands accepts, before the record | conversation exists, findable by tag | `test_a_crash_after_the_service_accepts_the_start_leaves_no_record`, `…_findable_by_the_tags…` |
+| During recovery by another worker | **adopted**, never a second start | `test_recovery_adopts_the_orphan_instead_of_starting_a_second_conversation` |
+| Two workers recovering at once | exactly one external start | `test_two_workers_recovering_at_once_start_exactly_one_conversation` |
+| After bind, before state transition | not a window: one statement | `test_binding_and_marking_running_happen_together` |
+| Bind the same conversation twice | no-op, one execution row | `test_binding_the_same_conversation_twice_is_a_no_op` |
+| Stale lease | cannot bind; fenced write changes nothing | `test_a_stale_lease_cannot_bind_the_conversation_it_started` |
+
+**Mutation-proven:** deleting the `_adopt` call (turning recovery into a blind
+retry) fails exactly `test_recovery_adopts_the_orphan_instead_of_starting_a_second_conversation`
+and nothing else; restoring it passes all nine.
+
+**Where OpenHands cannot guarantee idempotency:** `start_conversation` has no
+idempotency key (the request body has no such field). The outcome of a start
+whose response was lost is therefore *uncertain*, and the system reconciles it
+by tag search rather than retrying — which is the behaviour the requirement
+asks for.
+
+### Worker lifecycle, one case
+
+`test_a_three_task_dag_runs_in_order_with_one_conversation_each` drives
+claim → run → bind → collect → complete → dependent for a 3-task DAG and
+asserts one conversation per task, in order.
+
+### Measured (isolated cluster, `benchmarks/compare_claims.py`)
+
+`--tasks 400 --rounds 4`, one scratch cluster created by
+`tools/with_disposable_postgres.sh` (no `env`, no `.pgpass`), Postgres 17.11,
+median of four rounds:
+
+| Metric | Python | Rust |
+| --- | ---: | ---: |
+| grants/s | **465.85** | 465.35 |
+| p50 | 2.05 ms | 2.13 ms |
+| p95 | 2.51 ms | 2.51 ms |
+| p99 | 2.82 ms | 3.07 ms |
+| driver peak RSS | 39.6 MiB | **3.0 MiB** |
+| driver user CPU | 0.32 s | **0.03 s** |
+
+**No throughput advantage** to switching; Rust's driver is ~13× lighter in
+memory and ~10× lighter in user CPU. This is one transaction's cost, not the
+worker's, and not a dedicated host.
+
+### Acceptance evidence for this revision
+
+| Item | Result |
+| --- | --- |
+| Exact candidate HEAD | `4aae9f08da2cd8dde1a9bb76d132ca0fd6262d75` (branch `nexus/phase2-dispatch-durability`, draft PR #56) |
+| CI on that head (run `44805364105`) | **2111 passed, 19 skipped, 0 failed** in 10m45s; Chromium ran |
+| Local full suite | 2070 passed, 60 skipped, 0 failed in 6m22s |
+| Local vs CI counts | **same 2130 collected**; CI runs 41 more (38 browser + 3 Rust-claim) because Chromium and the claim probe are present there |
+| Rust build (locked) | `cargo build --locked --release` OK; `cargo test --locked --release` 30 tests pass |
+| Python↔Rust | 9 parity + 13 claim = **22 checks, zero skips** (probe + isolated DB) |
+| Evidence integrity | 37 passed (`test_evidence_trust`, `test_lab_evidence`, `test_dispatch_durability`) |
+| DB statements per cycle | **claim_task 4, mark_running (bind) 5 — 9 total** (driver-level count) |
+| Claim throughput | Python 465.85 vs Rust 465.35 grants/s (median of 4, isolated cluster) |
+| p50/p95/p99 | Python 2.05/2.51/2.82 ms; Rust 2.13/2.51/3.07 ms |
+| Peak RSS (driver) | Python 39.6 MiB; Rust 3.0 MiB |
+| CPU (driver, user) | Python 0.32 s; Rust 0.03 s |
+
+**Recommendation: keep Python authoritative.** The dispatch is already durable
+for every crash window tested, the claim transaction shows no throughput gain
+from Rust, and the remaining Rust work (API, worker, MCP) is unbuilt. Switching
+now would move the scheduler to a component that has only two of its operations.
