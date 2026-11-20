@@ -185,6 +185,12 @@ paths**, and this instrument shows no measurable speedup from it either — the
 optimisations in section 6 are measured by `benchmarks/`, not by this mix, and
 no claim is made here that the two agree.
 
+A **real chat turn** on the merged build (5 turns, live cascade) was faster than
+before the merge: min 645 ms, **p50 896 ms**, max 981 ms, mean 829 ms (was p50
+1 239 ms). That is consistent with section 6 item 4 (the chat turn's DB
+round-trips fell from 7–9 transactions to 2); it is a single 5-sample reading on
+a shared box, so treat it as a direction, not a precise figure.
+
 ## What was not done, and why
 
 - **No language migration.** A Go/Rust rewrite of the API would not move these
