@@ -252,6 +252,11 @@ def main() -> int:
         m["export_conversation_ms"] = _percentiles(_time(
             lambda: api.get(f"/api/v1/projects/{pid}/conversations/{cid}/export"),
             repeat=args.repeat))
+        # The evidence viewer's two calls. A list over an empty project is the
+        # cost the Agent tab pays when it opens the section.
+        m["evidence_list_ms"] = _percentiles(_time(
+            lambda: api.get(f"/api/v1/projects/{pid}/evidence"),
+            repeat=args.repeat))
 
         # --- a chat turn (the LLM stand-in answers immediately) ---
         def chat_turn():

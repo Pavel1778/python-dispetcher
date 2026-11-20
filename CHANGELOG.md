@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — measured under real load, with a real provider
+
+### Added
+
+- **`tools/loadtest.py`** — a stdlib-only load generator for a **running**
+  server (there is no `wrk`/`ab` here). A pool of threads loops over a weighted
+  mix of the studio's own requests (`reads`/`writes`/`mixed`) with no sleep,
+  recording every latency and every non-2xx, and reports throughput plus
+  min/p50/p90/p95/p99/max per call. Tests pin its percentile maths, the weight
+  expansion, the per-call recording and the mixes (`tests/test_benchmark_tool.py`).
+- `tools/benchmark.py` gained `evidence_list_ms` (the evidence viewer's list call).
+
+### Measured (recorded in `docs/PERFORMANCE.md`)
+
+- A real `python -m orchestration.web_server` under concurrent load: **~1 340
+  req/s** on the read mix at 4 clients (p50 2.95 ms), ~1 069 req/s at 16 clients
+  (p50 6.53 ms, p99 17 ms), **0 errors**.
+- A **real chat turn** end to end through the live provider cascade (OpenRouter
+  `gpt-4o-mini` after Gemini): p50 **1 239 ms**, p90 1 592 ms over 10 turns —
+  the provider's latency, not NEXUS's, stated as such.
+- Footprint of the running process: RSS 65 MB idle / 67 MB under load, 0.9 % CPU
+  idle / 10–15 % under load, 8 threads idle / 14 under load, 13 MB database.
+- Confirmed the no-provider path is honest: every chat turn is `502` with
+  `no providers configured`, and the user turn is still stored.
+
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
 ### Added

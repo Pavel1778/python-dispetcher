@@ -156,6 +156,71 @@ the instrument for any such claim.
   three statements.) Claim latency and its lock hold now do not grow with
   task history on this path.
 
+## A running server under concurrent load (2026-11-20, this session)
+
+The measurements above are one call at a time, in-process. This section is the
+other half: a **real** `python -m orchestration.web_server` started the way a
+deployment starts it, driven over real sockets by many concurrent clients, with
+the **live** provider keys (Gemini and OpenRouter both answered).
+
+The generator is `tools/loadtest.py` (stdlib only — there is no `wrk`/`ab` in
+this environment): a pool of threads, no sleep between requests, every latency
+recorded with `perf_counter`, every non-2xx counted.
+
+```bash
+python -m orchestration.web_server --host 127.0.0.1 --port 12000 --token TOKEN &
+python tools/loadtest.py --base http://127.0.0.1:12000 --token TOKEN \
+    --clients 16 --duration 10 --mix reads --out reads.json
+```
+
+### Read paths, 4 vs 16 concurrent clients (10 s each, 0 errors)
+
+| clients | throughput | p50 | p90 | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | **1340 req/s** | 2.95 ms | 4.21 ms | 4.75 ms | 6.03 ms |
+| 16 | 1069 req/s | 6.53 ms | 10.49 ms | 12.07 ms | 17.01 ms |
+
+The mix is what the studio polls: `/api/studio`, the project list, one project,
+the conversation list, one conversation, its messages, `/api/commands`. At 16
+clients the machine's 4 cores are shared with the client threads, so the p50
+rises while throughput stays near a thousand requests a second; the reads are
+database-bound and stay single-digit to low-double-digit milliseconds.
+
+### A real chat turn, end to end (live provider)
+
+Ten turns through the real cascade against `openrouter` (`openai/gpt-4o-mini`
+served them after `gemini`):
+
+| n | min | p50 | p90 | max | mean |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 914 ms | **1239 ms** | 1592 ms | 1667 ms | 1254 ms |
+
+This is the number a person actually feels, and it is the **provider's**, not
+NEXUS's: the same server answers a read in 3–6 ms. It is recorded so that no one
+reads the in-process `chat_turn_ms` (19.6 ms against the stand-in LLM) as a
+promise about a real turn.
+
+### Footprint (the same running process)
+
+| metric | idle | under 16-client load |
+| --- | ---: | ---: |
+| RSS | 65 MB | 67 MB |
+| CPU | 0.9 % | 10–15 % |
+| threads | 8 | 14 |
+| database | 13 MB (3 projects, 30 conversations, 40 messages each) | — |
+
+The process is a single Python interpreter with one PostgreSQL connection; the
+thread count grows by one per in-flight request under load and returns to its
+idle set afterwards. Memory is flat: nothing accumulates per request.
+
+### The write path when no provider is configured
+
+`--mix writes` against a server with **no** provider key answers every chat turn
+`502` with `no orchestrator provider succeeded (no providers configured)`, and
+the user turn is still stored. That is correct — a missing provider is said, not
+faked — but it means a "write latency" measured without keys is the failure
+path, not a turn. Measure a turn only with a working provider (as above).
+
 ## What was not done, and why
 
 - **No language migration.** A Go/Rust rewrite of the API would not move these

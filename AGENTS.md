@@ -3054,3 +3054,40 @@ the CLI. The routes existed and were tested; the screen did not.
 - Still backend-only after this (the rest of P1 #3): File Lab uploads,
   workspaces and voice notes, plan approval, GitHub create/visibility
   confirmations, the allowlist editor, the diagnostics page.
+
+## Running the server for real and measuring it (this session)
+
+The performance numbers in `docs/PERFORMANCE.md` used to be one call at a time,
+in-process. This session started a **real** `python -m orchestration.web_server`
+and drove it over real sockets, with the live provider keys. Keep the method:
+
+- **`tools/loadtest.py` is the concurrency instrument** (stdlib only; there is no
+  `wrk`/`ab` here). It seeds a project + conversation, then N threads loop over a
+  weighted mix (`reads`/`writes`/`mixed`) with **no sleep**, recording every
+  latency and every non-2xx. It reports throughput and min/p50/p90/p95/p99/max
+  per call. `tests/test_benchmark_tool.py` pins its maths and mixes; the script
+  itself needs a running server and is run by hand, like `benchmark.py`.
+- **A write latency measured without a provider is the failure path.** With no
+  `GEMINI_API_KEY`/`OPENROUTER_API_KEY`/`GROQ_API_KEY`, every chat turn is a
+  `502` "no providers configured" (correct — said, not faked) and the user turn
+  is still stored. Measure a **turn** only with a working provider; measure the
+  **read** paths any time.
+- **The live cascade serves turns** in this environment (Gemini and OpenRouter
+  both accept their key; Groq is `blocked` for want of one). A real turn is
+  ~1.0–1.7 s, dominated by the provider — do not read the in-process
+  `chat_turn_ms` (~20 ms against the stand-in LLM) as a promise about a real
+  turn.
+- **Starting the server by hand** needs `SUPABASE_DB_URL`, `WEB_AUTH_TOKEN`,
+  and (for a public bind) the three `AUTH_*` variables. On `127.0.0.1` the token
+  alone is enough. `NEXUS_LAB_INLINE=0` keeps a measurement from also running
+  the autonomous loop.
+- **The environment is reset between sessions**: `pip install -r
+  requirements.txt -r requirements-dev.txt`, then `apt-get update` **before**
+  `apt-get install postgresql` (a stale package list makes it "unable to locate
+  package"), then create the `nexus` role and a database. Re-run this before
+  trusting any "module not found" as a code defect.
+- Numbers recorded (4-core sandbox): reads ~1 340 req/s at 4 clients (p50
+  2.95 ms) and ~1 069 req/s at 16 clients (p50 6.53 ms, p99 17 ms), 0 errors;
+  RSS 65–67 MB; 0.9 % CPU idle, 10–15 % under load; 8 threads idle, 14 under
+  load. Update `docs/PERFORMANCE.md` with the same method when you re-measure;
+  never replace a measured row with an estimate.

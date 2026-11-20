@@ -54,6 +54,20 @@ is not in the request path; Python is authoritative.** See `docs/RUST_MIGRATION.
 | Temporary public URL (Cloudflare quick tunnel) | IMPLEMENTED | `docs/CLOUDFLARE_TUNNEL.md`; requires `cloudflared` |
 | Named tunnel (stable hostname) | IMPLEMENTED | `docs/CLOUDFLARE_TUNNEL.md`; needs a Cloudflare account + domain |
 
+## Measured live (2026-11-20, this session)
+
+A real `python -m orchestration.web_server` was started and driven over real
+sockets, with the live provider keys and the live OpenHands key. Numbers in
+`docs/PERFORMANCE.md`; the diagnostic run:
+
+| What | Result |
+|---|---|
+| `POST /api/openhands/diagnostics` (`live: true`), one registered account | **18 VERIFIED / 0 FAILED / 0 BLOCKED, `ok: true`**, in 18.1 s |
+| `conversation_create` → `message_and_events` → `run_command` → `task_completion` → `workspace_rw` | all VERIFIED — a real conversation ran a shell command, uploaded a file and read it back with a matching SHA-256, and reached `finished` |
+| read paths under load | ~1 340 req/s at 4 clients (p50 2.95 ms), 0 errors |
+| a real chat turn (live provider cascade) | p50 1 239 ms, p90 1 592 ms |
+| footprint | RSS 65–67 MB, ~1 % CPU idle, 8 threads idle |
+
 ## External blockers (not defects)
 
 - A second live OpenHands key (two-account failover).

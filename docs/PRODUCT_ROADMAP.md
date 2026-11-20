@@ -46,7 +46,11 @@ the value it adds to a working product, not by novelty.
 4. **A named Cloudflare Tunnel as a first-class install target** (a systemd unit
    and a config template), so a stable public URL is one command.
 5. **A resource-usage baseline** on the target i3/8 GB laptop (idle, one run,
-   several tasks) recorded in `docs/PERFORMANCE.md`.
+   several tasks) recorded in `docs/PERFORMANCE.md`. **Partly done:** a baseline
+   of the *running server* on this 4-core sandbox is recorded there (RSS ~65 MB,
+   ~1 % CPU idle, 10–15 % under 16 concurrent clients, ~1 340 req/s on reads,
+   a real chat turn p50 ≈ 1.24 s through the live provider). The i3 laptop and
+   a run in flight are still to be measured on that hardware.
 6. **Android runtime testing** on a real device, and a Windows host run — both
    are build-verified only today.
 
