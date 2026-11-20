@@ -47,14 +47,9 @@ NIL = "00000000-0000-4000-8000-000000000000"
 
 
 def _reset_schema() -> None:
-    import psycopg
+    from tests._test_db import reset_schema
 
-    with psycopg.connect(DSN, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
-            for name in sorted(os.listdir(_MIG)):
-                if name.endswith(".sql"):
-                    cur.execute(open(os.path.join(_MIG, name)).read())
+    reset_schema(DSN)
 
 
 class Api:
@@ -142,6 +137,9 @@ class Studio:
         return (self.github.auth_headers[-1] or "").split()[-1]
 
 
+_OWNER_PASSWORD_HASH = hash_password("owner-password")
+
+
 @contextlib.contextmanager
 def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
     """The real server on the fakes. *app_options* go to ``App``.
@@ -155,7 +153,7 @@ def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
     monkeypatch.setenv("OPENHANDS_API_KEY", "cloud-key-value")
     monkeypatch.setenv("NEXUS_SECRET_KEY", "studio-tests-secret-key")
     monkeypatch.setenv("AUTH_USERNAME", "owner")
-    monkeypatch.setenv("AUTH_PASSWORD_HASH", hash_password("owner-password"))
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", _OWNER_PASSWORD_HASH)
     monkeypatch.setenv("AUTH_SESSION_SECRET", "s" * 32)
     for name in ("GITHUB_TOKEN", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(name, raising=False)
@@ -163,7 +161,9 @@ def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
     github = FakeGitHub()
     llm = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
     llm.script, llm.calls, llm.index = [{"payload": {}}], [], 0
-    threading.Thread(target=llm.serve_forever, daemon=True).start()
+    threading.Thread(
+        target=llm.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+    ).start()
 
     with (FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server,
           FakeServer() as sandbox):

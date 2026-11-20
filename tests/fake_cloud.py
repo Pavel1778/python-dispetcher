@@ -558,7 +558,9 @@ class FakeCloudServer:
         self.cloud = cloud or FakeCloud()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.httpd.cloud = self.cloud  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self.httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
 
     @property
     def base_url(self) -> str:

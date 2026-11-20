@@ -123,14 +123,18 @@ class ProjectService:
             if cur.fetchone() is None:
                 raise NotFound("project not found")
 
-            def count(sql: str, params: tuple = ()) -> int:
-                cur.execute(sql, (project_id, *params))
-                return int(cur.fetchone()["n"])
-
-            active_runs = count(
-                "SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s "
-                "AND state = ANY(%s)", (_active_run_states(),))
-            repositories = []
+            cur.execute(
+                "SELECT "
+                "  (SELECT count(*) FROM nexus_conversations WHERE project_id=%s) AS conversations, "
+                "  (SELECT count(*) FROM nexus_runs WHERE project_id=%s) AS runs, "
+                "  (SELECT count(*) FROM nexus_runs WHERE project_id=%s AND state = ANY(%s)) AS active_runs, "
+                "  (SELECT count(*) FROM nexus_run_tasks WHERE project_id=%s) AS tasks, "
+                "  (SELECT count(*) FROM nexus_goals WHERE project_id=%s) AS goals, "
+                "  (SELECT count(*) FROM nexus_project_members WHERE project_id=%s) AS members",
+                (project_id, project_id, project_id, _active_run_states(),
+                 project_id, project_id, project_id))
+            counts = cur.fetchone()
+            active_runs = int(counts["active_runs"])
             cur.execute("SELECT r.full_name, pr.branch, pr.enabled "
                         "FROM nexus_project_repositories pr "
                         "JOIN repositories r ON r.id = pr.repository_id "
@@ -138,14 +142,12 @@ class ProjectService:
             repositories = [{"full_name": r["full_name"], "branch": r["branch"],
                              "enabled": r["enabled"]} for r in cur.fetchall()]
             return {
-                "conversations": count("SELECT count(*) AS n FROM nexus_conversations "
-                                       "WHERE project_id=%s"),
-                "runs": count("SELECT count(*) AS n FROM nexus_runs WHERE project_id=%s"),
+                "conversations": int(counts["conversations"]),
+                "runs": int(counts["runs"]),
                 "active_runs": active_runs,
-                "tasks": count("SELECT count(*) AS n FROM nexus_run_tasks WHERE project_id=%s"),
-                "goals": count("SELECT count(*) AS n FROM nexus_goals WHERE project_id=%s"),
-                "members": count("SELECT count(*) AS n FROM nexus_project_members "
-                                 "WHERE project_id=%s"),
+                "tasks": int(counts["tasks"]),
+                "goals": int(counts["goals"]),
+                "members": int(counts["members"]),
                 "repositories": repositories,
                 "has_active_runs": active_runs > 0,
             }

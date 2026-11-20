@@ -64,6 +64,7 @@ def main() -> int:
     if not dsn:
         print("set TEST_SUPABASE_DB_URL", file=sys.stderr)
         return 2
+    os.environ.setdefault("NEXUS_LAB_MAX_ACTIVE_TASKS", "0")
     _reset_schema()
     store = PostgresStore(dsn)
     projects = ProjectService(store)

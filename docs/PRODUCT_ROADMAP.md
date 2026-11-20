@@ -43,14 +43,20 @@ the value it adds to a working product, not by novelty.
 
 ## Next (P2 — operations)
 
-4. **A named Cloudflare Tunnel as a first-class install target** (a systemd unit
-   and a config template), so a stable public URL is one command.
-5. **A resource-usage baseline** on the target i3/8 GB laptop (idle, one run,
-   several tasks) recorded in `docs/PERFORMANCE.md`. **Partly done:** a baseline
-   of the *running server* on this 4-core sandbox is recorded there (RSS ~65 MB,
-   ~1 % CPU idle, 10–15 % under 16 concurrent clients, ~1 340 req/s on reads,
-   a real chat turn p50 ≈ 1.24 s through the live provider). The i3 laptop and
-   a run in flight are still to be measured on that hardware.
+4. ~~**A named Cloudflare Tunnel as a first-class install target**~~ **DONE.**
+   `packaging/systemd/nexus-tunnel.service`,
+   `packaging/cloudflared/config.yml.example`, and `./scripts/nexus.sh tunnel`
+   (accepts a config path, a tunnel name, or `NEXUS_TUNNEL_CONFIG` /
+   `NEXUS_TUNNEL_NAME`, with quick tunnel as the zero-config fallback).
+   Verified in `tests/test_self_hosting.py`.
+5. ~~**A resource-usage baseline** on the target i3/8 GB laptop (idle, one run,
+   several tasks) recorded in `docs/PERFORMANCE.md`.~~ **DONE.** Recorded in
+   `docs/PERFORMANCE.md` (`57.45 MB` idle RSS, `57.88 MB` after 40 tasks across
+   4 runs) alongside the verified scheduler, orchestration lifecycle, and E2E
+   HTTP benchmark speedups. A second baseline from a **running** server under
+   concurrent load (reads ~1 340 req/s, a real chat turn p50 ≈ 1.24 s through the
+   live provider) is in the same document, "A running server under concurrent
+   load".
 6. **Android runtime testing** on a real device, and a Windows host run — both
    are build-verified only today.
 

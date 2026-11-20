@@ -201,6 +201,19 @@ cmd_update() {
 
 cmd_tunnel() {
   command -v cloudflared >/dev/null || die "cloudflared not installed — see docs/CLOUDFLARE_TUNNEL.md"
+  local target="${1:-${NEXUS_TUNNEL_CONFIG:-}}"
+  if [ -n "$target" ]; then
+    if [ -f "$target" ]; then
+      say "Starting named Cloudflare Tunnel from config: $target"
+      exec cloudflared tunnel --no-autoupdate --config "$target" run
+    fi
+    say "Starting named Cloudflare Tunnel: $target"
+    exec cloudflared tunnel --no-autoupdate run "$target"
+  fi
+  if [ -n "${NEXUS_TUNNEL_NAME:-}" ]; then
+    say "Starting named Cloudflare Tunnel: $NEXUS_TUNNEL_NAME"
+    exec cloudflared tunnel --no-autoupdate run "$NEXUS_TUNNEL_NAME"
+  fi
   say "Starting a temporary public URL (trycloudflare.com). It changes on every start."
   say "Press Ctrl-C to stop. The URL is printed below by cloudflared."
   cloudflared tunnel --url "http://127.0.0.1:$PORT"
@@ -218,7 +231,7 @@ main() {
     backup)  cmd_backup ;;
     restore) cmd_restore "$@" ;;
     update)  cmd_update ;;
-    tunnel)  cmd_tunnel ;;
+    tunnel)  cmd_tunnel "$@" ;;
     -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command: $cmd (try: $0 help)" ;;
   esac

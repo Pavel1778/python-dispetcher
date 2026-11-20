@@ -1075,6 +1075,39 @@ class SpecService:
                         "FROM nexus_spec_links WHERE spec_id=%s ORDER BY ordinal", (spec_id,))
             return [dict(r) for r in cur.fetchall()]
 
+    def stage_context_internal(
+        self, spec_id: str, begin: int, end: int, *, need_text: bool = False,
+    ) -> tuple[dict | None, str | None, list[dict], list[dict], list[dict], list[dict]]:
+        """Read ``(spec, text, stages, pieces, sections, links)`` in one transaction."""
+        with self.store._tx() as cur:
+            if need_text:
+                cur.execute(f"SELECT {_META}, content FROM nexus_specs WHERE id=%s", (spec_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return None, None, [], [], [], []
+                spec, text = self._checked(row)
+            else:
+                spec = self._meta(cur, spec_id)
+                text = None
+                if spec is None:
+                    return None, None, [], [], [], []
+            cur.execute("SELECT g.id AS goal_id FROM nexus_goals g WHERE g.spec_id=%s",
+                        (spec_id,))
+            grow = cur.fetchone()
+            spec["goal_id"] = str(grow["goal_id"]) if grow else None
+            stages = self._stages(cur, spec_id)
+            cur.execute(
+                "SELECT ordinal, key, section, kind, normative, start_char, end_char, "
+                "start_line, end_line, excerpt FROM nexus_spec_requirements "
+                "WHERE spec_id=%s AND end_char > %s AND (%s::int IS NULL OR start_char < %s) "
+                "ORDER BY ordinal", (spec_id, begin, end, end))
+            pieces = [dict(r) for r in cur.fetchall()]
+            sections = self._sections(cur, spec_id)
+            cur.execute("SELECT ordinal, requirement, target_section, reference "
+                        "FROM nexus_spec_links WHERE spec_id=%s ORDER BY ordinal", (spec_id,))
+            links = [dict(r) for r in cur.fetchall()]
+            return spec, text, stages, pieces, sections, links
+
     def stages(self, principal: str, project_id: str, spec_id: str) -> list[dict]:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)

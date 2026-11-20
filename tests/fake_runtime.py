@@ -584,7 +584,9 @@ class FakeServer:
         self.runtime = FakeRuntime()
         handler = type("Handler", (_Handler,), {"runtime": self.runtime})
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
 
     @property
     def base_url(self) -> str:

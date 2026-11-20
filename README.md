@@ -52,6 +52,7 @@ Start here:
 - [docs/CLOUDFLARE_TUNNEL.md](docs/CLOUDFLARE_TUNNEL.md) — a temporary or stable public URL.
 - [docs/PRODUCT_ROADMAP.md](docs/PRODUCT_ROADMAP.md) — what is next, and what is deliberately out of scope.
 - [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — dependency direction and module boundaries.
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — resource-usage baseline and verified orchestration, scheduler, and E2E HTTP speedups.
 - [docs/performance/BASELINE.md](docs/performance/BASELINE.md) — measured startup/footprint/claim-path numbers.
 - [docs/security/SECURITY_AUDIT.md](docs/security/SECURITY_AUDIT.md) — security findings and their classes.
 - [CHANGELOG.md](CHANGELOG.md) — what changed, newest first.

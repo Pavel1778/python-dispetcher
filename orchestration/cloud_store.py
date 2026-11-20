@@ -290,6 +290,21 @@ def _pool_check_connection(conn: Any) -> None:
         raise psycopg.OperationalError("the connection is dead") from e
 
 
+_MIGRATION_FILE_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
+
+
+def _read_migration_file(path: Path) -> tuple[str, str]:
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _MIGRATION_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    sql = path.read_text(encoding="utf-8")
+    checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    _MIGRATION_FILE_CACHE[key] = (sql, checksum)
+    return sql, checksum
+
+
 def _has_pending_input(fd: int) -> bool:
     """Whether a socket has something to read (data, end-of-file, an error).
 
@@ -479,10 +494,13 @@ class PostgresStore:
                 "  checksum text NOT NULL,"
                 "  applied_at timestamptz NOT NULL DEFAULT now())"
             )
+            cur.execute("SELECT filename, checksum FROM schema_migrations")
+            existing = {row["filename"]: row["checksum"] for row in cur.fetchall()}
         applied: list[str] = []
         for path in files:
-            sql = path.read_text(encoding="utf-8")
-            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            sql, checksum = _read_migration_file(path)
+            if existing.get(path.name) == checksum:
+                continue
             with self._tx() as cur:
                 cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
                             (path.name,))
@@ -629,8 +647,14 @@ class PostgresStore:
         required = tuple(self.REQUIRED_COLUMNS)
         with self._tx() as cur:
             cur.execute(
-                "SELECT table_name, column_name FROM information_schema.columns "
-                "WHERE table_schema = current_schema()"
+                "SELECT c.relname AS table_name, a.attname AS column_name "
+                "FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_attribute a ON a.attrelid = c.oid "
+                "WHERE n.nspname = current_schema() "
+                "  AND c.relname = ANY(%s) "
+                "  AND a.attnum > 0 AND NOT a.attisdropped",
+                (list(required),),
             )
             columns: dict[str, set[str]] = {}
             for row in cur.fetchall():

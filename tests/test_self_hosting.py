@@ -102,6 +102,47 @@ def test_backup_then_restore_round_trip_leaves_the_live_database_alone(tmp_path)
     assert _table_count(live_dsn) == live_before
 
 
+def test_named_tunnel_systemd_unit_and_config_template_exist():
+    unit = os.path.join(_ROOT, "packaging", "systemd", "nexus-tunnel.service")
+    template = os.path.join(_ROOT, "packaging", "cloudflared", "config.yml.example")
+    assert os.path.isfile(unit)
+    assert os.path.isfile(template)
+    unit_text = open(unit).read()
+    assert "ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --config /etc/nexus/cloudflared.yml run" in unit_text
+    assert "NoNewPrivileges=true" in unit_text
+    tpl_text = open(template).read()
+    assert "http://127.0.0.1:8080" in tpl_text
+    assert "http_status:404" in tpl_text
+
+
+def test_tunnel_command_supports_quick_and_named_modes(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_cf = bin_dir / "cloudflared"
+    fake_cf.write_text('#!/usr/bin/env bash\necho "CF_ARGS:$*"\n')
+    fake_cf.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    env.pop("NEXUS_TUNNEL_CONFIG", None)
+    env.pop("NEXUS_TUNNEL_NAME", None)
+
+    quick = subprocess.run([_SCRIPT, "tunnel"], capture_output=True, text=True, env=env)
+    assert quick.returncode == 0, quick.stderr
+    assert "CF_ARGS:tunnel --url http://127.0.0.1:8080" in quick.stdout
+
+    cfg = tmp_path / "cloudflared.yml"
+    cfg.write_text("tunnel: test-uuid\n")
+    named_cfg = subprocess.run([_SCRIPT, "tunnel", str(cfg)],
+                               capture_output=True, text=True, env=env)
+    assert named_cfg.returncode == 0, named_cfg.stderr
+    assert f"CF_ARGS:tunnel --no-autoupdate --config {cfg} run" in named_cfg.stdout
+
+    named_by_name = subprocess.run([_SCRIPT, "tunnel", "my-nexus-tunnel"],
+                                   capture_output=True, text=True, env=env)
+    assert named_by_name.returncode == 0, named_by_name.stderr
+    assert "CF_ARGS:tunnel --no-autoupdate run my-nexus-tunnel" in named_by_name.stdout
+
+
 def _table_count(dsn: str) -> int:
     import psycopg
 

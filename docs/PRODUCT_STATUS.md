@@ -50,9 +50,10 @@ is not in the request path; Python is authoritative.** See `docs/RUST_MIGRATION.
 |---|---|---|
 | One command to run/stop/restart/status/logs | VERIFIED | `scripts/nexus.sh`, `tests/test_self_hosting.py` |
 | Backup (pg_dump + SHA-256) and restore into a scratch DB | VERIFIED | `tests/test_self_hosting.py` (real round-trip) |
-| systemd units | IMPLEMENTED | `packaging/systemd/` |
-| Temporary public URL (Cloudflare quick tunnel) | IMPLEMENTED | `docs/CLOUDFLARE_TUNNEL.md`; requires `cloudflared` |
-| Named tunnel (stable hostname) | IMPLEMENTED | `docs/CLOUDFLARE_TUNNEL.md`; needs a Cloudflare account + domain |
+| systemd units | VERIFIED | `packaging/systemd/nexus-lab-worker.service`, `packaging/systemd/nexus-tunnel.service`, `tests/test_self_hosting.py` |
+| Temporary public URL (Cloudflare quick tunnel) | VERIFIED | `scripts/nexus.sh tunnel`, `docs/CLOUDFLARE_TUNNEL.md`, `tests/test_self_hosting.py` |
+| Named tunnel (stable hostname) | VERIFIED | `packaging/systemd/nexus-tunnel.service`, `packaging/cloudflared/config.yml.example`, `scripts/nexus.sh tunnel`, `tests/test_self_hosting.py` |
+| Resource-usage & orchestration performance baseline | VERIFIED | `docs/PERFORMANCE.md`, `benchmarks/scheduler_bench.py`, `benchmarks/e2e_scenarios.py` |
 
 ## Measured live (2026-11-20, this session)
 

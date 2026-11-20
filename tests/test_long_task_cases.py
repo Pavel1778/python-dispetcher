@@ -300,6 +300,14 @@ def _gone():
 
     def detach(store):
         dsn = store.dsn
+        dead = "postgresql://127.0.0.1:1/nexus-gone"
+        # Point the store itself at the dead address: a later ``close()`` and
+        # reopen (``_ensure_pool``) must not reach the real database again.
+        store.dsn = dead
+        store.pool_min = 0
+        store.pool_max = 1
+        store.pool_timeout = 0.5
+        store._connect_timeout = 0.5
         try:
             with psycopg.connect(dsn, autocommit=True) as admin:
                 with admin.cursor() as cur:
@@ -309,10 +317,6 @@ def _gone():
         except Exception:  # noqa: BLE001 - best effort; the swap already isolates
             pass
         store._pool.close()
-        dead = "postgresql://127.0.0.1:1/nexus-gone"
-        # Point the store itself at the dead address: a later ``close()`` and
-        # reopen (``_ensure_pool``) must not reach the real database again.
-        store.dsn = dead
         store._pool = psycopg_pool.ConnectionPool(
             dead, kwargs=store._connect_kwargs, min_size=0, max_size=1,
             open=True, timeout=0.5, reconnect_timeout=0.5,

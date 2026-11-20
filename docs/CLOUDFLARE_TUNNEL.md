@@ -53,18 +53,25 @@ cloudflared tunnel create nexus
 # 3. Route your domain to it
 cloudflared tunnel route dns nexus nexus.example.com
 
-# 4. Point it at NEXUS (config file, then run as a service)
-#    /etc/cloudflared/config.yml:
+# 4. Copy the config template and fill in your tunnel UUID and hostname
+sudo mkdir -p /etc/nexus
+sudo cp packaging/cloudflared/config.yml.example /etc/nexus/cloudflared.yml
+sudo chmod 0600 /etc/nexus/cloudflared.yml
+#    Edit /etc/nexus/cloudflared.yml:
 #      tunnel: <tunnel-uuid>
-#      credentials-file: /root/.cloudflared/<tunnel-uuid>.json
+#      credentials-file: /etc/nexus/<tunnel-uuid>.json
 #      ingress:
 #        - hostname: nexus.example.com
 #          service: http://127.0.0.1:8080
 #        - service: http_status:404
 
-# 5. Install as a service (auto-reconnect, starts on boot)
-sudo cloudflared service install
-sudo systemctl enable --now cloudflared
+# 5. Either run interactively with one command:
+./scripts/nexus.sh tunnel /etc/nexus/cloudflared.yml
+#    or install the systemd unit (auto-reconnect, starts on boot):
+sudo install -m 0644 packaging/systemd/nexus-tunnel.service \
+    /etc/systemd/system/nexus-tunnel.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now nexus-tunnel
 ```
 
 The tunnel reconnects automatically. The credential JSON is a **secret**: keep it
