@@ -786,8 +786,14 @@ class App:
             # all. It is on unless the deployment sets ``NEXUS_SELFQA_GATE=0``;
             # whether a given project's checks actually run is that project's
             # own ``quality_gate`` mode (auto/on/off), shown in its settings.
+            # ``evidence``: whether results can be signed at all. Without a
+            # signer nothing is recorded, so an empty evidence list has to say
+            # *why* it is empty instead of reading as "nothing was verified".
+            # Presence only - never a key, an id or a path.
             "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours(),
-                    "selfqa_gate": self.quality_gate is not None},
+                    "selfqa_gate": self.quality_gate is not None,
+                    "evidence": (self.evidence_signer is not None
+                                 and bool(self.evidence_keyring))},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {

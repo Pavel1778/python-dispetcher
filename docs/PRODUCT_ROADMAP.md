@@ -34,9 +34,12 @@ the value it adds to a working product, not by novelty.
    design is bounded (new tasks depend on the failure, the DAG is re-validated,
    iterations and time are capped, the run goes BLOCKED at the budget). *Not
    started:* it needs a careful safety review, and it must never loop.
-3. **Studio screens for backend-only capabilities:** File Lab uploads, evidence
-   viewer, GitHub create/visibility confirmations, the allowlist editor, the
-   diagnostics page. The routes exist and are tested; the screens are the gap.
+3. **Studio screens for backend-only capabilities:** File Lab uploads, GitHub
+   create/visibility confirmations, the allowlist editor, the diagnostics page.
+   The routes exist and are tested; the screens are the gap. **Started:** the
+   **evidence viewer** is done — the Agent tab lists a project's signed records
+   and re-verifies one against the trusted keyring (`tests/test_evidence_viewer.py`,
+   plus a Chromium journey).
 
 ## Next (P2 — operations)
 

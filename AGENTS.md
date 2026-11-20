@@ -860,9 +860,11 @@ There are no dashboards, section tabs or forms outside that.
   - an untitled conversation is named after its first message; `PATCH
     .../conversations/{id}` accepts `archived` (the only way to restore one).
 - **Features that have routes but no screen now:** lab file uploads, workspaces
-  and voice notes; evidence; plan approval; GitHub create-repository and
+  and voice notes; plan approval; GitHub create-repository and
   visibility confirmations; the legacy task form and the queue; the system
   diagnostics page; the allowlist editor; OpenHands account management.
+  Evidence is **no longer** on this list: the Agent tab lists a project's signed
+  records and re-verifies one (see "The evidence viewer" below).
 - **Limits, stated in the UI where they bite.** Stored OpenHands accounts are not
   used for execution: workflows run under the server `OPENHANDS_API_KEY`
   (nothing calls `openhands_accounts.client_for_project`). Files are read-only
@@ -3010,3 +3012,45 @@ started, never deletes user data, and `restore` proves a dump loads into a
 `backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
 both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
 per-process isolation passes the latter.
+
+## The evidence viewer: the Trust Engine made visible (this session)
+
+Roadmap P1 #3 ("studio screens for backend-only capabilities") started with the
+gap that matters most: the Evidence Trust Engine is what makes a "verified"
+result mean anything, and until now an operator could not see a record without
+the CLI. The routes existed and were tested; the screen did not.
+
+- **`GET …/evidence` and `POST …/evidence/{id}/verify` are the whole contract.**
+  The screen calls them and nothing else; it decides no verdict. The badge is the
+  record's stored `verdict`, and «Проверить» shows the **server's** answer
+  (`verification_detail.reason`) under the row.
+- **The four verdicts map to the existing pills** (`VERIFIED`→ok,
+  `UNVERIFIED`→warn, `FAILED`→bad, `BLOCKED`→idle). Do not invent a fifth
+  colour: the engine's vocabulary is `evidence_trust.VERIFIED/UNVERIFIED/
+  FAILED/BLOCKED` and a record that is merely stored is `UNVERIFIED`, never ok.
+- **An empty list says *why* it is empty.** `/api/studio` now reports
+  `lab.evidence` (a bool: signer **and** keyring present). Without a signer
+  nothing is ever recorded, so "no records" must not read as "nothing was
+  verified". Presence only — never a key, a key id or a path.
+- **`lab` gained a field, so the four whole-dict assertions had to name it**
+  (`tests/test_lab_inline.py` ×3, `tests/test_studio_api.py` ×1) — the exact trap
+  the earlier section warns about. They expect `"evidence": False` in those
+  fixtures (no signer configured), never a subset comparison.
+- **The engine is stricter than it looks.** An unknown `key_id` is `UNVERIFIED`
+  ("signing key … is not trusted"); a *trusted* `key_id` whose signature does
+  not verify is `FAILED`. Both are tested
+  (`test_a_record_signed_by_an_unknown_key_is_unverified`,
+  `test_a_trusted_key_id_with_the_wrong_key_is_failed`); do not collapse them.
+- **The row layout keeps the verdict on its line.** `.evidence-subject` is the
+  only flexible part; the badge, the time and the button are `flex: none`, so a
+  long repository name cannot push a verdict out of sight on a phone.
+- Tests: `tests/test_evidence_viewer.py` (9 cases: the list, project isolation,
+  auth, a trusted signature → VERIFIED, an unknown key → UNVERIFIED, a wrong key
+  → FAILED, a tampered row → FAILED, a foreign record → 404, and
+  `/api/studio` with and without a signer) and the Chromium journey
+  `test_the_evidence_viewer_lists_records_and_re_verifies_one`. Mutation-proven:
+  making `check-evidence` a no-op fails the journey, and hard-coding
+  `lab.evidence = True` fails the no-signer case.
+- Still backend-only after this (the rest of P1 #3): File Lab uploads,
+  workspaces and voice notes, plan approval, GitHub create/visibility
+  confirmations, the allowlist editor, the diagnostics page.
