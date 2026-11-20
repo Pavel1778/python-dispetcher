@@ -1,0 +1,35 @@
+[Unit]
+# Named Cloudflare Tunnel for a self-hosted NEXUS instance (stable public URL).
+#
+# Install on a host that runs the NEXUS web server:
+#
+#   sudo mkdir -p /etc/nexus
+#   sudo cp packaging/cloudflared/config.yml.example /etc/nexus/cloudflared.yml
+#   sudo chmod 0600 /etc/nexus/cloudflared.yml
+#   # Edit /etc/nexus/cloudflared.yml with your tunnel UUID, credentials-file and hostname
+#   sudo install -m 0644 packaging/systemd/nexus-tunnel.service \
+#       /etc/systemd/system/nexus-tunnel.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nexus-tunnel
+#   systemctl status nexus-tunnel
+#   journalctl -u nexus-tunnel -f
+#
+# Only the local NEXUS web server (127.0.0.1:8080) is published by the tunnel;
+# PostgreSQL, the worker and SSH remain loopback/local only.
+Description=NEXUS named Cloudflare Tunnel (cloudflared)
+Documentation=https://github.com/Pavel1778/python-dispetcher/blob/main/docs/CLOUDFLARE_TUNNEL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --config /etc/nexus/cloudflared.yml run
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2765,3 +2765,248 @@ has that the parallel one did not, at the time: a decompressed-member bound
 test suite that pins all of it. The parallel commit claims a stronger
 source-verification (that the saved file is the *clipped rendering*, not raw
 stdout) — worth reading before choosing.
+
+## Canonical consolidation (2026-11-16, this session)
+
+The three consolidation candidates were reconciled into one canonical branch.
+What a future change has to know:
+
+- **One base, three candidates.** Candidate B (`owner/phase34-consolidation`,
+  `3ca8e5f`) is the owner-approved Phase 3+4 reconciliation on `main` (PR #41 and
+  #42 merged); Candidate A (`cand/A`, `d570e89`) is the same work plus the
+  Phase 3 engineering branch (`engineering/performance-evolution`, `ce70f07`);
+  Phase 5 (`phase5/execution-intelligence`, `7859e3a`) adds the durable run-time
+  profiler. This branch is the **union**: B, everything A and Phase 5 carry that
+  B did not, and the parallel consolidation that was merged into `main` as PR
+  #45 (`consolidate/final`, `4282489`) — the OpenHands inventory tool, the
+  registered migration-correction recovery, the pause-honesty UI and the
+  `docs/performance/baseline_db.json` benchmark sample.
+- **The terminal-output design is B's, kept whole.** One canonical module,
+  `orchestration/terminal_output.py`: the conversation-scoped trajectory
+  transport (never the global unscoped `/api/file/download`), with the
+  decompressed-member (ZIP-bomb) bound and the `..`-member skip, **and** PR #42's
+  source verification (the saved file name recomputed from the event; a member
+  whose name is not it is refused). The task-scoped helpers, the HTTP routes, the
+  CLI (`run outputs`/`run output`) and the MCP tools all reach this one module.
+  The separate `orchestration/nexus_outputs.py` (A and Phase 5) is **not** in the
+  canonical branch: it duplicated the same feature on task-level routes.
+- **The run-level (PR #42) terminal-output routes are kept too** —
+  `GET …/runs/{run}/terminal-outputs[/{cid}/{event_id}[/download]]` — because the
+  studio's run card and the CLI/MCP already drive the task-level pair; both reach
+  `terminal_output.py`'s primitives.
+- **The connection pool is kept** (`psycopg_pool`, `NEXUS_DB_POOL_MIN/MAX`), and
+  PR #41's `test_connection_concurrency.py` keeps the pool's real invariants
+  (`pool_stats()`: size ≤ pool_max, idle == size, no caller queued), not the old
+  single-connection model. `_conn`/`_lock` are not restored.
+- **The Phase 5 profiler is integrated, not copied.** Migration
+  `0040_run_profiler.sql`, `orchestration/nexus_profiler.py`,
+  `LabStore.record_run_milestone`/`run_profile`, the milestone stamps in
+  `nexus_lab.py`, the run-detail `profile` (with `idle_ratio`), the studio
+  time-profile section, `tests/test_run_profiler.py`, the run-detail case in
+  `tests/test_lab_http.py` and `docs/RUN-PROFILER.md`. `REQUIRED_COLUMNS` in
+  `cloud_store.py` names the milestone columns.
+- **A test-isolation defect was found and fixed.** Two parallel pytest processes
+  on one cluster both run the cluster-global Supabase-role case and one failed
+  with `UniqueViolation` on `pg_authid_rolname_index`. `test_schema_bootstrap.py`
+  now takes a `pg_advisory_lock` on the shared `postgres` maintenance database
+  (a lock on the per-process test database would not collide) around that case.
+- **The engineering branch's docs and the `file_lab` batch insert** are in the
+  canonical branch (B omitted them): `docs/architecture/` (19 files),
+  `docs/performance/` (12 more), and `file_lab.py`'s `executemany` workspace-file
+  insert.
+- **Verified on the canonical branch** (PostgreSQL 17, per-process isolated DB):
+  `ruff check .` clean; `node tests/studio_render_test.js` passed;
+  `pytest tests/` (browser E2E excluded) **1914 passed, 9 skipped, 0 failed**;
+  browser E2E **37 passed, 0 skipped**; a fresh database applies all 41
+  migrations; two parallel `test_schema_bootstrap.py` runs both pass. Skips are
+  environmental only (Android SDK, mingw-w64, pooler DSN, live-OpenHands section).
+
+## NEXUS 2.0 program: integration, Rust core, acceptance (2026-11-16, this session)
+
+The program's integration branch is `nexus/2.0-integration` (not merged to
+`main`; merging/tagging/deploying need the owner's authorisation). What a future
+change must know:
+
+### Integration
+
+- The **canonical union** (`canonical/union` @ `c09d888` + C1 fix
+  `canonical/union-c1` @ `c2d24b3`) does **not** exist on `origin`; it lives in a
+  preserved local repository (`/workspace/project/030cf2d0.../python-dispetcher`).
+  It was fetched read-only and merged. Its real content: the C1 shutdown check
+  (`_backend_alive`, one specific backend, not the whole-database count), the
+  `executemany` batch insert in `file_lab`, the cluster-wide advisory lock in
+  `test_schema_bootstrap`, route-auth coverage of the run-level output routes,
+  the faithful `_gone()` helper, `docs/phase4-consolidation-audit.md`, **and the
+  schema-guard repair**: `cloud_store.REQUIRED_COLUMNS["nexus_runs"]` now names
+  the profiler columns migration `0040` adds. The C1 *isolation* half is
+  intentionally excluded (main's conftest imports `tests._test_db` first).
+- **PR #49** (`release/acceptance`) merged cleanly but its branch had **dropped
+  `NEXUS_ACCEPTANCE.md`** (a main-side file) as a merge artifact; it was
+  restored. **PR #47** (`feat/run-restart-duplicate`) conflicted in exactly
+  three places: an import (`IdempotencyConflict`), and `COMPLETION_LEDGER.md` /
+  `FINAL_RELEASE_REPORT.md`, where **both** sides' content was kept.
+- The deadlock fix integrated from PR #47 and the bounded retry from PR #46 are
+  **both** preserved: a bounded retry is not a substitute for the lock order.
+
+### The Rust core (`rust/`)
+
+- Three crates: `nexus-domain` (state machines, DAG validation, plan hash,
+  retry), `nexus-core` (the claim decision), `nexus-cli` (`nexus-rs`, also the
+  parity oracle). Pure: no I/O, no DB, no clock.
+- **Parity is the gate.** `tests/test_rust_parity.py` drives both
+  implementations over the same cases and compares - exhaustively for the
+  transition tables, byte for byte for the plan hash, over real runs in a live
+  lab store for the claim decision. A change to a migrated table on either side
+  that the other does not follow fails it.
+- **`can_transition_task` is strict** (no no-op) because
+  `control_plane.transition` is; the run and workflow machines allow a no-op.
+  This asymmetry is real and the parity test pins it.
+- **Do not migrate the intent router or the task-kind derivation.** They are
+  language-sensitive regexes with a history of subtle production bugs; the Rust
+  validator carries the `kind` it is given and does not derive one. See
+  `docs/RUST_MIGRATION.md` §4.
+- The SQL claim, the HTTP layer and the store stay Python. Rust is a **verified
+  candidate**, not authoritative; the switch procedure is in
+  `docs/RUST_PYTHON_COMPATIBILITY.md` §6 and ends with removing the Python
+  version.
+
+### Live acceptance (real, this session)
+
+- Live OpenHands diagnostics: **17 VERIFIED / 0 FAILED / 0 BLOCKED / 1
+  UNVERIFIED** on one run, with a stored account (`direct`,
+  `openhands/deepseek-v4.1-flash`). The one UNVERIFIED is `lab_worker` (no worker
+  live, no active run) - correct. **The live count is not fixed:** a re-run on
+  the same candidate gave 16 VERIFIED / 1 FAILED (`workspace_rw`), because the
+  OpenHands sandbox file-upload endpoint intermittently answers 502. A red
+  `workspace_rw` is a sandbox-upload failure to retry, not a NEXUS regression.
+- The documented trap reproduced live: **without** `OPENHANDS_DEFAULT_MODEL` the
+  probe ends `error` (LLM auth); with the model above it is green.
+- A real autonomous run through NEXUS to live OpenHands dispatched, the agent
+  worked, and NEXUS recorded **`completed_unverified`** ("no repository bound")
+  and **blocked** the run - a textual result is not proof of work. A live
+  `completed_verified` needs a repository bound to a GitHub account with a token
+  the sandbox can push with; the live account has **no GitHub provider token**.
+- `NEXUS_SECRET_KEY` is required to store an account (the cipher refuses
+  without it). A throwaway key was generated for the acceptance run only; the
+  account was removed afterwards.
+
+### Verification numbers (final, at the report's HEAD)
+
+`ruff check .` clean; full suite (Python + browser E2E in one run) **2028 passed,
+9 skipped, 0 failed**; Python-only (browser excluded) **1991 passed, 9 skipped**;
+Rust `cargo test` **29 passed**; parity **9 passed**;
+isolation **8 passed**. The 9 skips: 4 Android SDK, 3 mingw-w64, 1 pooler DSN,
+1 live-OpenHands section F. Docs: `NEXUS_2_0_MASTER_PLAN.md`,
+`NEXUS_2_0_ARCHITECTURE.md`, `NEXUS_2_0_FINAL_ACCEPTANCE_REPORT.md`,
+`docs/RUST_MIGRATION.md`, `docs/RUST_PYTHON_COMPATIBILITY.md`,
+`docs/SECURITY_MODEL.md`, `docs/RELEASE_GUIDE.md`, `docs/COMPLETION_LEDGER.md`.
+
+### The schema guard was checking eight tables, not all of them (2026-11-17)
+
+`PostgresStore.verify_schema()` iterated a **hardcoded eight-table tuple**
+(`workflows`, `tasks`, `conversations`, `repositories`, `task_events`,
+`sr_tool_calls`, `sessions`, `login_attempts`) and only then consulted
+`REQUIRED_COLUMNS` for those tables. Every table added to the map later - the
+whole `nexus_*` family, `nexus_runs` among them - was **never checked**: dropping
+`nexus_runs.completed_at`, or the entire `nexus_runs` table, produced
+`verify_schema() == []`. The union's "profiler schema guard" repair had added the
+eleven columns to the map, but the map was not being consulted for that table, so
+the repair was **inert**. Fixed by iterating `tuple(self.REQUIRED_COLUMNS)` - the
+map is exactly the columns the code reads - so all 32 tables are now guarded.
+Regression tests: `tests/test_run_profiler.py::
+test_the_eleven_profiler_columns_are_required_for_nexus_runs` and
+`::test_a_schema_missing_any_profiler_column_fails_validation` (drops each of the
+eleven in turn, asserts it is named). Both fail if a column is removed from the
+map **or** if the guard reverts to the eight-table tuple. Do not narrow the
+guard back to a hand-kept subset: a table the map names but the loop skips is a
+schema contract that is not enforced.
+
+## The Self-QA gate is per project, and it finally works on a real repository (this session)
+
+Roadmap P1 #1 ("Self-QA as a default gate") is done, and two real defects that
+sat underneath it were found and fixed. Each is proven by a test that fails if
+the fix is undone.
+
+- **The gate is per project** (`nexus_projects.quality_gate`, migration
+  `0042_project_quality_gate.sql`). `auto` (the default) runs the project's own
+  checks only when the repository declares `.nexus-qa.json`; `on` always;
+  `off` never. `ProjectQualityGate` (`nexus_selfqa.py`) is the policy wrapper:
+  it never decides a result is a pass, it only chooses whether the engine runs,
+  and the engine's own `failed` is the one thing that weakens a verdict.
+  `build_quality_gate(store, github=, github_accounts=)` builds it by default;
+  **`NEXUS_SELFQA_GATE` is now a deployment-wide override** (`1` forces every
+  project's checks, `0` turns the gate off everywhere), not the only way in.
+  Without a store (`build_quality_gate()`), the old env-only behaviour is kept
+  for a single-project caller. Surface: `PATCH /api/v1/projects/{id}`
+  (`quality_gate`), `nexus project quality-gate <id> [auto|on|off]`, and the
+  Studio's project settings (`#quality-gate-mode`).
+- **The gate never worked on a real project.** A task's `repository` is
+  `owner/name`, and `SelfQa._clone` ran `git clone owner/name`, which git reads
+  as a *relative path* — `fatal: repository 'owner/name' does not exist`, so the
+  report was `blocked` for every real project while every existing test passed
+  on a local directory. `clone_url` maps `owner/name` to
+  `https://github.com/owner/name.git` and leaves a URL or a path alone. The
+  clone is **full**, not shallow, because the gate checks a *specific* commit
+  that a shallow clone may not contain; a missing commit is fetched by name (the
+  branch first, then the SHA). A commit that cannot be reached is `blocked`
+  ("not verified"), never a pass.
+- **A private repository is cloned with the project's own identity, and the
+  token never leaves the environment.** `_auth_env` puts the credential in
+  `GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` (an `http.<host>/.extraheader`), not in
+  argv and not in the URL: a token in the URL is written to `.git/config`, and a
+  token in argv is visible in `ps`. `SelfQa(token=...)` holds it and nothing in
+  a report or an exception carries it.
+- **A failing project passed after the first task.** `run()` reused a fixed
+  `workdir/checkout`, so the *second* run's clone failed ("already exists"), the
+  report was `blocked`, and `blocked` leaves the task verdict alone — a project
+  whose checks fail was accepted on every run after the first. Each run now gets
+  its own scratch directory under `workdir` (`tempfile.mkdtemp(dir=...)`).
+  `tests/test_quality_gate_policy.py::test_the_same_engine_checks_two_commits_in_a_row`
+  is the case that caught it; do not fold the workdir back into one directory.
+- **`SelfQa.run` takes `project_id` and `branch`** so a plain engine and the
+  policy wrapper are interchangeable to the scheduler (`_apply_quality_gate`
+  passes both). `project_id` is ignored by the engine; `branch` is used only to
+  fetch a commit the default clone depth would not contain.
+- **The two check timeouts are settings** (`NEXUS_SELFQA_CHECK_TIMEOUT`,
+  `NEXUS_SELFQA_TOTAL_TIMEOUT`); a junk or non-positive value is the default,
+  never `0` (which would fail every check and blame the project).
+- Tests: `tests/test_quality_gate_policy.py` (the clone fix, the auth env, the
+  three modes, real git repositories and real exit codes, the scheduler
+  integration, and the HTTP/CLI surface) and the updated
+  `tests/test_quality_gate.py`. Mutation-proven: reverting `clone_url`, the
+  `auto` declaration check, or the per-run scratch directory each makes a test
+  fail.
+- `REQUIRED_COLUMNS["nexus_projects"]` names `quality_gate`; the schema guard
+  fails if the column is missing.
+
+### The Self-QA gate, and why `/api/studio`'s `lab` dict is asserted four times
+
+`LabScheduler(quality_gate=…)` runs the project's own checks at the exact
+`remote_sha` the Git verifier accepted, and can only *weaken* a verdict: a
+failing required check downgrades `completed_verified` → `completed_unverified`
+(so the task is reworked); `passed` leaves it; `skipped`/`blocked` never turns a
+pass into a failure; a gate that raises is logged and ignored. It is now on
+**per project** (see the section above: `auto`/`on`/`off`, default `auto`;
+`NEXUS_SELFQA_GATE` overrides deployment-wide), wired in `lab_worker.main` and
+the server's inline loop, and reported as `lab.selfqa_gate` in `/api/studio`
+(shown on the Settings screen as «Самопроверка (Self-QA)»).
+
+**Trap.** The `lab` object in `/api/studio` is compared **whole** in four
+places, so adding a field breaks all four at once and only some are obvious:
+`tests/test_lab_inline.py` (three assertions) and
+`tests/test_studio_api.py::test_status_says_what_is_configured_and_never_the_values`.
+The fix each time was to add the new key to the expected dict, never to loosen
+the comparison to a subset — a subset check would stop catching a removed
+field. When you add to `lab`, grep for `"cleanup_hours": 24.0` and update every
+hit.
+
+### One-command self-hosting
+
+`scripts/nexus.sh` (setup/start/stop/restart/status/logs/backup/restore/update/
+tunnel) is the operator entry point. It waits for `/healthz` before reporting
+started, never deletes user data, and `restore` proves a dump loads into a
+**scratch** database it drops — the live database is untouched
+(`tests/test_self_hosting.py` asserts this over a real pg_dump/pg_restore).
+`backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
+both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
+per-process isolation passes the latter.

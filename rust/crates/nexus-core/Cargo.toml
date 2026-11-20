@@ -1,0 +1,13 @@
+[package]
+name = "nexus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NEXUS orchestration core in Rust: the scheduling decisions the Python loop makes, over nexus-domain."
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

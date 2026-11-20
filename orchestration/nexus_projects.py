@@ -80,7 +80,7 @@ class ProjectService:
         with self.store._tx() as cur:
             cur.execute(
                 "SELECT p.id, p.name, p.description, p.archived_at, p.deleted_at, "
-                "  p.created_at, p.updated_at "
+                "  p.quality_gate, p.created_at, p.updated_at "
                 "FROM nexus_projects p JOIN nexus_project_members m ON m.project_id=p.id "
                 "WHERE m.principal=%s AND ("
                 "  (p.deleted_at IS NULL AND (p.archived_at IS NULL OR %s))"
@@ -98,7 +98,7 @@ class ProjectService:
         # A deleted project is still *readable* by a member, so it can be
         # restored; it is ``_refuse_if_deleted`` that stops new work in it.
         cur.execute("SELECT p.id, p.name, p.description, p.archived_at, p.deleted_at, "
-                    "  p.created_at, p.updated_at "
+                    "  p.quality_gate, p.created_at, p.updated_at "
                     "FROM nexus_projects p JOIN nexus_project_members m ON m.project_id=p.id "
                     "WHERE p.id=%s AND m.principal=%s FOR KEY SHARE OF m", (project_id, principal))
         row = cur.fetchone()
@@ -386,24 +386,50 @@ class ProjectService:
         return role
 
     def update(self, principal: str, project_id: str, changes: dict) -> dict:
-        if not changes or set(changes) - {"name", "description"}:
-            raise ValueError("provide name and/or description")
+        if not changes or set(changes) - {"name", "description", "quality_gate"}:
+            raise ValueError("provide name, description and/or quality_gate")
         name = _text(changes["name"], "name", maximum=120) if "name" in changes else None
         description = (_text(changes["description"], "description", maximum=4000, required=False)
                        if "description" in changes else None)
+        quality_gate = (self._gate_mode(changes["quality_gate"])
+                        if "quality_gate" in changes else None)
         with self.store._tx() as cur:
             # Only an owner may change what a project *is*.
             self.require_scope(cur, principal, project_id, SCOPE_PROJECT_ADMIN)
             cur.execute("UPDATE nexus_projects p SET name=COALESCE(%s, p.name), "
-                        "description=COALESCE(%s, p.description), updated_at=now() "
+                        "description=COALESCE(%s, p.description), "
+                        "quality_gate=COALESCE(%s, p.quality_gate), updated_at=now() "
                         "WHERE p.id=%s "
-                        "RETURNING p.id, p.name, p.description, p.created_at, p.updated_at",
-                        (name, description, project_id))
+                        "RETURNING p.id, p.name, p.description, p.quality_gate, "
+                        "  p.created_at, p.updated_at",
+                        (name, description, quality_gate, project_id))
             row = cur.fetchone()
             if row is None:
                 raise NotFound("project not found")
             self._event(cur, project_id, principal, "project.updated", project_id)
             return dict(row)
+
+    @staticmethod
+    def _gate_mode(value: Any) -> str:
+        """A validated quality-gate mode, from the request body.
+
+        The stored column's CHECK is the same set, but a wrong value must be a
+        400 at the route, not a 500 from the database - so it is validated here
+        too, and ``True``/``False`` are accepted as the ``on``/``off`` an older
+        client may still send.
+        """
+        from .nexus_selfqa import GATE_MODES, normalise_mode
+
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        text = str(value or "").strip().lower()
+        if text not in GATE_MODES:
+            raise ValueError("quality_gate must be one of " + ", ".join(GATE_MODES))
+        return normalise_mode(text)
+
+    def set_quality_gate(self, principal: str, project_id: str, mode: Any) -> dict:
+        """Change only the project's quality-gate mode. An owner action."""
+        return self.update(principal, project_id, {"quality_gate": mode})
 
     def create_goal(self, principal: str, project_id: str, text: Any,
                     key: str | None = None) -> tuple[dict, bool]:

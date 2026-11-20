@@ -332,6 +332,8 @@ class App:
             self.store,
             EvidenceTrustEngine(self.evidence_keyring, self.evidence_signer),
         )
+        # The QUALITY GATE (Self-QA) is built once the GitHub identity above
+        # exists; see just below.
         self.github_confirmations = Confirmations()
         self.github_writes_enabled = os.environ.get("GITHUB_ENABLE_WRITES", "").lower() in ("1", "true", "yes")
         # The LLM orchestrator cascade (Gemini -> Groq -> OpenRouter ->
@@ -415,6 +417,15 @@ class App:
         # that only needs to read can reach a write, and every call happens
         # inside a confirmed-action handler (see ``_github_*`` routes).
         self.github_writer = GitHubWriter(self.github)
+        # The QUALITY GATE (Self-QA). Each project carries its own mode
+        # (``nexus_projects.quality_gate``): ``auto`` runs the checks only when
+        # the repository declares them, ``on`` always, ``off`` never.
+        # ``NEXUS_SELFQA_GATE`` remains a deployment-wide override. The gate can
+        # only ever downgrade a verified verdict, and a failing required check
+        # reworks the task.
+        from .lab_worker import build_quality_gate
+        self.quality_gate = build_quality_gate(
+            self.store, github=self.github, github_accounts=self.github_accounts)
         # Bearer token for the machine API. Without one, only read-only requests
         # are served, so a misconfigured ``--host 0.0.0.0`` cannot be used by a
         # stranger to start Cloud conversations. ``None`` means "not set".
@@ -567,6 +578,7 @@ class App:
                                       github_accounts=self.github_accounts,
                                       account_router=build_account_router(self.store),
                                       evidence=self.evidence,
+                                      quality_gate=self.quality_gate,
                                       # A start that is on its way when the
                                       # server is stopped is left, recorded, to
                                       # the process that replaces this one.
@@ -798,7 +810,12 @@ class App:
             # and the page says so instead of showing a run that never moves.
             # ``cleanup_hours``: how long after a run is over its OpenHands
             # conversations are deleted; ``None`` when they are kept for ever.
-            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours()},
+            # ``selfqa_gate``: whether the Self-QA gate mechanism is active at
+            # all. It is on unless the deployment sets ``NEXUS_SELFQA_GATE=0``;
+            # whether a given project's checks actually run is that project's
+            # own ``quality_gate`` mode (auto/on/off), shown in its settings.
+            "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours(),
+                    "selfqa_gate": self.quality_gate is not None},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {
@@ -5029,10 +5046,13 @@ class Handler(BaseHTTPRequestHandler):
                 project = (self.app.projects.restore(principal, parsed[0])
                            if not body["deleted"]
                            else self.app.projects.delete(principal, parsed[0]))
-            if set(body) & {"name", "description"}:
+            if set(body) & {"name", "description", "quality_gate"}:
+                # ``quality_gate`` is validated in the service (auto|on|off), so
+                # a wrong value is a 400 with the allowed set, not a 500.
                 project = self.app.projects.update(principal, parsed[0], body)
             if project is None:
-                raise ValueError("provide name, description, archived and/or deleted")
+                raise ValueError("provide name, description, quality_gate, "
+                                 "archived and/or deleted")
             return self._json(200, {"project": project})
         except NotFound:
             return self._json(404, {"error": "not found"})

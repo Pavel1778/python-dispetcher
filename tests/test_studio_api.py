@@ -224,8 +224,11 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     assert body["github"] == {"server_token": True}
     assert body["accounts"] == {"encryption_key": True}
     # This server does not advance autonomous runs unless it is told to. The
-    # OpenHands conversations of a finished run are deleted a day later.
-    assert body["lab"] == {"inline": False, "cleanup_hours": 24.0}
+    # OpenHands conversations of a finished run are deleted a day later. The
+    # Self-QA gate mechanism is available by default (each project's own mode
+    # decides); only NEXUS_SELFQA_GATE=0 turns it off everywhere.
+    assert body["lab"] == {"inline": False, "cleanup_hours": 24.0,
+                           "selfqa_gate": True}
     assert isinstance(body["version"], str) and body["version"]
     # The page asks on every load, so the answer must not depend on OpenHands
     # being reachable: no request reaches the Cloud API.

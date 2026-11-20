@@ -1459,6 +1459,13 @@ def test_expired_sessions_and_stale_attempts_are_swept(server):
     grew forever.
     """
     store = server.app.store
+    # The server sweeps once when it starts (its first pass). Wait for that
+    # sweep to have happened before inserting, or it can delete the row this
+    # test just made and ``purge_expired_sessions`` then returns 0 - the same
+    # race the sibling sweep tests avoid the same way.
+    deadline = time.monotonic() + 10
+    while server.app._swept_at is None and time.monotonic() < deadline:
+        time.sleep(0.02)
     store.create_session(token_hash="dead", username="owner",
                          csrf_token="c", ttl_seconds=-1)   # already expired
     store.record_login_failure("stale-key", max_failures=5, lockout_seconds=0)

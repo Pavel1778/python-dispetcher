@@ -1,0 +1,22 @@
+# Named Cloudflare Tunnel configuration template for NEXUS.
+#
+# Copy to /etc/nexus/cloudflared.yml (mode 0600) and replace <tunnel-uuid> and
+# nexus.example.com with the tunnel created by:
+#
+#   cloudflared tunnel login
+#   cloudflared tunnel create nexus
+#   cloudflared tunnel route dns nexus nexus.example.com
+#
+# Then start either via:
+#   ./scripts/nexus.sh tunnel /etc/nexus/cloudflared.yml
+# or as a persistent systemd service:
+#   sudo install -m 0644 packaging/systemd/nexus-tunnel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nexus-tunnel
+
+tunnel: <tunnel-uuid>
+credentials-file: /etc/nexus/<tunnel-uuid>.json
+
+ingress:
+  - hostname: nexus.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404

@@ -576,7 +576,8 @@ class PostgresStore:
                                      "error_count"),
         "nexus_openhands_account_events": ("id", "account_id", "kind", "detail"),
         "nexus_openhands_pool": ("principal", "selection_mode", "fallback_order"),
-        "nexus_projects": ("id", "name", "description", "archived_at", "deleted_at"),
+        "nexus_projects": ("id", "name", "description", "archived_at", "deleted_at",
+                           "quality_gate"),
         "nexus_conversations": ("id", "project_id", "title", "mode", "state",
                                 "archived", "pinned", "pinned_at", "deleted_at",
                                 "workflow_state", "workflow_goal_id",
@@ -604,7 +605,12 @@ class PostgresStore:
                             "pending_start"),
         "nexus_runs": ("id", "project_id", "goal_id", "state", "iteration",
                        "policy", "cycle", "resume_at", "conversation_id",
-                       "hidden_at", "total_iterations"),
+                       "hidden_at", "total_iterations",
+                       "queued_at", "claimed_at", "dispatch_started_at",
+                       "executor_started_at", "conversation_ready_at",
+                       "prompt_sent_at", "first_agent_event_at", "last_progress_at",
+                       "verification_started_at", "verification_completed_at",
+                       "completed_at"),
         "nexus_run_reports": ("run_id", "project_id", "conversation_id", "state",
                               "body", "attempts", "next_attempt_at"),
         "nexus_executor_stops": ("id", "run_id", "task_id", "conversation_id",
@@ -634,10 +640,11 @@ class PostgresStore:
         table is returned as ``table(column)`` so the name that matters is
         visible. This method only reads; it never alters the schema.
         """
-        required = (
-            "workflows", "tasks", "conversations", "repositories",
-            "task_events", "sr_tool_calls", "sessions", "login_attempts",
-        )
+        # Every table the column map names, not a hand-kept subset: the eight
+        # legacy tables were once the whole set, and the NEXUS tables added to
+        # the map later (the profiler columns of migration 0040 among them) went
+        # unchecked. The map is exactly the columns the code reads.
+        required = tuple(self.REQUIRED_COLUMNS)
         with self._tx() as cur:
             cur.execute(
                 "SELECT c.relname AS table_name, a.attname AS column_name "

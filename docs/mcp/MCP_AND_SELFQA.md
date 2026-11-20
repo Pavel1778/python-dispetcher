@@ -69,6 +69,17 @@ What it is **not**, by construction (no code path exists for these):
 Tests: `tests/test_selfqa.py` (skipped≠pass, timeout kills the check, required
 vs optional semantics, redaction, no NEXUS checkout mutation).
 
+**As a gate on the autonomous loop** (`ProjectQualityGate`): a task the Git
+verifier accepted is checked at *that* commit, and only a `failed` verdict
+weakens it (to `completed_unverified`, so the task is reworked); `passed`,
+`skipped` and `blocked` leave the verdict as it was. It is **per project**
+(`nexus_projects.quality_gate`): `auto` (the default) runs only when the
+repository declares `.nexus-qa.json`, `on` always, `off` never;
+`NEXUS_SELFQA_GATE` overrides that deployment-wide. A private repository is
+cloned with the project's own GitHub account, and the token reaches git through
+the environment only (never argv, never the URL, never a report). Tests:
+`tests/test_quality_gate.py`, `tests/test_quality_gate_policy.py`.
+
 The CLI surface: `nexus qa report` (real system report via `/api/dashboard` + `/api/system`),
 `nexus qa run` (isolated checkout run), `nexus qa verify` (evidence
 verification). Destructive operations refuse without `--yes` (exit 8).

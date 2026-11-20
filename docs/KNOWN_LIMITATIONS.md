@@ -56,9 +56,8 @@ this environment:
 - Deployment must set `WEB_COOKIE_SECURE=1` (or a proxy that emits
   `X-Forwarded-Proto: https`) or the session cookie is not `Secure` on
   plain-HTTP installs (M1).
-- `requirements.txt` uses ranges, not a hashed lock file; rebuilds can drift
-  within `>=,<` (L2). Generate and verify a `requirements.lock` before the
-  next release if reproducible builds matter.
+- `requirements.txt` uses ranges (`>=,<`) for flexibility, while a pinned
+  `requirements.lock` is now provided alongside it for reproducible builds (L2).
 
 ## Testing & orchestration performance (resolved 2026-11-20)
 
