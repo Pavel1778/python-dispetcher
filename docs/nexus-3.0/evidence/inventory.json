@@ -1,0 +1,345 @@
+{
+  "base": "20eb8bffc3e89f08e24522aa98dba0e62fc6e070",
+  "refs": [
+    {
+      "ref": "refs/heads/arena/3a132869-python-dispetcher",
+      "sha": "397e1de00caf64df59f74355903a5cb56503aa03",
+      "tree": "ae59d023188a7cddbdfe915a7a4088f4fbd0e8b5",
+      "common_with_main": "397e1de00caf64df59f74355903a5cb56503aa03",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/arena/6f80793e-python-dispetcher",
+      "sha": "992391667689f4906650dbd5b607258fd701b3a8",
+      "tree": "4073e19727a3ffac8e0ec9c88f22da0af279e70a",
+      "common_with_main": "992391667689f4906650dbd5b607258fd701b3a8",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml",
+        "rust/crates/nexus-storage/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/arena/71f72168-python-dispetcher",
+      "sha": "8ddd29d435bf4d60a3cb6a915177ca5c004e1548",
+      "tree": "4c7826113ac403f39850c956d37d99c4cb48f7d0",
+      "common_with_main": "8ddd29d435bf4d60a3cb6a915177ca5c004e1548",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/arena/75afb703-python-dispetcher",
+      "sha": "7d35ae5e0f57be9834e2a610e1cb739911d05bea",
+      "tree": "8e09fe70e52c02b41dcaf3e46d7037055779a43c",
+      "common_with_main": "7d35ae5e0f57be9834e2a610e1cb739911d05bea",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml",
+        "rust/crates/nexus-storage/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/arena/aa1abcbc-python-dispetcher",
+      "sha": "d2cf513382a134802074cdca90393cb492f377e7",
+      "tree": "20bad66e37e63d23d5eab8f06c4949d8530fc4b6",
+      "common_with_main": "d2cf513382a134802074cdca90393cb492f377e7",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/arena/e1a9f455-python-dispetcher",
+      "sha": "60eba442ee9e2fb18781899a369cdd87abe50c77",
+      "tree": "4660154eb9abe6ec8b07ad94da3a3bd066372b99",
+      "common_with_main": "60eba442ee9e2fb18781899a369cdd87abe50c77",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/feat/run-restart-duplicate",
+      "sha": "f6e77c9682eb7df296a68f6720e85d89de01f5c7",
+      "tree": "4b2ff1a1265b84e3de61cab45218797b467756dc",
+      "common_with_main": "f6e77c9682eb7df296a68f6720e85d89de01f5c7",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/main",
+      "sha": "20eb8bffc3e89f08e24522aa98dba0e62fc6e070",
+      "tree": "8e09fe70e52c02b41dcaf3e46d7037055779a43c",
+      "common_with_main": "20eb8bffc3e89f08e24522aa98dba0e62fc6e070",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml",
+        "rust/crates/nexus-storage/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/nexus/3.0-audit",
+      "sha": "5688854b2e84b0d6d3c4191eec8f8ac945e8f1fb",
+      "tree": "b73d7a87b1d1686b361f4ef14c48f46e7e66fac5",
+      "common_with_main": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml",
+        "rust/crates/nexus-storage/Cargo.toml"
+      ],
+      "master_docs": [
+        "docs/nexus-3.0/API_MIGRATION_MATRIX.md",
+        "docs/nexus-3.0/CI_RELEASE_READINESS.md",
+        "docs/nexus-3.0/DISPATCH_RECOVERY_PROTOCOL.md",
+        "docs/nexus-3.0/FORENSIC_BASELINE.md",
+        "docs/nexus-3.0/MASTER_ACCEPTANCE_REPORT.md",
+        "docs/nexus-3.0/PARITY_MATRIX.md",
+        "docs/nexus-3.0/PERFORMANCE_REPORT.md",
+        "docs/nexus-3.0/PHASE2_ACCEPTANCE_REPORT.md",
+        "docs/nexus-3.0/PHASE3_EXECUTOR_ARCHITECTURE.md",
+        "docs/nexus-3.0/SECURITY_AUDIT.md"
+      ]
+    },
+    {
+      "ref": "refs/heads/nexus/phase2-dispatch-durability",
+      "sha": "1c827462c1ed84045ad2b01b3e21e488e5d5f4c7",
+      "tree": "073ea9947cd26d4fc7ebfb98273c4ba65955a498",
+      "common_with_main": "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml",
+        "rust/crates/nexus-storage/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/release/acceptance",
+      "sha": "2cefae5e85fef5e6fedce65bf17d3a412c88bcc3",
+      "tree": "742ecc818db8f11143f5c07200890bb0544e7fd0",
+      "common_with_main": "2cefae5e85fef5e6fedce65bf17d3a412c88bcc3",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/heads/release/nexus-2.0-pr-ready",
+      "sha": "cc509e20ae30c742689f4d828373fc7d3db91046",
+      "tree": "5dbd4a50f1aeb9ff13483018d7740c6a20e76103",
+      "common_with_main": "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "crates": [
+        "benchmarks/rust-archive/Cargo.toml",
+        "benchmarks/rust-db/Cargo.toml",
+        "rust/Cargo.toml",
+        "rust/crates/nexus-cli/Cargo.toml",
+        "rust/crates/nexus-core/Cargo.toml",
+        "rust/crates/nexus-domain/Cargo.toml"
+      ],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/arena-06dcb2d2",
+      "sha": "16efad12002bdba867a7a312008f5b8011218c6f",
+      "tree": "fcb8dc6e0c203a0bc3248c62e01d89dbb3f5b797",
+      "common_with_main": "16efad12002bdba867a7a312008f5b8011218c6f",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/arena-1d4f42a1",
+      "sha": "5c1eea3ad561923f8b29f9607510e2ef01882d52",
+      "tree": "1a5fb7c8dff957932f322fa41890f6a9a87e2532",
+      "common_with_main": "5c1eea3ad561923f8b29f9607510e2ef01882d52",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/arena-22525405",
+      "sha": "82d34285d9165c5c6d81d633b11a5463ee1c5294",
+      "tree": "990de8f220b8cc928e19ddd16d960f7956fbfc7e",
+      "common_with_main": "82d34285d9165c5c6d81d633b11a5463ee1c5294",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/arena-5a479709",
+      "sha": "bfa5b4fade1cbf27cbf0474f3254471c09ccc8d1",
+      "tree": "ee4ba22b29d88ec02f0c3083a6e0bb0a900c56d6",
+      "common_with_main": "bfa5b4fade1cbf27cbf0474f3254471c09ccc8d1",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/arena-60148d7e",
+      "sha": "e386e3c33f6287fb958c48c380380664899e6dc0",
+      "tree": "a3185314c54763db1fc5b5823bc093dd28bc4970",
+      "common_with_main": "e386e3c33f6287fb958c48c380380664899e6dc0",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/autonomous-completion",
+      "sha": "e85d1c6c53581ee1c8814274fc1d6c20b4637518",
+      "tree": "bc842a0d356ea133b272ec14f58a7144b389c1c4",
+      "common_with_main": "e85d1c6c53581ee1c8814274fc1d6c20b4637518",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/docs-branch-topology",
+      "sha": "dff2966c202f666758b9fbf20f02e5c8b1ee2bdc",
+      "tree": "a76171cf94934ab52d11de19a4ed711e8e354bd2",
+      "common_with_main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/fix-ci-python-version",
+      "sha": "de16b34f987ce8c699715aa83c04bfba22d59e0e",
+      "tree": "dd053e4a5e8c4a14441bc6391bfce66906fe5123",
+      "common_with_main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/laboratory-files-github",
+      "sha": "9287a442a0630ff908c518d645d7033b38f44d4b",
+      "tree": "528e36c05d65a282ddcf4a7b34ec97f25dfc78dc",
+      "common_with_main": "9287a442a0630ff908c518d645d7033b38f44d4b",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/mvp-baseline-main",
+      "sha": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "tree": "a3185314c54763db1fc5b5823bc093dd28bc4970",
+      "common_with_main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/mvp-integration-tip",
+      "sha": "7d2ecf63d2a33d492982fd373a73fe7f2dc96403",
+      "tree": "b1a6fdd866a69fbcbbe2ba48af2de134a9b5db1c",
+      "common_with_main": "7d2ecf63d2a33d492982fd373a73fe7f2dc96403",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/mvp-nexus-tip",
+      "sha": "9287a442a0630ff908c518d645d7033b38f44d4b",
+      "tree": "528e36c05d65a282ddcf4a7b34ec97f25dfc78dc",
+      "common_with_main": "9287a442a0630ff908c518d645d7033b38f44d4b",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/mvp-phase0-tip",
+      "sha": "ba04467c9c7b1d6d13edabf61d57694d70831d63",
+      "tree": "066f49eabd9fc0e167867a271bdb94d0134e0aa8",
+      "common_with_main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/pre-autonomous-main",
+      "sha": "556734732eddeb6029c394aeabf28480092ac744",
+      "tree": "02113e19fc4bd33cf2a2ca05a5c3bc35dbac65a6",
+      "common_with_main": "556734732eddeb6029c394aeabf28480092ac744",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/pre-integration-main",
+      "sha": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "tree": "a3185314c54763db1fc5b5823bc093dd28bc4970",
+      "common_with_main": "bd3138171740e4e3608fa035d179c1579d720a2e",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/preservation/pre-openhands-integration",
+      "sha": "78416031045c168d8ff9afeb747b9210df671556",
+      "tree": "9487a3fd80b6e1d7f714d50dae8399189aa02db2",
+      "common_with_main": "78416031045c168d8ff9afeb747b9210df671556",
+      "crates": [],
+      "master_docs": []
+    },
+    {
+      "ref": "refs/tags/v2.0.0",
+      "sha": "363f20fb9ba12d5f8bc7cbc1ef62b38df703b986",
+      "tree": "3dfc0525cfe6f9ed7f22912f48cd751dad67448e",
+      "common_with_main": "363f20fb9ba12d5f8bc7cbc1ef62b38df703b986",
+      "crates": [],
+      "master_docs": []
+    }
+  ],
+  "merge_plus_parents": {
+    "54": [
+      "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+      "2edf3aa70eefb0628fa88997a1d1c095b133e007",
+      "992391667689f4906650dbd5b607258fd701b3a8"
+    ],
+    "55": [
+      "20eb8bffc3e89f08e24522aa98dba0e62fc6e070",
+      "e866666fb69a13e0edc0c7670b9f56e3561b34c0",
+      "7d35ae5e0f57be9834e2a610e1cb739911d05bea"
+    ]
+  },
+  "reachable_path_history": {
+    "nexus-store": [],
+    "nexus-storage": [
+      "a59c00c0ae17117b01b0b6b3da699b6bd0b06261"
+    ],
+    "nexus-worker": [],
+    "nexus-api": []
+  },
+  "unresolved_rev_parse_exit": {
+    "nexus/3.0-foundation": 1,
+    "9c11f52": 1,
+    "5a9989b": 1
+  },
+  "worktrees_at_start": 1,
+  "stash_at_start": 0,
+  "reachable_commits": "462"
+}
