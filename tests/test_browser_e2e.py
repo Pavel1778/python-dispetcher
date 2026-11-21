@@ -120,12 +120,12 @@ def _stack(monkeypatch, **app_options):
     threading.Thread(target=llm.serve_forever, daemon=True).start()
 
     with FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server:
-        app = App(DSN, poll_interval=0.2, token="machine-token", **app_options)
+        app = App(DSN, poll_interval=0.2, token="machine-token",
+                  github=GitHubClient(base_url=github_server.base_url, token="server-github-token"), **app_options)
         app.client = CloudClient(cloud.base_url, api_key="test-key", timeout=10.0)
         app.dispatcher.client = app.client
         app.runtime.client = app.client
         app.verifier.client = app.client
-        app.github = GitHubClient(base_url=github_server.base_url, token="server-github-token")
         app.github_accounts._client_factory = lambda token: GitHubClient(
             base_url=github_server.base_url, token=token)
         app.providers = ProviderCascade([GroqProvider(
@@ -1984,6 +1984,38 @@ def test_the_project_quality_gate_is_changed_from_the_project_settings(stack, ch
         page.wait_for_selector("#quality-gate-mode")
         assert page.input_value("#quality-gate-mode") == "off"
         assert watch.problems == []
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (820, 1180), (390, 844)])
+def test_execution_profile_persistence_and_refused_sync_in_browser(stack, chromium, width, height):
+    from tests.test_execution_profile_barriers import desired
+
+    ctx, page, _watch = _open(chromium, viewport={'width':width, 'height':height}, has_touch=width<1000)
+    try:
+        _login(page, stack.base)
+        def open_form():
+            if page.locator('#open-sidebar').is_visible() and page.locator('#app').get_attribute('data-sidebar') != 'open':
+                page.click('#open-sidebar')
+            page.click('#user-menu')
+            page.click(".menu-item[data-action='open-settings']")
+            page.locator('details.execution-profile summary').click()
+            return page.locator('form.execution-profile-form')
+        form = open_form()
+        for k,v in desired().items():
+            if v is not None:
+                form.locator(f'input[name="{k}"]').fill(json.dumps(v) if isinstance(v,dict) else v)
+        form.locator('button[value=save]').click()
+        expect(form.locator('.form-msg')).to_contain_text('saved')
+        form.locator('button[value=sync]').click()
+        expect(form.locator('.form-msg')).to_contain_text('Ошибка')
+        expect(page.locator('details.execution-profile > p[role=status]')).to_contain_text('blocked')
+        page.keyboard.press('Escape')
+        form = open_form()
+        assert form.locator('input[name=model]').input_value() == desired()['model']
+        expect(page.locator('details.execution-profile > p[role=status]')).to_contain_text('blocked')
+        assert not form.locator('input[name=api_key]').count()
     finally:
         ctx.close()
 

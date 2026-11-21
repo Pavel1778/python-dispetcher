@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import json
+import hashlib
 import logging
 import os
 import re
@@ -93,6 +94,7 @@ class QaResult:
     stdout: str = ""
     stderr: str = ""
     detail: str = ""
+    argv: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -101,7 +103,10 @@ class QaResult:
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "required": self.required, "status": self.status,
                 "exit_code": self.exit_code, "duration_s": round(self.duration_s, 3),
-                "stdout": self.stdout, "stderr": self.stderr, "detail": self.detail}
+                "stdout": self.stdout, "stderr": self.stderr, "detail": self.detail,
+                "argv": [redact_text(arg) for arg in self.argv],
+                "output_sha256": hashlib.sha256(json.dumps([self.stdout, self.stderr],
+                    ensure_ascii=False).encode()).hexdigest()}
 
 
 @dataclass
@@ -117,6 +122,11 @@ class QaReport:
     environment: dict[str, Any] = field(default_factory=dict)
     started_at: float = 0.0
     finished_at: float = 0.0
+    binding: dict = field(default_factory=dict)
+    checked_sha: str = ''
+    started_utc: float = 0.0
+    finished_utc: float = 0.0
+    policy_skip: bool = False
 
     @property
     def ok(self) -> bool:
@@ -126,7 +136,9 @@ class QaReport:
         return {
             "verdict": self.verdict,
             "reason": self.reason,
-            "ok": self.ok,
+            "ok": self.ok, 'source': 'nexus:isolated-checkout', 'binding': self.binding,
+            'checked_sha': self.checked_sha, 'started_utc': self.started_utc, 'finished_utc': self.finished_utc,
+            'policy_skip': self.policy_skip,
             "repository": self.repository,
             "commit": self.commit,
             "checks": [c.as_dict() for c in self.checks],
@@ -158,23 +170,21 @@ def _declared_checks(root: Path) -> list[QaCheck] | None:
     defaults; an empty ``checks`` list is honoured (the repository said so).
     """
     path = root / ".nexus-qa.json"
-    if not path.is_file():
+    if not path.exists() and not path.is_symlink():
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        log.warning(".nexus-qa.json is not valid JSON; using the default checks")
-        return None
-    raw = data.get("checks")
-    if not isinstance(raw, list):
-        return None
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+        raise ValueError('invalid Self-QA declaration')
+    data = json.loads(path.read_text(encoding='utf-8'))
+    raw = data.get('checks') if isinstance(data, dict) else None
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise ValueError('invalid Self-QA check list')
     out: list[QaCheck] = []
     for item in raw:
-        if not isinstance(item, dict):
-            continue
-        run = item.get("run")
-        if not (isinstance(run, list) and run and all(isinstance(x, str) for x in run)):
-            continue
+        run = item.get('run') if isinstance(item, dict) else None
+        if (not isinstance(run, list) or not 1 <= len(run) <= 64
+                or not all(isinstance(x, str) and 0 < len(x) <= 4096 for x in run)
+                or not isinstance(item.get('required', True), bool)):
+            raise ValueError('invalid Self-QA command declaration')
         name = str(item.get("name") or run[0])
         out.append(QaCheck(name=name[:80], argv=tuple(run),
                            required=bool(item.get("required", True)),
@@ -309,6 +319,8 @@ def _verdict(checks: list[QaResult]) -> tuple[str, str]:
         return "failed", f"required check(s) failed: {names}"
     if not ran:
         return "skipped", "no check could be run (tooling absent)"
+    if any(c.required and (c.status != 'passed' or c.exit_code != 0) for c in checks):
+        return 'blocked', 'a required check did not run successfully'
     optional_failed = [c for c in checks
                        if not c.required and c.status in ("failed", "timeout", "error")]
     if optional_failed:
@@ -395,7 +407,7 @@ class SelfQa:
     # -------------------------------------------------------------------- run
     def run(self, *, repository: str, commit: str = "",
             checks: list[QaCheck] | None = None,
-            project_id: str = "", branch: str | None = None) -> QaReport:
+            project_id: str = "", branch: str | None = None, binding: dict | None = None) -> QaReport:
         """Clone *repository* at *commit*, run the checks, return the report.
 
         ``project_id`` and ``branch`` are part of the signature so a plain
@@ -411,7 +423,7 @@ class SelfQa:
                "branch": branch or ""}
         report = QaReport(verdict="blocked", reason="not started",
                           repository=repository, commit=commit,
-                          environment=env, started_at=started)
+                          environment=env, started_at=started, binding=dict(binding or {}), started_utc=time.time())
         if not repository:
             report.reason = "no repository to check"
             report.finished_at = time.monotonic()
@@ -436,13 +448,21 @@ class SelfQa:
                 report.reason = f"could not make an isolated checkout: {detail}"
                 report.finished_at = time.monotonic()
                 return report
+            report.checked_sha = subprocess.check_output(['git', '-C', str(dest), 'rev-parse', 'HEAD'],
+                                                         text=True, timeout=5).strip()
+            if binding and report.checked_sha != commit:
+                report.reason = 'checkout differs from verified commit'
+                return report
             chosen = checks if checks is not None else checks_for(dest)
             report.checks = self._run_all(chosen, dest, started)
             report.verdict, report.reason = _verdict(report.checks)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            report.verdict, report.reason = 'blocked', f'could not establish checks ({type(exc).__name__})'
         finally:
             if made is not None:
                 shutil.rmtree(made, ignore_errors=True)
             report.finished_at = time.monotonic()
+            report.finished_utc = time.time()
         return report
 
     def _run_all(self, checks: list[QaCheck], root: Path,
@@ -455,8 +475,9 @@ class SelfQa:
                                     detail="the run's total time limit was reached"))
                 continue
             remaining = max(1.0, self.total_timeout - (time.monotonic() - started))
-            out.append(run_check(check, root, timeout=min(self.check_timeout, remaining),
-                                 env=env))
+            result = run_check(check, root, timeout=min(self.check_timeout, remaining), env=env)
+            result.argv = check.argv
+            out.append(result)
         return out
 
 
@@ -504,6 +525,8 @@ def declares_checks(repository: str, *, branch: str | None = None,
     if client is None or not repository:
         return None
     try:
+        if hasattr(client, 'has_root_entry'):
+            return client.has_root_entry(repository, QA_DECLARATION, ref=branch)
         found = client.read_text_file(repository, QA_DECLARATION, branch=branch)
     except Exception as e:  # noqa: BLE001 - a read failure is "not established"
         log.debug("could not read %s of %s: %s", QA_DECLARATION, repository,
@@ -541,30 +564,22 @@ class ProjectQualityGate:
     def __init__(self, engine: SelfQa, *,
                  mode_for: Callable[[str], Any] | None = None,
                  declares: Callable[..., bool | None] | None = None,
-                 token_for: Callable[[str], str] | None = None):
+                 token_for: Callable[[str, str], str] | None = None,
+                 allow_revision: Callable[[str, str], bool] | None = None):
         self.engine = engine
         self._mode_for = mode_for or (lambda project_id: "auto")
         self._declares = declares or _declares_default
         self._token_for = token_for
+        self._allow_revision = allow_revision
 
     def mode(self, project_id: str) -> str:
-        try:
-            return normalise_mode(self._mode_for(project_id))
-        except Exception as e:  # noqa: BLE001 - an unreadable mode is the default
-            log.debug("could not read the quality-gate mode of %s: %s",
-                      project_id, type(e).__name__)
-            return "auto"
+        return normalise_mode(self._mode_for(project_id))
 
-    def _engine_for(self, project_id: str) -> SelfQa:
+    def _engine_for(self, project_id: str, repository: str) -> SelfQa:
         if self._token_for is None:
             return self.engine
-        try:
-            token = self._token_for(project_id) or ""
-        except Exception as e:  # noqa: BLE001 - no token is anonymous, not fatal
-            log.debug("no quality-gate token for %s: %s", project_id,
-                      type(e).__name__)
-            token = ""
-        if not token or token == self.engine.token:
+        token = self._token_for(project_id, repository) or ''
+        if token == self.engine.token:
             return self.engine
         # A fresh engine rather than mutating the shared one: two projects may
         # resolve different identities, and the engine is used concurrently.
@@ -573,26 +588,61 @@ class ProjectQualityGate:
                       total_timeout=self.engine.total_timeout, token=token)
 
     def run(self, *, repository: str, commit: str = "", project_id: str = "",
-            branch: str | None = None, checks: list[QaCheck] | None = None) -> QaReport:
+            branch: str | None = None, checks: list[QaCheck] | None = None, binding: dict | None = None) -> QaReport:
+        begin = time.time()
         mode = self.mode(project_id)
         now = time.monotonic()
         if mode == "off":
             return QaReport(verdict="skipped",
-                            reason="the project turned the quality gate off",
+                            reason="the project turned the quality gate off", policy_skip=True,
+                            binding=dict(binding or {}), started_utc=begin, finished_utc=time.time(),
                             repository=repository, commit=commit,
                             started_at=now, finished_at=now)
         if mode == "auto":
-            declared = self._declares(repository, branch=branch,
+            declared = self._declares(repository, branch=commit or branch,
                                       project_id=project_id)
             if declared is not True:
                 # ``False``: nothing declared, so `auto` has nothing to run.
                 # ``None``: the declaration could not be read - also nothing
-                # established. Either way the task verdict stands, unchanged.
+                # established. Only proven absence may leave the verdict unchanged.
                 why = ("the repository declares no checks (auto)" if declared is False
                        else "the repository's checks could not be read (auto)")
-                return QaReport(verdict="skipped", reason=why,
+                return QaReport(verdict="skipped" if declared is False else "blocked", reason=why, policy_skip=declared is False,
+                                binding=dict(binding or {}), started_utc=begin, finished_utc=time.time(),
                                 repository=repository, commit=commit,
                                 started_at=now, finished_at=now)
-        return self._engine_for(project_id).run(
+        if self._allow_revision is not None and not self._allow_revision(repository, commit):
+            return QaReport(verdict='blocked', reason='revision not authorized for this host runner',
+                            repository=repository, commit=commit, started_at=now, finished_at=now)
+        return self._engine_for(project_id, repository).run(
             repository=repository, commit=commit, checks=checks,
-            project_id=project_id, branch=branch)
+            project_id=project_id, branch=branch, **({"binding": binding} if binding else {}))
+
+
+def checked_receipt(qa: QaReport, binding: dict, repository: str, commit: str, before: float, after: float) -> dict:
+    """Build the signed projection, not a copy of a model-supplied transcript."""
+    if qa.repository != repository or qa.commit != commit:
+        raise ValueError('wrong evidence subject')
+    if qa.policy_skip and qa.verdict == 'skipped' and not qa.checks:
+        if qa.binding != binding or not before <= qa.started_utc <= qa.finished_utc <= after:
+            raise ValueError('stale policy skip')
+        return {'verdict': 'skipped', 'reason': qa.reason, 'policy_skip': True, 'binding': binding,
+                'started_utc': qa.started_utc, 'finished_utc': qa.finished_utc}
+    if qa.verdict != 'passed':
+        return {'verdict': 'failed' if qa.verdict == 'failed' else 'blocked', 'reason': redact_text(qa.reason)[:300]}
+    if (not all(binding.values()) or qa.binding != binding or not re.fullmatch('[0-9a-f]{40}', commit)
+            or qa.checked_sha != commit or not before <= qa.started_utc <= qa.finished_utc <= after):
+        raise ValueError('stale or unbound checkout')
+    if not qa.checks or not any(c.required for c in qa.checks):
+        raise ValueError('no required check')
+    checks = []
+    for c in qa.checks:
+        if (not c.argv or not isinstance(c.required, bool) or c.status not in ('passed', 'failed', 'error', 'timeout', 'skipped')
+                or (c.required and c.status != 'passed') or (c.status == 'passed' and (type(c.exit_code) is not int or c.exit_code != 0))
+                or (c.status == 'failed' and not c.exit_code)):
+            raise ValueError('contradictory check result')
+        projection = c.as_dict()
+        checks.append({k: projection[k] for k in ('name', 'argv', 'required', 'status', 'exit_code', 'duration_s', 'output_sha256')})
+    return {'verdict': 'passed', 'source': 'nexus:isolated-checkout', 'binding': binding,
+            'repository': repository, 'checked_sha': commit, 'started_utc': qa.started_utc, 'finished_utc': qa.finished_utc,
+            'checks': checks}

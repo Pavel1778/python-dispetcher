@@ -36,7 +36,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
-from .cloud_client import DEFAULT_CLOUD_BASE_URL, CloudClient, validate_base_url
+from .cloud_client import DEFAULT_CLOUD_BASE_URL, MAX_RESPONSE_BYTES, CloudClient, CloudError, _NoRedirect, validate_base_url
+from .net_guard import AddressPolicy, AddressRefused, check_url, guarded_handlers
 from .openhands_diagnostics import BLOCKED, FAILED, UNVERIFIED, VERIFIED, Report
 
 
@@ -168,6 +169,16 @@ class Inventory:
             self.api_key = getattr(self.cloud_client, "_api_key", None) or None
 
     # ------------------------------------------------------------------ http
+    @staticmethod
+    def _bounded_read(resp):
+        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ValueError('oversized inventory')
+        return raw
+
+    def _safe_open(self, req):
+        return urllib.request.build_opener(_NoRedirect, *guarded_handlers(AddressPolicy.from_env())).open(req, timeout=self.timeout)
+
     def _get(self, path: str, *, auth: bool = True) -> tuple[int | None, Any]:
         """A read-only GET. Returns ``(status, payload)``; never raises."""
         req = urllib.request.Request(self.base_url + path)
@@ -177,17 +188,17 @@ class Inventory:
         elif auth and getattr(self.cloud_client, "_api_key", None):
             req.add_header("Authorization", f"Bearer {self.cloud_client._api_key}")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read()
+            with self._safe_open(req) as resp:
+                raw = self._bounded_read(resp)
                 return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as e:
-            raw = e.read()
+            raw = e.read(65536)
             try:
                 payload = json.loads(raw) if raw else None
             except json.JSONDecodeError:
                 payload = None
             return e.code, payload
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (ValueError, CloudError, urllib.error.URLError, TimeoutError, OSError):
             return None, None
 
     # ------------------------------------------------------------- sections
@@ -344,19 +355,26 @@ class Inventory:
 
     def check_agent_server(self, report: Report) -> dict[str, Any]:
         """The agent-server surface, when one is reachable at a known URL."""
-        out: dict[str, Any] = {"url": self.agent_server_url}
+        out: dict[str, Any] = {"url": None}
         if not self.agent_server_url:
             report.add("agent_server", BLOCKED,
                        "no agent-server URL known (it lives inside the Cloud sandbox)",
                        out)
             return out
-        base = self.agent_server_url.rstrip("/")
+        try:
+            base = check_url(self.agent_server_url, resolve=False)
+        except AddressRefused:
+            report.add('agent_server', BLOCKED, 'agent-server address refused', out)
+            return out
+        out['url'] = base
         req = urllib.request.Request(base + "/openapi.json")
         if self.agent_server_key:
-            req.add_header("Authorization", f"Bearer {self.agent_server_key}")
+            req.add_header("X-Session-API-Key", self.agent_server_key)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                spec = json.loads(resp.read() or b"{}")
+            with self._safe_open(req) as resp:
+                spec = json.loads(self._bounded_read(resp) or b"{}")
+                if not isinstance(spec, dict):
+                    raise ValueError("malformed inventory")
         except Exception as e:  # noqa: BLE001
             report.add("agent_server", BLOCKED,
                        f"cannot read the agent-server openapi ({type(e).__name__})", out)

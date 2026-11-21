@@ -11,7 +11,7 @@ The four claims under test:
 
 * a passing gate leaves a verified task verified;
 * a failing required check downgrades it to ``completed_unverified`` (rework);
-* a skipped/blocked gate (no tooling) never turns a pass into a failure;
+* missing required tooling cannot be reported as a verified result;
 * with no gate configured the loop is exactly as before.
 """
 from __future__ import annotations
@@ -155,18 +155,30 @@ def test_a_failing_required_check_downgrades_the_task(lab, tmp_path):
     assert _settled(lab, run) != "completed_verified"
 
 
-def test_the_gate_records_its_verdict_as_evidence(lab, tmp_path):
+def test_the_gate_records_its_verdict_as_evidence(lab, tmp_path, monkeypatch):
+    from orchestration.lab_worker import build_evidence_service
+    from tests.test_lab_evidence import _signer_env
+    _signer_env(monkeypatch)
+    service = build_evidence_service(lab['store'])
     repo = _repo_with_tests(tmp_path, tests_pass=True)
     head = _git(repo, "rev-parse", "HEAD")
     run = _one_task_run(lab, repository=repo)
     sched = LabScheduler(lab["lab"], _Executor(), _Verifier(commit=head),
-                         quality_gate=SelfQa())
+                         quality_gate=SelfQa(), evidence=service)
     sched.run_until_done(str(run["id"]))
     task = lab["lab"].list_tasks("user:alice", lab["project"], run["id"])[0]
     entries = task.get("evidence") or []
     self_qa = [e["self_qa"] for e in entries if isinstance(e, dict) and "self_qa" in e]
     assert self_qa, entries
-    assert self_qa[-1]["verdict"] in ("passed", "skipped", "blocked")
+    receipt = self_qa[-1]
+    assert receipt['verdict'] == 'passed' and receipt['source'] == 'nexus:isolated-checkout'
+    assert receipt['binding']['id'] == str(task['id']) and receipt['binding']['run_id'] == str(run['id'])
+    assert receipt['checked_sha'] == head and receipt['checks'][0]['argv'] == ['python', 'check.py']
+    assert receipt['checks'][0]['exit_code'] == 0 and len(receipt['checks'][0]['output_sha256']) == 64
+    signed, = [e for e in service.list(project_id=lab['project']) if e['subject_id'] == str(task['id'])]
+    assert signed['body']['detail']['self_qa'] == receipt
+    assert service.reverify(signed['id'], project_id=lab['project'], expected_commit=head)['verdict'] == 'VERIFIED'
+    assert service.index_integrity(project_id=lab['project'])['intact']
 
 
 def test_no_gate_means_no_self_qa_evidence(lab, tmp_path):
@@ -181,7 +193,7 @@ def test_no_gate_means_no_self_qa_evidence(lab, tmp_path):
     assert not [e for e in entries if isinstance(e, dict) and "self_qa" in e]
 
 
-def test_a_gate_that_raises_does_not_change_the_verdict(lab, tmp_path):
+def test_a_gate_that_raises_cannot_verify_the_task(lab, tmp_path):
     repo = _repo_with_tests(tmp_path, tests_pass=True)
     run = _one_task_run(lab, repository=repo)
 
@@ -191,7 +203,7 @@ def test_a_gate_that_raises_does_not_change_the_verdict(lab, tmp_path):
 
     sched = LabScheduler(lab["lab"], _Executor(), _Verifier(), quality_gate=_Broken())
     sched.run_until_done(str(run["id"]))
-    assert _settled(lab, run) == "completed_verified"
+    assert _settled(lab, run) != "completed_verified"
 
 
 def test_the_gate_never_runs_for_a_task_without_a_repository(lab):
@@ -289,3 +301,37 @@ def test_the_studio_reports_whether_the_gate_is_active(monkeypatch):
         assert app_off.studio_status()["lab"]["selfqa_gate"] is False
     finally:
         app_off.stop()
+
+
+@pytest.mark.parametrize('change', ['sha', 'task', 'clock', 'status', 'exit', 'command', 'no_required'])
+def test_a_contradictory_check_receipt_cannot_pass(change):
+    from orchestration.nexus_selfqa import checked_receipt, QaReport, QaResult
+    subject = dict(project_id='project', run_id='run', id='task', lease_token='2', invocation='fresh')
+    sha = 'a' * 40
+    check = QaResult('test', True, 'passed', 0, argv=('test',))
+    qa = QaReport('passed', 'ok', repository='org/repo', commit=sha, checks=[check], binding=dict(subject), checked_sha=sha,
+                  started_utc=10, finished_utc=12)
+    if change == 'sha':
+        qa.checked_sha = 'b' * 40
+    elif change == 'task':
+        qa.binding['id'] = 'other'
+    elif change == 'clock':
+        qa.started_utc = 1
+    elif change == 'status':
+        check.status = 'skipped'
+    elif change == 'exit':
+        check.exit_code = 1
+    elif change == 'command':
+        check.argv = ()
+    else:
+        check.required = False
+    with pytest.raises(ValueError):
+        checked_receipt(qa, subject, qa.repository, sha, 9, 13)
+
+
+def test_corrupt_declaration_never_runs_a_subset_or_falls_back(tmp_path):
+    repo = _repo_with_tests(tmp_path, tests_pass=True)
+    (tmp_path / 'proj' / '.nexus-qa.json').write_text('{"checks":[{"run":["true"]},{"required":true}]}')
+    _git(repo, 'commit','-qam','malformed declaration')
+    report = SelfQa().run(repository=repo, commit=_git(repo,'rev-parse','HEAD'))
+    assert report.verdict == 'blocked' and report.checks == []

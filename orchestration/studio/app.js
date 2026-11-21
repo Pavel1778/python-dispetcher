@@ -2189,7 +2189,8 @@
              api(projectUrl('/executors')).then(null, function () { return {}; }),
              api(projectUrl('/repositories')).then(function (data) { return data.repositories || []; },
                                                    function () { return []; }),
-             loadGithubAccounts().then(null, function () { S.accounts.github = []; })
+             loadGithubAccounts().then(null, function () { S.accounts.github = []; }),
+             loadProfile(projectUrl('/execution-profile'))
            ]).then(function (parts) {
              return { context: parts[0], executors: parts[1], repositories: parts[2] };
            })
@@ -2197,6 +2198,7 @@
       : Promise.all([
           loadGithubAccounts().catch(function () { S.accounts.github = []; }),
           loadOpenhandsAccounts().catch(function () { S.accounts.openhands = []; }),
+          loadProfile('/api/openhands/execution-profile'),
           loadOpenhandsPool().catch(function () { S.pool = null; }),
           api('/api/studio').then(function (data) { S.status = data; }, function () {})
         ]);
@@ -2204,7 +2206,7 @@
       if (settingsTab !== tab || !document.contains(pane)) return;
       if (tab === 'project') {
         S.projectSettings = result || null;
-        pane.innerHTML = projectSettingsHtml(result);
+        pane.innerHTML = projectSettingsHtml(result) + (S.projectId ? executionProfileForm(projectUrl('/execution-profile')) : '');
       } else {
         pane.innerHTML = connectionsHtml();
       }
@@ -2296,6 +2298,73 @@
       (account.last_error ? '<small class="is-bad">' + esc(account.last_error) + '</small>' : '') + '</div>' +
       pill(account.state === 'active' ? (on ? 'active' : 'revoked') : account.state) +
       '<div class="card-actions">' + actions + '</div></div>';
+  }
+
+  // The model credential lives on the agent-server. Never ask for its value.
+  function loadProfile(path) {
+    S.executionProfiles = S.executionProfiles || {};
+    return api(path).then(function (data) { S.executionProfiles[path] = data; },
+      function (error) { S.executionProfiles[path] = {error: error.message}; });
+  }
+
+  var executionProfileFields = [
+    {name: 'provider', label: 'Провайдер', hint: 'openai'},
+    {name: 'model', label: 'Модель с префиксом', hint: 'openai/gpt-4o-mini'},
+    {name: 'base_url', label: 'Base URL модели (не URL OpenHands)', hint: 'HTTPS-адрес API провайдера'},
+    {name: 'key_ref', label: 'ID учётных данных модели (не ключ)', hint: 'ID provider connection в agent-server'},
+    {name: 'agent_profile_id', label: 'ID профиля агента', hint: 'UUID'},
+    {name: 'connection_id', label: 'ID подключения NEXUS', hint: 'пусто — подключение сервера'},
+    {name: 'params', label: 'Параметры модели (JSON)', hint: '{}'}
+  ];
+
+  function executionProfileForm(path) {
+    var data = (S.executionProfiles || {})[path] || {};
+    var row = data.profile || {}, cfg = row.desired || {}, obs = row.observation || {};
+    return '<details class="section execution-profile"><summary>Модель исполнителя OpenHands</summary>' +
+      '<p class="section-note">Для новых сессий. Смена ключа выполняется в provider connection OpenHands. Проверка конфигурации не означает, что задача выполнена.</p>' +
+      '<p role="status">' + esc(data.error ? 'Ошибка чтения: ' + data.error :
+        (row.scope ? row.scope + ' · rev ' + row.revision + ' · ' + obs.state : 'Профиль не сохранён')) +
+        (row.last_sync ? ' · ' + esc(row.last_sync) : '') + (obs.reason ? ' · ' + esc(obs.reason) : '') +
+        (obs.model_test ? ' · ' + esc(obs.model_test) : '') + '</p>' +
+      '<form class="execution-profile-form" data-path="' + esc(path) + '" autocomplete="off"><div class="grid-2">' +
+      executionProfileFields.map(function (f) { return '<label class="field"><span class="field-label">' + f.label + '</span>' +
+        '<input class="input" name="' + f.name + '" placeholder="' + esc(f.hint) + '" value="' +
+        esc(f.name === 'params' ? JSON.stringify(cfg.params || {}) : cfg[f.name] || '') + '"></label>'; }).join('') +
+      '</div><div class="row"><button class="btn" type="submit" value="save">Сохранить</button>' +
+      '<button class="btn" type="submit" value="sync">Сверить с OpenHands</button>' +
+      '<button class="btn" type="submit" value="test-model">Проверить модель</button></div>' +
+      '<p class="form-msg" role="status"></p></form></details>';
+  }
+
+  function submitProfile(form, action) {
+    var path = form.dataset.path, message = $('.form-msg', form), body = {};
+    if (action === 'save') {
+      try {
+        executionProfileFields.forEach(function (field) {
+          var value = form.elements[field.name].value.trim();
+          body[field.name] = field.name === 'params' ? JSON.parse(value || '{}') : (value || null);
+        });
+      }
+      catch (_) { message.textContent = 'Некорректный JSON параметров.'; return; }
+    }
+    var buttons = Array.from(form.querySelectorAll('button'));
+    buttons.forEach(function (b) { b.disabled = true; });
+    message.textContent = action === 'save' ? 'Сохранение…' : 'Проверка сохранённой версии…';
+    api(path + (action === 'save' ? '' : '/' + action), {method: 'POST', body: body, timeout: 60000})
+      .then(function (data) {
+        var row = data.profile;
+        message.textContent = row.scope + ' · rev ' + row.revision + ' · ' + row.observation.state +
+          (row.last_sync ? ' · ' + row.last_sync : '') + (row.observation.model_test ? ' · ' + row.observation.model_test : '');
+        form.previousElementSibling.textContent = message.textContent;
+      }, function (error) {
+        message.textContent = 'Ошибка: ' + error.message;
+        return api(path).then(function (data) {
+          var row = data.profile;
+          if (row) form.previousElementSibling.textContent = row.scope + ' · rev ' + row.revision + ' · ' +
+            row.observation.state + ' · ' + (row.observation.reason || '') + ' · ' + (row.last_sync || '');
+        }, function () { form.previousElementSibling.textContent = 'Состояние не подтверждено'; });
+      })
+      .then(function () { buttons.forEach(function (b) { b.disabled = false; }); });
   }
 
   function openhandsFormHtml() {
@@ -2410,6 +2479,7 @@
       '<p class="section-note">Подключения OpenHands, на которых выполняются задачи. Ключ хранится зашифрованным и не показывается. Несколько подключений дают переключение при недоступности одного из них.</p>' +
       (ohAccounts.length ? '<div class="cards">' + ohAccounts.map(openhandsCard).join('') + '</div>' : '') +
       '<details class="add"' + (ohAccounts.length ? '' : ' open') + '><summary>' + icon('plus', 'icon-sm') + 'Подключить OpenHands</summary>' + openhandsFormHtml() + '</details></div>' +
+      executionProfileForm('/api/openhands/execution-profile') +
       (ohAccounts.length ? openhandsPoolHtml() : '') +
       '<div class="section"><h3 class="section-title">' + icon('info', 'icon-sm') + 'Сервер</h3>' +
       '<p class="section-note">Задаётся переменными окружения сервера. Здесь видно только, что настроено: сами значения в браузер не передаются.</p>' +
@@ -3766,6 +3836,9 @@
       if (form.id === 'composer') {
         event.preventDefault();
         send($('#prompt').value);
+      } else if (form.classList.contains('execution-profile-form')) {
+        event.preventDefault();
+        submitProfile(form, event.submitter ? event.submitter.value : 'save');
       } else if (form.classList.contains('openhands-form')) {
         event.preventDefault();
         submitOpenhandsForm(form);

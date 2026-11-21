@@ -308,3 +308,35 @@ def test_a_revoked_connection_does_not_stop_the_sr_tick(store, cloud, service):
                    SrTools(store, None), client_for_workflow=boom)
     report = rt.tick()  # must not raise
     assert wf in report.unavailable
+
+
+@pytest.mark.parametrize('managed', [False, True], ids=['poll-accepted-start', 'enforce-project-profile'])
+def test_sr_create_and_poll_obey_the_selected_connections_profile(store, cloud, service, managed):
+    from orchestration.cloud_client import CloudClient
+    from orchestration.execution_profiles import ExecutionProfiles, ProfileBlocked
+    from orchestration.nexus_projects import ProjectService
+    from orchestration.sr_runtime import SrRuntime
+    from orchestration.sr_tools import SrTools
+    from tests.test_execution_profile_barriers import desired
+
+    account = service.add(PRINCIPAL, label='bound', api_key=KEY, base_url=cloud.base_url, transport='app')
+    project = str(ProjectService(store).create(PRINCIPAL, 'selected connection')['id'])
+    wid, _ = store.create_workflow_once('inspect', project_id=project)
+    selected = service.execution_client_for_account(PRINCIPAL, account['id'])
+    if managed:
+        ExecutionProfiles(store).save(PRINCIPAL, desired(connection_id=str(account['id'])), project_id=project)
+    cloud.cloud.start_polls_required = 1  # READY must be read on this connection, not the process client
+    with FakeCloudServer() as other:
+        process_client = CloudClient(other.base_url, api_key='other')
+        runtime = SrRuntime(store, process_client, SrTools(store, None), start_poll_interval=0.01,
+                            client_for_workflow=lambda _: selected)
+        if managed:
+            # A managed App start is unsupported. Passing no project here would
+            # incorrectly bypass the barrier and start an unmanaged session.
+            with pytest.raises(ProfileBlocked):
+                runtime.ensure_sr(wid)
+            assert not cloud.cloud.start_bodies
+        else:
+            cid = runtime.ensure_sr(wid)
+            assert cid == store.sr_for(wid)['sr_conversation_id'] and cid in cloud.cloud.conversations
+        assert other.cloud.calls == []

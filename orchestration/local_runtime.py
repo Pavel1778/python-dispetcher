@@ -103,8 +103,11 @@ class LocalCloudClient(OpenHandsClient):
         workspace_root: str = DEFAULT_WORKSPACE_ROOT,
         max_iterations: int = 50,
         llm_model: str | None = None,
+        store: PostgresStore | None = None,
     ):
         super().__init__(base_url, api_key=api_key, timeout=timeout)
+        from .execution_profiles import ExecutionProfiles
+        self.execution_profiles = ExecutionProfiles(store) if store is not None else None
         self.workspace_root = workspace_root
         self.max_iterations = max_iterations
         # When set, every conversation uses this model instead of the server's
@@ -130,6 +133,7 @@ class LocalCloudClient(OpenHandsClient):
         agent_profile_id: str | None = None,
         agent_type: str | None = None,
         plugins: list[dict[str, Any]] | None = None,
+        profile_scope=(None, None),
     ) -> StartTask:
         """Create a local conversation and return an already-``READY`` start task.
 
@@ -139,21 +143,35 @@ class LocalCloudClient(OpenHandsClient):
         """
         conversation_id = str(uuid.UUID(dispatch_id)) if dispatch_id else self._conversation_id(initial_message, title)
         working_dir = os.path.join(self.workspace_root, conversation_id)
-        os.makedirs(working_dir, exist_ok=True)
-        agent_settings = self.agent_settings()
-        if self.llm_model:
-            agent_settings = {**agent_settings, "llm": {**(agent_settings.get("llm") or {}), "model": self.llm_model}}
-        _view, created = self.create_conversation(
+        profile = self.execution_profiles.select(profile_scope, None, 'local') if self.execution_profiles else None
+        if profile:
+            source = self.profile_source(profile, requested_agent=agent_profile_id)
+            if selected_repository:
+                working_dir = self.execution_profiles.checkout(profile, profile_scope, dispatch_id, selected_repository,
+                                                              selected_branch, self._request)
+        else:
+            agent_settings = self.agent_settings()
+            if self.llm_model:
+                agent_settings = {**agent_settings, "llm": {**(agent_settings.get("llm") or {}), "model": self.llm_model}}
+            source = {'agent_settings': agent_settings}
+        if not (profile and selected_repository):
+            os.makedirs(working_dir, exist_ok=True)
+        expected = self.execution_profiles.session_expectation(profile, profile_scope, dispatch_id, working_dir) if profile else None
+        view, created = self.create_conversation(
             conversation_id=conversation_id,
             working_dir=working_dir,
             title=(title or initial_message[:60] or None),
             max_iterations=self.max_iterations,
-            agent_settings=agent_settings,
+            **source,
             client_tools=client_tools,
             # For durable lab sends the initial turn and the idempotent create
             # are one provider operation. Never POST another events/run on 200.
             **({'initial_message': initial_message, 'tags': tags} if dispatch_id else {}),
         )
+        if dispatch_id and view.conversation_id != conversation_id:
+            raise CloudUnavailable('ambiguous conversation receipt')
+        if expected:
+            self.confirm_session(conversation_id, expected, tags if dispatch_id else None)
         if not dispatch_id and tags and created:
             self._patch_tags(conversation_id, tags)
         if initial_message and not dispatch_id:
@@ -168,6 +186,13 @@ class LocalCloudClient(OpenHandsClient):
             sandbox_id=conversation_id,
             agent_server_url=self.base_url,
         )
+
+    def confirm_session(self, cid, expected, tags):
+        self.execution_profiles.check_session(self._request('GET', '/api/conversations/' + str(uuid.UUID(cid))), cid, expected, tags)
+
+    def profile_source(self, profile, *, test_model=False, requested_agent=None):
+        return self.execution_profiles.reconcile(profile, self._request, test_model=test_model,
+                                                 requested_agent=requested_agent)
 
     def _conversation_id(self, initial_message: str, title: str | None) -> str:
         # A deterministic id keeps a retried start from creating a second sandbox.
@@ -392,10 +417,11 @@ class LocalCloudClient(OpenHandsClient):
         The local server has no marketplaces or agent-profile store, so those
         blocks are empty; the LLM block is derived from ``agent_settings``.
         """
-        agent_settings = (self.get_settings() or {}).get("agent_settings") or {}
+        settings = self.get_settings() or {}
+        agent_settings = settings.get("agent_settings") or {}
         mcp = agent_settings.get("mcp_config") or {}
         return {
-            "llm_api_key_set": bool(agent_settings.get("llm")),
+            "llm_api_key_set": settings.get("llm_api_key_is_set") is True,
             "active_agent_profile_id": None,
             "mcp_servers": sorted(mcp.keys()) if isinstance(mcp, dict) else [],
             "registered_marketplaces": 0,
@@ -470,7 +496,7 @@ def build_local_stack(
     """
     client = LocalCloudClient(
         base_url or os.environ.get("LOCAL_AGENT_SERVER_URL", "http://127.0.0.1:60000"),
-        workspace_root=workspace_root,
+        workspace_root=workspace_root, store=store,
     )
     dispatcher = LocalCloudDispatcher(
         store, client, worker_id=worker_id, start_poll_interval=2.0,

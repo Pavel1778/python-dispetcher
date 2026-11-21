@@ -1,0 +1,63 @@
+{
+  "measured_revision": "722a19c4688fbb59678437e0883e179a76885574",
+  "same_rust_tree": true,
+  "rust_tree": "9106ba82874be77cdeb5d22fa16cf0858bfa2ad9",
+  "repository_lock_sha256": "97c591d764b0e4ea999e532bf473fa4d2781d6cec5db0f3d57d96c445d1e79f8",
+  "commands": [
+    {
+      "workspace": "repository",
+      "command": "cargo fmt --all --check",
+      "exit": 0,
+      "seconds": 0.082,
+      "first_error": null
+    },
+    {
+      "workspace": "repository",
+      "command": "cargo build --workspace --locked",
+      "exit": 101,
+      "seconds": 0.038,
+      "first_error": "error: no matching package named `serde` found"
+    },
+    {
+      "workspace": "repository",
+      "command": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
+      "exit": 101,
+      "seconds": 0.094,
+      "first_error": "error: no matching package named `serde` found"
+    },
+    {
+      "workspace": "repository",
+      "command": "cargo test --workspace --locked",
+      "exit": 101,
+      "seconds": 0.046,
+      "first_error": "error: no matching package named `serde` found"
+    },
+    {
+      "workspace": "path-patched three-crate subset, no SQLx",
+      "command": "cargo test --workspace --offline --locked",
+      "exit": 0,
+      "seconds": 20.424,
+      "first_error": null
+    },
+    {
+      "workspace": "path-patched three-crate subset, no SQLx",
+      "command": "cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings",
+      "exit": 0,
+      "seconds": 4.804,
+      "first_error": null
+    }
+  ],
+  "subset_rust_unit_tests": 30,
+  "unique_state_edges": {
+    "run": 49,
+    "workflow": 81,
+    "task": 100
+  },
+  "state_disagreements": 0,
+  "deliberate_run_self_loop_mutant_disagreements": 7,
+  "binaries": {
+    "nexus-rs": "79f25dd0317d5787d49e515bc4e1d83904628986008379e52f574e6c7303d623",
+    "state_edges": "b4280c95490c7c141063547588e1695f0888cf38466c8dc534ddb40053d24362"
+  },
+  "caveat": "Same decision source files; dependency paths from matching-version upstream source tags, alternate manifests/lock, CLI color disabled. Not registry-checksum or storage validation."
+}

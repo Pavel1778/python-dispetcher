@@ -619,6 +619,7 @@ class PostgresStore:
                                  "openhands_account_id", "external_conversation_id",
                                  "state"),
         "nexus_lab_workers": ("worker_id", "kind", "state", "heartbeat_at"),
+        "nexus_execution_profiles": ("scope", "project_id", "task_id", "desired", "revision", "updated_at", "observation", "last_sync"),
         "nexus_dispatch_intents": ("id", "task_id", "run_id", "state", "lease_token", "context",
                                    "start_id", "conversation_id", "repository", "branch"),
         "nexus_task_attestations_due": ("id", "run_id", "task_id", "lease_token", "payload"),

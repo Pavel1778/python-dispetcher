@@ -45,6 +45,7 @@ log = logging.getLogger("mcp_server")
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "nexus"
 SERVER_VERSION = "2.0.0"
+VERIFY_TOOLS = frozenset({"list_evidence", "verify_evidence", "get_execution_profile"})
 
 
 class McpError(Exception):
@@ -57,13 +58,14 @@ class McpServer:
     """The tool surface. One instance per process; ``principal`` is the caller."""
 
     def __init__(self, store: PostgresStore, principal: str, *,
-                 role: str = ROLE_OWNER):
+                 role: str = ROLE_OWNER, verify_project: str | None = None):
         self.store = store
         self.principal = principal
         #: The caller's role, which decides which tool scopes it carries. The
         #: stdio/HTTP entry points pass the authenticated user's role; the
         #: default is the owner, matching the owner-level machine bearer.
         self.role = role
+        self.verify_project = verify_project
         self.projects = ProjectService(store)
         self.tools: dict[str, Callable[[dict], Any]] = {
             "list_projects": self._list_projects,
@@ -83,6 +85,7 @@ class McpServer:
             "duplicate_run": self._duplicate_run,
             "list_run_task_outputs": self._list_run_task_outputs,
             "get_run_task_output": self._get_run_task_output,
+            "get_execution_profile": self._get_execution_profile,
             "list_project_executors": self._list_project_executors,
             "assign_project_executor": self._assign_project_executor,
         }
@@ -140,6 +143,8 @@ class McpServer:
                   {"project_id": _s("string"), "run_id": _s("string"),
                    "task_id": _s("string"), "event_id": _s("string")},
                   ["project_id", "run_id", "task_id", "event_id"]),
+            _tool("get_execution_profile", "Read the effective model and sync status for a member's project or task.",
+                  {"project_id": _s("string"), "task_id": _s("string")}, ["project_id"]),
             _tool("list_project_executors",
                   "List the OpenHands executors assigned to a project.",
                   {"project_id": _s("string")}, ["project_id"]),
@@ -210,7 +215,7 @@ class McpServer:
 
     def _dispatch_task(self, args: dict) -> Any:
         task = self.store.try_get_task(args["task_id"])
-        if task is None:
+        if task is None or not task.project_id:
             raise McpError(-32004, "not found")
         if task.project_id:
             self._member(task.project_id)
@@ -298,6 +303,15 @@ class McpServer:
 
         return build_cloud_client(self.store)
 
+    def _get_execution_profile(self, args: dict) -> Any:
+        from .execution_profiles import ExecutionProfiles
+        row = ExecutionProfiles(self.store).view(self.principal, project_id=args['project_id'], task_id=args.get('task_id'))
+        if not row:
+            return {'profile': None}
+        # No runtime credential handle or connection ID in the agent-facing projection.
+        return {'profile': {**{k: row['desired'][k] for k in ('model', 'provider', 'base_url', 'params')},
+                            'revision': row['revision'], 'status': row['observation']['state']}}
+
     def _list_project_executors(self, args: dict) -> Any:
         pid = args["project_id"]
         self._member(pid)
@@ -326,7 +340,15 @@ class McpServer:
     def _list_evidence(self, args: dict) -> Any:
         pid = args["project_id"]
         self._member(pid)
-        return {"evidence": self.store.list_evidence(project_id=pid)}
+        rows = self.store.list_evidence(project_id=pid)
+        if self.verify_project:
+            return {'evidence': [self._receipt_view(r) for r in rows]}
+        return {'evidence': rows}
+
+    @staticmethod
+    def _receipt_view(row):
+        # No command output, task text, paths, transcripts, key material, or write capability.
+        return {k: row.get(k) for k in ('id', 'project_id', 'subject_kind', 'subject_id', 'commit_sha', 'verdict')}
 
     def _verify_evidence(self, args: dict) -> Any:
         from .evidence_trust import EvidenceTrustEngine, Keyring, signer_from_env
@@ -336,14 +358,16 @@ class McpServer:
         self._member(pid)
         service = EvidenceService(
             self.store,
-            EvidenceTrustEngine(Keyring.from_env(), signer_from_env()),
+            EvidenceTrustEngine(Keyring.from_env(), None if self.verify_project else signer_from_env()),
         )
         rec = service.reverify(args["evidence_id"], project_id=pid,
-                               expected_commit=args.get("expected_commit"))
-        return {"evidence": rec}
+                               expected_commit=args.get("expected_commit"), persist=not self.verify_project)
+        return {"evidence": self._receipt_view(rec) if self.verify_project else rec}
 
     # ------------------------------------------------------------ dispatch
     def handle(self, method: str, params: dict) -> Any:
+        if not isinstance(params, dict):
+            raise McpError(-32602, 'params must be an object')
         if method == "initialize":
             return {
                 "protocolVersion": PROTOCOL_VERSION,
@@ -351,10 +375,14 @@ class McpServer:
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             }
         if method == "tools/list":
-            return {"tools": self.tool_schemas()}
+            return {"tools": [s for s in self.tool_schemas() if not self.verify_project or s['name'] in VERIFY_TOOLS]}
         if method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments") or {}
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                raise McpError(-32602, 'invalid tool arguments')
+            if self.verify_project and (name not in VERIFY_TOOLS or arguments.get('project_id') != self.verify_project):
+                raise McpError(-32003, 'not authorized by verification grant')
             fn = self.tools.get(name)
             if fn is None:
                 raise McpError(-32601, f"unknown tool: {name}")
@@ -413,6 +441,9 @@ def serve(server: McpServer, stdin: Any = None, stdout: Any = None) -> None:
         except json.JSONDecodeError:
             _write(stdout, {"jsonrpc": "2.0", "id": None,
                             "error": {"code": -32700, "message": "parse error"}})
+            continue
+        if not isinstance(message, dict):
+            _write(stdout, {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32600, 'message': 'invalid request'}})
             continue
         msg_id = message.get("id")
         method = message.get("method")

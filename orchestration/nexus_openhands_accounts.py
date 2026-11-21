@@ -765,6 +765,9 @@ class OpenHandsAccountService:
         key = self._decrypt(principal, account_id)
         cloud = self._client(cfg["base_url"], key)
         if cfg["transport"] == "app":
+            from .execution_profiles import ExecutionProfiles
+            cloud.execution_profiles = ExecutionProfiles(self.store)
+            cloud.scope = str(account_id)
             return cloud
         # ``scope``: this connection reuses only the sandboxes it started.
         return build_direct_client(self.store, cloud=cloud,

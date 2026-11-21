@@ -1,0 +1,38 @@
+{
+  "agent_server": "1.60.1",
+  "worker_bound_sessions_read_back": 2,
+  "agent_pids": [
+    97764,
+    97970
+  ],
+  "backend_pids": [
+    97873,
+    98201
+  ],
+  "worker_pids": [
+    97900,
+    98256
+  ],
+  "session_profiles": [
+    {
+      "model": "openai/gpt-4o-mini",
+      "base_url": "https://127.0.0.1:1/v1",
+      "max_output_tokens": 81,
+      "temperature": 0.2
+    },
+    {
+      "model": "openai/gpt-4o",
+      "base_url": "https://127.0.0.1:1/v1",
+      "temperature": 0.1,
+      "max_output_tokens": 56
+    }
+  ],
+  "revisions": [
+    1,
+    2
+  ],
+  "key_rotation": "native connection, stable ref",
+  "model_inference": "not successful (isolated unreachable provider)",
+  "candidate": "c6b1a9931ec86df66f018e30f48dac9a81a280b2",
+  "scope": "isolated upstream native agent-server processes and PostgreSQL; GitHub branch read served by a loopback fixture, assigned checkouts staged locally"
+}

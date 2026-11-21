@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -111,16 +112,58 @@ def _cloud_conversation_count(fake) -> int:
     return len(fake.cloud.conversations)
 
 
+def _assert_bound_once(app, fake, *workflow_ids):
+    # The HTTP handler may return starting=True if the background tick won the
+    # start lease. Observe the durable bind, not thread scheduling at HTTP 200.
+    deadline = time.monotonic() + 10
+    while True:
+        conversations = [app.store.sr_for(wid)["sr_conversation_id"] for wid in workflow_ids]
+        if all(conversations):
+            break
+        assert time.monotonic() < deadline, "workflow did not bind its Sr"
+        time.sleep(0.02)
+    assert len(set(conversations)) == len(workflow_ids)
+    assert set(conversations) == set(fake.cloud.conversations)
+    assert fake.cloud.calls.count(("POST", "/api/v1/app-conversations")) == len(workflow_ids)
+
+
 # ---------------------------------------------------------------------------
 # 1. One request, sent once, creates one task.
 # ---------------------------------------------------------------------------
-def test_one_request_creates_exactly_one_workflow(server, app, fake):
-    status, out = _post(f"http://127.0.0.1:{server.port}", "/api/workflows",
-                        {"goal": "Привет, создай новую сессию и назови ее: Тест1"})
-    assert status == 200
-    assert out["workflow_id"]
+@pytest.mark.parametrize("worker_first", [False, True], ids=["normal", "worker-owns-start"])
+def test_one_request_creates_exactly_one_workflow(server, app, fake, monkeypatch, worker_first):
+    claimed, release = threading.Event(), threading.Event()
+    if worker_first:
+        # Hold the real worker after it wins the actual PG lease but before its
+        # Cloud POST. The HTTP caller must return an in-progress workflow.
+        real_claim = app.store.claim_sr_start
+        real_ensure = app.runtime.ensure_sr
+
+        def claim(*args, **kwargs):
+            if threading.current_thread() is not app._loop:
+                assert claimed.wait(10), "worker did not acquire the lease"
+            return real_claim(*args, **kwargs)
+
+        def ensure(*args, **kwargs):
+            if threading.current_thread() is app._loop:
+                claimed.set()
+                assert release.wait(10), "HTTP caller did not return"
+            return real_ensure(*args, **kwargs)
+
+        monkeypatch.setattr(app.store, "claim_sr_start", claim)
+        monkeypatch.setattr(app.runtime, "ensure_sr", ensure)
+
+    try:
+        status, out = _post(f"http://127.0.0.1:{server.port}", "/api/workflows",
+                            {"goal": "Привет, создай новую сессию и назови ее: Тест1"})
+        assert status == 200 and out["workflow_id"]
+        if worker_first:
+            assert out["starting"] is True and out["sr_conversation_id"] is None
+            assert not fake.cloud.conversations
+    finally:
+        release.set()
     assert len(app.store.list_workflows()) == 1
-    assert _cloud_conversation_count(fake) == 1
+    _assert_bound_once(app, fake, out["workflow_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +179,7 @@ def test_same_idempotency_key_creates_one_workflow(server, app, fake):
     assert out1["workflow_id"] == out2["workflow_id"]
     assert out2["reused"] is True
     assert len(app.store.list_workflows()) == 1
-    assert _cloud_conversation_count(fake) == 1
+    _assert_bound_once(app, fake, out1["workflow_id"])
 
 
 def test_request_id_in_body_is_honoured(server, app, fake):
@@ -217,8 +260,7 @@ def test_concurrent_requests_with_one_key_create_one_workflow(server, app, fake)
     ids = {out.get("workflow_id") for _, out in results if out}
     assert len(ids) == 1, f"expected one workflow, got {ids}"
     assert len(app.store.list_workflows()) == 1
-    # At most one Sr conversation, however the race resolved.
-    assert _cloud_conversation_count(fake) <= 1
+    _assert_bound_once(app, fake, *ids)
 
 
 def test_concurrent_ticks_start_sr_only_once(app, fake):
@@ -254,7 +296,7 @@ def test_two_distinct_requests_with_the_same_text_are_both_created(server, app, 
 
     assert a["workflow_id"] != b["workflow_id"]
     assert len(app.store.list_workflows()) == 2
-    assert _cloud_conversation_count(fake) == 2
+    _assert_bound_once(app, fake, a["workflow_id"], b["workflow_id"])
 
 
 def test_no_key_still_creates_distinct_workflows(app, fake):

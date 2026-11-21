@@ -84,7 +84,11 @@ class Client:
         if idempotency_key:
             req.add_header("Idempotency-Key", idempotency_key)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            # A redirect can replay the owner bearer to another origin.
+            class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *args):
+                    raise CliError('NEXUS server redirected the request', EXIT['refused'])
+            with urllib.request.build_opener(RefuseRedirect).open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as e:
@@ -150,6 +154,34 @@ def _client(args: argparse.Namespace) -> Client:
 
 
 # --------------------------------------------------------------------- commands
+def cmd_execution_profile(args: argparse.Namespace) -> int:
+    from uuid import UUID
+    path = '/api/openhands'
+    try:
+        if args.project:
+            path = '/api/v1/projects/' + str(UUID(args.project))
+        if args.task:
+            if not args.project:
+                raise ValueError()
+            path += '/tasks/' + str(UUID(args.task))
+    except ValueError:
+        raise CliError('use a project UUID and optionally a task UUID', EXIT['usage']) from None
+    path += '/execution-profile'
+    client = _client(args)
+    if args.action == 'show':
+        result = client.get(path)
+    elif args.action == 'save':
+        # Read non-secret canonical JSON on stdin. No arbitrary file tool or argv credential.
+        try:
+            result = client.post(path, json.loads(sys.stdin.read(4097)))
+        except ValueError:
+            raise CliError('supply a canonical JSON object on stdin', EXIT['usage']) from None
+    else:
+        result = client.post(path + '/' + args.action, {})
+    _emit(args, result)
+    return EXIT['ok']
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     from . import __version__ as v
     _emit(args, {"version": v}, human=v)
@@ -373,7 +405,7 @@ def cmd_evidence_verify(args: argparse.Namespace) -> int:
     rec = out.get("evidence", {})
     verdict = rec.get("verdict")
     _emit(args, out, human=f"{args.evidence_id}: {verdict}")
-    return EXIT["ok"]
+    return EXIT["ok"] if verdict == "VERIFIED" else EXIT["conflict"]
 
 
 def cmd_agent_status(args: argparse.Namespace) -> int:
@@ -798,12 +830,18 @@ def cmd_qa_verify(args: argparse.Namespace) -> int:
     client = _client(args)
     if not args.project_id:
         raise CliError("--project is required", EXIT["usage"])
-    evidence = client.get(f"/api/v1/projects/{args.project_id}/evidence").get("evidence", [])
+    root = f'/api/v1/projects/{args.project_id}/evidence'
+    evidence = client.get(root).get('evidence', [])
     verdicts: dict[str, int] = {}
-    for e in evidence:
-        verdicts[e["verdict"]] = verdicts.get(e["verdict"], 0) + 1
-    ok = verdicts.get("FAILED", 0) == 0
-    data = {"count": len(evidence), "verdicts": verdicts, "ok": ok}
+    for entry in evidence:
+        rec = client.post(f"{root}/{entry['id']}/verify", {}).get('evidence', {})
+        value = rec.get('verdict') or 'UNVERIFIED'
+        verdicts[value] = verdicts.get(value, 0) + 1
+    # list_evidence is a window, not an unbounded or atomic chain scan. Do
+    # not attest completeness at its cap, or turn an empty list into proof.
+    complete = 0 < len(evidence) < 100
+    ok = complete and set(verdicts) == {'VERIFIED'}
+    data = {'count': len(evidence), 'verdicts': verdicts, 'ok': ok, 'complete_window': complete}
     _emit(args, data, human=f"{len(evidence)} record(s): {verdicts}")
     return EXIT["ok"] if ok else EXIT["conflict"]
 
@@ -1114,6 +1152,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="show an account's error history (failures and recoveries)")
     ohx.add_argument("--account", dest="account_id", required=True)
     ohx.set_defaults(func=cmd_openhands_account_errors)
+    ohp = oh.add_parser('profile', parents=[common], help='managed execution profile; save reads JSON on stdin')
+    ohp.add_argument('action', choices=['show', 'save', 'sync', 'test-model'])
+    ohp.add_argument('--project')
+    ohp.add_argument('--task', help='pending run task; requires --project')
+    ohp.set_defaults(func=cmd_execution_profile)
     ohd = oh.add_parser("diagnostics", parents=[common], help="run the diagnostic report")
     ohd.add_argument("--live", action="store_true",
                      help="also run the end-to-end conversation probe (creates and deletes one conversation)")

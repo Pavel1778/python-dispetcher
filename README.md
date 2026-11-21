@@ -4,6 +4,8 @@ Durable control-plane state for orchestrating OpenHands agent conversations,
 with project-scoped execution, a CLI, an MCP surface and an Ed25519 Evidence
 Trust Engine.
 
+**3.0 candidate (not a release):** [acceptance and blockers](docs/nexus-3.0/ACCEPTANCE.md) · [managed OpenHands profiles and verification grants](docs/nexus-3.0/OPERATIONS.md).
+
 A **project** owns repositories (many-to-many), tasks and workflows. A
 **workflow** holds a goal. A **Sr** (senior) OpenHands conversation plans it and
 delegates each unit of work to **Jr** tasks through client tools. A dispatcher

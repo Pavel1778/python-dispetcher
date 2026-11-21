@@ -462,6 +462,14 @@ class GitHubClient:
                     out["names_failed"].append(run["name"][:100])
         return out
 
+    def has_root_entry(self, full_name: str, name: str, *, ref: str) -> bool:
+        """A negative only from a complete, well-formed root listing at the verified revision."""
+        data = self._request(repo_path(full_name, 'git', 'trees', ref))
+        if (not isinstance(data, dict) or data.get('truncated') is not False or not isinstance(data.get('tree'), list)
+                or not all(isinstance(i, dict) and isinstance(i.get('path'), str) for i in data['tree'])):
+            raise GitHubError('incomplete repository tree')
+        return any(i['path'] == name for i in data['tree'])
+
     def list_tree(self, full_name: str, *, branch: str | None = None,
                   recursive: bool = True, limit: int = 500) -> list[dict[str, Any]]:
         """The repository tree at a branch. Read-only; used for context.

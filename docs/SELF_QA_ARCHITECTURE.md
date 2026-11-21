@@ -1,5 +1,8 @@
 # NEXUS Self-QA — Architecture (design)
 
+For the current worker (as distinct from this design), see [enforced policy, signed receipt and limitations](nexus-3.0/OPERATIONS.md#qa-evidence-and-an-independent-reader). A host scratch directory is not a sandbox.
+
+
 Status: **design only.** Nothing in this document is implemented yet. It
 specifies the "NEXUS Self-QA / Autonomous Quality Laboratory" (brief §5). No
 command listed here exists today; the CLI reference marks each one as

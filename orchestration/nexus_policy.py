@@ -80,6 +80,7 @@ MCP_TOOL_SCOPES: dict[str, str] = {
     "duplicate_run": SCOPE_RUN_CONTROL,
     "list_run_task_outputs": SCOPE_PROJECT_READ,
     "get_run_task_output": SCOPE_PROJECT_READ,
+    "get_execution_profile": SCOPE_PROJECT_READ,
     "list_project_executors": SCOPE_PROJECT_READ,
     "assign_project_executor": SCOPE_PROJECT_ADMIN,
 }

@@ -168,7 +168,8 @@ def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
     with (FakeCloudServer() as cloud, FakeGitHubServer(github) as github_server,
           FakeServer() as sandbox):
         def boot(**options):
-            app = App(DSN, poll_interval=0.2, token=TOKEN, **{**app_options, **options})
+            app = App(DSN, poll_interval=0.2, token=TOKEN, github=GitHubClient(
+                base_url=github_server.base_url, token=SERVER_GITHUB_TOKEN), **{**app_options, **options})
             app.client = CloudClient(cloud.base_url, api_key="cloud-key-value", timeout=10.0)
             if transport == "direct":
                 cloud.cloud.agent_server_url = sandbox.base_url
@@ -178,8 +179,6 @@ def studio_stack(monkeypatch, *, transport: str = "app", **app_options):
             app.dispatcher.client = app.client
             app.runtime.client = app.client
             app.verifier.client = app.client
-            app.github = GitHubClient(base_url=github_server.base_url,
-                                      token=SERVER_GITHUB_TOKEN)
             app.github_accounts._client_factory = lambda token: GitHubClient(
                 base_url=github_server.base_url, token=token)
             app.providers = ProviderCascade([GroqProvider(

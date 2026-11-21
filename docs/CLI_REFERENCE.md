@@ -84,7 +84,7 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | Command | Backed by |
 |---|---|
 | `nexus evidence list --project <id>` | `GET /api/v1/projects/{id}/evidence` |
-| `nexus evidence verify <evidence_id> --project <id> [--expected-commit]` | `POST /api/v1/projects/{id}/evidence/{evidence_id}/verify` |
+| `nexus evidence verify <evidence_id> --project <id> [--expected-commit]` | `POST /api/v1/projects/{id}/evidence/{evidence_id}/verify`; non-VERIFIED exits 5 |
 
 ### Agent / QA
 
@@ -92,7 +92,7 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 |---|---|
 | `nexus agent status` | `GET /api/capabilities`, `GET /api/health` |
 | `nexus qa report` | `GET /api/dashboard`, `GET /api/system` |
-| `nexus qa verify --project <id>` | evidence verdicts (exit 5 if any FAILED) |
+| `nexus qa verify --project <id>` | re-verify returned records; exit 5 if empty, at the 100-record cap, or any verdict is not VERIFIED |
 
 ### Autonomous runs
 
@@ -107,6 +107,8 @@ The token is attached as `Authorization: Bearer ...` and never printed.
 | `nexus run output <run_id> <task_id> <event_id> --project <id> [--out FILE]` | `GET …/runs/{r}/tasks/{t}/outputs/{event}` |
 
 ### OpenHands accounts
+
+Managed model selection is separate from account administration. `nexus openhands profile show|save|sync|test-model [--project UUID [--task UUID]]` reads or reconciles the same selection as Studio. `save` reads JSON from stdin, not a secret from argv. Syntax, authority and supported runtime: [operator contract](nexus-3.0/OPERATIONS.md). A successful configuration sync is not model execution.
 
 | Command | Backed by |
 |---|---|

@@ -273,6 +273,7 @@ class CloudDispatcher:
             selected_branch=task.selected_branch,
             title=(task.goal[:60] or None),
             tags={key: value},
+            **({'profile_scope': (task.project_id, None)} if getattr(self.client, 'execution_profiles', None) else {}),
         )
         # Record the start task before polling so a crash here is recoverable.
         self.store.bind_conversation(

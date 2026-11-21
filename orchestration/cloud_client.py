@@ -101,7 +101,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise CloudError(f"refusing to follow redirect ({code}) to {newurl!r}")
+        raise CloudError(f"refusing to follow redirect ({code})")
 
 
 class CloudAuthError(CloudError):
@@ -253,6 +253,8 @@ class CloudClient:
         #: this client opens is then checked against it (``net_guard``). The
         #: server's own client, configured from its environment, has none.
         self.address_policy = address_policy
+        self.execution_profiles = None
+        self.scope = ""
 
     def _opener(self) -> urllib.request.OpenerDirector:
         """An opener that never follows a redirect.
@@ -307,7 +309,7 @@ class CloudClient:
                 raise CloudNotFound(f"{method} {path} -> 404") from e
             if e.code == 422:
                 raise CloudValidationError(
-                    f"{method} {path} -> 422: {json.dumps(payload)[:300]}"
+                    f"{method} {path} -> 422"
                 ) from e
             if e.code == 429:
                 # Rate limit / daily quota: transient by nature, must not burn an
@@ -318,13 +320,16 @@ class CloudClient:
                     retry_after: float | None = float(e.headers.get("Retry-After", ""))
                 except (TypeError, ValueError):
                     retry_after = None       # absent, or an HTTP date: not used
+                # Keep actionable, known reasons without echoing arbitrary response bodies or codes.
+                daily = code == 'daily_conversation_limit_reached'
+                reason = 'daily conversation limit' if daily else ('capacity full' if detail == 'capacity full' else 'rate limited')
                 raise CloudRateLimited(
-                    f"{method} {path} -> 429: {json.dumps(payload, ensure_ascii=False)[:300]}",
-                    code=code if isinstance(code, str) else None, retry_after=retry_after,
+                    f"{method} {path} -> 429: {reason}",
+                    code='daily_conversation_limit_reached' if daily else None, retry_after=retry_after,
                 ) from e
             if e.code >= 500:
                 raise CloudUnavailable(f"{method} {path} -> {e.code}") from e
-            raise CloudError(f"{method} {path} -> {e.code}: {json.dumps(payload)[:200]}")
+            raise CloudError(f"{method} {path} -> {e.code}")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise CloudUnavailable(f"{method} {path}: {type(e).__name__}") from e
 
@@ -343,6 +348,7 @@ class CloudClient:
         agent_profile_id: str | None = None,
         agent_type: str | None = None,
         plugins: list[dict[str, Any]] | None = None,
+        profile_scope=(None, None),
     ) -> StartTask:
         """``POST /api/v1/app-conversations`` -> a start task to poll.
 
@@ -363,6 +369,8 @@ class CloudClient:
         account already uses", which is the desired default for reusing the
         existing Cloud workspace rather than reconfiguring it.
         """
+        if self.execution_profiles is not None:
+            self.execution_profiles.select(profile_scope, self.scope, 'app')
         body: dict[str, Any] = {
             "initial_message": {
                 "role": "user",

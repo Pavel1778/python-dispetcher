@@ -143,10 +143,12 @@ def test_the_same_scan_is_slow_with_the_server_default(monkeypatch):
 
     with psycopg.connect(DSN) as plain:
         with plain.cursor() as cur:
-            cur.execute("show jit")
-            server_default = cur.fetchone()[0]
+            cur.execute("SELECT current_setting('jit'), pg_jit_available()")
+            server_default, available = cur.fetchone()
     if server_default == "off":
         pytest.skip("the server has JIT off already; the override cannot change it")
+    if not available:
+        pytest.skip("this PostgreSQL build has no JIT provider; no compilation to time")
 
     monkeypatch.setenv("NEXUS_DB_JIT", "on")
     store = PostgresStore(DSN)

@@ -156,7 +156,7 @@ def test_mcp_initialize_and_tool_list(app):
         "list_evidence", "verify_evidence",
         "list_runs", "get_run", "cancel_run", "restart_run", "duplicate_run",
         "list_run_task_outputs", "get_run_task_output",
-        "list_project_executors", "assign_project_executor",
+        "list_project_executors", "assign_project_executor", "get_execution_profile",
     }
 
 
@@ -233,7 +233,7 @@ def test_mcp_stdio_round_trip(app):
     serve(server, stdin=stdin, stdout=stdout)
     lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nexus"
-    assert len(lines[1]["result"]["tools"]) == 19
+    assert len(lines[1]["result"]["tools"]) == 20
 
 
 def test_mcp_parse_error_is_reported(app):
@@ -271,7 +271,7 @@ def test_mcp_http_initialize_and_tools(base):
     assert status == 200
     assert body["result"]["serverInfo"]["name"] == "nexus"
     status, body = _mcp_post(base, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert len(body["result"]["tools"]) == 19
+    assert len(body["result"]["tools"]) == 20
 
 
 def test_mcp_http_project_isolation(base, app):
@@ -326,3 +326,66 @@ def test_mcp_registers_restart_and_duplicate(app):
     from orchestration.nexus_policy import MCP_TOOL_SCOPES, SCOPE_RUN_CONTROL
     assert MCP_TOOL_SCOPES["restart_run"] == SCOPE_RUN_CONTROL
     assert MCP_TOOL_SCOPES["duplicate_run"] == SCOPE_RUN_CONTROL
+
+
+def test_profile_cli_uses_authenticated_http_and_distinguishes_blocked(base, monkeypatch, capsys):
+    from tests.test_execution_profile_barriers import desired
+    monkeypatch.setenv('NEXUS_URL', base)
+    monkeypatch.setenv('NEXUS_TOKEN', TOKEN)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps(desired())))
+    assert cli.main(['openhands','profile','save','--json']) == 0
+    assert json.loads(capsys.readouterr().out)['profile']['revision'] == 1
+    assert cli.main(['openhands','profile','sync','--json']) == cli.EXIT['conflict']
+    assert TOKEN not in capsys.readouterr().out
+    assert cli.main(['openhands','profile','show','--json']) == 0
+    assert json.loads(capsys.readouterr().out)['profile']['observation']['state'] == 'blocked'
+
+
+def test_verifier_capability_checks_current_membership_commit_and_expiry(base, app, monkeypatch):
+    import secrets
+    import time
+    from orchestration.evidence_trust import EvidenceTrustEngine, Keyring
+    from orchestration.nexus_evidence import EvidenceService
+    from orchestration.verification_grant import VerificationGrant
+    from tests.test_lab_evidence import _signer_env
+
+    actor, token = 'agent:reviewer', secrets.token_hex(32)
+    pid = str(app.projects.create(actor,'probe')['id'])
+    foreign = str(app.projects.create(actor,'not delegated')['id'])  # membership alone is insufficient
+    signer = _signer_env(monkeypatch)
+    record = EvidenceService(app.store,EvidenceTrustEngine(Keyring.from_env(),signer)).record(
+        subject_kind='project', subject_id=pid, project_id=pid, commit_sha='a'*40, detail={'report':'private details'})
+    for k,v in [('TOKEN',token),('PRINCIPAL',actor),('PROJECT',pid),('EXPIRES',str(int(time.time()+60)))]:
+        monkeypatch.setenv('NEXUS_MCP_VERIFY_'+k,v)
+    app.verification_grant = VerificationGrant.from_env(owner_token=TOKEN)
+    def send(method,params):
+        return _mcp_post(base, {'jsonrpc':'2.0','id':1,'method':method,'params':params}, token)
+    def call(name, **args):
+        return send('tools/call', {'name':name, 'arguments':args})[1]
+    assert {s['name'] for s in send('tools/list',{})[1]['result']['tools']} == {
+        'list_evidence','verify_evidence','get_execution_profile'}
+    assert call('list_evidence',project_id=foreign)['error']['code'] == -32003
+    assert call('cancel_run',project_id=pid)['error']['code'] == -32003
+    for sha,expected in [('a'*40,'VERIFIED'),('b'*40,'UNVERIFIED')]:
+        answer = call('verify_evidence',project_id=pid,evidence_id=record['id'],expected_commit=sha)
+        payload = json.loads(answer['result']['content'][0]['text'])
+        assert payload['evidence']['verdict'] == expected and 'private details' not in json.dumps(payload)
+    assert app.store.list_evidence(project_id=pid)[0]['verdict'] == 'VERIFIED'  # no verifier write
+    req = urllib.request.Request(base+'/api/v1/projects',headers={'Authorization':'Bearer '+token})
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        urllib.request.urlopen(req)
+    assert denied.value.code == 401
+    with app.store._tx() as c:
+        c.execute('DELETE FROM nexus_project_members WHERE project_id=%s AND principal=%s',(pid,actor))
+    assert call('list_evidence',project_id=pid)['error']['code'] == -32004
+    monkeypatch.setenv('NEXUS_MCP_VERIFY_EXPIRES','1')
+    app.verification_grant = VerificationGrant.from_env(owner_token=TOKEN)
+    assert send('tools/list',{})[0] == 401
+
+
+def test_empty_evidence_is_not_qa_success(base,app,monkeypatch,capsys):
+    project = cli.Client(base,TOKEN).post('/api/v1/projects',{'name':'empty'})['project']['id']
+    monkeypatch.setenv('NEXUS_URL',base)
+    monkeypatch.setenv('NEXUS_TOKEN',TOKEN)
+    assert cli.main(['qa','verify','--project',project,'--json']) == cli.EXIT['conflict']
+    assert json.loads(capsys.readouterr().out)['ok'] is False
