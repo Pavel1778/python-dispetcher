@@ -93,7 +93,7 @@ def _claim_all(store: PostgresStore, run_id: str, workers: int) -> list[dict]:
     return [row for mine in results for row in mine]
 
 
-@pytest.mark.parametrize("workers", [1, 4, 16, 64])
+@pytest.mark.parametrize("workers", [1, 2, 4, 8, 16, 32, 64])
 def test_no_task_is_claimed_twice_and_none_is_lost(store, workers):
     run_id, _project = _run(store, n_tasks=40)
     claims = _claim_all(store, run_id, workers)

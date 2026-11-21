@@ -611,6 +611,18 @@ a:hover { text-decoration: underline; }
 .archive-list { list-style: none; margin: 0; padding: 0 14px 14px; display: grid; gap: 6px; }
 .archive-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .archive-row .dot { flex: none; }
+
+/* The evidence viewer: one signed record per row, its verdict, and a re-check.
+   The subject is the widest part, so it is the one that wraps; the badge, the
+   time and the button stay on their line so a verdict is never pushed out of
+   sight by a long repository name. */
+.evidence-list { list-style: none; margin: 0; padding: 0 14px 14px; display: grid; gap: 6px; }
+.evidence-row { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.evidence-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.evidence-line .dot { flex: none; }
+.evidence-subject { flex: 1 1 8em; min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--text); }
+.evidence-when { flex: none; font-size: 12px; color: var(--text-3); }
+.evidence-detail { padding: 4px 2px 0 16px; }
 .archive-title { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .archive-when { flex: none; font-size: 12px; color: var(--text-3); }
 

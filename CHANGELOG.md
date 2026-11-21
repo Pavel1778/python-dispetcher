@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — the evidence viewer: the Trust Engine in the Studio
+
+### Added
+
+- **The Evidence Trust Engine is visible in the Studio.** The Agent tab has a
+  «Доказательства» section: it lists the project's signed records (repository,
+  short commit, verdict, time) and «Проверить» re-verifies one against the
+  trusted keyring, showing the server's own verdict and reason under the row.
+  The screen decides no verdict; it calls `GET …/evidence` and
+  `POST …/evidence/{id}/verify`, which already existed and are tested.
+  (`studio/app.js`, `studio/app.css`; tests `tests/test_evidence_viewer.py` and
+  the Chromium journey `test_the_evidence_viewer_lists_records_and_re_verifies_one`.)
+- **`/api/studio` reports whether records can be signed** (`lab.evidence`, a
+  boolean: signer and keyring present). An empty evidence list can then say
+  *why* it is empty — no signer means nothing is recorded — instead of reading
+  as "nothing was verified". Presence only; no key, key id or path is returned.
+
+### Changed
+
+- The four whole-dict assertions of `/api/studio`'s `lab` object name the new
+  `evidence` field (the trap AGENTS.md warns about): they expect `False` in
+  those fixtures, which configure no signer.
+
 ## Unreleased — the Self-QA gate is per project, and it works on a real repository
 
 ### Added
