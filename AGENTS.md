@@ -860,9 +860,11 @@ There are no dashboards, section tabs or forms outside that.
   - an untitled conversation is named after its first message; `PATCH
     .../conversations/{id}` accepts `archived` (the only way to restore one).
 - **Features that have routes but no screen now:** lab file uploads, workspaces
-  and voice notes; evidence; plan approval; GitHub create-repository and
+  and voice notes; plan approval; GitHub create-repository and
   visibility confirmations; the legacy task form and the queue; the system
   diagnostics page; the allowlist editor; OpenHands account management.
+  Evidence is **no longer** on this list: the Agent tab lists a project's signed
+  records and re-verifies one (see "The evidence viewer" below).
 - **Limits, stated in the UI where they bite.** Stored OpenHands accounts are not
   used for execution: workflows run under the server `OPENHANDS_API_KEY`
   (nothing calls `openhands_accounts.client_for_project`). Files are read-only
@@ -3010,3 +3012,96 @@ started, never deletes user data, and `restore` proves a dump loads into a
 `backups/` is gitignored: a dump is data, never a commit. DSN rewriting handles
 both URL and libpq `key=value` forms (`with_dbname`), because the test suite's
 per-process isolation passes the latter.
+
+## NEXUS 3.0 mission (2026-11-20, this session)
+
+Worked on `nexus/3.0-mission` (local, from `main` `20eb8bf`; not pushed/merged).
+Facts and invariants a future change must keep:
+
+- **The brief's "two competing Rust implementations" do not exist.** `nexus-store`,
+  `nexus-worker`, `nexus-api` and the branch `nexus/3.0-foundation` were never in
+  this repository (checked on every ref). Only `nexus-domain`, `nexus-core`,
+  `nexus-storage`, `nexus-cli` exist; `nexus-storage` is the one canonical
+  storage crate. See `docs/nexus-3.0/ARCHITECTURE_RECONCILIATION.md`. Do not
+  "delete a duplicate" that is not there.
+- **OpenHands model/Base URL persistence had two real root causes, both fixed:**
+  (1) `OpenHandsAccountService.add` upserted `default_model=EXCLUDED.default_model`,
+  so a reconnect that omitted the model wiped it; an omitted field now keeps its
+  stored value (also `transport` and the limits), and the account-add route no
+  longer defaults `transport` to `direct`. (2) `SrRuntime` drove every `code`
+  workflow on the process-wide client; it now resolves the client per workflow
+  from the project's bound account (`App._workflow_client`), falling back to the
+  process client only on `NotFound` (no bound account), never to a *different*
+  account. Tests: `tests/test_openhands_config_persistence.py`.
+- **One bad connection must not kill the Sr loop.** `SrRuntime.tick` and
+  `_retry_sr_starts` now catch `ValueError`/`NotFound` from the resolver (revoked
+  or vanished account) and report/block that workflow instead of aborting the
+  pass for every workflow.
+- **`tools/parity_matrix.py` is the honest parity counter** (282 distinct
+  Python↔Rust comparisons, 0 disagree), not a count of test functions. It skips a
+  duplicated `(from,to)` pair, exits non-zero on any disagreement, and is gated by
+  `tests/test_parity_matrix_tool.py` (≥ 100 comparisons).
+- **`main` shipped with Rust fmt/clippy failing** (10 files unformatted,
+  `manual_clamp`, `manual_range_contains`); CI never ran them. Fixed and gated:
+  `.github/workflows/tests.yml` now runs `cargo fmt --all --check` and
+  `cargo clippy -D warnings`. Do not remove those steps.
+- **`tests/test_concurrent_claims.py` is the real claim-concurrency proof**
+  (1/4/16/64 workers unconditional, 128 with `NEXUS_STRESS=1`). It lifts
+  `NEXUS_LAB_MAX_ACTIVE_TASKS` to 0 because the default 8 caps in-flight tasks
+  and would otherwise stop a 40-task sweep at 8. Mutation-proven: re-allowing
+  `dispatched` in `task_due.sql` makes the 64-worker case fail with 3× claims.
+- **Live OpenHands execution was verified** (`OpenHandsDiagnostics(live=True)`:
+  17 VERIFIED incl. `conversation_create`, `run_command`, `workspace_rw`,
+  `task_completion`). A **push-verified** (`completed_verified`) live task is
+  BLOCKED: the live account has no GitHub provider token
+  (`provider_tokens_set: {'github': False}`). That is a capability limit, not a
+  defect — do not fabricate a completion for it.
+- **A throwaway `NEXUS_SECRET_KEY` is needed to store an account**; changing it
+  makes stored keys unreadable (`InvalidToken`). The test DB is per-process and
+  dropped at session end, so a stored account does not persist across runs.
+- Final verified suite (all deps present): **2161 passed, 9 skipped, 0 failed**;
+  `cargo test --workspace` 30 passed; `cargo fmt`/`clippy` clean; `ruff` clean.
+  The 9 skips are environmental (Android SDK, mingw-w64, pooler DSN, section F).
+- Docs for this increment live in `docs/nexus-3.0/` (12 files named by the brief).
+
+## The evidence viewer: the Trust Engine made visible (this session)
+
+Roadmap P1 #3 ("studio screens for backend-only capabilities") started with the
+gap that matters most: the Evidence Trust Engine is what makes a "verified"
+result mean anything, and until now an operator could not see a record without
+the CLI. The routes existed and were tested; the screen did not.
+
+- **`GET …/evidence` and `POST …/evidence/{id}/verify` are the whole contract.**
+  The screen calls them and nothing else; it decides no verdict. The badge is the
+  record's stored `verdict`, and «Проверить» shows the **server's** answer
+  (`verification_detail.reason`) under the row.
+- **The four verdicts map to the existing pills** (`VERIFIED`→ok,
+  `UNVERIFIED`→warn, `FAILED`→bad, `BLOCKED`→idle). Do not invent a fifth
+  colour: the engine's vocabulary is `evidence_trust.VERIFIED/UNVERIFIED/
+  FAILED/BLOCKED` and a record that is merely stored is `UNVERIFIED`, never ok.
+- **An empty list says *why* it is empty.** `/api/studio` now reports
+  `lab.evidence` (a bool: signer **and** keyring present). Without a signer
+  nothing is ever recorded, so "no records" must not read as "nothing was
+  verified". Presence only — never a key, a key id or a path.
+- **`lab` gained a field, so the four whole-dict assertions had to name it**
+  (`tests/test_lab_inline.py` ×3, `tests/test_studio_api.py` ×1) — the exact trap
+  the earlier section warns about. They expect `"evidence": False` in those
+  fixtures (no signer configured), never a subset comparison.
+- **The engine is stricter than it looks.** An unknown `key_id` is `UNVERIFIED`
+  ("signing key … is not trusted"); a *trusted* `key_id` whose signature does
+  not verify is `FAILED`. Both are tested
+  (`test_a_record_signed_by_an_unknown_key_is_unverified`,
+  `test_a_trusted_key_id_with_the_wrong_key_is_failed`); do not collapse them.
+- **The row layout keeps the verdict on its line.** `.evidence-subject` is the
+  only flexible part; the badge, the time and the button are `flex: none`, so a
+  long repository name cannot push a verdict out of sight on a phone.
+- Tests: `tests/test_evidence_viewer.py` (9 cases: the list, project isolation,
+  auth, a trusted signature → VERIFIED, an unknown key → UNVERIFIED, a wrong key
+  → FAILED, a tampered row → FAILED, a foreign record → 404, and
+  `/api/studio` with and without a signer) and the Chromium journey
+  `test_the_evidence_viewer_lists_records_and_re_verifies_one`. Mutation-proven:
+  making `check-evidence` a no-op fails the journey, and hard-coding
+  `lab.evidence = True` fails the no-signer case.
+- Still backend-only after this (the rest of P1 #3): File Lab uploads,
+  workspaces and voice notes, plan approval, GitHub create/visibility
+  confirmations, the allowlist editor, the diagnostics page.

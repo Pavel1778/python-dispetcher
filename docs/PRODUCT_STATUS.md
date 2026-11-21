@@ -18,6 +18,7 @@ code, exercised against the local stand-ins) · **PARTIAL** · **BLOCKED**
 | Restart / duplicate a run; cancel; retry failed tasks | VERIFIED | `tests/test_run_history.py`, `test_cancel_lock_order.py` |
 | Project isolation (404, never 403, at every boundary) | VERIFIED | `tests/test_project_isolation.py`, `test_project_isolation_routes.py` |
 | Evidence Trust Engine (Ed25519, re-verifiable) | VERIFIED | `tests/test_evidence_trust.py`, `test_lab_evidence.py` |
+| Evidence viewer in the Studio (list + re-verify) | VERIFIED | `tests/test_evidence_viewer.py`, the Chromium journey in `test_browser_e2e.py` |
 | Self-QA engine (isolated checkout, real exit codes) | VERIFIED | `tests/test_selfqa.py` |
 | **Self-QA as an automatic run gate** | VERIFIED | `tests/test_quality_gate.py`, `test_quality_gate_policy.py`; per project (`auto`/`on`/`off`, default `auto`), `NEXUS_SELFQA_GATE` overrides deployment-wide |
 | Multi-account pool, failover, load balancing | IMPLEMENTED | `tests/test_openhands_pool.py`, `test_openhands_failover.py` |

@@ -150,17 +150,25 @@ class OpenHandsAccountService:
 
     # ------------------------------------------------------------------- add
     def add(self, principal: str, *, label: str, api_key: str,
-            base_url: str | None = None, transport: str = "direct",
+            base_url: str | None = None, transport: str | None = None,
             default_model: str | None = None, make_default: bool = False,
             max_concurrent_tasks: int | None = None,
             daily_conversation_limit: int | None = None) -> dict:
-        """Verify the key, then store it encrypted. Returns a key-free view."""
+        """Verify the key, then store it encrypted. Returns a key-free view.
+
+        Re-adding a connection that already exists (a reconnect, or the same
+        form submitted again) updates it in place. A field the caller did not
+        name is **left as it was**: a reconnect that omits ``default_model``
+        must not clear the model the operator saved, and the same holds for the
+        transport, the base URL and the limits. Only an explicit value changes a
+        field; use :meth:`edit` to clear one deliberately.
+        """
         label = _text(label, "label", maximum=120)
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")
         api_key = api_key.strip()
         base_url = self._url(base_url)
-        if transport not in ("direct", "app"):
+        if transport is not None and transport not in ("direct", "app"):
             raise ValueError("transport must be 'direct' or 'app'")
         if default_model is not None:
             default_model = _text(default_model, "default_model", maximum=200,
@@ -186,15 +194,19 @@ class OpenHandsAccountService:
                 " max_concurrent_tasks, daily_conversation_limit, health, health_checked_at, "
                 " connection_ok, last_connection_at, api_version, compatibility, "
                 " compatibility_detail) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s,%s,'healthy',now(),true,now(),"
-                "        %s,%s,%s) "
+                "VALUES (%s,%s,%s,COALESCE(%s,'direct'),%s,%s,%s,%s,now(),%s,%s,%s,"
+                "        'healthy',now(),true,now(),%s,%s,%s) "
                 "ON CONFLICT (principal, label) DO UPDATE SET "
-                "  base_url=EXCLUDED.base_url, transport=EXCLUDED.transport, "
-                "  default_model=EXCLUDED.default_model, "
+                # A field the caller did not name keeps its stored value; only an
+                # explicit value overwrites it (see the docstring).
+                "  base_url=EXCLUDED.base_url, "
+                "  transport=COALESCE(%s, nexus_openhands_accounts.transport), "
+                "  default_model=COALESCE(%s, nexus_openhands_accounts.default_model), "
                 "  api_key_encrypted=EXCLUDED.api_key_encrypted, "
                 "  api_key_hint=EXCLUDED.api_key_hint, "
-                "  max_concurrent_tasks=EXCLUDED.max_concurrent_tasks, "
-                "  daily_conversation_limit=EXCLUDED.daily_conversation_limit, "
+                "  max_concurrent_tasks=COALESCE(%s, nexus_openhands_accounts.max_concurrent_tasks), "
+                "  daily_conversation_limit=COALESCE("
+                "      %s, nexus_openhands_accounts.daily_conversation_limit), "
                 "  identity=EXCLUDED.identity, capabilities=EXCLUDED.capabilities, "
                 "  state='active', last_error=NULL, last_checked_at=now(), "
                 "  health='healthy', health_checked_at=now(), "
@@ -205,7 +217,8 @@ class OpenHandsAccountService:
                 (principal, label, base_url, transport, default_model, ciphertext,
                  identity, _json(capabilities), _mask_key(api_key),
                  max_concurrent_tasks, daily_conversation_limit, probe.get("api_version"),
-                 probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500]))
+                 probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500],
+                 transport, default_model, max_concurrent_tasks, daily_conversation_limit))
             view = self._view(cur.fetchone())
             if make_default:
                 self._set_default(cur, principal, view["id"])
@@ -676,6 +689,23 @@ class OpenHandsAccountService:
                     "WHERE id=%s AND principal=%s", (account_id, principal))
 
     # --------------------------------------------------------------- binding
+    def bound_account_id(self, project_id: str) -> str | None:
+        """The account a project is bound to, or ``None``. No principal check.
+
+        The worker drives a workflow's Sr and is not the project's owner, so this
+        reads the binding by project id alone. Callers that act for a person use
+        ``bind_project``/``client_for_project`` (which do check membership); this
+        is for the loop, exactly like ``execution_client_internal``.
+        """
+        with self.store._tx() as cur:
+            cur.execute("SELECT openhands_account_id FROM nexus_projects WHERE id=%s",
+                        (project_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise NotFound("project not found")
+            value = row["openhands_account_id"]
+            return str(value) if value is not None else None
+
     def bind_project(self, principal: str, project_id: str, account_id: str | None) -> dict:
         with self.store._tx() as cur:
             ProjectService._project(cur, principal, project_id)

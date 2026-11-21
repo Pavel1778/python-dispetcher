@@ -227,7 +227,7 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     # Self-QA gate mechanism is available by default (each project's own mode
     # decides); only NEXUS_SELFQA_GATE=0 turns it off everywhere.
     assert body["lab"] == {"inline": False, "cleanup_hours": 24.0,
-                           "selfqa_gate": True}
+                           "selfqa_gate": True, "evidence": False}
     assert isinstance(body["version"], str) and body["version"]
     # The page asks on every load, so the answer must not depend on OpenHands
     # being reachable: no request reaches the Cloud API.

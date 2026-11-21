@@ -2018,3 +2018,78 @@ def test_execution_profile_persistence_and_refused_sync_in_browser(stack, chromi
         assert not form.locator('input[name=api_key]').count()
     finally:
         ctx.close()
+
+
+def test_the_evidence_viewer_lists_records_and_re_verifies_one(stack, chromium, monkeypatch):
+    """The Trust Engine is visible: the project's signed records are listed with
+    their verdict, and «Проверить» re-verifies one against the trusted keyring.
+    The verdict shown is the server's own answer, never the page's guess."""
+    import base64
+
+    from orchestration.evidence_trust import (
+        EvidenceTrustEngine,
+        Keyring,
+        generate_signer,
+        public_key_b64,
+        signer_from_env,
+    )
+    from orchestration.nexus_evidence import EvidenceService
+
+    # The chat turn needs an answer from the scripted provider.
+    stack.answers("Готово.")
+
+    # A real signer for this test: the app was built without one.
+    signer = generate_signer("nexus-viewer")
+    monkeypatch.setenv("NEXUS_EVIDENCE_KEY_ID", "nexus-viewer")
+    monkeypatch.setenv("NEXUS_EVIDENCE_PRIVATE_KEY",
+                       base64.urlsafe_b64encode(signer.private_key.private_bytes_raw()).decode())
+    monkeypatch.setenv("NEXUS_EVIDENCE_KEYRING", f"nexus-viewer:{public_key_b64(signer)}")
+    stack.app.evidence = EvidenceService(
+        stack.app.store,
+        EvidenceTrustEngine(Keyring.from_env(), signer_from_env()))
+
+    ctx, page, watch = _open(chromium)
+    try:
+        _login(page, stack.base)
+        _send(page, "Привет")
+        page.wait_for_selector(".msg.assistant")
+
+        # The first message creates the project; wait for it to exist before
+        # reading its id (the turn is asynchronous).
+        project_id = ""
+        for _ in range(50):
+            with stack.app.store._tx() as cur:
+                cur.execute("SELECT id FROM nexus_projects ORDER BY created_at LIMIT 1")
+                found = cur.fetchone()
+            if found:
+                project_id = str(found["id"])
+                break
+            page.wait_for_timeout(100)
+        assert project_id, "the chat turn did not create a project"
+        rec = stack.app.evidence.record(
+            subject_kind="manual", subject_id=None, project_id=project_id,
+            repository_full_name="acme/shop", commit_sha="a" * 40,
+            branch="main", summary="проверено", created_by="tester")
+
+        # Open the Agent tab and the evidence section.
+        page.click("#ws-toggle")
+        page.wait_for_selector("#tab-agent")
+        page.click("#tab-agent")
+        page.wait_for_selector("[data-action='toggle-evidence']")
+        page.click("[data-action='toggle-evidence']")
+
+        row = page.locator(f".evidence-row[data-id='{rec['id']}']")
+        row.wait_for()
+        # The row names the repository and the short commit, and carries the
+        # stored verdict.
+        expect(row).to_contain_text("acme/shop")
+        expect(row.locator(".pill")).to_have_text("VERIFIED")
+
+        # Re-verifying asks the server; the answer is the engine's verdict.
+        row.locator("[data-action='check-evidence']").click()
+        expect(page.locator(".toast", has_text="Проверено")).to_be_visible()
+        expect(row.locator(".pill")).to_have_text("VERIFIED")
+        expect(row.locator(".evidence-detail")).to_contain_text("VERIFIED")
+        assert watch.problems == []
+    finally:
+        ctx.close()

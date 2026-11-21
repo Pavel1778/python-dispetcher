@@ -259,6 +259,30 @@ def _pool_size_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _jit_options() -> str:
+    """Server settings for every connection: JIT off by default.
+
+    PostgreSQL's JIT compiler is switched on by *estimated* cost, and this
+    application has a query whose estimate is astronomically high while its
+    result is usually empty: the cleanup scan (``LabStore.queue_cleanups``)
+    unions five sources with ``jsonb_array_elements`` lateral joins, and the
+    planner prices that in the millions. Measured on a warm database with a few
+    thousand tasks, PostgreSQL spent **~500-670 ms compiling** a plan that then
+    returned zero rows and executed in microseconds. The same call with JIT off
+    took **3-6 ms** - a ~170x difference, on the worker's hot path every pass.
+
+    Raising ``jit_above_cost`` did not help: the plan's estimate exceeded even
+    10 000 000, so JIT still engaged. This is a control plane - short OLTP
+    statements, no analytical scans - so the honest default is to switch JIT
+    off. ``NEXUS_DB_JIT=on`` restores the server's own behaviour for a
+    deployment that runs heavy queries through the same database.
+    """
+    raw = os.environ.get("NEXUS_DB_JIT", "").strip().lower()
+    if raw in ("on", "default", "server"):
+        return ""
+    return "-c jit=off"
+
+
 def _pool_check_connection(conn: Any) -> None:
     """Raise if a pooled connection is known unusable, so the pool replaces it.
 
@@ -372,6 +396,7 @@ class PostgresStore:
             "autocommit": False,
             "connect_timeout": connect_timeout,
             "prepare_threshold": prepare_threshold,
+            "options": _jit_options(),
         }
         self.prepare_threshold = prepare_threshold
         # Kept so a connection is opened the same way everywhere (the pool and

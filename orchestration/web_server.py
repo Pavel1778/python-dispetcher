@@ -450,6 +450,10 @@ class App:
             self.store, self.client, SrTools(self.store, self.dispatcher),
             worker_id=worker_id, start_poll_interval=2.0, start_poll_attempts=40,
             agent_profile_id=profile, plugins=plugins,
+            # Sr runs on the connection the workflow's project is bound to, so a
+            # "code" turn gets the stored model and base URL. A project with no
+            # bound account falls back to the process client (NotFound).
+            client_for_workflow=self._workflow_client,
         )
         self.verifier = WorkflowVerifier(self.store, self.client)
         self.poll_interval = poll_interval
@@ -733,6 +737,30 @@ class App:
         return {"workflow_id": workflow_id, "sr_conversation_id": conversation_id,
                 "reused": not created}
 
+    def _workflow_client(self, workflow_id: str) -> Any:
+        """The Cloud client to drive one workflow's Sr with.
+
+        The workflow's project may be bound to a stored OpenHands connection;
+        when it is, Sr runs on *that* connection (its base URL and model) instead
+        of the process-wide client, so a ``code`` turn gets the model the
+        operator configured. ``NotFound`` (no project, no bound account) is
+        raised for the runtime to fall back to the process client; a stored
+        connection that has become unusable raises ``ValueError`` and is not
+        silently replaced by a different identity.
+        """
+        row = self.store.sr_for(workflow_id)
+        project_id = (row or {}).get("project_id")
+        if not project_id:
+            raise NotFound("workflow has no project")
+        account_id = self.openhands_accounts.bound_account_id(project_id)
+        if not account_id:
+            raise NotFound("project has no OpenHands account bound")
+        principal = self.openhands_accounts.owner_of(str(account_id))
+        if principal is None:
+            raise NotFound("account not found")
+        return self.openhands_accounts.execution_client_for_account(
+            principal, str(account_id))
+
     def _chat_dispatch_code(self, request: dict) -> dict[str, Any]:
         """Chat "Code" mode: start a real OpenHands workflow for the request.
 
@@ -823,8 +851,14 @@ class App:
             # all. It is on unless the deployment sets ``NEXUS_SELFQA_GATE=0``;
             # whether a given project's checks actually run is that project's
             # own ``quality_gate`` mode (auto/on/off), shown in its settings.
+            # ``evidence``: whether results can be signed at all. Without a
+            # signer nothing is recorded, so an empty evidence list has to say
+            # *why* it is empty instead of reading as "nothing was verified".
+            # Presence only - never a key, an id or a path.
             "lab": {"inline": self.lab_inline, "cleanup_hours": _cleanup_hours(),
-                    "selfqa_gate": self.quality_gate is not None},
+                    "selfqa_gate": self.quality_gate is not None,
+                    "evidence": (self.evidence_signer is not None
+                                 and bool(self.evidence_keyring))},
             # Stored accounts are encrypted with NEXUS_SECRET_KEY; without it
             # adding one is refused (orchestration/secrets.py).
             "accounts": {
@@ -1953,8 +1987,10 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _mcp_verification(self, path):
-        grant = self.app.verification_grant
-        return grant if path == '/mcp' and grant and grant.accepts(self.headers.get('Authorization')) else None
+        if path != '/mcp':
+            return None
+        grant = getattr(self.app, 'verification_grant', None)
+        return grant if grant and grant.accepts(self.headers.get('Authorization')) else None
 
     def _require_write(self, *, verification=None) -> bool:
         """Only POST /mcp may pass its independently authenticated read-only grant."""
@@ -4765,7 +4801,9 @@ class Handler(BaseHTTPRequestHandler):
                         self._project_principal(),
                         label=body.get("label"), api_key=body.get("api_key"),
                         base_url=(body.get("base_url") or None),
-                        transport=(body.get("transport") or "direct"),
+                        # A reconnect that does not name a transport must keep the
+                        # stored one; only an explicit value changes it.
+                        transport=(body.get("transport") or None),
                         default_model=(body.get("default_model") or None),
                         make_default=bool(body.get("make_default")),
                         max_concurrent_tasks=body.get("max_concurrent_tasks"),

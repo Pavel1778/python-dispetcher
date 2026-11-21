@@ -1562,13 +1562,114 @@
     return head + inner;
   }
 
+  /* -------------------------------------------------------------- evidence */
+  // The Evidence Trust Engine, made visible. A "verified" task is only worth
+  // something if its record can be re-checked, so this lists the project's
+  // signed records and re-verifies one against the trusted keyring on demand.
+  // Nothing here decides a verdict: the badge is the stored verdict and the
+  // re-check is the server's own answer.
+  var evidence = { open: false, items: [], loading: false, error: null,
+                   checking: {}, detail: {} };
+  var VERDICT_TONE = { VERIFIED: 'ok', UNVERIFIED: 'warn', FAILED: 'bad', BLOCKED: 'idle' };
+
+  function verdictPill(verdict) {
+    var tone = VERDICT_TONE[verdict] || 'idle';
+    return '<span class="pill is-' + tone + '">' + esc(verdict || '—') + '</span>';
+  }
+
+  function evidenceWhen(rec) {
+    var at = rec.verified_at || rec.created_at;
+    return at ? fullTime(at) : '';
+  }
+
+  function evidenceRow(rec) {
+    var id = esc(rec.id);
+    var subject = rec.repository_full_name
+      ? esc(rec.repository_full_name) + (rec.commit_sha ? ' · ' + esc(String(rec.commit_sha).slice(0, 8)) : '')
+      : esc(rec.subject_kind || '') + (rec.subject_id ? ' · ' + esc(shortId(rec.subject_id)) : '');
+    var detail = evidence.detail[rec.id];
+    return '<li class="evidence-row" data-id="' + id + '">' +
+      '<div class="evidence-line"><span class="dot is-' + (VERDICT_TONE[rec.verdict] || 'idle') + '"></span>' +
+      '<span class="evidence-subject">' + subject + '</span>' +
+      verdictPill(rec.verdict) +
+      '<span class="evidence-when">' + esc(evidenceWhen(rec)) + '</span>' +
+      '<button class="btn btn-sm" type="button" data-action="check-evidence" data-id="' + id + '">' +
+      (evidence.checking[rec.id] ? 'Проверяю…' : 'Проверить') + '</button></div>' +
+      (detail ? '<p class="step-sub evidence-detail">' + esc(detail) + '</p>' : '') +
+      '</li>';
+  }
+
+  function evidenceHtml() {
+    var head = '<div class="ws-section-head"><button class="btn btn-sm" type="button" data-action="toggle-evidence">' +
+      icon('check', 'icon-sm') + (evidence.open ? 'Скрыть доказательства' : 'Доказательства') + '</button></div>';
+    if (!evidence.open) return head;
+    var inner;
+    if (evidence.loading) inner = '<p class="step-sub">Загружаю…</p>';
+    else if (evidence.error) inner = '<p class="step-sub">' + esc(evidence.error) + '</p>';
+    else if (!evidence.items.length) {
+      // Say *why* the list is empty: with no signer nothing is ever recorded,
+      // which is not the same as "nothing was verified".
+      var signed = S.status && S.status.lab && S.status.lab.evidence;
+      inner = '<p class="step-sub">' + (signed === false
+        ? 'Подписи не настроены (NEXUS_EVIDENCE_PRIVATE_KEY), поэтому записи доказательств не создаются.'
+        : 'Записей доказательств по этому проекту пока нет.') + '</p>';
+    } else {
+      inner = '<ul class="evidence-list">' + evidence.items.map(evidenceRow).join('') + '</ul>';
+    }
+    return head + inner;
+  }
+
+  function loadEvidence() {
+    evidence.loading = true;
+    evidence.error = null;
+    renderAgent();
+    return api(projectUrl('/evidence'))
+      .then(function (data) {
+        evidence.items = (data.evidence || []);
+        evidence.loading = false;
+        renderAgent();
+      }, function (error) {
+        evidence.loading = false;
+        evidence.error = error.message;
+        renderAgent();
+      });
+  }
+
+  // Re-verify one record against the trusted keyring. The answer is the
+  // server's; the row shows its verdict and its reason, never an assumption.
+  function checkEvidence(button, id) {
+    evidence.checking[id] = true;
+    renderAgent();
+    api(projectUrl('/evidence/' + enc(id) + '/verify'), { method: 'POST', body: {} })
+      .then(function (data) {
+        var rec = data.evidence || {};
+        evidence.checking[id] = false;
+        evidence.items = evidence.items.map(function (item) {
+          return item.id === id ? rec : item;
+        });
+        var detail = rec.verification_detail || {};
+        var reason = detail.reason || (detail.checks || []).map(function (c) {
+          return (c.name || '') + ': ' + (c.ok ? 'ок' : 'нет');
+        }).join('; ');
+        evidence.detail[id] = (rec.verdict || '—') + (reason ? ' — ' + reason : '');
+        renderAgent();
+        toast('Проверено: ' + (rec.verdict || '—'),
+              rec.verdict === 'VERIFIED' ? 'ok' : 'bad');
+      }, function (error) {
+        evidence.checking[id] = false;
+        evidence.detail[id] = 'Проверить не удалось: ' + explain(error.message).text;
+        renderAgent();
+        toast(explain(error.message).text, 'bad');
+      });
+  }
+
   function renderAgent() {
     var body = $('#ws-body');
     clearTimeout(agentScroll.timer);
     if (!S.work.items.length) {
       body.innerHTML = emptyHtml('bot', 'Агент ещё не запускался',
         'Отправьте задачу в режиме «Код», «Автономно» или «Вручную» — здесь появятся ' +
-        'шаги, статусы и ссылка на сессию OpenHands.') + archiveHtml();
+        'шаги, статусы и ссылка на сессию OpenHands.') + archiveHtml() + evidenceHtml();
       return;
     }
     var html = S.work.items.map(function (entry) {
@@ -1582,7 +1683,7 @@
           '<div class="work-foot"><button class="btn btn-sm" type="button" data-action="refresh-work">Обновить</button></div></section>';
       }
       return entry.kind === 'workflow' ? workflowCard(entry, record.detail) : runCard(entry, record.detail);
-    }).join('') + archiveHtml();
+    }).join('') + archiveHtml() + evidenceHtml();
     var list = $('.work-list', body);
     if (list && list.__html === html) return;
     if (list && agentListBusy()) {
@@ -3250,6 +3351,14 @@
       archive.open = !archive.open;
       if (archive.open && !archive.items.length && !archive.loading) loadArchive();
       else renderAgent();
+    },
+    'toggle-evidence': function () {
+      evidence.open = !evidence.open;
+      if (evidence.open && !evidence.items.length && !evidence.loading) loadEvidence();
+      else renderAgent();
+    },
+    'check-evidence': function (el) {
+      checkEvidence(el, el.getAttribute('data-id'));
     },
     // An archived run is opened the same way a live one is: the card shows its
     // tasks, its report and its history. It is not a second interface. It is
