@@ -106,12 +106,12 @@ def server(fake, monkeypatch):
     app.client = CloudClient(fake.base_url, api_key="test-key", timeout=5.0)
     app.dispatcher.client = app.client
     app.runtime.client = app.client
-    ws = WebServer(app, "127.0.0.1", 0)
-    ws.start()
-    # The background loop must not race the assertions; keep it idle by not
-    # relying on it. Tests drive ticks explicitly where needed.
-    yield ws
-    ws.stop()
+    # Exercise the synchronous HTTP start, not the worker winning the lease
+    # and returning starting=True. Tests drive subsequent ticks explicitly;
+    # test_duplicate_requests covers the competing worker over real HTTP.
+    monkeypatch.setattr(app, "_run", app._stop.wait)
+    with WebServer(app, "127.0.0.1", 0) as ws:
+        yield ws
 
 
 @pytest.fixture
