@@ -1,0 +1,28 @@
+{
+  "candidate": "c6b1a9931ec86df66f018e30f48dac9a81a280b2",
+  "upstream": "openhands-agent-server 1.60.1",
+  "transport": "local; counting loopback relay",
+  "original_exit": -9,
+  "terminal_acks_forwarded_to_original": 0,
+  "native_create_statuses": [
+    201
+  ],
+  "replacements": 2,
+  "interrupted_conversation_reads": 1,
+  "intent_states": [
+    "sending",
+    "uncertain",
+    "bound"
+  ],
+  "fences": [
+    1,
+    2,
+    2
+  ],
+  "original_launch_revision": 1,
+  "desired_during_recovery": 2,
+  "original_model_read_back": true,
+  "execution_records": 1,
+  "total_iterations": 1,
+  "model_completion": "not tested"
+}

@@ -1,0 +1,43 @@
+{
+  "base": "20eb8bffc3e89f08e24522aa98dba0e62fc6e070",
+  "candidate": "c6b1a9931ec86df66f018e30f48dac9a81a280b2",
+  "http_cases": [
+    "/",
+    "/healthz",
+    "/login/state",
+    "/readyz",
+    "/static/app.css",
+    "foreign_project",
+    "mcp_no_auth",
+    "mcp_parse_error",
+    "projects_no_auth"
+  ],
+  "http_equal": true,
+  "stdio_reply_ids": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "mcp_http_cases": 5,
+  "unchanged_tool_schemas": 19,
+  "added_tool_schemas": [
+    "get_execution_profile"
+  ],
+  "chromium": "153.0.8010.0",
+  "playwright": "1.65.2",
+  "changed_assets": [
+    "app.js"
+  ],
+  "identical_png_sha256": {
+    "desktop-agent.png": "6e01207d58c1ea31206959b118fb1e8dee67180f636677bbfc3a3fa89296f4ac",
+    "desktop-chat.png": "dc616595bd7736988350b8c02f1ee22e6b4fc687a477aae94c13c44cfaf1ca0f",
+    "desktop-files.png": "f81187ee8c6a28384eeb6ab47e3b05dbb1bb98db691c98631927773b8f6c39fa",
+    "desktop-home.png": "4bfdbd1cc154f1178e2a5b9a00c160771eb5266b4221b02dadea102c216475bb",
+    "desktop-login.png": "aa40b5e2d5a8a10f87ed87b2168afeed20b7afb4a1581ed8fdb8fc1a965abd76",
+    "desktop-settings.png": "1d102d5b1ddddb1ead70a8edf06a8c060ce20ad6b9612da72978b932ad22d3b9",
+    "phone-chat.png": "2f50f9db48353942436c01820ead3cf90f2213a859badeff56f41e2dc83f5a12",
+    "phone-history.png": "e285d15c8ea7d0a0253494762af517aca7626557e36a38a7d3a888bce839d2d3",
+    "phone-home.png": "d40adef3ee45402146aae84ef92c1119cc158207c737f3783b5d6ad8052bd694"
+  }
+}

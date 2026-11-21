@@ -1,0 +1,44 @@
+{
+  "base": "20eb8bffc3e89f08e24522aa98dba0e62fc6e070",
+  "candidate": "c6b1a9931ec86df66f018e30f48dac9a81a280b2",
+  "postgres": "16.2",
+  "before": {
+    "columns": 621,
+    "indexes": 172,
+    "foreign_keys": 94,
+    "tables": 54,
+    "migrations": 44
+  },
+  "after": {
+    "columns": 629,
+    "indexes": 173,
+    "foreign_keys": 96,
+    "tables": 55,
+    "migrations": 45
+  },
+  "new_table": {
+    "rls": true,
+    "columns": 8,
+    "indexes": 1,
+    "force_rls": false,
+    "foreign_keys": 2,
+    "shape_sha256": "f381ddf0ff52f1fa38750cc33ea7787e13a86c895bd8b9c979f5b41aa1e85ebe"
+  },
+  "roles": [
+    {
+      "rolname": "anon",
+      "any_grant": false
+    },
+    {
+      "rolname": "authenticated",
+      "any_grant": false
+    }
+  ],
+  "migration_sha256": "59cc73ad75f699d1cf8a318f8bbd0334b587835e6ba4b86f89f4f18264dbaa17",
+  "repeat_apply": [],
+  "existing_catalog_and_journal_grant_preserved": true,
+  "old_reader_passed": true,
+  "restore_equal": true,
+  "dump_bytes": 205848,
+  "ephemeral_dump_sha256": "a1a9c332308d4a86630997883db3c17d0738111f4f0df1626d9d4dadf5810df0"
+}
