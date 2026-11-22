@@ -25,13 +25,20 @@ artefact. See `ARCHITECTURE_RECONCILIATION.md`.
 
 ## 2. Architecture
 
-- **One canonical Rust storage authority**: `nexus-storage` (the only one). It
-  shares the claim predicates with Python via `include_str!`, so the two cannot
-  drift on what is claimable.
+- **Rust crates (7)**: `nexus-domain`, `nexus-core`, `nexus-storage`,
+  `nexus-store`, `nexus-worker`, `nexus-api`, `nexus-cli`.
+- **The claim predicates are shared, not copied.** `nexus-storage` and
+  `nexus-store` both `include_str!("…/orchestration/sql/*.sql")`, so neither can
+  drift from Python on *what is claimable*. A drift-guard test fails if a local
+  copy returns (the foundation's copy had lost the `nexus_dispatch_intents`
+  guard; see `FULL_PROJECT_AUDIT_2026-11-20.md` §2).
 - **Python remains the production authority.** Rust is a verified candidate; no
   production path calls it. Rollback is trivial (Rust holds no state Python
   does not).
-- Rust crates: `nexus-domain`, `nexus-core`, `nexus-storage`, `nexus-cli`.
+- **Two stores coexist deliberately**: `nexus-storage` (minimal: claim +
+  reclaim, 144 LOC) and `nexus-store` (full: claim, mark_running, holds_lease,
+  reclaim, with_tx; 1 602 LOC + 1 178 test LOC). Both read the same SQL; the
+  richer one is where the worker and API are headed.
 
 ## 3. OpenHands
 
