@@ -5273,6 +5273,7 @@ def main() -> int:
     install_log_redaction()
 
     dsn = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
+    migrate_dsn = os.environ.get("MIGRATE_DSN") or dsn
     if not dsn:
         print("set SUPABASE_DB_URL")
         return 2
@@ -5299,7 +5300,7 @@ def main() -> int:
         return 2
     # A forgotten migration shows up as UndefinedTable on the first request, and a
     # foreign schema as UndefinedColumn; name the problem at startup instead.
-    missing_tables = app.store.verify_schema()
+    missing_tables = app.store.verify_schema(migrate_dsn)
     if missing_tables:
         print("database schema does not match this dispatcher: "
               + ", ".join(missing_tables)

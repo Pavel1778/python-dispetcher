@@ -355,6 +355,7 @@ class PostgresStore:
         self.dsn = dsn or os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
         if not self.dsn:
             raise StoreError("SUPABASE_DB_URL is not set")
+        self._migrate_dsn = os.environ.get("MIGRATE_DSN") or self.dsn
         self._connect_timeout = connect_timeout
         # A pool of connections, not one shared connection. The previous model
         # held a single connection behind a lock, so every concurrent request
@@ -415,8 +416,14 @@ class PostgresStore:
         # be applied by the process itself. The migrations are idempotent, and
         # ``AUTO_MIGRATE=false`` opts out for environments that apply them out of
         # band (a release step, a DBA).
+        #
+        # ``MIGRATE_DSN`` (optional): a session-mode DSN (port 5432) used only
+        # for migrations.  Transaction-mode poolers (Supabase 6543, PgBouncer)
+        # cannot hold long-running transactions open, so `apply_migrations()`
+        # would hang behind one.  Point ``MIGRATE_DSN`` at a direct connection
+        # to avoid this.  Falls back to ``SUPABASE_DB_URL`` when unset.
         if auto_migrate and os.environ.get("AUTO_MIGRATE", "true").lower() not in ("0", "false", "no"):
-            self.apply_migrations()
+            self.apply_migrations(dsn=self._migrate_dsn)
 
     def _open_pool(self) -> None:
         """Open the connection pool (also used to reopen one that was closed).
@@ -482,7 +489,7 @@ class PostgresStore:
         }
 
     # ------------------------------------------------------------ migrations
-    def apply_migrations(self, directory: str | None = None) -> list[str]:
+    def apply_migrations(self, directory: str | None = None, dsn: str | None = None) -> list[str]:
         """Apply every ``*.sql`` migration in order, skipping applied ones.
 
         Returns the names of the files actually run. A file whose checksum was
@@ -492,6 +499,12 @@ class PostgresStore:
         Each file runs through ``_tx``, so a file that fails is rolled back and
         the original SQL error reaches the caller instead of leaving the shared
         connection aborted.
+
+        If ``dsn`` is given, a dedicated single connection is opened for the
+        migration run instead of using the main pool.  This is what
+        ``MIGRATE_DSN`` enables: long transactions are safe on a session-mode
+        connection, but hang behind a transaction-mode pooler (PgBouncer on
+        Supabase port 6543).
 
         An already-applied file whose body changed is a hard refusal
         (:class:`MigrationError`), not a silent re-run. Re-running a different
@@ -512,7 +525,36 @@ class PostgresStore:
         files = sorted(base.glob("*.sql"))
         if not files:
             return []
-        with self._tx() as cur:
+
+        # When a dedicated DSN is given (MIGRATE_DSN), open a single session-mode
+        # connection for the whole run.  Without it fall back to the main pool.
+        _mig_conn: Any = None
+        if dsn:
+            _mig_conn = psycopg.connect(
+                dsn, autocommit=False, connect_timeout=self._connect_timeout,
+                prepare_threshold=None, row_factory=dict_row,
+            )
+
+        def _mig_tx():
+            """Context manager yielding a cursor on the migration connection or the pool."""
+            from contextlib import contextmanager
+
+            @contextmanager
+            def _inner():
+                conn = _mig_conn if _mig_conn is not None else self._ensure_pool().getconn()
+                try:
+                    cur = conn.cursor()
+                    yield cur
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    if _mig_conn is None:
+                        self._pool.putconn(conn)
+            return _inner()
+
+        with _mig_tx() as cur:
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
                 "  filename text PRIMARY KEY,"
@@ -526,7 +568,7 @@ class PostgresStore:
             sql, checksum = _read_migration_file(path)
             if existing.get(path.name) == checksum:
                 continue
-            with self._tx() as cur:
+            with _mig_tx() as cur:
                 cur.execute("SELECT checksum FROM schema_migrations WHERE filename = %s",
                             (path.name,))
                 row = cur.fetchone()
@@ -559,6 +601,8 @@ class PostgresStore:
                     (path.name, checksum),
                 )
             applied.append(path.name)
+        if _mig_conn is not None:
+            _mig_conn.close()
         return applied
 
     def close(self) -> None:
@@ -655,8 +699,11 @@ class PostgresStore:
                                        "github_account_id", "is_primary"),
     }
 
-    def verify_schema(self) -> list[str]:
+    def verify_schema(self, dsn: str | None = None) -> list[str]:
         """Return the tables the store needs that the database is missing.
+
+        If ``dsn`` is provided, a dedicated session-mode connection is used
+        instead of the pool (safe behind a transaction-mode pooler).
 
         A missing table is a real root cause of ``UndefinedTable``, which in turn
         produced the reported ``InFailedSqlTransaction`` cascade. Checking at
@@ -675,20 +722,42 @@ class PostgresStore:
         # the map later (the profiler columns of migration 0040 among them) went
         # unchecked. The map is exactly the columns the code reads.
         required = tuple(self.REQUIRED_COLUMNS)
-        with self._tx() as cur:
-            cur.execute(
-                "SELECT c.relname AS table_name, a.attname AS column_name "
-                "FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "JOIN pg_attribute a ON a.attrelid = c.oid "
-                "WHERE n.nspname = current_schema() "
-                "  AND c.relname = ANY(%s) "
-                "  AND a.attnum > 0 AND NOT a.attisdropped",
-                (list(required),),
-            )
-            columns: dict[str, set[str]] = {}
-            for row in cur.fetchall():
-                columns.setdefault(row["table_name"], set()).add(row["column_name"])
+
+        if dsn:
+            # Use a dedicated session-mode connection (bypasses the pool).
+            conn = psycopg.connect(dsn, autocommit=True, connect_timeout=self._connect_timeout,
+                                   row_factory=dict_row, prepare_threshold=None)
+            try:
+                cur = conn.execute(
+                    "SELECT c.relname AS table_name, a.attname AS column_name "
+                    "FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "JOIN pg_attribute a ON a.attrelid = c.oid "
+                    "WHERE n.nspname = current_schema() "
+                    "  AND c.relname = ANY(%s) "
+                    "  AND a.attnum > 0 AND NOT a.attisdropped",
+                    (list(required),),
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        else:
+            with self._tx() as cur:
+                cur.execute(
+                    "SELECT c.relname AS table_name, a.attname AS column_name "
+                    "FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "JOIN pg_attribute a ON a.attrelid = c.oid "
+                    "WHERE n.nspname = current_schema() "
+                    "  AND c.relname = ANY(%s) "
+                    "  AND a.attnum > 0 AND NOT a.attisdropped",
+                    (list(required),),
+                )
+                rows = cur.fetchall()
+
+        columns: dict[str, set[str]] = {}
+        for row in rows:
+            columns.setdefault(row["table_name"], set()).add(row["column_name"])
 
         missing: list[str] = []
         for table in required:
