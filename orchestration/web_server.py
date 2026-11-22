@@ -382,6 +382,11 @@ class App:
         # selection mode. The policy lives in the service, not the UI.
         from .openhands_pool import AccountPool
         self.account_pool = AccountPool(self.store, self.openhands_accounts)
+        # The configuration reconciler: compares NEXUS's stored model/provider
+        # endpoint with what OpenHands reports and records drift. Read-only
+        # against OpenHands; it never writes settings it cannot write back.
+        from .openhands_config_sync import ConfigReconciler
+        self.config_sync = ConfigReconciler(self.store, self.openhands_accounts)
         # The persistent conversational surface. The responder needs the provider
         # cascade for ask/plan and the dispatch hooks for code/autonomous.
         from .nexus_chat import ChatResponder
@@ -4829,6 +4834,19 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, {"config": config})
+            if path == "/api/openhands/config/sync":
+                # Compare the stored model/provider endpoint with what OpenHands
+                # reports; one account when `account_id` is given, else all of
+                # the caller's active accounts. Read-only against OpenHands.
+                principal = self._project_principal()
+                account_id = body.get("account_id")
+                if account_id:
+                    if not UUID_RE.fullmatch(str(account_id)):
+                        return self._json(404, {"error": "not found"})
+                    result = self.app.config_sync.reconcile(principal, str(account_id))
+                    return self._json(200, {"results": [result.as_dict()]})
+                results = [r.as_dict() for r in self.app.config_sync.reconcile_all(principal)]
+                return self._json(200, {"results": results})
             if path == "/api/openhands/diagnostics":
                 # The opt-in live probe: creates and deletes one conversation.
                 return self._json(200, self.app.openhands_diagnostics(

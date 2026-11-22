@@ -484,3 +484,24 @@ def test_an_unset_llm_base_url_leaves_the_provider_default():
         assert "base_url" not in llm or llm.get("base_url") is None
     finally:
         store.close()
+
+
+def test_a_git_credential_reaches_the_create_body_as_a_static_secret():
+    """The GitHub token a task is given arrives as a masked StaticSecret.
+
+    This is the mechanism that lets a sandbox push without the OpenHands account
+    holding an account-level provider token: the executor passes ``secrets`` on
+    the create call, the agent-server injects and masks it.
+    """
+    store = PostgresStore(DSN)
+    try:
+        account = FakeCloudAccount()
+        client, server = _client(store, account)
+        client.start_conversation(
+            initial_message="push it", title="git",
+            secrets={"GITHUB_TOKEN": {"kind": "StaticSecret", "value": "ghp_test"}})
+        body = server.create_bodies[-1]
+        assert body["secrets"]["GITHUB_TOKEN"]["kind"] == "StaticSecret"
+        assert body["secrets"]["GITHUB_TOKEN"]["value"] == "ghp_test"
+    finally:
+        store.close()

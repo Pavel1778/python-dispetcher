@@ -333,3 +333,38 @@ def test_pool_view_reports_the_observed_load(base, fake, app):
     status, pool = _req("GET", base, "/api/openhands/pool")
     assert pool["candidates"][0]["load"] == 1
     assert KEY not in json.dumps(pool)
+
+
+def test_config_sync_route_reports_synced_when_the_model_matches(base, fake):
+    """POST /api/openhands/config/sync compares stored vs effective config.
+
+    The fake reports `agent_settings.llm.model = "fake-model"`; an account whose
+    default_model is the same is `synced`, one that differs is `drift`.
+    """
+    # Make OpenHands report the model we are about to configure.
+    fake[0].cloud.settings = {"llm_api_key_set": True,
+                              "agent_settings": {"llm": {"model": "fake-model"},
+                                                 "mcp_config": {}},
+                              "registered_marketplaces": [], "inherited_marketplaces": []}
+    status, body = _req("POST", base, "/api/openhands/accounts",
+                        {"label": "sync", "api_key": KEY, "base_url": fake[0].base_url,
+                         "default_model": "fake-model"})
+    assert status == 201, body
+    account_id = body["account"]["id"]
+
+    status, out = _req("POST", base, "/api/openhands/config/sync",
+                       {"account_id": account_id})
+    assert status == 200, out
+    (result,) = out["results"]
+    assert result["state"] == "synced", result
+
+
+def test_config_sync_route_reports_drift_for_a_different_model(base, fake):
+    status, body = _req("POST", base, "/api/openhands/accounts",
+                        {"label": "sync2", "api_key": KEY, "base_url": fake[0].base_url,
+                         "default_model": "openhands/wanted-not-fake"})
+    assert status == 201, body
+    status, out = _req("POST", base, "/api/openhands/config/sync", {})
+    assert status == 200
+    states = {r["state"] for r in out["results"]}
+    assert "drift" in states, out
