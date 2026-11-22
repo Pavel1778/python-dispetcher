@@ -60,7 +60,16 @@ class ProviderError(RuntimeError):
 
 
 class ProviderUnavailable(ProviderError):
-    """Transport failure, 5xx or 429. Transient: another provider may work."""
+    """Transport failure, 5xx, 429 or an exhausted quota.
+
+    Transient: another provider may work. When the provider said how long to
+    wait (``Retry-After``), ``retry_after`` carries it, so the caller can skip
+    this provider for that long instead of retrying it.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class ProviderAuthError(ProviderError):
@@ -84,6 +93,14 @@ _GREEK_CYRILLIC = re.compile(r"[\u0370-\u052f]")
 _TOO_LARGE_BODY = re.compile(
     r"context[ _-]?(?:length|window)|too (?:large|long|many tokens)|maximum[^.]{0,40}tokens|"
     r"token limit|tokens per minute|request_too_large|exceeds? the (?:limit|maximum)", re.IGNORECASE)
+#: What a 400/403 body says when the *credential* is the problem. Google answers
+#: 400 ``API_KEY_INVALID`` for a bad key rather than 401, so the status alone is
+#: not enough to tell a broken key from a malformed request.
+_BAD_KEY_BODY = re.compile(
+    r"api[ _-]?key[^.]{0,40}(?:invalid|not valid|expired|missing|required)|invalid[ _-]?api[ _-]?key|"
+    r"api_key_invalid|incorrect[ _-]?api[ _-]?key|unauthenticated|authentication failed|"
+    r"invalid[ _-]?(?:bearer|token|credential)|permission denied|credits? (?:exhausted|exceeded)",
+    re.IGNORECASE)
 
 #: Tokens left free in a model's window for its answer.
 RESPONSE_RESERVE_TOKENS = 2_000
@@ -150,6 +167,111 @@ def failure_kind(error: Exception) -> str:
     if isinstance(error, ProviderUnavailable):
         return "unavailable"
     return "rejected"
+
+
+# ----------------------------------------------------------------- cooldowns
+
+def _env_seconds(name: str, default: float) -> float:
+    """A duration from the environment; a junk or non-positive value is the default."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else 0.0
+    except ValueError:
+        value = 0.0
+    return value if value > 0 else default
+
+
+#: How long a provider whose key was refused (401/403, or 402 "credits
+#: exhausted") is skipped. Retrying a bad key only burns quota, and a topped-up
+#: account heals long before an hour passes.
+AUTH_COOLDOWN_SECONDS = _env_seconds("PROVIDER_AUTH_COOLDOWN", 900.0)
+#: First skip for a provider that was unreachable or out of quota; doubles with
+#: each consecutive failure.
+UNAVAILABLE_COOLDOWN_SECONDS = _env_seconds("PROVIDER_UNAVAILABLE_COOLDOWN", 60.0)
+#: The longest a provider is ever skipped because of a transport problem.
+MAX_COOLDOWN_SECONDS = _env_seconds("PROVIDER_MAX_COOLDOWN", 900.0)
+#: The longest a single request waits inside its own retry loop. A provider that
+#: asks for longer is marked cooling at once and another provider is asked: a
+#: request must not block for minutes on a limit that is already known.
+INLINE_WAIT_SECONDS = _env_seconds("PROVIDER_INLINE_WAIT", 10.0)
+
+
+@dataclass
+class _Cooling:
+    seconds: float
+    until: float
+    kind: str
+
+
+class Cooldowns:
+    """Which providers just failed, and until when they are skipped.
+
+    A cascade is only as useful as its memory. Without this, a provider whose
+    key was refused was retried on *every* request, and one that answered 429
+    made each request pay its retry backoff before the next provider was tried.
+    Here a provider that cannot answer is remembered for a while and passed
+    over at once, so the next provider in the hierarchy serves the request.
+
+    The clock is injectable so a test can let a cooldown expire without waiting.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._entries: dict[str, _Cooling] = {}
+        self._streak: dict[str, int] = {}
+
+    def remaining(self, name: str) -> float:
+        """Seconds this provider is still skipped for; ``0`` when it is usable."""
+        entry = self._entries.get(name)
+        if entry is None:
+            return 0.0
+        left = entry.until - self._clock()
+        if left <= 0:
+            self._entries.pop(name, None)
+            return 0.0
+        return left
+
+    def cooling(self, name: str) -> bool:
+        return self.remaining(name) > 0
+
+    def note_failure(self, name: str, kind: str, retry_after: float | None = None) -> float:
+        """Remember a failure and return how long *name* is now skipped for.
+
+        A ``rejected``/``too_large`` failure is the request's or the answer's
+        problem, not the provider's availability, so nothing is remembered for
+        it. ``auth`` is a fixed long skip; ``unavailable`` grows with each
+        consecutive failure and honours a ``Retry-After`` the provider sent.
+        """
+        if kind in ("rejected", "too_large"):
+            self._streak.pop(name, None)
+            return 0.0
+        if kind == "auth":
+            seconds = AUTH_COOLDOWN_SECONDS
+        else:
+            streak = self._streak.get(name, 0) + 1
+            self._streak[name] = streak
+            grown = UNAVAILABLE_COOLDOWN_SECONDS * (2 ** (streak - 1))
+            seconds = min(max(grown, float(retry_after or 0.0)), MAX_COOLDOWN_SECONDS)
+        self._entries[name] = _Cooling(seconds=seconds, until=self._clock() + seconds, kind=kind)
+        return seconds
+
+    def note_success(self, name: str) -> None:
+        """A provider answered: it is usable again and its streak is forgotten."""
+        self._entries.pop(name, None)
+        self._streak.pop(name, None)
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        """The providers skipped right now, and why (no secret, no key)."""
+        out: dict[str, dict[str, Any]] = {}
+        for name in list(self._entries):
+            left = self.remaining(name)
+            if left > 0:
+                out[name] = {"seconds": int(left), "kind": self._entries[name].kind}
+        return out
+
+    def reset(self) -> None:
+        self._entries.clear()
+        self._streak.clear()
 
 
 # ------------------------------------------------------------- http plumbing
@@ -390,10 +512,17 @@ class Provider:
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 raise ProviderAuthError(f"{self.name} -> {e.code}") from e
-            if e.code == 429:
-                raise ProviderUnavailable(f"{self.name} -> 429") from e
-            if e.code >= 500:
-                raise ProviderUnavailable(f"{self.name} -> {e.code}") from e
+            if e.code == 402:
+                # Credits spent. No request can fix that, so it is a refused
+                # identity rather than a transient fault.
+                raise ProviderAuthError(f"{self.name} -> 402 (credits exhausted)") from e
+            if e.code in (429,) or e.code >= 500:
+                raise ProviderUnavailable(f"{self.name} -> {e.code}",
+                                          retry_after=_retry_after(e.headers)) from e
+            if self._classify_4xx(e) == "auth":
+                # A probe that hits a refused credential in a 400 must still
+                # read as a refused key, or the cascade would keep asking it.
+                raise ProviderAuthError(f"{self.name} -> {e.code}: the key was refused") from e
             raise ProviderRejected(f"{self.name} -> {e.code}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
@@ -428,11 +557,17 @@ class Provider:
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 raise ProviderAuthError(f"{self.name} -> {e.code}") from e
-            if e.code == 429:
-                raise ProviderUnavailable(f"{self.name} -> 429") from e
-            if e.code >= 500:
-                raise ProviderUnavailable(f"{self.name} -> {e.code}") from e
-            if e.code == 413 or self._says_too_large(e):
+            if e.code == 402:
+                raise ProviderAuthError(f"{self.name} -> 402 (credits exhausted)") from e
+            if e.code in (429,) or e.code >= 500:
+                raise ProviderUnavailable(f"{self.name} -> {e.code}",
+                                          retry_after=_retry_after(e.headers)) from e
+            verdict = self._classify_4xx(e)
+            if verdict == "auth":
+                # A refused credential in a 400: retrying cannot help, so it is
+                # reported as auth and the cascade skips this provider for a while.
+                raise ProviderAuthError(f"{self.name} -> {e.code}: the key was refused") from e
+            if e.code == 413 or verdict == "too_large":
                 raise ProviderTooLarge(
                     f"{self.name} -> {e.code}: the request is too large for the model") from e
             raise ProviderRejected(f"{self.name} -> {e.code}") from e
@@ -445,17 +580,23 @@ class Provider:
             raise ProviderUnavailable(f"{self.name}: {type(e).__name__}") from e
 
     @staticmethod
-    def _says_too_large(error: urllib.error.HTTPError) -> bool:
-        """Whether a 4xx body blames the size of the request.
+    def _classify_4xx(error: urllib.error.HTTPError) -> str:
+        """What a 4xx body says the problem is: ``auth``, ``too_large`` or ``rejected``.
 
-        Only a bounded prefix is read, and it is used for this one decision:
-        an error body can echo the prompt, so it is never kept or logged.
+        The status alone does not settle it: Google answers ``400 API_KEY_INVALID``
+        for a refused key, and a provider says "too large" in prose. Only a
+        bounded prefix is read, and it is used for this one decision - an error
+        body can echo the prompt, so it is never kept or logged.
         """
         try:
             body = error.read(4000).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001 - an unreadable body decides nothing
-            return False
-        return bool(_TOO_LARGE_BODY.search(body))
+            return "rejected"
+        if _BAD_KEY_BODY.search(body):
+            return "auth"
+        if _TOO_LARGE_BODY.search(body):
+            return "too_large"
+        return "rejected"
 
     def complete(self, prompt: str, system: str = "", *,
                  timeout: float | None = None) -> ProviderResponse:
@@ -506,7 +647,15 @@ class Provider:
                 last = e
                 if attempts > self.max_retries:
                     raise
-                self._sleep(self.backoff_base * (2 ** (attempts - 1)))
+                wait = self.backoff_base * (2 ** (attempts - 1))
+                if e.retry_after:
+                    # A wait longer than a request may block for is not spent
+                    # here: the cascade records it against this provider and
+                    # asks the next one, which is what having a cascade is for.
+                    if e.retry_after > INLINE_WAIT_SECONDS:
+                        raise
+                    wait = max(wait, e.retry_after)
+                self._sleep(wait)
                 continue
             text = self._extract_text(body)
             if not text:
@@ -718,16 +867,53 @@ class CascadeResult:
 
 
 def default_providers() -> list[Provider]:
-    """The cascade in the documented order: Gemini → Groq → OpenRouter → OpenHands."""
-    return [GeminiProvider(), GroqProvider(), OpenRouterProvider(),
-            OpenHandsOrchestratorProvider()]
+    """The cascade in its configured order.
+
+    ``PROVIDER_ORDER`` (comma-separated names) is the hierarchy: the names it
+    lists are tried first, in that order, and a provider it does not name keeps
+    its place after them - so a typo costs ordering, never a provider. The
+    default is Gemini → Groq → OpenRouter → OpenHands.
+
+    The order decides *priority*, not exclusivity: whichever provider answers
+    first wins, so an exhausted or broken one costs one failed attempt before
+    the next in line serves the request.
+    """
+    built = [GeminiProvider(), GroqProvider(), OpenRouterProvider(),
+             OpenHandsOrchestratorProvider()]
+    raw = os.environ.get("PROVIDER_ORDER", "").strip()
+    if not raw:
+        return built
+    by_name = {p.name: p for p in built}
+    wanted = [name.strip().lower() for name in raw.split(",") if name.strip()]
+    first = [by_name[name] for name in wanted if name in by_name]
+    chosen = {p.name for p in first}
+    return first + [p for p in built if p.name not in chosen]
 
 
 class ProviderCascade:
-    """Try providers in order; return the first valid structured plan."""
+    """Try providers in order; return the first valid structured plan.
 
-    def __init__(self, providers: list[Provider] | None = None):
+    *cooldowns* is the cascade's memory: a provider that just refused a key or
+    ran out of quota is skipped at once for a while instead of being retried on
+    every request. It is shared by passing the same object to several cascades;
+    the default is one per cascade.
+    """
+
+    def __init__(self, providers: list[Provider] | None = None, *,
+                 cooldowns: Cooldowns | None = None):
         self.providers = providers if providers is not None else default_providers()
+        self.cooldowns = cooldowns if cooldowns is not None else Cooldowns()
+
+    def _attempt_order(self) -> list[Provider]:
+        """Configured providers: those that are ready first, then the cooling ones.
+
+        A cooling provider is still tried when every ready one has failed -
+        being passed over is a matter of priority, never a refusal to try at all.
+        """
+        configured = [p for p in self.providers if p.configured]
+        ready = [p for p in configured if not self.cooldowns.cooling(p.name)]
+        cooling = [p for p in configured if self.cooldowns.cooling(p.name)]
+        return ready + cooling
 
     def configured(self) -> list[str]:
         return [p.name for p in self.providers if p.configured]
@@ -743,8 +929,19 @@ class ProviderCascade:
         :meth:`Provider.probe`); a provider with no key is ``blocked``. Nothing
         here is guessed: the report says which providers answered and which did
         not, so the caller can never declare a provider connected on faith.
+
+        The answers also refresh the cascade's memory: a probe that earned
+        ``ok`` makes that provider usable at once, and one that proved a refused
+        key or an unreachable host records the same cooldown a real request
+        would have. ``blocked`` (no key) says nothing about reachability.
         """
-        return [p.probe() for p in self.providers]
+        results = [p.probe() for p in self.providers]
+        for result in results:
+            if result.kind == "ok":
+                self.cooldowns.note_success(result.provider)
+            elif result.kind in ("auth", "unavailable"):
+                self.cooldowns.note_failure(result.provider, result.kind)
+        return results
 
     def plan(self, prompt: str, system: str = "", *,
              timeout: float | None = None) -> CascadeResult:
@@ -757,13 +954,13 @@ class ProviderCascade:
         """
         failures: list[tuple[str, str]] = []
         kinds: list[str] = []
-        for provider in self.providers:
-            if not provider.configured:
-                continue
+        for provider in self._attempt_order():
             try:
                 response = provider.complete(prompt, system, timeout=timeout)
                 plan = validate_plan_json(response.data)
             except ProviderError as e:
+                self.cooldowns.note_failure(provider.name, failure_kind(e),
+                                            getattr(e, "retry_after", None))
                 failures.append((provider.name, str(e)))
                 kinds.append(failure_kind(e))
                 continue
@@ -771,6 +968,7 @@ class ProviderCascade:
                 failures.append((provider.name, f"invalid plan: {e}"))
                 kinds.append("rejected")
                 continue
+            self.cooldowns.note_success(provider.name)
             return CascadeResult(response=response, plan=plan, failovers=list(failures))
         raise AllProvidersFailed(failures, kinds)
 
@@ -789,14 +987,14 @@ class ProviderCascade:
         """
         failures: list[tuple[str, str]] = []
         kinds: list[str] = []
-        for provider in self.providers:
-            if not provider.configured:
-                continue
+        for provider in self._attempt_order():
             try:
                 text = provider.complete_text(prompt, system, token=token)
             except GenerationCancelled:
                 raise
             except ProviderError as e:
+                self.cooldowns.note_failure(provider.name, failure_kind(e),
+                                            getattr(e, "retry_after", None))
                 failures.append((provider.name, str(e)))
                 kinds.append(failure_kind(e))
                 continue
@@ -804,6 +1002,7 @@ class ProviderCascade:
                 failures.append((provider.name, "empty completion"))
                 kinds.append("rejected")
                 continue
+            self.cooldowns.note_success(provider.name)
             return ProviderResponse(provider=provider.name, model=provider.model,
                                     data={"text": text})
         raise AllProvidersFailed(failures, kinds)

@@ -18,8 +18,10 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchestration.providers import (  # noqa: E402
+    AUTH_COOLDOWN_SECONDS,
     USER_AGENT,
     AllProvidersFailed,
+    Cooldowns,
     GeminiProvider,
     GroqProvider,
     OpenHandsOrchestratorProvider,
@@ -27,6 +29,7 @@ from orchestration.providers import (  # noqa: E402
     ProviderAuthError,
     ProviderCascade,
     ProviderRejected,
+    default_providers,
     validate_plan_json,
 )
 
@@ -90,6 +93,10 @@ class FakeProvider(BaseHTTPRequestHandler):
             "ua": self.headers.get("User-Agent"),
             "body": None,
         })
+        status = getattr(self.server, "models_status", None)
+        if status:
+            self._reply(status, getattr(self.server, "models_error", {}))
+            return
         self._reply(200, self.server.models)
 
 
@@ -100,6 +107,8 @@ def provider_server():
     srv.calls = []
     srv.index = 0
     srv.models = {"data": [{"id": "m"}, {"id": "other"}]}
+    srv.models_status = None
+    srv.models_error = {}
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     yield srv
@@ -113,15 +122,18 @@ def base(srv) -> str:
 
 
 def gemini(srv, **kw) -> GeminiProvider:
-    return GeminiProvider(base_url=base(srv), api_key="k", model="m", sleep=lambda _s: None, **kw)
+    kw.setdefault("sleep", lambda _s: None)  # a test may want to see the waits
+    return GeminiProvider(base_url=base(srv), api_key="k", model="m", **kw)
 
 
 def groq(srv, **kw) -> GroqProvider:
-    return GroqProvider(base_url=base(srv), api_key="k", model="m", sleep=lambda _s: None, **kw)
+    kw.setdefault("sleep", lambda _s: None)
+    return GroqProvider(base_url=base(srv), api_key="k", model="m", **kw)
 
 
 def openrouter(srv, **kw) -> OpenRouterProvider:
-    return OpenRouterProvider(base_url=base(srv), api_key="k", model="m", sleep=lambda _s: None, **kw)
+    kw.setdefault("sleep", lambda _s: None)
+    return OpenRouterProvider(base_url=base(srv), api_key="k", model="m", **kw)
 
 
 def openhands(srv, **kw) -> OpenHandsOrchestratorProvider:
@@ -263,3 +275,118 @@ def test_validate_plan_json_rejects_prose():
 def test_validate_plan_json_accepts_a_minimal_plan():
     plan = validate_plan_json({"tasks": [{"title": "A"}]})
     assert plan[0]["title"] == "A" and plan[0]["id"] == "task-1"
+
+
+# -------------------------------------------------------------- the hierarchy
+def test_the_provider_order_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("PROVIDER_ORDER", "openrouter, groq")
+    names = [p.name for p in default_providers()]
+    assert names[:2] == ["openrouter", "groq"]
+    # A provider the variable does not name keeps its place instead of vanishing.
+    assert sorted(names) == ["gemini", "groq", "openhands", "openrouter"]
+
+
+def test_an_unknown_name_in_the_order_costs_nothing(monkeypatch):
+    monkeypatch.setenv("PROVIDER_ORDER", "groq,nonsense")
+    assert [p.name for p in default_providers()] == ["groq", "gemini", "openrouter", "openhands"]
+
+
+def test_a_refused_key_is_passed_over_at_once_on_the_next_request(provider_server):
+    """The hierarchy has to remember: a 401 costs one attempt, not one per request."""
+    provider_server.script = [{"status": 401, "payload": {}},
+                              {"payload": chat_body()},
+                              {"payload": chat_body()}]
+    cascade = ProviderCascade([gemini(provider_server), groq(provider_server)])
+
+    first = cascade.plan("goal")
+    assert first.provider == "groq"
+    assert [name for name, _ in first.failovers] == ["gemini"]
+    assert len(provider_server.calls) == 2
+    assert cascade.cooldowns.cooling("gemini")
+
+    second = cascade.plan("goal")
+    assert second.provider == "groq"
+    assert len(provider_server.calls) == 3  # gemini was not asked again
+
+
+def test_a_long_retry_after_moves_on_instead_of_blocking_the_request(provider_server):
+    slept: list[float] = []
+    provider_server.script = [{"status": 429, "payload": {},
+                               "headers": {"Retry-After": "120"}},
+                              {"payload": gemini_body()}]
+    cascade = ProviderCascade([groq(provider_server, sleep=slept.append),
+                               gemini(provider_server)])
+
+    result = cascade.plan("goal")
+    assert result.provider == "gemini"
+    assert slept == []                                   # the request did not block
+    assert cascade.cooldowns.remaining("groq") > 100     # but groq is skipped for that long
+
+
+def test_a_short_retry_after_is_waited_out(provider_server):
+    slept: list[float] = []
+    provider_server.script = [{"status": 429, "payload": {},
+                               "headers": {"Retry-After": "1"}},
+                              {"payload": chat_body()}]
+    cascade = ProviderCascade([groq(provider_server, sleep=slept.append)])
+    assert cascade.plan("goal").provider == "groq"
+    assert slept and slept[0] >= 1.0
+
+
+def test_402_means_the_account_is_out_of_credits(provider_server):
+    provider_server.script = [{"status": 402, "payload": {}}]
+    cascade = ProviderCascade([groq(provider_server)])
+    with pytest.raises(AllProvidersFailed) as excinfo:
+        cascade.plan("goal")
+    assert excinfo.value.kinds == ["auth"]
+    assert cascade.cooldowns.remaining("groq") > 100
+
+
+def test_cooling_providers_are_tried_after_the_ready_ones(provider_server):
+    now = [1000.0]
+    cooldowns = Cooldowns(clock=lambda: now[0])
+    cooldowns.note_failure("gemini", "auth")
+    cascade = ProviderCascade([gemini(provider_server), groq(provider_server)],
+                              cooldowns=cooldowns)
+    assert [p.name for p in cascade._attempt_order()] == ["groq", "gemini"]
+    now[0] += AUTH_COOLDOWN_SECONDS + 1
+    assert [p.name for p in cascade._attempt_order()] == ["gemini", "groq"]
+
+
+def test_a_400_that_names_the_key_is_a_refused_key(provider_server):
+    """Google answers ``400 API_KEY_INVALID`` for a bad key, so the status lies."""
+    provider_server.script = [{"status": 400, "payload": {"error": {
+        "code": 400,
+        "message": "API key not valid. Please pass a valid API key.",
+        "status": "INVALID_ARGUMENT"}}}]
+    cascade = ProviderCascade([gemini(provider_server)])
+
+    with pytest.raises(AllProvidersFailed) as excinfo:
+        cascade.plan("goal")
+    assert excinfo.value.kinds == ["auth"]
+    assert cascade.cooldowns.remaining("gemini") > 100
+
+
+def test_a_probe_on_a_refused_key_marks_that_provider_cooling(provider_server):
+    provider_server.models_status = 400
+    provider_server.models_error = {"error": {"message": "API key not valid"}}
+    cascade = ProviderCascade([gemini(provider_server)])
+
+    assert cascade.probe_all()[0].kind == "auth"
+    assert cascade.cooldowns.cooling("gemini")
+
+    # The key is fixed: a probe that earns "ok" makes the provider usable again.
+    provider_server.models_status = None
+    assert cascade.probe_all()[0].kind == "ok"
+    assert not cascade.cooldowns.cooling("gemini")
+
+
+def test_a_provider_is_still_tried_when_every_provider_is_cooling(provider_server):
+    """Being cooling is priority, not exclusion: the request is never sent nowhere."""
+    cooldowns = Cooldowns()
+    cooldowns.note_failure("groq", "auth")
+    provider_server.script = [{"payload": chat_body()}]
+    cascade = ProviderCascade([groq(provider_server)], cooldowns=cooldowns)
+
+    assert cascade.plan("goal").provider == "groq"
+    assert not cooldowns.cooling("groq")

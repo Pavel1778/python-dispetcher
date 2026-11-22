@@ -521,6 +521,11 @@ def cmd_providers(args: argparse.Namespace) -> int:
     configured = data.get("configured", [])
     lines = [f"order: {' → '.join(data.get('order', []))}",
              f"configured: {', '.join(configured) or '(none)'}"]
+    cooling = data.get("cooling") or {}
+    if cooling:
+        lines.append("cooling: " + ", ".join(
+            f"{name} {info.get('seconds', 0)}s ({info.get('kind', '')})"
+            for name, info in cooling.items()))
     for probe in data.get("probes", []):
         lines.append(f"  {probe['provider']}: {probe['kind']} — {probe['detail']}")
     _emit(args, data, human="\n".join(lines))

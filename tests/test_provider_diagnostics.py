@@ -41,6 +41,8 @@ from orchestration.openhands_diagnostics import (  # noqa: E402
     Report,
 )
 from orchestration.providers import (  # noqa: E402
+    AUTH_COOLDOWN_SECONDS,
+    Cooldowns,
     GeminiProvider,
     GroqProvider,
     OpenHandsOrchestratorProvider,
@@ -290,17 +292,31 @@ def test_context_is_preserved_across_the_switch(provider_server):
     assert messages[-1] == {"role": "user", "content": "GOAL-TEXT-42"}
 
 
-def test_return_to_the_primary_once_it_answers(provider_server):
-    """The primary is retried on every call; when it works it wins again."""
-    provider_server.script = [{"status": 401, "payload": {}},   # call 1: gemini down
+def test_the_primary_returns_once_its_cooldown_expires(provider_server):
+    """A refused key is passed over for a while; after that the primary is first again.
+
+    Changed on purpose: this test used to assert that the refused primary was
+    retried on *every* call. A 401 costs one attempt now and then the provider
+    is skipped until the cooldown ends, which is the hierarchy's whole point.
+    """
+    now = [1000.0]
+    cooldowns = Cooldowns(clock=lambda: now[0])
+    provider_server.script = [{"status": 401, "payload": {}},   # call 1: gemini refused
                               {"payload": chat_body()},          # call 1: groq
-                              {"payload": gemini_body()}]        # call 2: gemini back
-    cascade = ProviderCascade([gemini(provider_server), groq(provider_server)])
-    first = cascade.plan("goal")
+                              {"payload": chat_body()},          # call 2: groq again
+                              {"payload": gemini_body()}]        # call 3: gemini back
+    cascade = ProviderCascade([gemini(provider_server), groq(provider_server)],
+                              cooldowns=cooldowns)
+
+    assert cascade.plan("goal").provider == "groq"
     second = cascade.plan("goal")
-    assert first.provider == "groq"
-    assert second.provider == "gemini"
-    assert second.failovers == []
+    assert second.provider == "groq"                  # gemini is still cooling down
+    assert [name for name, _ in second.failovers] == []
+
+    now[0] += AUTH_COOLDOWN_SECONDS + 1               # the cooldown has expired
+    third = cascade.plan("goal")
+    assert third.provider == "gemini"
+    assert third.failovers == []                      # the primary is first again
 
 
 def test_cascade_probe_reports_no_false_success_when_all_fail(provider_server):

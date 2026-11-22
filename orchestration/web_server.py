@@ -1598,6 +1598,12 @@ class App:
                 {"provider": r.provider, "model": r.model, "kind": r.kind,
                  "detail": r.detail, "model_available": r.model_available}
                 for r in self.providers.probe_all()]
+        # Which providers are skipped right now, and why. A provider in here is
+        # still tried when every ready one has failed, so this is priority, not
+        # exclusion. Names and durations only; no key is ever returned. Read
+        # *after* the probes, or the answer would lag one call behind what the
+        # probes just proved.
+        out["cooling"] = self.providers.cooldowns.snapshot()
         return out
 
     def observability(self) -> dict[str, Any]:
