@@ -208,16 +208,22 @@ def collect(binary: str) -> Matrix:
               f"refusals={c['refusals']}", compared=True, agree=(abs(got - exp) < 1e-9))
 
     # -- areas with no Rust counterpart (honest, not counted) --------------
+    #
+    # The SQL claim, lease reclaim and HTTP read API *do* have a Rust
+    # counterpart now (nexus-store, nexus-api), but they are compared by their
+    # own real-PostgreSQL suites (tests/test_rust_claim_parity.py,
+    # test_rust_lifecycle_parity.py, test_rust_api_parity.py), not by this
+    # pure-function harness, so they are NOT COMPARABLE here rather than
+    # counted twice.
     for area in ("SQL claim (FOR UPDATE SKIP LOCKED)",
                  "lease reclaim (reclaim_expired)",
+                 "HTTP read API (nexus-api)",
                  "durable dispatch journal",
                  "evidence signing",
-                 "HTTP API surface",
                  "OpenHands transport",
                  "intent router (language-sensitive)",
                  "task-kind derivation (language-sensitive)"):
-        m.add(area, area, compared=False, agree=None,
-              note="NOT IMPLEMENTED" if "claim" not in area else "NOT COMPARABLE")
+        m.add(area, area, compared=False, agree=None, note="NOT COMPARABLE")
     return m
 
 

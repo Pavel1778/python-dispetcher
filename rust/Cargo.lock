@@ -1010,8 +1010,12 @@ dependencies = [
  "clap",
  "nexus-core",
  "nexus-domain",
+ "nexus-store",
  "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
