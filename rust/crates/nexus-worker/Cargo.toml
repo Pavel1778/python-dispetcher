@@ -1,0 +1,20 @@
+[package]
+name = "nexus-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NEXUS worker loop in Rust: claim, execute, settle, decide over nexus-store."
+
+[dependencies]
+nexus-store = { path = "../nexus-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "json"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

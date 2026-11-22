@@ -4,6 +4,9 @@ members = [
     "crates/nexus-domain",
     "crates/nexus-core",
     "crates/nexus-storage",
+    "crates/nexus-store",
+    "crates/nexus-worker",
+    "crates/nexus-api",
     "crates/nexus-cli",
 ]
 
