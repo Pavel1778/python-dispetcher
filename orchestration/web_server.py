@@ -4807,7 +4807,11 @@ class Handler(BaseHTTPRequestHandler):
                         default_model=(body.get("default_model") or None),
                         make_default=bool(body.get("make_default")),
                         max_concurrent_tasks=body.get("max_concurrent_tasks"),
-                        daily_conversation_limit=body.get("daily_conversation_limit"))
+                        daily_conversation_limit=body.get("daily_conversation_limit"),
+                        # The LLM *provider* endpoint and label, distinct from the
+                        # OpenHands API URL above.
+                        llm_base_url=(body.get("llm_base_url") or None),
+                        llm_provider=(body.get("llm_provider") or None))
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(201, {"account": account})

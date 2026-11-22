@@ -19,7 +19,9 @@ Capabilities are discovered read-only and cached; they never include a secret.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from .cloud_client import (
     CloudAuthError,
@@ -58,7 +60,8 @@ _VIEW_COLUMNS = (
     "is_default, capabilities, last_checked_at, last_error, created_at, updated_at, "
     "enabled, priority, health, active_tasks, last_error_at, max_concurrent_tasks, "
     "daily_conversation_limit, api_key_hint, connection_ok, last_connection_at, "
-    "error_count, api_version, compatibility, compatibility_detail, health_checked_at"
+    "error_count, api_version, compatibility, compatibility_detail, health_checked_at, "
+    "llm_base_url, llm_provider, config_synced_at, config_sync_state, config_sync_error"
 )
 
 
@@ -153,15 +156,17 @@ class OpenHandsAccountService:
             base_url: str | None = None, transport: str | None = None,
             default_model: str | None = None, make_default: bool = False,
             max_concurrent_tasks: int | None = None,
-            daily_conversation_limit: int | None = None) -> dict:
+            daily_conversation_limit: int | None = None,
+            llm_base_url: str | None = None,
+            llm_provider: str | None = None) -> dict:
         """Verify the key, then store it encrypted. Returns a key-free view.
 
         Re-adding a connection that already exists (a reconnect, or the same
         form submitted again) updates it in place. A field the caller did not
         name is **left as it was**: a reconnect that omits ``default_model``
         must not clear the model the operator saved, and the same holds for the
-        transport, the base URL and the limits. Only an explicit value changes a
-        field; use :meth:`edit` to clear one deliberately.
+        transport, the base URL, the limits and the LLM provider settings. Only
+        an explicit value changes a field; use :meth:`edit` to clear one.
         """
         label = _text(label, "label", maximum=120)
         if not isinstance(api_key, str) or not api_key.strip():
@@ -173,6 +178,8 @@ class OpenHandsAccountService:
         if default_model is not None:
             default_model = _text(default_model, "default_model", maximum=200,
                                   required=False) or None
+        llm_base_url = _llm_base_url(llm_base_url)
+        llm_provider = _llm_provider(llm_provider)
         max_concurrent_tasks = _check_limit(max_concurrent_tasks, "max_concurrent_tasks")
         daily_conversation_limit = _check_limit(daily_conversation_limit,
                                                 "daily_conversation_limit")
@@ -193,15 +200,17 @@ class OpenHandsAccountService:
                 " identity, capabilities, last_checked_at, api_key_hint, "
                 " max_concurrent_tasks, daily_conversation_limit, health, health_checked_at, "
                 " connection_ok, last_connection_at, api_version, compatibility, "
-                " compatibility_detail) "
+                " compatibility_detail, llm_base_url, llm_provider) "
                 "VALUES (%s,%s,%s,COALESCE(%s,'direct'),%s,%s,%s,%s,now(),%s,%s,%s,"
-                "        'healthy',now(),true,now(),%s,%s,%s) "
+                "        'healthy',now(),true,now(),%s,%s,%s,%s,%s) "
                 "ON CONFLICT (principal, label) DO UPDATE SET "
                 # A field the caller did not name keeps its stored value; only an
                 # explicit value overwrites it (see the docstring).
                 "  base_url=EXCLUDED.base_url, "
                 "  transport=COALESCE(%s, nexus_openhands_accounts.transport), "
                 "  default_model=COALESCE(%s, nexus_openhands_accounts.default_model), "
+                "  llm_base_url=COALESCE(%s, nexus_openhands_accounts.llm_base_url), "
+                "  llm_provider=COALESCE(%s, nexus_openhands_accounts.llm_provider), "
                 "  api_key_encrypted=EXCLUDED.api_key_encrypted, "
                 "  api_key_hint=EXCLUDED.api_key_hint, "
                 "  max_concurrent_tasks=COALESCE(%s, nexus_openhands_accounts.max_concurrent_tasks), "
@@ -218,7 +227,9 @@ class OpenHandsAccountService:
                  identity, _json(capabilities), _mask_key(api_key),
                  max_concurrent_tasks, daily_conversation_limit, probe.get("api_version"),
                  probe.get("compatibility") or "unknown", (probe.get("detail") or "")[:500],
-                 transport, default_model, max_concurrent_tasks, daily_conversation_limit))
+                 llm_base_url, llm_provider,
+                 transport, default_model, llm_base_url, llm_provider,
+                 max_concurrent_tasks, daily_conversation_limit))
             view = self._view(cur.fetchone())
             if make_default:
                 self._set_default(cur, principal, view["id"])
@@ -230,7 +241,9 @@ class OpenHandsAccountService:
              transport: str | None = None, default_model: object = _UNSET,
              max_concurrent_tasks: object = _UNSET,
              daily_conversation_limit: object = _UNSET,
-             api_key: str | None = None) -> dict:
+             api_key: str | None = None,
+             llm_base_url: object = _UNSET,
+             llm_provider: object = _UNSET) -> dict:
         """Edit a connection: its name, where it points, what it signs with.
 
         Only the fields passed are changed; ``default_model`` and the limits
@@ -263,6 +276,10 @@ class OpenHandsAccountService:
         if daily_conversation_limit is not _UNSET:
             daily_conversation_limit = _check_limit(daily_conversation_limit,
                                                     "daily_conversation_limit")
+        if llm_base_url is not _UNSET:
+            llm_base_url = _llm_base_url(llm_base_url)
+        if llm_provider is not _UNSET:
+            llm_provider = _llm_provider(llm_provider)
         with self.store._tx() as cur:
             cur.execute("SELECT base_url, state FROM nexus_openhands_accounts "
                         "WHERE id=%s AND principal=%s", (account_id, principal))
@@ -311,6 +328,12 @@ class OpenHandsAccountService:
         if daily_conversation_limit is not _UNSET:
             sets.append("daily_conversation_limit=%s")
             params.append(daily_conversation_limit)
+        if llm_base_url is not _UNSET:
+            sets.append("llm_base_url=%s")
+            params.append(llm_base_url)
+        if llm_provider is not _UNSET:
+            sets.append("llm_provider=%s")
+            params.append(llm_provider)
         if api_key is not None:
             sets.append("api_key_encrypted=%s")
             params.append(_encrypt_secret(api_key))
@@ -768,10 +791,16 @@ class OpenHandsAccountService:
             from .execution_profiles import ExecutionProfiles
             cloud.execution_profiles = ExecutionProfiles(self.store)
             cloud.scope = str(account_id)
+            # The app transport has no agent-settings surface to set a model or
+            # base URL on; record the desired values so a caller can see them.
+            cloud.llm_model = cfg.get("default_model")
+            cloud.llm_base_url = cfg.get("llm_base_url")
             return cloud
         # ``scope``: this connection reuses only the sandboxes it started.
         return build_direct_client(self.store, cloud=cloud,
                                    llm_model=cfg.get("default_model"),
+                                   llm_base_url=cfg.get("llm_base_url"),
+                                   llm_provider=cfg.get("llm_provider"),
                                    scope=str(account_id))
 
     def client_for_project(self, principal: str, project_id: str) -> CloudClient:
@@ -790,12 +819,16 @@ class OpenHandsAccountService:
         return self.client_for_account(principal, str(account_id))
 
     def account_config(self, principal: str, account_id: str) -> dict:
-        """Non-secret execution config for an account (transport, base URL, model).
+        """Non-secret execution config for an account.
 
-        The caller uses this to build the transport; the key never leaves here.
+        Three distinct values, kept apart on purpose: ``base_url`` is the
+        OpenHands *API* endpoint, ``default_model`` the model identifier, and
+        ``llm_base_url`` the LLM *provider* endpoint (``None`` = the provider's
+        default). The key never leaves here.
         """
         with self.store._tx() as cur:
-            cur.execute("SELECT base_url, transport, default_model, state "
+            cur.execute("SELECT base_url, transport, default_model, state, "
+                        "llm_base_url, llm_provider "
                         "FROM nexus_openhands_accounts WHERE id=%s AND principal=%s",
                         (account_id, principal))
             row = cur.fetchone()
@@ -804,7 +837,9 @@ class OpenHandsAccountService:
             if row["state"] != "active":
                 raise ValueError(f"account is {row['state']}")
             return {"base_url": row["base_url"], "transport": row["transport"],
-                    "default_model": row["default_model"]}
+                    "default_model": row["default_model"],
+                    "llm_base_url": row["llm_base_url"],
+                    "llm_provider": row["llm_provider"]}
 
     def _decrypt(self, principal: str, account_id: str) -> str:
         with self.store._tx() as cur:
@@ -842,6 +877,45 @@ def _renumber(cur: Any, project_id: Any) -> None:
                     (position, project_id, account_id))
     cur.execute("UPDATE nexus_projects SET openhands_account_id=%s, updated_at=now() "
                 "WHERE id=%s", (ordered[0] if ordered else None, project_id))
+
+
+def _llm_base_url(value: Any) -> str | None:
+    """Validate an LLM *provider* Base URL (not the OpenHands API URL).
+
+    ``None`` or empty means "the provider's own default endpoint". A value must
+    be an absolute http(s) URL with a host; anything else is refused rather than
+    stored, because a bad provider URL turns into an LLM auth/connection error
+    deep inside a sandbox where it is hard to diagnose.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("llm_base_url must be a string or null")
+    value = value.strip()
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError("llm_base_url must be an absolute http(s) URL")
+    return value.rstrip("/")
+
+
+def _llm_provider(value: Any) -> str | None:
+    """A short provider label (``openai``, ``anthropic``, ``openrouter``…).
+
+    Informational only: the model string is what OpenHands routes on. Kept so an
+    operator can see which endpoint a model belongs to without reading the URL.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("llm_provider must be a string or null")
+    value = value.strip().lower()
+    if not value:
+        return None
+    if len(value) > 60 or not re.fullmatch(r"[a-z0-9_.-]+", value):
+        raise ValueError("llm_provider must be a short lowercase label")
+    return value
 
 
 def _check_limit(value: Any, name: str) -> int | None:

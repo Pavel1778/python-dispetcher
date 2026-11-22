@@ -113,6 +113,9 @@ class FakeAgentServer:
         # sandbox url -> {conversation id -> payload}
         self.by_sandbox: dict[str, dict[str, dict]] = {}
         self.requests: list[tuple[str, str, str]] = []
+        #: The body of every POST /api/conversations, so a test can assert on
+        #: the agent_settings (model, base_url) a conversation was created with.
+        self.create_bodies: list[dict] = []
 
     def _box(self, url: str) -> dict[str, dict]:
         return self.by_sandbox.setdefault(url, {})
@@ -132,6 +135,7 @@ class FakeAgentServer:
         if path.startswith("/api/conversations/search"):
             return 200, {"items": list(box.values())}
         if method == "POST" and path == "/api/conversations":
+            self.create_bodies.append(body)
             cid = body["conversation_id"]
             box[cid] = {
                 "id": cid,
@@ -437,5 +441,46 @@ def test_repository_less_task_is_never_prefixed(monkeypatch):
         client, _ = _client(store, account)
         # No repository: even refuse mode must not raise.
         assert client._apply_repository_mode("analyze", None, None) == "analyze"
+    finally:
+        store.close()
+
+
+def test_the_llm_provider_base_url_reaches_the_sandbox_agent_settings():
+    """A configured LLM base URL and model are applied to the session.
+
+    This is the Phase One acceptance for the *provider endpoint*: it is distinct
+    from the OpenHands API URL, and a bare sandbox's default must not win. The
+    assertion is on the body the agent-server actually received, not on a
+    client attribute.
+    """
+    store = PostgresStore(DSN)
+    try:
+        account = FakeCloudAccount()
+        client, server = _client(store, account)
+        client.llm_model = "openhands/configured-model"
+        client.llm_base_url = "https://llm.example.test/v1"
+        client.start_conversation(initial_message="do it", title="cfg")
+
+        body = server.create_bodies[-1]
+        llm = body["agent_settings"]["llm"]
+        assert llm["model"] == "openhands/configured-model"
+        assert llm["base_url"] == "https://llm.example.test/v1"
+    finally:
+        store.close()
+
+
+def test_an_unset_llm_base_url_leaves_the_provider_default():
+    """No configured base URL means the sandbox keeps its own (None), and the
+    model still overrides — the two are independent."""
+    store = PostgresStore(DSN)
+    try:
+        account = FakeCloudAccount()
+        client, server = _client(store, account)
+        client.llm_model = "openhands/only-model"
+        client.llm_base_url = None
+        client.start_conversation(initial_message="do it", title="cfg2")
+        llm = server.create_bodies[-1]["agent_settings"]["llm"]
+        assert llm["model"] == "openhands/only-model"
+        assert "base_url" not in llm or llm.get("base_url") is None
     finally:
         store.close()
