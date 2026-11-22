@@ -8,6 +8,10 @@ state/
 .env
 .env.*
 !.env.example
+# A per-deployment env file kept beside the code (it holds live keys and a DSN).
+# Untracked by accident is one `git add .` away from publishing every secret.
+python-dispetcher.env
+*.env
 .audit-baseline/
 .restore-points/
 dist/
