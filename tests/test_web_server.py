@@ -286,6 +286,16 @@ def test_healthz_is_public_and_minimal(server):
 def test_config_reports_cloud_key(http):
     st, body = http.get("/api/config")
     assert st == 200 and body["cloud_key"] is True
+    # The model a sandbox conversation is forced onto: None when the sandbox's
+    # own default applies. Reported so a forced model can be confirmed rather
+    # than inferred from a conversation that ended on an LLM auth error.
+    assert body["sandbox_model"] is None
+
+
+def test_config_reports_the_forced_sandbox_model(http, monkeypatch):
+    monkeypatch.setenv("OPENHANDS_DEFAULT_MODEL", "openhands/deepseek-v4.1-flash")
+    st, body = http.get("/api/config")
+    assert st == 200 and body["sandbox_model"] == "openhands/deepseek-v4.1-flash"
 
 
 def test_health(http):

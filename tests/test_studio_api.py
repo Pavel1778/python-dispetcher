@@ -219,7 +219,12 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     status, body = studio.api.get("/api/studio")
     assert status == 200
     assert body["providers"] == ["groq"]
-    assert body["openhands"] == {"server_key": True, "transport": "direct"}
+    # ``model`` is None because this deployment forces no model on a sandbox
+    # conversation. It is reported (not a secret) so the page can name the model
+    # in force: without it a conversation may end on an LLM auth error for a
+    # model nobody chose.
+    assert body["openhands"] == {"server_key": True, "transport": "direct",
+                                 "model": None}
     assert body["github"] == {"server_token": True}
     assert body["accounts"] == {"encryption_key": True}
     # This server does not advance autonomous runs unless it is told to. The
@@ -236,6 +241,14 @@ def test_status_says_what_is_configured_and_never_the_values(studio, monkeypatch
     for value in ("cloud-key-value", SERVER_GITHUB_TOKEN, "llm-key-value",
                   "studio-tests-secret-key", TOKEN):
         assert value not in text
+
+    # A forced sandbox model is reported by name, so the operator can confirm
+    # the setting took effect instead of inferring it from a failed task.
+    monkeypatch.setenv("OPENHANDS_DEFAULT_MODEL", "openhands/deepseek-v4.1-flash")
+    status, body = studio.api.get("/api/studio")
+    assert status == 200
+    assert body["openhands"]["model"] == "openhands/deepseek-v4.1-flash"
+    monkeypatch.delenv("OPENHANDS_DEFAULT_MODEL")
 
     monkeypatch.delenv("OPENHANDS_API_KEY")
     monkeypatch.delenv("NEXUS_SECRET_KEY")

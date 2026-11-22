@@ -840,6 +840,12 @@ class App:
             "openhands": {
                 "server_key": bool(os.environ.get("OPENHANDS_API_KEY")),
                 "transport": os.environ.get("OPENHANDS_TRANSPORT", "direct"),
+                # The model forced on every sandbox conversation, or None when
+                # the sandbox's own default applies. Without it a conversation
+                # can end on an LLM auth error the operator never chose, so the
+                # page has to be able to say which model is in force. A model
+                # name is not a secret.
+                "model": os.environ.get("OPENHANDS_DEFAULT_MODEL") or None,
             },
             "github": {"server_token": self.github.configured},
             # Whether this process advances autonomous runs itself. When it
@@ -4574,6 +4580,12 @@ class Handler(BaseHTTPRequestHandler):
                         self.app.client, "supports_repository_selection", False),
                     "repository_mode": os.environ.get(
                         "OPENHANDS_DIRECT_REPO_MODE", "prompt"),
+                    # The model a sandbox conversation is forced onto, or None
+                    # when the sandbox's own default applies. Reported so an
+                    # operator can confirm the setting took effect: without it
+                    # a conversation may end on an LLM auth error for a model
+                    # nobody chose.
+                    "sandbox_model": os.environ.get("OPENHANDS_DEFAULT_MODEL") or None,
                 })
             if path == "/api/repositories":
                 return self._json(200, {

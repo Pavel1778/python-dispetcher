@@ -108,7 +108,7 @@ shell, and double every `$` (`$$`) inside a Docker Compose `env_file`.
 | `OPENHANDS_API_KEY` | — | `cloud_client.py` | Bearer key for Cloud V1. Required for real execution. Never logged or returned. |
 | `OPENHANDS_CLOUD_URL` | `https://app.all-hands.dev` | `cloud_client.py` | Cloud base URL. Must be `http(s)`; any other scheme is refused at construction. |
 | `OPENHANDS_TRANSPORT` | `direct` | `cloud_direct.py` | `direct` provisions a sandbox and drives its agent-server; `app` uses the legacy app-conversation endpoint. |
-| `OPENHANDS_DEFAULT_MODEL` | — | `cloud_direct.py` | Model forced on every sandbox conversation. **Recommended**: a bare sandbox's default model may have no key (see `OPENHANDS_SETUP.md`). |
+| `OPENHANDS_DEFAULT_MODEL` | — | `cloud_direct.py` | Model forced on every sandbox conversation. **Recommended**: a bare sandbox's default model may have no key (see `OPENHANDS_SETUP.md`). Reported as `sandbox_model` in `/api/config` and as `openhands.model` in `/api/studio`, so a forced model can be confirmed rather than inferred. |
 | `OPENHANDS_DIRECT_REPO_MODE` | `prompt` | `cloud_direct.py` | How the direct transport handles a repository-scoped task: `prompt` prepends a clone step, `refuse` dead-letters, `allow` ignores the field. |
 | `OPENHANDS_AGENT_PROFILE_ID` | — | `web_server.py` | Select an account agent profile by id. Unset = inherit the account's active profile and its MCP servers/skills. |
 | `OPENHANDS_ORCHESTRATOR_MODEL` | `gpt-5` | `providers.py` | Model for OpenHands used as the orchestrator fallback (see §3.4). |
@@ -135,14 +135,19 @@ only *proposes* plans; OpenHands remains the executor.
 
 | Variable | Default | Read by | Meaning |
 | --- | --- | --- | --- |
+| `PROVIDER_ORDER` | `gemini,groq,openrouter,openhands` | `providers.py` | The cascade hierarchy. Names listed here are tried first, in this order; a provider it does not name keeps its place after them, so a typo costs ordering, never a provider. |
 | `GEMINI_API_KEY` | — | `providers.py` | Gemini (first in the cascade). |
 | `GROQ_API_KEY` | — | `providers.py` | Groq (second). |
 | `OPENROUTER_API_KEY` | — | `providers.py` | OpenRouter (third). |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | `providers.py` | Model override. |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | `providers.py` | Model override. |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | `providers.py` | Model override. Groq retired the Llama models; a Llama default reads as "model not in the key's list", i.e. a broken key. |
 | `OPENROUTER_MODEL` | `openai/gpt-4o-mini` | `providers.py` | Model override. |
 | `GEMINI_BASE_URL` / `GROQ_BASE_URL` / `OPENROUTER_BASE_URL` | provider defaults | `providers.py` | Endpoint overrides. |
 | `<PROVIDER>_CONTEXT_TOKENS` | per provider | `providers.py` | The model's window, used to size planning parts. |
+| `PROVIDER_AUTH_COOLDOWN` | `900` | `providers.py` | Seconds a provider whose key was refused (401/403, 402, or a 400 whose body names the key) is skipped. |
+| `PROVIDER_UNAVAILABLE_COOLDOWN` | `60` | `providers.py` | First skip for an unreachable or out-of-quota provider; doubles with each consecutive failure. A `Retry-After` the provider sends wins when it is longer. |
+| `PROVIDER_MAX_COOLDOWN` | `900` | `providers.py` | The longest a transport failure can skip a provider. |
+| `PROVIDER_INLINE_WAIT` | `10` | `providers.py` | The longest one request waits inside its own retry loop. A provider that asks to wait longer is skipped (see above) and the next one in the hierarchy is asked, instead of the request blocking for minutes. |
 
 ### 3.5 Evidence Trust Engine
 

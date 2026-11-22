@@ -2491,7 +2491,9 @@
       '<dt>Модели для ответов</dt>' + line(providers.length, providers.length ? esc(providers.join(', '))
         : 'не настроены — «Вопрос», «План» и «Автономно» не ответят') +
       '<dt>OpenHands</dt>' + line(openhands.server_key, openhands.server_key
-        ? 'ключ задан · транспорт ' + esc(openhands.transport || '') : 'OPENHANDS_API_KEY не задан — задачи не запустятся') +
+        ? 'ключ задан · транспорт ' + esc(openhands.transport || '') +
+          ' · модель ' + esc(openhands.model || 'по умолчанию аккаунта')
+        : 'OPENHANDS_API_KEY не задан — задачи не запустятся') +
       '<dt>GitHub</dt>' + line(github.server_token, github.server_token
         ? 'токен сервера задан' : 'токена сервера нет — нужен аккаунт GitHub выше') +
       '<dt>Шифрование</dt>' + line(crypto.encryption_key, crypto.encryption_key

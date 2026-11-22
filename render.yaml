@@ -95,6 +95,54 @@ services:
       # account's own active profile and its configured MCP servers/skills.
       - key: OPENHANDS_AGENT_PROFILE_ID
         sync: false
+      # The cascade hierarchy. The names listed are tried first, in this order;
+      # a provider it does not name keeps its place after them, so a typo costs
+      # ordering, never a provider. Which providers answer is decided by the
+      # keys below: a missing key skips that provider, it never fails.
+      - key: PROVIDER_ORDER
+        value: "gemini,groq,openrouter,openhands"
+      # Optional. One key per provider the cascade may plan with. With none of
+      # them, planning answers 503 with the reason per provider instead of
+      # inventing a plan. Server-side only; never logged, never returned.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      # Recommended. The model forced on every sandbox conversation. A bare
+      # sandbox starts on a model whose key it may not have, and the
+      # conversation then fails with an LLM auth error. This value was verified
+      # against the live account; change it when the account's LLM keys are
+      # reconfigured, not per deploy.
+      - key: OPENHANDS_DEFAULT_MODEL
+        value: "openhands/deepseek-v4.1-flash"
+      # Optional. `direct` (default) provisions a sandbox and drives its
+      # agent-server; `app` uses the legacy app-conversation endpoint, which
+      # cannot place a long task's text as a file.
+      - key: OPENHANDS_TRANSPORT
+        sync: false
+      # Required to store a GitHub PAT or an OpenHands key through the API: an
+      # account is Fernet-encrypted with it, and the endpoint refuses rather
+      # than write a plaintext credential. Generate once and keep it - a new
+      # value makes every stored key unreadable.
+      - key: NEXUS_SECRET_KEY
+        sync: false
+      # Optional. The Evidence Trust Engine signer. Without it the lab records
+      # no evidence at all (never a fabricated one), so a "verified" result has
+      # nothing to re-verify. Mint a pair with
+      # `python -m orchestration.evidence_keygen --key-id nexus-lab`.
+      - key: NEXUS_EVIDENCE_KEY_ID
+        sync: false
+      - key: NEXUS_EVIDENCE_PRIVATE_KEY
+        sync: false
+      - key: NEXUS_EVIDENCE_KEYRING
+        sync: false
+      # Optional. Direct session-mode DSN for migrations only (port 5432), used
+      # when SUPABASE_DB_URL points at a transaction-mode pooler (6543). The
+      # process applies the schema on start, so a pooler without it can hang.
+      - key: MIGRATE_DSN
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12.6"
 
@@ -127,6 +175,19 @@ services:
       - key: NEXUS_SECRET_KEY
         sync: false
       - key: GITHUB_TOKEN
+        sync: false
+      # This process applies the schema on start too, so it needs the same
+      # direct DSN when the main one is a transaction-mode pooler.
+      - key: MIGRATE_DSN
+        sync: false
+      # This process signs the run-level acceptance record (ACCEPTANCE stage),
+      # so it needs the same signer as the web service. Without it the stage is
+      # skipped, never faked.
+      - key: NEXUS_EVIDENCE_KEY_ID
+        sync: false
+      - key: NEXUS_EVIDENCE_PRIVATE_KEY
+        sync: false
+      - key: NEXUS_EVIDENCE_KEYRING
         sync: false
       - key: PYTHON_VERSION
         value: "3.12.6"
