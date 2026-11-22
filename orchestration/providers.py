@@ -231,6 +231,14 @@ def _retry_after(headers: Any) -> float | None:
     return value if value >= 0 else None
 
 
+#: Sent on every outbound provider request. Python's own ``Python-urllib/<ver>``
+#: is answered with a bare ``403`` by Groq's edge, which reads as a rejected key
+#: and fails a real completion the same way - so the probe and the working path
+#: must both name themselves. A value that resembles a bot is what gets refused;
+#: a plain product token is accepted.
+USER_AGENT = "nexus-orchestrator/1.0"
+
+
 # --------------------------------------------------------------- provider API
 
 
@@ -372,6 +380,7 @@ class Provider:
     def _get(self, path: str) -> Any:
         """A read-only GET to *path* on the provider, same error mapping."""
         req = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+        req.add_header("User-Agent", USER_AGENT)
         for key, value in self._headers().items():
             req.add_header(key, value)
         try:
@@ -393,6 +402,7 @@ class Provider:
               timeout: float | None = None, token: Any = None) -> Any:
         data = json.dumps(self._payload(prompt, system, prose=prose)).encode()
         req = urllib.request.Request(self._endpoint(), data=data, method="POST")
+        req.add_header("User-Agent", USER_AGENT)
         for key, value in self._headers().items():
             req.add_header(key, value)
         # The response object is bound to the generation token *before* it is
@@ -594,7 +604,10 @@ class GroqProvider(_OpenAICompatProvider):
 
     def __init__(self, **kw: Any):
         kw.setdefault("base_url", os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"))
-        kw.setdefault("model", os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
+        # Groq retired the Llama models; a key's own list now carries the
+        # gpt-oss family. The old default answered every probe with "model not
+        # in the key's list", which read as a broken key.
+        kw.setdefault("model", os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"))
         super().__init__(**kw)
 
 

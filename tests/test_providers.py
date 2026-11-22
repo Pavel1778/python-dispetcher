@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchestration.providers import (  # noqa: E402
+    USER_AGENT,
     AllProvidersFailed,
     GeminiProvider,
     GroqProvider,
@@ -61,6 +62,7 @@ class FakeProvider(BaseHTTPRequestHandler):
             "path": self.path,
             "auth": self.headers.get("Authorization"),
             "gkey": self.headers.get("x-goog-api-key"),
+            "ua": self.headers.get("User-Agent"),
             "body": body,
         })
         respond = getattr(self.server, "respond", None)
@@ -78,6 +80,18 @@ class FakeProvider(BaseHTTPRequestHandler):
             return
         self._reply(200, step["payload"], step.get("headers"))
 
+    def do_GET(self):  # noqa: N802
+        """The model list, which is what a probe reads. Its headers are recorded
+        the same way, so a test can assert what a read-only request carries."""
+        self.server.calls.append({
+            "path": self.path,
+            "auth": self.headers.get("Authorization"),
+            "gkey": self.headers.get("x-goog-api-key"),
+            "ua": self.headers.get("User-Agent"),
+            "body": None,
+        })
+        self._reply(200, self.server.models)
+
 
 @pytest.fixture
 def provider_server():
@@ -85,6 +99,7 @@ def provider_server():
     srv.script = [{"payload": {}}]
     srv.calls = []
     srv.index = 0
+    srv.models = {"data": [{"id": "m"}, {"id": "other"}]}
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     yield srv
@@ -137,6 +152,21 @@ def test_groq_and_openrouter_use_bearer(provider_server):
     groq(provider_server).complete("goal")
     assert provider_server.calls[-1]["auth"] == "Bearer k"
     assert provider_server.calls[-1]["path"].endswith("/chat/completions")
+
+
+def test_every_request_names_itself_so_a_bot_filter_does_not_refuse_it(provider_server):
+    """Groq's edge answers Python's default ``Python-urllib/<ver>`` with a bare
+    403. That reads as a rejected key, and a real completion is refused the same
+    way, so both the working path and the read-only probe must name themselves.
+    """
+    provider_server.script = [{"payload": chat_body()}]
+    groq(provider_server).complete("goal")
+    assert provider_server.calls[-1]["ua"] == USER_AGENT
+
+    result = groq(provider_server).probe()
+    assert result.kind == "ok" and result.model_available is True
+    assert provider_server.calls[-1]["path"] == "/models"
+    assert provider_server.calls[-1]["ua"] == USER_AGENT
 
 
 def test_openhands_orchestrator_posts_a_conversation(provider_server):
