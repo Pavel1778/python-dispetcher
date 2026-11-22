@@ -76,9 +76,39 @@ engine behaving correctly: the work happened, but there is no observed commit to
 prove it, so it is not `completed_verified`. The signed record exists and
 re-verifies; the *verdict* is honest.
 
-## 7. Remaining limit
+## 7. Remaining limit — CLOSED this session (2026-11-20)
 
-A `completed_verified` live result needs a repository bound to a GitHub account
-with a token the sandbox can push with. The live OpenHands account has no GitHub
-provider token, so this is BLOCKED for a live push-verified task, not for the
-engine.
+The earlier text here said a `completed_verified` live result needs a repository
+bound to a GitHub account "with a token the sandbox can push with", and that the
+live account's missing *account-level* provider token blocked it. **That was
+wrong about the mechanism.** The sandbox receives a GitHub token as a per-session
+`StaticSecret` (`git_credential_for` → `secrets` on the create call), resolved
+from the project's bound GitHub account — no account-level provider token is
+needed, and the Cloud settings surface is read-only for provider tokens anyway
+(`PATCH`/`PUT /api/v1/settings` → 405, verified live).
+
+**Live proof this session** (`docs/nexus-3.0/OPENHANDS_LIVE_EXECUTION.md`):
+a real agent pushed `9afb666…` to `lab-fix` of `Pavel1778/nexus-lab-smoke`, and
+the **real `GitVerifier`** returned **`completed_verified`**
+(`remote_sha == named_sha`, branch moved from `base_sha`). Negative controls on
+the same live branch: no commit → `completed_unverified`; wrong commit →
+`completed_unverified`; conversation `error` → `failed`. The engine does not
+trust a text claim.
+
+## 8. Negative-case inventory (verified this session)
+
+`pytest tests/test_evidence_trust.py tests/test_lab_evidence.py
+tests/test_quality_gate*.py tests/test_selfqa.py tests/test_project_isolation*.py -q`
+→ **107 passed**. The mission's required refusals each have a test:
+
+| Attempt | Result | Test |
+| --- | --- | --- |
+| Stale evidence (expected commit differs) | `UNVERIFIED` | `test_expected_commit_mismatch_is_unverified` |
+| Tampered commit field | `FAILED` | `test_tampering_with_commit_column_fails` |
+| Tampered project id | `FAILED` | `test_tampering_with_project_id_column_fails` |
+| Tampered signed payload | `FAILED` | `test_tampering_with_signed_payload_fails` |
+| Another project's record | 404 | `test_cross_project_read_is_not_found` |
+| Another project's list | not leaked | `test_project_list_does_not_leak_other_projects` |
+| Unsigned / legacy | `UNVERIFIED` | `test_unsigned_record_is_unverified` |
+| Unknown key | `UNVERIFIED` | `test_unknown_key_is_unverified_not_verified` |
+| Revoked key | `UNVERIFIED` | `test_revoked_key_is_unverified` |
