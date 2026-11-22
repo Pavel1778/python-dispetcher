@@ -2119,9 +2119,12 @@
   function githubFormHtml() {
     return '<form class="account-form" autocomplete="off">' +
       '<div class="grid-2"><label class="field"><span class="field-label">Название</span>' +
-      '<input class="input" name="label" required maxlength="120" placeholder="Например: личный"></label>' +
+      '<input class="input" name="label" required maxlength="120" autocomplete="off" placeholder="Например: личный"></label>' +
       '<label class="field"><span class="field-label">Personal access token</span>' +
-      '<input class="input" name="token" type="password" required autocomplete="off" placeholder="ghp_… или github_pat_…"></label></div>' +
+      // `new-password` is the one value a browser honours on a password field:
+      // with `off` Chromium still filled it with the owner's site login, which
+      // could then be submitted as a GitHub token.
+      '<input class="input" name="token" type="password" required autocomplete="new-password" placeholder="ghp_… или github_pat_…"></label></div>' +
       '<p class="field-hint">Токену нужен доступ на чтение репозиториев (для приватных — scope repo). Он проверяется в GitHub, хранится зашифрованным и больше нигде не показывается. Чтобы заменить токен, подключите аккаунт заново с тем же названием.</p>' +
       '<div class="row"><button class="btn btn-primary btn-sm" type="submit">Подключить</button><p class="form-msg" role="status"></p></div></form>';
   }
@@ -2370,11 +2373,12 @@
   function openhandsFormHtml() {
     return '<form class="account-form openhands-form" autocomplete="off">' +
       '<div class="grid-2"><label class="field"><span class="field-label">Название</span>' +
-      '<input class="input" name="label" required maxlength="120" placeholder="Например: основной"></label>' +
+      '<input class="input" name="label" required maxlength="120" autocomplete="off" placeholder="Например: основной"></label>' +
       '<label class="field"><span class="field-label">API URL</span>' +
-      '<input class="input" name="base_url" type="url" placeholder="https://app.all-hands.dev"></label></div>' +
+      '<input class="input" name="base_url" type="url" autocomplete="off" placeholder="https://app.all-hands.dev"></label></div>' +
       '<div class="grid-2"><label class="field"><span class="field-label">API key</span>' +
-      '<input class="input" name="api_key" type="password" required autocomplete="off" placeholder="Ключ OpenHands"></label>' +
+      // Same reason as the GitHub token: a site password must never land here.
+      '<input class="input" name="api_key" type="password" required autocomplete="new-password" placeholder="Ключ OpenHands"></label>' +
       '<label class="field"><span class="field-label">Транспорт</span>' +
       '<select class="input" name="transport"><option value="direct">direct — свой sandbox</option>' +
       '<option value="app">app — app-conversation</option></select></label></div>' +
