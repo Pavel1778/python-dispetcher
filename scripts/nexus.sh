@@ -2,22 +2,22 @@
 # nexus — one command to run, stop, back up and restore NEXUS on Debian 13.
 #
 #   ./scripts/nexus.sh setup      check dependencies and configuration
-#   ./scripts/nexus.sh start      start PostgreSQL + web + worker (systemd)
+#   ./scripts/nexus.sh start      start web + worker (systemd; PostgreSQL must be up)
 #   ./scripts/nexus.sh stop       stop the services (data is kept)
 #   ./scripts/nexus.sh restart    restart the services
 #   ./scripts/nexus.sh status     services, health, and the local URL
 #   ./scripts/nexus.sh logs       follow the web and worker logs
 #   ./scripts/nexus.sh backup     dump the database and record a manifest
 #   ./scripts/nexus.sh restore    restore a dump into a fresh test database
-#   ./scripts/nexus.sh update     pull, migrate, restart
+#   ./scripts/nexus.sh update     fast-forward, install dependencies, restart
 #   ./scripts/nexus.sh tunnel     a temporary public URL (cloudflared quick tunnel)
 #
 # Every command is safe to run twice. Nothing here deletes user data: `stop`
 # stops the services and `backup` only adds a file. `restore` never touches the
 # live database - it restores into a scratch database and proves the dump loads.
 #
-# This is a thin, honest wrapper. It does not start NEXUS unless the health check
-# answers; it does not report READY on a service that failed to bind.
+# During startup the web service must pass its database readiness probe before
+# the script starts the worker. A refused systemd operation is an error.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -100,48 +100,64 @@ cmd_setup() {
   say "Setup checks complete."
 }
 
-cmd_start() {
+# Check these before restart/update can take a working installation down.
+prepare_start() {
   load_env
-  say "Starting NEXUS"
-  systemctl start "$WEB_UNIT" 2>/dev/null || die "cannot start $WEB_UNIT (is it installed? see packaging/systemd/)"
-  systemctl start "$WORKER_UNIT" 2>/dev/null || warn "$WORKER_UNIT did not start (the web server also advances runs)"
-  wait_healthy || die "the web service did not become healthy — check: $0 logs"
-  cmd_status
+  command -v systemctl >/dev/null || die "systemctl is required"
+  command -v curl >/dev/null || die "curl is required for the readiness check"
 }
 
-wait_healthy() {
+http_ok() {
+  # Probe loopback directly. A redirect, a stalled connection or a partial
+  # response with a 200 header is not a successful probe.
+  local code
+  code=$(curl -q --silent --noproxy '*' --max-time 2 --output /dev/null \
+    --write-out '%{http_code}' "http://127.0.0.1:$PORT/$1") && [[ $code == 200 ]]
+}
+
+wait_ready() {
   local i
-  for i in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-      ok "health check answered"
-      return 0
-    fi
-    sleep 1
+  for ((i=1; i<=30; i++)); do
+    if http_ok readyz; then return 0; fi
+    if ((i < 30)); then sleep 1; fi
   done
   return 1
 }
 
+cmd_start() {
+  say "Starting NEXUS"
+  systemctl start "$WEB_UNIT" || die "cannot start $WEB_UNIT — check: $0 logs"
+  wait_ready || die "$WEB_UNIT did not pass /readyz on port $PORT; not starting $WORKER_UNIT — check: $0 logs"
+  systemctl is-active --quiet "$WEB_UNIT" || die "$WEB_UNIT is not active; not starting $WORKER_UNIT"
+  ok "$WEB_UNIT ready (database reachable)"
+  systemctl start "$WORKER_UNIT" || die "cannot start $WORKER_UNIT — check: $0 logs"
+  systemctl is-active --quiet "$WORKER_UNIT" || die "$WORKER_UNIT is not active — check: $0 logs"
+  ok "$WORKER_UNIT active"
+  say "Local URL: http://127.0.0.1:$PORT/"
+}
+
 cmd_stop() {
+  local unit failed=()
   say "Stopping NEXUS (data is kept)"
-  systemctl stop "$WORKER_UNIT" 2>/dev/null || true
-  systemctl stop "$WEB_UNIT" 2>/dev/null || true
+  for unit in "$WORKER_UNIT" "$WEB_UNIT"; do
+    systemctl stop "$unit" || failed+=("$unit")
+  done
+  if ((${#failed[@]})); then die "cannot stop: ${failed[*]} — check: $0 status"; fi
   ok "services stopped"
 }
 
 cmd_restart() { cmd_stop; cmd_start; }
 
 cmd_status() {
+  # Useful even before setup, but use the service's port when configured.
+  if [[ -f "$ENV_FILE" ]]; then load_env; fi
   say "Services"
   for unit in "$WEB_UNIT" "$WORKER_UNIT"; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then ok "$unit active"; else warn "$unit not active"; fi
   done
   say "Health"
-  if curl -fsS "http://127.0.0.1:$PORT/healthz" 2>/dev/null; then
-    echo; ok "liveness"
-  else
-    warn "no answer on http://127.0.0.1:$PORT/healthz"
-  fi
-  if curl -fsS "http://127.0.0.1:$PORT/readyz" >/dev/null 2>&1; then ok "readiness (database reachable)"; else warn "readiness failed (database?)"; fi
+  if http_ok healthz; then ok "liveness"; else warn "liveness failed on http://127.0.0.1:$PORT/healthz"; fi
+  if http_ok readyz; then ok "readiness (database reachable)"; else warn "readiness failed (database?)"; fi
   say "Local URL: http://127.0.0.1:$PORT/"
 }
 
@@ -204,12 +220,11 @@ cmd_restore() {
 }
 
 cmd_update() {
-  load_env
   say "Updating NEXUS"
   git pull --ff-only || die "git pull failed — resolve by hand, then re-run"
-  python3 -m pip install -r requirements.txt >/dev/null && ok "dependencies updated"
+  python3 -m pip install -r requirements.txt >/dev/null || die "dependency installation failed; not restarting services"
+  ok "dependencies updated"
   cmd_restart
-  say "Migrations apply on first connect; /readyz confirms the database."
 }
 
 cmd_tunnel() {
@@ -236,14 +251,14 @@ main() {
   local cmd="${1:-status}"; shift || true
   case "$cmd" in
     setup)   cmd_setup ;;
-    start)   cmd_start ;;
+    start)   prepare_start; cmd_start ;;
     stop)    cmd_stop ;;
-    restart) cmd_restart ;;
+    restart) prepare_start; cmd_restart ;;
     status)  cmd_status ;;
     logs)    cmd_logs ;;
     backup)  cmd_backup ;;
     restore) cmd_restore "$@" ;;
-    update)  cmd_update ;;
+    update)  prepare_start; cmd_update ;;
     tunnel)  cmd_tunnel "$@" ;;
     -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command: $cmd (try: $0 help)" ;;
