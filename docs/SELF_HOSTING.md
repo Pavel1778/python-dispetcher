@@ -35,12 +35,21 @@ cp .env.example .env
 # 5. Check everything
 ./scripts/nexus.sh setup
 
-# 6. Install the systemd units and start
-sudo cp packaging/systemd/nexus-lab-worker.service /etc/systemd/system/
-# The web unit is generated from your .env; see packaging/systemd/README.md.
+# 6. Install the worker unit (adjust its /opt/nexus paths first) and your web
+# unit described below. The operator needs permission to control both units.
+sudo install -m 0644 packaging/systemd/nexus-lab-worker.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ./scripts/nexus.sh start
 ```
+
+The checkout supplies the worker unit; it does **not** generate a web unit.
+Provide `nexus-web.service` with the same `WorkingDirectory` and `EnvironmentFile`
+as the worker. For an installation in `/opt/nexus`, its `ExecStart` can be
+`/opt/nexus/.venv/bin/python -m orchestration.web_server --host 127.0.0.1 --port 8080`.
+Run the units under an appropriate unprivileged service account. If using other
+unit names, export `NEXUS_WEB_UNIT` and `NEXUS_WORKER_UNIT` in the shell that
+runs the script. PostgreSQL must already be running; the script does not start
+or stop it.
 
 ## Required environment (the minimum to boot)
 
@@ -68,7 +77,9 @@ The full list, with defaults and the module that reads each, is
 ./scripts/nexus.sh update     # git pull, pip install, restart
 ```
 
-The local URL is `http://127.0.0.1:8080/` (set `PORT` to change it).
+The local URL is `http://127.0.0.1:8080/`. For a different port, set `PORT`
+in the trusted shell-compatible `.env` and pass that port to the web unit's
+`--port`. `status` reports both probes; it is diagnostic, not a startup gate.
 
 ## Exposure
 
@@ -85,11 +96,26 @@ process is exposed, and only through the tunnel/proxy.
 
 ## What "one command" means, and its limits
 
-`./scripts/nexus.sh start` starts the systemd units and **waits for
-`/healthz`** before it reports success. It will not print READY for a service
-that failed to bind. If a dependency is missing it says which. It never deletes
-user data: `stop` stops the services, `backup` only adds a file, and `restore`
-works on a scratch database and drops only that scratch database.
+- `start` starts web first. Before requesting the worker it requires a direct
+  HTTP **200 from `/readyz`** on loopback and an active web unit. A live process
+  (`/healthz`), a redirect or a `503` does not pass. It tries up to 30 times,
+  with a two-second timeout per request and one second between attempts.
+- Success also requires the worker unit to start and be active. A worker failure
+  is a nonzero exit, not a silent fallback to the web process. Web is left up
+  for diagnosis; use `status` and `logs`. These checks do not prove a worker
+  heartbeat or a provider's availability. If you intentionally run web alone,
+  manage just the web unit rather than using this two-unit command.
+- `stop` requests both stops, worker first, even if the first fails. It names
+  any unit systemd refused to stop and exits nonzero. `restart` checks that the
+  environment file and probe tools are available before stopping anything; a
+  failed stop prevents the start phase.
+- `update` restarts only after **both** the fast-forward pull and dependency
+  install succeed. If `pip` fails, no units are stopped or restarted; the
+  checkout may already have advanced. Fix the install in the service's virtual
+  environment before retrying. There is no automatic code or package rollback.
+
+None of these service commands deletes database data. `backup` writes a dump
+and checksum; `restore` tests a dump in a scratch database.
 
 ## See also
 
