@@ -12,9 +12,9 @@
 #   ./scripts/nexus.sh update     fast-forward, install dependencies, restart
 #   ./scripts/nexus.sh tunnel     a temporary public URL (cloudflared quick tunnel)
 #
-# Every command is safe to run twice. Nothing here deletes user data: `stop`
-# stops the services and `backup` only adds a file. `restore` never touches the
-# live database - it restores into a scratch database and proves the dump loads.
+# `stop` stops the services, not the database. `backup` rotates completed local
+# archives; `restore` never writes to the live database — it uses a scratch
+# database to prove the dump loads.
 #
 # During startup the web service must pass its database readiness probe before
 # the script starts the worker. A refused systemd operation is an error.
@@ -167,23 +167,61 @@ cmd_logs() {
     || die "journalctl unavailable — read the service logs another way"
 }
 
-cmd_backup() {
+# Called while holding the backup-directory lock. Always retain the new dump,
+# even if the machine clock went backwards or other files have future mtimes.
+rotate_backups() (
+  cd -- "$BACKUP_DIR"
+  local newest=$1 old others=()
+  for old in nexus-*.dump; do
+    [[ $old != "$newest" && $old =~ ^nexus-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?\.dump$ ]] || continue
+    [[ -f $old && ! -L $old && -f $old.sha256 && ! -L $old.sha256 ]] || continue
+    others+=("$old")
+  done
+  if ((${#others[@]} > 13)); then
+    LC_ALL=C ls -t --zero -- "${others[@]}" | tail -z -n +14 | while IFS= read -r -d '' old; do
+      rm -- "$old"
+      rm -- "$old.sha256"
+      warn "rotated out $old"
+    done
+  fi
+)
+
+# A skipped `mv -n` can exit zero. Confirm the staged regular file moved.
+publish_backup_file() { mv -nT -- "$1" "$2" && [[ ! -e $1 ]]; }
+
+cmd_backup() (
   umask 077
   load_env
-  mkdir -p "$BACKUP_DIR"
-  local stamp dump
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  dump="$BACKUP_DIR/nexus-$stamp.dump"
-  say "Backing up the database to $dump"
-  pg_dump --format=custom --no-owner "$(db_url)" -f "$dump"
-  ( cd "$BACKUP_DIR" && sha256sum "$(basename "$dump")" > "$(basename "$dump").sha256" )
-  ok "dump written ($(du -h "$dump" | cut -f1)) with a SHA-256"
-  # Keep the last 14; rotate only our own dumps, never anything else.
-  ls -1t "$BACKUP_DIR"/nexus-*.dump 2>/dev/null | tail -n +15 | while read -r old; do
-    rm -f "$old" "$old.sha256"; warn "rotated out $(basename "$old")"
+  mkdir -p -- "$BACKUP_DIR"
+  # A timer and a manual run may overlap. Lock the directory inode itself:
+  # no lockfile to unlink or mistake for stale after a crash.
+  exec 9<"$BACKUP_DIR"
+  flock --exclusive 9 || die "cannot lock backup directory: $BACKUP_DIR"
+
+  local stem dump name stage suffix=0
+  stem="$BACKUP_DIR/nexus-$(date -u +%Y%m%dT%H%M%SZ)"
+  dump="$stem.dump"
+  while [[ -e $dump || -L $dump || -e $dump.sha256 || -L $dump.sha256 ]]; do
+    ((++suffix))
+    dump="$stem-$suffix.dump"
   done
-  say "Restore is proven by: $0 restore $dump"
-}
+  name=${dump##*/}
+  stage=$(mktemp -d -- "$BACKUP_DIR/.nexus-backup.XXXXXXXX")
+  trap 'rm -rf -- "$stage"' EXIT
+  say "Backing up the database to $dump"
+  pg_dump --format=custom --no-owner "$(db_url)" -f "$stage/$name"
+  ( cd -- "$stage" && sha256sum -- "$name" > "$name.sha256" )
+  # A visible .dump is the commit point. Both files are complete before the
+  # first rename; staging on the same filesystem keeps each rename atomic.
+  publish_backup_file "$stage/$name.sha256" "$dump.sha256" || die "cannot publish checksum for $dump"
+  if ! publish_backup_file "$stage/$name" "$dump"; then
+    rm -- "$dump.sha256"
+    die "cannot publish $dump"
+  fi
+  ok "dump written ($(du -h -- "$dump" | cut -f1)) with a SHA-256"
+  rotate_backups "$name"
+  printf 'Test the backup with: %q restore %q\n' "$0" "$dump"
+)
 
 cmd_restore() {
   load_env

@@ -24,8 +24,24 @@ repository is not in the database backup.
 ```
 
 This writes `backups/nexus-<UTC timestamp>.dump` (custom format) and a matching
-`.sha256`. It keeps the last 14 and rotates older **NEXUS** dumps only — it never
-touches anything else in that directory.
+`.dump.sha256`. To use another local directory, export `NEXUS_BACKUP_DIR`.
+Manual and scheduled runs using the same directory wait for one another
+(Debian `flock`, from `util-linux`). If either filename is taken, the new pair
+gets a numeric suffix such as `nexus-20261119T000000Z-1.dump`; neither file of
+an earlier pair is overwritten.
+
+Copy **published `.dump` files and their adjacent checksums**. The script first
+writes both in a private staging directory on the same filesystem, then moves
+the checksum into place and the dump last. A `pg_dump` or checksum error exits
+nonzero without publishing or rotating anything. A hard kill can leave a
+hidden `.nexus-backup.*` directory or a checksum without a dump; neither is a
+backup. Inspect such leftovers when no backup is running.
+
+Rotation keeps the newly published pair and the 13 other newest pairs by dump
+mtime. It considers only regular, non-symlink files with the script's timestamp
+name (with or without a numeric suffix) and an adjacent regular checksum file.
+Unpaired dumps and separately named archives such as `nexus-monthly.dump` are
+not counted or deleted.
 
 Schedule it with a timer:
 
@@ -85,8 +101,8 @@ the automated proof that a dump restores. `tests/test_self_hosting.py` proves th
 
 ## Retention and integrity
 
-- Every dump carries a SHA-256 next to it; `sha256sum -c <dump>.sha256` before
-  you rely on a restore.
+- Check the sidecar from the dump directory (it names the dump by basename):
+  `(cd backups && sha256sum -c nexus-20261119T000000Z.dump.sha256)`.
 - Keep at least a week of daily dumps and one monthly.
 - Test a restore monthly. A restore that fails when you need it is the failure
   that costs the most.
