@@ -4,6 +4,10 @@
 
 ### Added
 
+- Optional Docker Self-QA runner with a preloaded digest-pinned image,
+  restricted container settings, fail-closed setup and signed runtime/image
+  receipt. Real Docker isolation remains to be validated on the target host;
+  the default host runner is not a sandbox. See `docs/SELF_QA_SANDBOX.md`.
 - Optional PostgreSQL LISTEN/NOTIFY wakeups for the web dispatcher, inline lab
   loop and separate lab worker. Set `NEXUS_LISTEN_DSN` to a direct or session
   connection; polling and durable claims remain the fallback. Migration 0045
@@ -14,6 +18,8 @@
 
 ### Changed
 
+- Self-QA command output is bounded while being read, and ordinary child
+  process groups are terminated when a check exits or times out.
 - Both dispatchers filter active task states in the store rather than fetching
   historical tasks; SQLite's dispatch gate reuses its queued snapshot. The
   Cloud dispatcher fetches bound conversation IDs in one batch instead of one

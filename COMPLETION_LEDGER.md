@@ -51,9 +51,32 @@
   1.44–9.76 ms for the five documented examples; see `docs/PERFORMANCE.md`.
   No production or 430 ms before/after claim is made.
 - **Not implemented:** Redis, MinIO, PgBouncer deployment, WebSocket/Push,
-  LLM replanner, Docker sandbox, Rust/PyO3 integration, metrics and key
+  LLM replanner, agent sandbox tool, Rust/PyO3 integration, metrics and key
   rotation/DR automation. Live self-healing and p99 under 100+ real agents
-  remain unverified.
+  remain unverified; the later Docker runner below is not live verified.
+
+## 2026-11-25 — Self-QA runner hardening (PR #61)
+
+- **Verification:** local Python 3.11 and disposable PostgreSQL 16 full suite:
+  **2251 passed, 122 skipped** in 412.94 s. After final small test/flag changes,
+  the focused Self-QA, quality-gate and evidence suites passed **76 tests**,
+  with one real-Docker test skipped. `ruff check .` passed. This is not a live
+  Docker or production verification.
+- **Implemented, tested with stand-ins:** optional Docker check execution with
+  a preloaded digest-pinned image, local Unix daemon socket, read-only checkout,
+  restricted container settings and no automatic host fallback. The existing
+  quality-gate receipt includes runtime/image and is signed when the signer is
+  configured. `tests/test_selfqa_sandbox.py` tests command construction and
+  failure handling; `tests/test_quality_gate.py::test_container_receipt_is_bound_and_signed_with_stubbed_runner`
+  verifies the real PostgreSQL/Ed25519 receipt path with a fake Docker runner.
+- **Implemented and locally tested:** Self-QA output is drained with bounded
+  memory and ordinary child process groups are killed on completion/timeout;
+  `tests/test_selfqa.py` tests large stdout/stderr and timeout cleanup.
+- **NOT LIVE VERIFIED:** no Docker daemon/image was available in this sandbox;
+  the real-container integration test is skipped. Docker is defense in depth,
+  not a VM boundary, and the existing default host runner is not isolated.
+  No `run_tests_in_sandbox` agent tool or Jest image has been implemented.
+  See `docs/SELF_QA_SANDBOX.md` for deployment and residual risks.
 
 Status of every requirement in the "Final Completion Program" against the actual
 repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,

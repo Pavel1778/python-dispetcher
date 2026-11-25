@@ -43,9 +43,12 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -266,6 +269,70 @@ def _tool_present(argv: tuple[str, ...]) -> bool:
     return shutil.which(argv[0]) is not None
 
 
+def _run_bounded(argv: list[str], *, root: Path, timeout: float,
+                 env: dict[str, str] | None = None) -> tuple[int | None, bytes, bytes, bool]:
+    """Drain both streams with bounded memory and stop the process group.
+
+    A scratch checkout is *not* a security sandbox: a hostile child could
+    escape its process group or access host resources. This limits output and
+    cleans up ordinary descendants, but does not make host execution safe for
+    untrusted code.
+    """
+    proc = subprocess.Popen(  # noqa: S603 - caller supplies an argv, never a shell string
+        argv, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, env=env, start_new_session=(os.name == "posix"),
+    )
+    buffers = [bytearray(), bytearray()]
+
+    def drain(stream: Any, output: bytearray) -> None:
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                remaining = MAX_OUTPUT_BYTES + 1 - len(output)
+                if remaining > 0:
+                    output.extend(chunk[:remaining])
+        except (OSError, ValueError):
+            pass
+        finally:
+            stream.close()
+
+    threads = [threading.Thread(target=drain, args=(stream, output), daemon=True)
+               for stream, output in zip((proc.stdout, proc.stderr), buffers)]
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+        elif proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        for thread in threads:
+            thread.join(timeout=1.0)
+    return proc.returncode, bytes(buffers[0]), bytes(buffers[1]), timed_out
+
+
 def run_check(check: QaCheck, root: Path, *, timeout: float,
               env: dict[str, str] | None = None) -> QaResult:
     """Run one check in *root*. Never raises: a failure is a result."""
@@ -274,26 +341,84 @@ def run_check(check: QaCheck, root: Path, *, timeout: float,
                         detail=f"{check.argv[0]} is not installed")
     started = time.monotonic()
     try:
-        proc = subprocess.run(  # noqa: S603 - the argv is a declared check, not a shell string
-            list(check.argv), cwd=str(root), capture_output=True,
-            timeout=timeout, env=env, check=False,
-        )
-    except subprocess.TimeoutExpired as e:
-        return QaResult(check.name, check.required, "timeout",
-                        duration_s=time.monotonic() - started,
-                        stdout=_truncate(e.stdout or b""),
-                        stderr=_truncate(e.stderr or b""),
-                        detail=f"timed out after {timeout:.0f}s")
+        code, stdout, stderr, timed_out = _run_bounded(list(check.argv), root=root,
+                                                       timeout=timeout, env=env)
     except OSError as e:
         return QaResult(check.name, check.required, "error",
                         duration_s=time.monotonic() - started,
                         detail=f"{type(e).__name__}: {e}")
     duration = time.monotonic() - started
-    status = "passed" if proc.returncode == 0 else "failed"
+    if timed_out:
+        return QaResult(check.name, check.required, "timeout", duration_s=duration,
+                        stdout=_truncate(stdout), stderr=_truncate(stderr),
+                        detail=f"timed out after {timeout:.0f}s")
+    status = "passed" if code == 0 else "failed"
     return QaResult(check.name, check.required, status,
-                    exit_code=proc.returncode, duration_s=duration,
-                    stdout=_truncate(proc.stdout or b""),
-                    stderr=_truncate(proc.stderr or b""))
+                    exit_code=code, duration_s=duration,
+                    stdout=_truncate(stdout), stderr=_truncate(stderr))
+
+
+class SandboxUnavailable(RuntimeError):
+    """The configured sandbox could not be established; do not fall back to host."""
+
+
+_IMAGE = re.compile(r"(?:[a-zA-Z0-9][a-zA-Z0-9._:/-]*@)?sha256:[a-f0-9]{64}\Z")
+
+
+def run_docker_check(check: QaCheck, root: Path, *, timeout: float, image: str) -> QaResult:
+    """Run a check in a locked-down container, using a preloaded pinned image.
+
+    This requires a trusted local Docker daemon and image. It is defense in
+    depth, not a substitute for a dedicated host/VM for hostile code.
+    """
+    docker = shutil.which("docker")
+    if not docker or not _IMAGE.fullmatch(image):
+        raise SandboxUnavailable("Docker or a digest-pinned image is not configured")
+    if os.name != "posix" or os.getuid() == 0:
+        raise SandboxUnavailable("container checks require a non-root POSIX worker")
+    socket_path = os.environ.get("NEXUS_SELFQA_DOCKER_SOCKET", "/var/run/docker.sock")
+    if not os.path.isabs(socket_path) or "\n" in socket_path or "\r" in socket_path:
+        raise SandboxUnavailable("Docker socket must be an absolute local path")
+    docker_prefix = [docker, "--host", "unix://" + socket_path]
+    root_path = str(root.resolve())
+    if "," in root_path or "\n" in root_path or "\r" in root_path:
+        raise SandboxUnavailable("checkout path cannot be safely mounted")
+    if not check.argv or not check.argv[0] or "\x00" in "".join(check.argv):
+        raise SandboxUnavailable("invalid check command")
+    name = "nexus-qa-" + uuid.uuid4().hex
+    command = [*docker_prefix, "run", "--rm", "--name", name, "--pull=never",
+               "--label=nexus.selfqa.managed=true", "--network=none", "--read-only", "--cap-drop=ALL",
+               "--security-opt=no-new-privileges", f"--user={os.getuid()}:{os.getgid()}",
+               "--pids-limit=128", "--memory=512m", "--memory-swap=512m", "--cpus=1",
+               "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m",
+               "--mount", f"type=bind,src={root_path},dst=/workspace,readonly",
+               "--workdir=/workspace", "--env=HOME=/tmp", "--env=TMPDIR=/tmp",
+               "--env=PYTHONDONTWRITEBYTECODE=1", "--env=NEXUS_SELFQA=1",
+               "--entrypoint", check.argv[0], image, *check.argv[1:]]
+    started = time.monotonic()
+    try:
+        code, stdout, stderr, timed_out = _run_bounded(command, root=root, timeout=timeout,
+                                                       env=_child_env())
+    except OSError as exc:
+        raise SandboxUnavailable("Docker could not be started") from exc
+    if timed_out:
+        # Killing the Docker CLI does not stop a container in the daemon.
+        try:
+            cleanup = subprocess.run([*docker_prefix, "rm", "-f", name],  # noqa: S603 - fixed argv
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     timeout=10, env=_child_env(), check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxUnavailable("container cleanup could not be confirmed") from exc
+        if cleanup.returncode != 0:
+            raise SandboxUnavailable("container cleanup could not be confirmed")
+        return QaResult(check.name, check.required, "timeout", duration_s=time.monotonic() - started,
+                        stdout=_truncate(stdout), stderr=_truncate(stderr),
+                        detail=f"timed out after {timeout:.0f}s")
+    if code in (125, 126, 127) or code is None:
+        raise SandboxUnavailable("Docker could not start the check")
+    return QaResult(check.name, check.required, "passed" if code == 0 else "failed",
+                    exit_code=code, duration_s=time.monotonic() - started,
+                    stdout=_truncate(stdout), stderr=_truncate(stderr))
 
 
 def _child_env() -> dict[str, str]:
@@ -335,7 +460,7 @@ class SelfQa:
     def __init__(self, *, workdir: Path | None = None,
                  check_timeout: float = DEFAULT_CHECK_TIMEOUT,
                  total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
-                 token: str = "",
+                 token: str = "", runtime: str | None = None, image: str | None = None,
                  runner: Callable[..., Any] = subprocess.run):
         self.workdir = Path(workdir) if workdir else None
         self.check_timeout = check_timeout
@@ -344,6 +469,8 @@ class SelfQa:
         #: through the environment only (``_auth_env``); never logged, never in
         #: argv, never in the URL, and never in a report.
         self.token = (token or "").strip()
+        self.runtime = (runtime if runtime is not None else os.environ.get("NEXUS_SELFQA_RUNTIME", "host")).strip().lower()
+        self.image = (image if image is not None else os.environ.get("NEXUS_SELFQA_IMAGE", "")).strip()
         self._runner = runner
 
     # ------------------------------------------------------------------ source
@@ -420,7 +547,9 @@ class SelfQa:
         del project_id
         started = time.monotonic()
         env = {"python": _py_version(), "cwd_repo": repository, "commit": commit,
-               "branch": branch or ""}
+               "branch": branch or "", "runner": self.runtime}
+        if self.runtime == "docker" and _IMAGE.fullmatch(self.image):
+            env["image"] = self.image
         report = QaReport(verdict="blocked", reason="not started",
                           repository=repository, commit=commit,
                           environment=env, started_at=started, binding=dict(binding or {}), started_utc=time.time())
@@ -428,6 +557,22 @@ class SelfQa:
             report.reason = "no repository to check"
             report.finished_at = time.monotonic()
             return report
+        if self.runtime not in ("host", "docker"):
+            report.reason = "unknown Self-QA runtime"
+            report.finished_at = time.monotonic()
+            report.finished_utc = time.time()
+            return report
+        if self.runtime == "docker":
+            if not shutil.which("docker") or not _IMAGE.fullmatch(self.image):
+                report.reason = "Docker or a digest-pinned image is not configured"
+                report.finished_at = time.monotonic()
+                report.finished_utc = time.time()
+                return report
+            if os.name != "posix" or os.getuid() == 0:
+                report.reason = "container checks require a non-root POSIX worker"
+                report.finished_at = time.monotonic()
+                report.finished_utc = time.time()
+                return report
         base = self.workdir
         made: Path | None = None
         try:
@@ -454,9 +599,13 @@ class SelfQa:
                 report.reason = 'checkout differs from verified commit'
                 return report
             chosen = checks if checks is not None else checks_for(dest)
+            if self.runtime == "docker":
+                # The clone may contain remote configuration; do not expose it
+                # or clone credentials inside an untrusted check container.
+                shutil.rmtree(dest / ".git")
             report.checks = self._run_all(chosen, dest, started)
             report.verdict, report.reason = _verdict(report.checks)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError, SandboxUnavailable) as exc:
             report.verdict, report.reason = 'blocked', f'could not establish checks ({type(exc).__name__})'
         finally:
             if made is not None:
@@ -475,7 +624,11 @@ class SelfQa:
                                     detail="the run's total time limit was reached"))
                 continue
             remaining = max(1.0, self.total_timeout - (time.monotonic() - started))
-            result = run_check(check, root, timeout=min(self.check_timeout, remaining), env=env)
+            timeout = min(self.check_timeout, remaining)
+            if self.runtime == "docker":
+                result = run_docker_check(check, root, timeout=timeout, image=self.image)
+            else:
+                result = run_check(check, root, timeout=timeout, env=env)
             result.argv = check.argv
             out.append(result)
         return out
@@ -585,7 +738,8 @@ class ProjectQualityGate:
         # resolve different identities, and the engine is used concurrently.
         return SelfQa(workdir=self.engine.workdir,
                       check_timeout=self.engine.check_timeout,
-                      total_timeout=self.engine.total_timeout, token=token)
+                      total_timeout=self.engine.total_timeout, token=token,
+                      runtime=self.engine.runtime, image=self.engine.image)
 
     def run(self, *, repository: str, commit: str = "", project_id: str = "",
             branch: str | None = None, checks: list[QaCheck] | None = None, binding: dict | None = None) -> QaReport:
@@ -643,6 +797,15 @@ def checked_receipt(qa: QaReport, binding: dict, repository: str, commit: str, b
             raise ValueError('contradictory check result')
         projection = c.as_dict()
         checks.append({k: projection[k] for k in ('name', 'argv', 'required', 'status', 'exit_code', 'duration_s', 'output_sha256')})
-    return {'verdict': 'passed', 'source': 'nexus:isolated-checkout', 'binding': binding,
-            'repository': repository, 'checked_sha': commit, 'started_utc': qa.started_utc, 'finished_utc': qa.finished_utc,
-            'checks': checks}
+    runtime = qa.environment.get('runner', 'host')
+    if runtime not in ('host', 'docker'):
+        raise ValueError('invalid QA runtime')
+    receipt = {'verdict': 'passed', 'source': 'nexus:isolated-checkout', 'binding': binding,
+               'repository': repository, 'checked_sha': commit, 'started_utc': qa.started_utc,
+               'finished_utc': qa.finished_utc, 'checks': checks, 'runtime': runtime}
+    if runtime == 'docker':
+        image = qa.environment.get('image', '')
+        if not isinstance(image, str) or not _IMAGE.fullmatch(image):
+            raise ValueError('invalid QA image')
+        receipt['image'] = image
+    return receipt

@@ -35,6 +35,10 @@ agent-server.
   `force_transition`. Holds the sandbox/conversation route table.
 - `orchestration/cloud_dispatcher.py` — Cloud dispatcher. Two-phase create
   (start task → poll → bind), allowlist, bounded retry, recovery.
+- `orchestration/nexus_selfqa.py` — checks run on the host by default; a scratch
+  checkout is **not** a sandbox. `NEXUS_SELFQA_RUNTIME=docker` opts into a
+  restricted container with a pinned, preloaded `NEXUS_SELFQA_IMAGE`. Errors
+  block verification; never fall back to host. See `docs/SELF_QA_SANDBOX.md`.
 - `orchestration/queue_wakeup.py` and `migrations/0045_queue_wakeups.sql` —
   optional commit-time hints for task and lab loops. Set `NEXUS_LISTEN_DSN` to
   a direct/session PostgreSQL DSN for each web/worker process; transaction

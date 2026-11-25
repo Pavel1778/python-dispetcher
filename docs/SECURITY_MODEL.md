@@ -92,7 +92,7 @@ Rotation procedure is in section 6.
 | Upload limits | per-file and total caps; a body over the route's cap is 413 | `test_file_lab.py` |
 | Path validation | a workspace path is normalised and re-checked by a DB `CHECK` | `test_file_lab.py` |
 | SQL injection | every query is parameterised; column lists are constants | audit + `test_migration_sql_guards.py` |
-| Command injection | Self-QA runs a *declared argv*, never a shell string | `test_selfqa.py` |
+| Self-QA command execution | Declared argv avoids implicit shell parsing, but the declared program itself can execute arbitrary code. Host mode is **not** sandboxed; optional Docker mode is described in [SELF_QA_SANDBOX.md](SELF_QA_SANDBOX.md) | `test_selfqa.py`, `test_selfqa_sandbox.py` |
 
 ### Evidence and verification
 

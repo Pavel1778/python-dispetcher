@@ -246,3 +246,23 @@ jobs:
             | while IFS= read -r line; do echo "::error title=test::$line"; done
           grep -E '^SKIPPED ' /tmp/pytest.log | sed -E 's/^SKIPPED \[[0-9]+\] [^ ]+: //' | sort | uniq -c \
             | head -n 8 | cut -c1-300 | while IFS= read -r line; do echo "::notice title=skipped::$line"; done
+
+  selfqa-container:
+    # Exercise the real local Docker daemon; unit tests alone cannot prove that
+    # network/filesystem flags are enforced. The image ID passed to the runner
+    # is immutable; it is a CI fixture, not a production-approved QA image.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest==9.0.3
+      - name: Pull Python fixture and record its image ID
+        run: |
+          docker pull python:3.12-slim
+          echo "NEXUS_TEST_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' python:3.12-slim)" >> "$GITHUB_ENV"
+      - name: Exercise the real container runner
+        run: python -m pytest tests/test_selfqa_sandbox.py -q -p no:cacheprovider

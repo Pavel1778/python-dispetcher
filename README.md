@@ -30,6 +30,11 @@ Cloud transport provisions a sandbox and drives its agent-server directly
 (the `direct` transport); the legacy app-conversation endpoint is kept behind
 `OPENHANDS_TRANSPORT=app`.
 
+Self-QA's default host mode runs repository commands with the worker's OS
+permissions; a scratch checkout is **not a security sandbox**. An optional,
+fail-closed Docker runner is available for operator-provisioned pinned images;
+read [the setup and limitations](docs/SELF_QA_SANDBOX.md) before enabling it.
+
 For faster cross-process queue wakeups, optionally set `NEXUS_LISTEN_DSN` on
 web and lab-worker processes to a **direct or session-pooled** connection to
 that same PostgreSQL database. Migration `0045` sends type-only task/run
