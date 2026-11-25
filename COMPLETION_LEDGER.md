@@ -1,13 +1,14 @@
 # NEXUS — Completion Ledger
 
-## 2026-11-25 — event-driven RFC (proposed, not implemented)
+## 2026-11-25 — event-driven RFC and approval gate
 
 - **Status:** [PR #61](https://github.com/Pavel1778/python-dispetcher/pull/61);
-  customer subsequently requested continued implementation without stopping
-  for per-step approval. Phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) inventories
-  dispatcher, lab, planning and external-service polling and describes a
-  bounded, recoverable LISTEN/NOTIFY design. The implementation below was
-  added after this RFC entry.
+  the required customer approval in a PR comment was not found when checked.
+  The LISTEN/NOTIFY implementation was started prematurely, contrary to the
+  requested order; a general instruction to continue does not replace RFC
+  approval. Further event-driven transition work is on hold pending that
+  decision. Phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md)
+  inventories polling and describes a bounded, recoverable design.
 - **Verification:** on the working tree, `.venv/bin/python -m pytest -q
   -p no:cacheprovider` completed with 597 passed, 1783 skipped, 0 failed;
   `.venv/bin/ruff check .` passed. These runs include existing uncommitted
@@ -57,11 +58,12 @@
 
 ## 2026-11-25 — Self-QA runner hardening (PR #61)
 
-- **Verification:** local Python 3.11 and disposable PostgreSQL 16 full suite:
-  **2251 passed, 122 skipped** in 412.94 s. After final small test/flag changes,
-  the focused Self-QA, quality-gate and evidence suites passed **76 tests**,
-  with one real-Docker test skipped. `ruff check .` passed. This is not a live
-  Docker or production verification.
+- **Verification:** local Python 3.11 and disposable PostgreSQL 16 full suite
+  reported **2251 passed, 122 skipped** in 412.94 s, but overlapped another
+  suite using the same disposable database, so it is not a clean full-suite
+  result. After final small test/flag changes, the focused Self-QA, quality-gate
+  and evidence suites passed **76 tests**, with one real-Docker test skipped.
+  `ruff check .` passed. This is not a live Docker or production verification.
 - **Implemented, tested with stand-ins:** optional Docker check execution with
   a preloaded digest-pinned image, local Unix daemon socket, read-only checkout,
   restricted container settings and no automatic host fallback. The existing
