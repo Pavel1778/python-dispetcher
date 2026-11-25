@@ -2,7 +2,7 @@
 
 ## 2026-11-25 — event-driven RFC (proposed, not implemented)
 
-- **Status:** awaiting customer approval in the PR before implementation;
+- **Status:** awaiting customer approval in [PR #61](https://github.com/Pavel1778/python-dispetcher/pull/61) before implementation;
   phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) inventories
   dispatcher, lab, planning and external-service polling and describes a
   bounded, recoverable LISTEN/NOTIFY design. No event-driven runtime change or
