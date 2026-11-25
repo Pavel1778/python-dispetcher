@@ -323,6 +323,13 @@ correction is delivered to the next attempt and signed into the Evidence Trust
 Engine as `AUTO_CORRECTED`; a provider outage falls back to the deterministic
 rework note and never stops a run (`orchestration/replanner.py`).
 
+**Live updates.** `GET /ws/updates` upgrades to a WebSocket behind the same
+auth. The server publishes small events (`task.started`, `task.completed`,
+`task.retried`, `run.failed`, `run.completed`, `evidence.verified`) from an
+in-process bus, and the studio refreshes the open work view when one arrives;
+the poll remains the fallback. The bus is per process: a separate lab worker's
+events need Redis fan-out, which is not implemented.
+
 ## Evidence Trust Engine
 
 Evidence is signed with Ed25519 over a canonical byte encoding. A verdict is

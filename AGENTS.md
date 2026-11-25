@@ -3197,3 +3197,34 @@ ported onto it. A deployment that sets nothing keeps the previous behaviour.
 - The test environment is reset between sessions; rebuild it with
   `apt-get install postgresql`, `pip install -r requirements.txt -r
   requirements-dev.txt`, and a `nexus` superuser role.
+
+### `orchestration/nexus_events.py` — WebSocket updates (`GET /ws/updates`)
+
+- **A hint, not a record.** An event says "look again"; the studio still reads
+  the run over HTTP. A slow or vanished client loses events; the bus never
+  blocks a worker, and a full subscriber queue drops its oldest event.
+- **In-process only.** A client sees events published in this process. The
+  default deployment advances runs in the web server's own loop, so that is the
+  whole path; a separate worker's events need Redis fan-out, which is **not**
+  implemented. Do not describe the bus as cross-process.
+- **Bounded.** At most `MAX_SUBSCRIBERS` clients, `QUEUE_SIZE` events per client
+  and `MAX_EVENT_BYTES` per event (an oversized event is replaced by a
+  `truncated` marker). Payloads carry a task key, a run id and a verdict - never
+  a report, a prompt or a credential.
+- **Auth is the existing gate.** `_require_read` runs before the upgrade, so a
+  browser uses its session cookie and a machine client its bearer token. A
+  browser cannot set `Authorization` on a WebSocket; do not require one there.
+- **Frames are stdlib.** `accept_key`/`read_frame`/`encode_text` implement RFC
+  6455; a client frame larger than the cap is refused before buffering. Ping is
+  answered with pong; close is answered and the handler returns with
+  `close_connection = True`.
+- **Studio consumer.** `connectUpdates()` in `studio/app.js` opens the socket,
+  calls `refreshWork()` on an event (or schedules the poll when the tab is
+  hidden), reconnects with exponential backoff, and closes on `beforeunload`.
+  The existing poll remains the fallback.
+- **Producers.** `LabScheduler` publishes `task.started`, `task.completed`,
+  `task.retried`, `run.failed`, `run.completed`; `EvidenceService` publishes
+  `evidence.verified` on record and re-verify.
+- Tests: `tests/test_ws_updates.py` (RFC vector, bounded bus, raw-socket
+  handshake + event, unauthenticated refusal, ping/pong, close, a real evidence
+  record, route auth).

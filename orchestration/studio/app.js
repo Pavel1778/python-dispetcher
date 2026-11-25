@@ -1176,6 +1176,35 @@
     });
   }
 
+  // Server-pushed updates: a small WebSocket that refreshes the open work view.
+  // The HTTP reads remain authoritative; an event only says "look again". A
+  // deployment without the endpoint reconnects with backoff and keeps polling.
+  var updatesSocket = null;
+  var updatesRetry = null;
+  var updatesDelay = 1000;
+  function connectUpdates() {
+    if (!window.WebSocket) return;
+    if (updatesSocket && (updatesSocket.readyState === 0 || updatesSocket.readyState === 1)) return;
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var socket = new WebSocket(proto + '//' + location.host + '/ws/updates');
+    updatesSocket = socket;
+    socket.onopen = function () { updatesDelay = 1000; };
+    socket.onmessage = function (event) {
+      var data;
+      try { data = JSON.parse(event.data); } catch (e) { return; }
+      if (!data || !data.kind) return;
+      if (document.visibilityState === 'visible') refreshWork();
+      else scheduleWorkPoll();
+    };
+    socket.onclose = function () {
+      updatesSocket = null;
+      clearTimeout(updatesRetry);
+      updatesRetry = setTimeout(connectUpdates, updatesDelay);
+      updatesDelay = Math.min(updatesDelay * 2, 30000);
+    };
+    socket.onerror = function () { try { socket.close(); } catch (e) {} };
+  }
+
   function emptyHtml(iconName, title, text, action) {
     return '<div class="empty"><div class="empty-icon">' + icon(iconName) + '</div><h3>' + esc(title) +
       '</h3><p>' + esc(text) + '</p>' + (action || '') + '</div>';
@@ -3953,6 +3982,10 @@
     });
 
     bindResizer();
+    connectUpdates();
+    window.addEventListener('beforeunload', function () {
+      if (updatesSocket) { try { updatesSocket.close(); } catch (e) {} }
+    });
   }
 
   function bindResizer() {

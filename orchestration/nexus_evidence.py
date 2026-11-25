@@ -25,6 +25,7 @@ import psycopg
 from .cloud_store import NotFound, PostgresStore, StoreError
 from .nexus_lab_store import VERIFIED_STATES
 from . import nexus_metrics
+from . import nexus_events
 from .evidence_trust import (
     FORMAT_VERSION,
     LEGACY_FORMAT_VERSION,
@@ -120,6 +121,8 @@ class EvidenceService:
         nexus_metrics.evidence_verification(verdict.verdict)
         record.update(verdict=verdict.verdict, verification_detail=verdict.as_dict())
         stored = self.store.insert_evidence(record)
+        nexus_events.BUS.publish("evidence.verified", verdict=verdict.verdict,
+                                 subject=subject_kind, id=stored["id"])
         if project_id is not None:
             self._event(project_id, created_by, "evidence.recorded", stored["id"])
         return stored
@@ -235,6 +238,8 @@ class EvidenceService:
         verdict = self.engine.verify(rec, expected_commit=expected_commit,
                                      prev_expected_hash=row['entry_hash'] if row else '')
         nexus_metrics.evidence_verification(verdict.verdict)
+        nexus_events.BUS.publish("evidence.verified", verdict=verdict.verdict,
+                                 subject=rec.get("subject_kind"), id=evidence_id)
         if persist:
             self.store.update_evidence_verification(
                 evidence_id, verdict=verdict.verdict, detail=verdict.as_dict())

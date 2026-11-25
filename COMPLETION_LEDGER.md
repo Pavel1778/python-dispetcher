@@ -107,10 +107,17 @@
   After the follow-up fix, the targeted replanner suite passed **14 tests**;
   combined durable-run and Self-QA suites passed **124 tests, 1 skipped** before
   the final fencing test was added. `ruff check .` and `git diff --check` passed.
-- **This closes two items of the "Not implemented" list above:** metrics and the
-  LLM replanner. The rest of that list is unchanged. The replanner's provider
-  call is exercised with a deterministic text function in the tests; a live
-  provider run is not claimed.
+- **This closes three items of the "Not implemented" list above:** metrics, the
+  LLM replanner and the WebSocket endpoint. The rest of that list is unchanged.
+  The replanner's provider call is exercised with a deterministic text function
+  in the tests; a live provider run is not claimed.
+- **WebSocket updates — implemented, locally tested, in-process.** `GET /ws/updates`
+  and `orchestration/nexus_events.py`: a bounded in-process bus publishes
+  `task.started`/`task.completed`/`task.retried`/`run.failed`/`run.completed`/
+  `evidence.verified`, and the studio refreshes the open work view on an event
+  with reconnect backoff. Tests: `tests/test_ws_updates.py` and the route-auth
+  entry. **Limits:** fan-out is per process (a separate worker's events need
+  Redis, not implemented), and the PWA Push API is not implemented.
 - **Read-path measurement, not a production SLO.** On local PostgreSQL 17,
   `tools/benchmark.py` measured read-path p99 at 1.1–2.8 ms. The user's parallel
   PR #61 separately measured the PostgreSQL scan at 289 → 0.99 ms (20 050 rows,

@@ -62,6 +62,7 @@ from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
 from . import nexus_retry, tracing
 from . import nexus_metrics
+from . import nexus_events
 from .nexus_binding import AuthorizationError, ProjectRepositoryService, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_evidence import LabEvidence
@@ -1728,6 +1729,9 @@ class LabScheduler:
             attestation=self._attestation(task, verdict, report), stop_reason=stop_reason, applied_only=True)
         if won is None:
             return False
+        nexus_events.BUS.publish("task.completed", task=task.get("task_key"),
+                                 verdict=verdict.verdict,
+                                 run=str(task.get("run_id") or ""))
         self._after_result(task, report)
         return True
 
@@ -1865,6 +1869,8 @@ class LabScheduler:
         if task is not None:
             result.claimed = task["task_key"]
             nexus_metrics.task_claimed(self.worker_id)
+            nexus_events.BUS.publish("task.started", worker=self.worker_id,
+                                     task=task["task_key"], run=str(run_id))
             if self._start(run, durable, task, result):
                 return result
             if result.dispatched:
@@ -1890,6 +1896,9 @@ class LabScheduler:
                     # tasks' own verdicts - ACCEPTED only when every task verified,
                     # otherwise REJECTED/NOT_READY - never asserted by the scheduler.
                     self._record_run_acceptance(run_id, state, last_error)
+                    if state == "failed":
+                        nexus_events.BUS.publish("run.failed", run=str(run_id),
+                                                 reason=last_error)
         elif durable and in_flight == 0 and task is None:
             # Nothing at work and nothing that may be started this instant: the
             # run is between two tries, or pausing. It goes on by itself.
@@ -2076,6 +2085,9 @@ class LabScheduler:
         if won:
             if correction is not None:
                 self._record_auto_correction(task, correction, verdict)
+            nexus_events.BUS.publish("task.retried", task=task.get("task_key"),
+                                     verdict=verdict.verdict,
+                                     run=str(task.get("run_id") or ""))
             self._after_result(task, report)
             result.retried = task["task_key"]
             result.note = "not verified: " + ("trying again" if wait is None else f"next cycle in {_span(wait)}")
@@ -2653,6 +2665,7 @@ class LabScheduler:
         # ACCEPTANCE: attested over the tasks' own verdicts, like every other
         # terminal decision of a run.
         self._record_run_acceptance(run_id, "completed", None)
+        nexus_events.BUS.publish("run.completed", run=str(run_id))
         if self.reports is not None:
             # Straight away, for the person who is waiting; a failure here is
             # made good by the next pass of the loop (``deliver_due``).

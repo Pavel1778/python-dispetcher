@@ -62,6 +62,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import signal
@@ -139,6 +140,7 @@ from .nexus_projects import (
 from .nexus_planning import PlanService
 from .nexus_policy import install_log_redaction, policy_report
 from . import nexus_metrics
+from . import nexus_events
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
 from .nexus_specs import (
     SpecCorrupted,
@@ -1790,6 +1792,63 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _websocket(self) -> None:
+        """Upgrade to WebSocket and stream small update events.
+
+        Authentication has already run (``_require_read``): a browser sends its
+        session cookie on the handshake, a machine client may send the bearer
+        token. Events are hints; the studio still reads the run over HTTP. A
+        slow or vanished client loses events; the bus never blocks a worker.
+        """
+        upgrade = (self.headers.get("Upgrade") or "").strip().lower()
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if upgrade != "websocket" or not key:
+            return self._json(400, {"error": "websocket upgrade required"})
+        subscriber = nexus_events.BUS.subscribe()
+        if subscriber is None:
+            return self._json(503, {"error": "too many update listeners"})
+        try:
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", nexus_events.accept_key(key))
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            self.connection.settimeout(1.0)
+            while True:
+                try:
+                    opcode, payload = nexus_events.read_frame(self.connection)
+                except TimeoutError:
+                    opcode, payload = None, b""
+                except (nexus_events.FrameError, OSError):
+                    break
+                if opcode == 0x8:                 # close
+                    try:
+                        self.wfile.write(nexus_events.encode_close())
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    break
+                if opcode == 0x9:                 # ping
+                    try:
+                        self.wfile.write(nexus_events.encode_control(0xA, payload))
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                while True:
+                    try:
+                        message = subscriber.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        self.wfile.write(nexus_events.encode_text(message))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+        finally:
+            nexus_events.BUS.unsubscribe(subscriber)
 
     def _json(self, code: int, payload: Any, *, cookie: str | None = None) -> None:
         # What the handler says about the cookie itself (login, logout) stands.
@@ -4402,6 +4461,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(200, web_ui.APP_HTML)
             if not self._require_read():
                 return
+            if path == "/ws/updates":
+                return self._websocket()
             if path == "/metrics":
                 # Prometheus scrape. Protected like every other read: the
                 # operator's scraper sends the bearer token. Counts only - the

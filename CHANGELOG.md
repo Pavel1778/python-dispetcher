@@ -62,6 +62,24 @@
   `tests/test_replanner.py` (pure rules + a real durable run through the real
   scheduler/store), and the `/metrics` entry in `tests/test_route_auth.py`.
 
+### Added — WebSocket updates
+
+- **`GET /ws/updates`** (`orchestration/nexus_events.py`) upgrades to a
+  WebSocket (RFC 6455 handshake and frames implemented in the stdlib) behind the
+  same session/bearer auth as every other read. A small in-process event bus
+  publishes `task.started`, `task.completed`, `task.retried`, `run.failed`,
+  `run.completed` and `evidence.verified`; the studio opens the socket and
+  refreshes the open work view on an event, with reconnect backoff and the
+  existing poll as the fallback. Payloads carry a task key, a run id and a
+  verdict - never a report, a prompt or a credential.
+- **Honest limit:** the bus is in-process. The default deployment advances runs
+  in the web server's own loop, so it sees them; a separate worker's events
+  would need Redis fan-out (not implemented). A slow client loses events; the
+  HTTP reads remain authoritative.
+- Tests: `tests/test_ws_updates.py` (RFC handshake vector, bounded bus,
+  handshake + event over a raw socket, unauthenticated refusal, ping/pong,
+  close, a real evidence record publishing, and the route-auth entry).
+
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
 ### Added
