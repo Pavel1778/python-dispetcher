@@ -64,12 +64,11 @@
   result. After final small test/flag changes, the focused Self-QA, quality-gate
   and evidence suites passed **76 tests**, with one real-Docker test skipped.
   `ruff check .` passed. A later clean run on the merged tree before replanner
-  follow-up changes passed **2272 tests, 122 skipped** in 436.02 s.
-  GitHub Actions `selfqa-container` on commit `950c7ff` reported success, but
-  job logs could not be retrieved in this network environment, so its exact
-  test/skip count is not independently confirmed. The next revision makes the
-  job fail when the real Docker test's non-root/image prerequisites would skip
-  it. This is not production verification.
+  follow-up changes passed **2272 tests, 122 skipped** in 436.02 s. After that
+  fix, a clean PostgreSQL 16 full run on commit `96760d1` passed **2275 tests,
+  122 skipped** in 431.10 s. GitHub Actions `selfqa-container` on that revision
+  passed with non-root/image prerequisites enforced, including the real Docker
+  integration test. The image is a CI fixture; this is not production verification.
 - **Implemented, tested with stand-ins:** optional Docker check execution with
   a preloaded digest-pinned image, local Unix daemon socket, read-only checkout,
   restricted container settings and no automatic host fallback. The existing
@@ -81,8 +80,9 @@
   memory and ordinary child process groups are killed on completion/timeout;
   `tests/test_selfqa.py` tests large stdout/stderr and timeout cleanup.
 - **LOCAL LIMITATION:** no Docker daemon/image was available in this sandbox;
-  the real-container integration test is skipped locally. Docker is defense in depth,
-  not a VM boundary, and the existing default host runner is not isolated.
+  the real-container integration test is skipped locally but passed in the
+  `selfqa-container` CI job for `96760d1`. Docker is defense in depth, not a VM
+  boundary, and the existing default host runner is not isolated.
   No `run_tests_in_sandbox` agent tool or Jest image has been implemented.
   See `docs/SELF_QA_SANDBOX.md` for deployment and residual risks.
 
