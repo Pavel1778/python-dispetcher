@@ -171,6 +171,8 @@ Without a key pair the lab records no evidence (never a fabricated one).
 | `NEXUS_RETRY_BASE_SECONDS` | `60` | `nexus_retry.py` | Wait after the first exhausted work cycle. |
 | `NEXUS_RETRY_MAX_SECONDS` | `3600` | `nexus_retry.py` | Longest wait between cycles. |
 | `NEXUS_RETRY_MAX_CYCLES` | `0` | `nexus_retry.py` | Operator ceiling on cycles per task (`0` = none; then the run waits for a person). |
+| `NEXUS_LISTEN_DSN` | — | `queue_wakeup.py` | Optional direct/session-mode DSN for LISTEN/NOTIFY wakeups. Empty means timer-only polling. Never a transaction-mode pooler. |
+| `NEXUS_REPLANNER` | off | `replanner.py` | `1`/`true`/`yes`/`on` (and a provider key) gives a task that did not verify one short corrective instruction from the provider cascade, at most 3 per task, signed as `AUTO_CORRECTED`. Off, the deterministic rework note is used. |
 | `NEXUS_SELFQA_GATE` | — | `lab_worker.py` | Deployment-wide override for the Self-QA gate. Unset, each project's own mode decides (`nexus_projects.quality_gate`: `auto`/`on`/`off`). A true value forces every project's checks to run; a false value turns the gate off everywhere. |
 | `NEXUS_SELFQA_CHECK_TIMEOUT` | `900` | `nexus_selfqa.py` | Seconds one declared check may run. A check that hangs is a failure of the check. |
 | `NEXUS_SELFQA_TOTAL_TIMEOUT` | `2400` | `nexus_selfqa.py` | Seconds the whole run of a project's checks may take. |

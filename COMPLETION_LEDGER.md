@@ -78,6 +78,37 @@
   No `run_tests_in_sandbox` agent tool or Jest image has been implemented.
   See `docs/SELF_QA_SANDBOX.md` for deployment and residual risks.
 
+## 2026-11-25 — metrics and self-healing replanner (on top of PR #61)
+
+- **Prometheus metrics — implemented, locally tested.** `orchestration/nexus_metrics.py`
+  and a protected `GET /metrics` publish the metrics the requirement names
+  (`nexus_tasks_claimed_total`, `nexus_evidence_verifications_total`,
+  `nexus_openhands_api_latency_seconds`) plus database-pool, queue, worker and
+  HTTP series. Tests: `tests/test_metrics.py` and the `/metrics` entry in
+  `tests/test_route_auth.py`. Dashboard: `docs/dashboards/nexus-overview.json`.
+- **LLM-driven replanner — implemented, locally tested.** `orchestration/replanner.py`
+  and `LabScheduler._retry`; at most three corrections per task (the count is
+  stored in the task's `verification` detail), delivered to the next attempt and
+  signed into the Evidence Trust Engine as `AUTO_CORRECTED`. Off by default
+  (`NEXUS_REPLANNER=1`). Tests: `tests/test_replanner.py`, which drives a real
+  durable run through the real scheduler and store.
+- **This closes two items of the "Not implemented" list above:** metrics and the
+  LLM replanner. The rest of that list is unchanged. The replanner's provider
+  call is exercised with a deterministic text function in the tests; a live
+  provider run is not claimed.
+- **Read-path measurement, not a production SLO.** On local PostgreSQL 17,
+  `tools/benchmark.py` measured read-path p99 at 1.1–2.8 ms. The user's parallel
+  PR #61 separately measured the PostgreSQL scan at 289 → 0.99 ms (20 050 rows,
+  filtered) and conversation lookups at 13.74 → 0.50 ms (batch). Neither is a
+  production or 100-live-agent result.
+- **Verification (merged tree, this session):** `ruff check .` clean; full
+  suite on local PostgreSQL 17.12 with the Rust parity binary
+  (`pytest tests/ -q --ignore=tests/test_browser_e2e.py`) **2347 passed,
+  32 skipped, 0 failed**; browser E2E **42 passed**; `cargo test --workspace`
+  **63 passed**, `cargo fmt --all --check` and `cargo clippy -D warnings`
+  clean. Skips are environmental (Android SDK, mingw-w64, pooler DSN, live
+  section). No live OpenHands or live provider run was made.
+
 Status of every requirement in the "Final Completion Program" against the actual
 repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,
 PR #50 reconstruction-merge; before that, PR #49 `6e5c2b4`, PR #46 `6629161`)

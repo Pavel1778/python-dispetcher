@@ -3117,3 +3117,83 @@ the CLI. The routes existed and were tested; the screen did not.
 - Still backend-only after this (the rest of P1 #3): File Lab uploads,
   workspaces and voice notes, plan approval, GitHub create/visibility
   confirmations, the allowlist editor, the diagnostics page.
+
+## Queue wakeups, metrics and the replanner (2026-11-25, PR #61 + this increment)
+
+Three additive areas. The event-driven one is PR #61's; the other two were
+ported onto it. A deployment that sets nothing keeps the previous behaviour.
+
+### `orchestration/queue_wakeup.py` — LISTEN/NOTIFY (PR #61)
+
+- **The database is the durable queue; a notification is a hint.** Migration
+  `0045_queue_wakeups.sql` installs triggers on `tasks`, `nexus_run_tasks` and
+  `nexus_runs` that `pg_notify('nexus_queue_wakeup', 'task'|'lab')` **on
+  commit**. A listener still polls; a lost notification can never lose work.
+- **`NEXUS_LISTEN_DSN` is opt-in and must be a direct or session-mode
+  connection.** `LISTEN` lives on a session, so a transaction-mode pooler
+  cannot preserve it. One dedicated connection per web or lab-worker process.
+- **The listener reconnects with backoff and coalesces per queue**
+  (`MIN_WAKE_INTERVAL = 0.5 s`), so a burst - including the worker's own
+  transient-failure requeues - cannot become a hot loop. A reconnect forces a
+  rescan (`_wake_all`) because events may have been missed.
+- **Wiring:** `App.start` listens for `task` (the dispatcher loop) and `lab`
+  (the inline lab loop); `LabWorker.run_forever` listens for `lab`. The wake
+  events are cleared at the top of each pass, not inside `wait()`, so a
+  notification that arrives during a pass is not lost.
+- **Do not add a second listener.** An earlier `orchestration/nexus_notify.py`
+  with an `App.wake_lab()` producer was superseded by this trigger-based design
+  and is **not** in this branch; keep one mechanism.
+- Tests: `tests/test_queue_wakeup.py` (commit/rollback, reconnect, fan-out,
+  coalescing, both loops) against real PostgreSQL.
+
+### `orchestration/nexus_metrics.py` — Prometheus metrics
+
+- **Instrumentation never raises.** Every helper swallows its own errors: a
+  metrics bug must not fail the request or the dispatch it observes.
+- **Cardinality is bounded.** `normalize_path` turns UUIDs and numbers into
+  `{id}`/`{n}`; never label a raw user-supplied path.
+- **No secret is a label.** Labels are worker ids, verdicts, transports and
+  normalised paths only.
+- **`GET /metrics` is protected** like every other read (session or bearer); it
+  is in `tests/test_route_auth.py`. It publishes pool and queue/worker gauges at
+  scrape time from `PostgresStore.pool_stats()` and `App.observability()`
+  (counts only).
+- Instrumented: claims (`LabScheduler.tick`), evidence verifications
+  (`EvidenceService.record`/`reverify`), OpenHands latency
+  (`CloudClient._request`, `OpenHandsClient._request_to`), HTTP responses
+  (`Handler._json`/`_html`).
+- Tests: `tests/test_metrics.py` (pure registry + real `/metrics` + a real
+  evidence record counted through `EvidenceService`).
+
+### `orchestration/replanner.py` — LLM-driven self-healing
+
+- **Bounded, and the ceiling is durable.** At most `max_attempts` (3)
+  corrections per task. The count lives in the task's `verification` detail
+  (`auto_corrections`), written by `LabScheduler._verdict_detail`; do not move
+  it to memory, or a restart resets the ceiling.
+- **Best effort.** A provider outage, an empty answer or a malformed one is
+  logged and answered with `None`; the deterministic rework note is used and the
+  run continues. `_auto_correct` never raises.
+- **The model proposes; the scheduler disposes.** The correction is appended to
+  the note the next attempt reads (`resume_note`) and signed into the Evidence
+  Trust Engine as `detail.status = AUTO_CORRECTED`. It never changes a verdict,
+  a budget or a task's state.
+- **No secret in the prompt or the record.** Free text goes through
+  `nexus_policy.redact_text` and is truncated.
+- **Off unless `NEXUS_REPLANNER=1` and a provider key exists.** `LabWorker`
+  builds it from the environment in that case; tests construct one explicitly.
+- Tests: `tests/test_replanner.py` (pure prompt/safety rules; then a real
+  durable run through the real scheduler/store, including the three-correction
+  ceiling and a provider outage). The same tick that retries may re-claim the
+  task, so assert on the second dispatch / the stored verification, not on
+  `state == "pending"`.
+
+### Environment note
+
+- The Rust parity suites need a toolchain that satisfies the workspace's
+  dependency `rust-version`s (Debian's 1.85 is too old: `uuid` wants 1.89).
+  Install `rustup` and `rustup toolchain install stable`, then `cargo build` in
+  `rust/`, or set `NEXUS_RUST_BIN` to an already-built `nexus-rs`.
+- The test environment is reset between sessions; rebuild it with
+  `apt-get install postgresql`, `pip install -r requirements.txt -r
+  requirements-dev.txt`, and a `nexus` superuser role.

@@ -34,6 +34,7 @@ from typing import Any, Callable
 from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
 from .github_client import GitHubClient
+from .replanner import from_env_if_enabled
 from .nexus_binding import ProjectRepositoryService
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import (
@@ -105,6 +106,7 @@ class LabWorker:
                  heartbeat_seconds: int = 60, account_router: Any | None = None,
                  evidence: Any | None = None, discover_router: bool = True,
                  quality_gate: Any | None = None,
+                 replanner: Any | None = None,
                  stopping: Callable[[], bool] | None = None):
         self.store = store
         self.lab = LabStore(store)
@@ -130,6 +132,11 @@ class LabWorker:
         # commit; a failing required check reworks it. Off by default - a
         # deployment that has not opted in keeps the loop exactly as it was.
         self.quality_gate = quality_gate
+        #: The REPLANNER (self-healing): an explicit one wins; otherwise built
+        #: from the environment only when ``NEXUS_REPLANNER=1`` and a provider
+        #: has a key. A deployment that sets nothing keeps the deterministic
+        #: rework note and never calls a model.
+        self.replanner = replanner if replanner is not None else from_env_if_enabled()
         # The executor reads a task's original text from the store, to hand it
         # to the agent along with the planner's summary.
         exec_poll = min(2.0, max(0.01, float(poll_interval)))
@@ -200,6 +207,7 @@ class LabWorker:
                             worker_id=self.worker_id, lease_seconds=self.lease_seconds,
                             router=self.account_router, reports=self.reports,
                             evidence=self.evidence, quality_gate=self.quality_gate,
+                            replanner=self.replanner,
                             stopping=self.stopping)
 
     def stopping(self) -> bool:

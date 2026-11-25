@@ -31,6 +31,7 @@ from enum import Enum
 from typing import Any
 
 from .net_guard import AddressPolicy, AddressRefused, guarded_handlers
+from . import nexus_metrics
 
 DEFAULT_CLOUD_BASE_URL = "https://app.all-hands.dev"
 
@@ -275,6 +276,23 @@ class CloudClient:
 
     # ------------------------------------------------------------------ http
     def _request(
+        self, method: str, path: str, body: dict[str, Any] | None = None
+    ) -> tuple[int, Any]:
+        """Issue a request, recording its latency for ``/metrics``.
+
+        The timing covers the whole call (connect, send, read, decode) and is
+        recorded whether it succeeded or raised, so a failing transport is
+        visible in the same histogram as a slow one.
+        """
+        started = time.perf_counter()
+        try:
+            return self._request_impl(method, path, body)
+        finally:
+            nexus_metrics.observe_openhands(
+                getattr(self, "account_label", None), "app",
+                time.perf_counter() - started)
+
+    def _request_impl(
         self, method: str, path: str, body: dict[str, Any] | None = None
     ) -> tuple[int, Any]:
         if not self._api_key:
