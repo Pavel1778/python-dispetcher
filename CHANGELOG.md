@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — 2026-11-25
+
+### Added
+
+- Proposed [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) for PostgreSQL
+  LISTEN/NOTIFY wakeups, with polling inventory, failure handling, PgBouncer
+  constraints and a verification plan. Awaiting customer approval; runtime
+  behaviour is unchanged by the RFC.
+
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
 ### Added

@@ -1,5 +1,21 @@
 # NEXUS — Completion Ledger
 
+## 2026-11-25 — event-driven RFC (proposed, not implemented)
+
+- **Status:** awaiting customer approval in the PR before implementation;
+  phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) inventories
+  dispatcher, lab, planning and external-service polling and describes a
+  bounded, recoverable LISTEN/NOTIFY design. No event-driven runtime change or
+  migration is claimed by this entry.
+- **Verification:** on the working tree, `.venv/bin/python -m pytest -q
+  -p no:cacheprovider` completed with 597 passed, 1783 skipped, 0 failed;
+  `.venv/bin/ruff check .` passed. These runs include existing uncommitted
+  dispatcher changes and are not a PostgreSQL integration or E2E result.
+  PostgreSQL-dependent tests could not be verified locally.
+- **Acceptance still open:** p99 API read latency <50 ms, 100+ parallel agents,
+  production LISTEN/NOTIFY, and all other requested phases require separate
+  implementation and measurements. There is no live self-healing example.
+
 Status of every requirement in the "Final Completion Program" against the actual
 repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,
 PR #50 reconstruction-merge; before that, PR #49 `6e5c2b4`, PR #46 `6629161`)
