@@ -21,6 +21,36 @@
 - The missing-env self-hosting test now uses a fake `psql` so that it exercises
   the configuration guard even when PostgreSQL client tools are absent.
 
+### Added — observability and self-healing
+
+- **Prometheus metrics** (`orchestration/nexus_metrics.py`, protected
+  `GET /metrics`). A dependency-free registry in the exposition format 0.0.4:
+  `nexus_tasks_claimed_total{worker}`, `nexus_evidence_verifications_total{verdict}`,
+  `nexus_openhands_api_latency_seconds{account,transport}`, the database-pool
+  gauges, queue/stuck/worker gauges and HTTP count/latency by normalised path.
+  Instrumentation never raises and never labels a secret. A 12-panel Grafana
+  dashboard is in `docs/dashboards/nexus-overview.json`.
+- **LLM-driven replanner (self-healing)** (`orchestration/replanner.py`). When a
+  durable task does not verify, the provider cascade is asked for one short,
+  concrete corrective instruction; it is appended to the note the next attempt
+  reads and signed into the Evidence Trust Engine as `AUTO_CORRECTED`. Bounded
+  at three per task (the count is stored on the task, so it survives a restart),
+  best effort (a provider outage keeps the deterministic note) and redacted.
+  Off unless `NEXUS_REPLANNER=1` and a provider key is configured.
+
+### Changed — observability and self-healing
+
+- `LabScheduler._retry` records `auto_corrections` in the task's `verification`
+  detail, so the replanner's ceiling is durable rather than in memory.
+- `CloudClient._request` and `OpenHandsClient._request_to` record their real
+  latency; the request path is otherwise unchanged.
+
+### Tests — observability and self-healing
+
+- `tests/test_metrics.py` (registry + real `/metrics` + a real evidence record),
+  `tests/test_replanner.py` (pure rules + a real durable run through the real
+  scheduler/store), and the `/metrics` entry in `tests/test_route_auth.py`.
+
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
 ### Added

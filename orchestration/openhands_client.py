@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,7 @@ from enum import Enum
 from typing import Any
 
 from .nexus_policy import UnsafeTarget, check_outbound_url
+from . import nexus_metrics
 
 
 #: Scheme default ports, so an omitted port and an explicit default compare equal.
@@ -201,6 +203,28 @@ class OpenHandsClient:
         return self._request_to(self._base_url(), self._auth_key(), method, path, body)
 
     def _request_to(
+        self,
+        base_url: str,
+        key: str,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[int, Any]:
+        """Issue a request against an explicit host, recording its latency.
+
+        The timing covers the whole agent-server call (connect, send, read,
+        decode), success or failure, so the ``agent-server`` transport is
+        visible in ``nexus_openhands_api_latency_seconds`` beside ``app``.
+        """
+        started = time.perf_counter()
+        try:
+            return self._request_to_impl(base_url, key, method, path, body)
+        finally:
+            nexus_metrics.observe_openhands(
+                getattr(self, "account_label", None), "agent-server",
+                time.perf_counter() - started)
+
+    def _request_to_impl(
         self,
         base_url: str,
         key: str,

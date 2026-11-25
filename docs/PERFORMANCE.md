@@ -180,3 +180,33 @@ an improvement vs. the claimed 430 ms production p99 and not a 100-agent load
 test. Production network, larger datasets, concurrency and real OpenHands must
 be measured separately. The benchmark **resets its target schema**: use only a
 disposable database.
+
+### Read-path re-measurement after metrics instrumentation (2026-11-25, PostgreSQL 17.12)
+
+`tools/benchmark.py` was re-run on the merged tree (PostgreSQL 17.12, Python
+3.13.15, psycopg 3.3.9, local loopback, schema reset per run) after adding the
+`/metrics` instrumentation. Every value is a real HTTP round trip.
+
+| Path | p50 (ms) | p99 (ms) | n |
+|---|---:|---:|---:|
+| `studio_status_ms` (`GET /api/studio`) | 0.73 | 1.08 | 15 |
+| `list_projects_ms` | 1.32 | 1.69 | 15 |
+| `open_project_ms` | 1.64 | 1.96 | 15 |
+| `list_conversations_ms` | 1.64 | 1.93 | 15 |
+| `open_conversation_ms` | 1.49 | 1.65 | 15 |
+| `fetch_history_ms` | 2.40 | 3.01 | 15 |
+| `search_by_content_ms` | 1.97 | 2.50 | 15 |
+| `export_conversation_ms` | 2.61 | 3.04 | 15 |
+| `chat_turn_ms` (fake provider) | 12.13 | 17.16 | 5 |
+| `start_run_ms` (plan + store) | 26.86 | 32.01 | 5 |
+| `queue_claim_ms` | 3.16 | 5.05 | 15 |
+
+Read-path p99 is **1.1–3.0 ms** on this local stack. The instrumentation adds one
+`perf_counter()` pair and one histogram observation per OpenHands call, one
+counter per claim/verification and one status/duration observation per
+JSON/HTML response — in-memory operations behind a lock, below the noise of these
+numbers. No SQL, index, pool or event-loop change was made for this.
+
+**Not claimed:** a production SLO, the 430 ms before/after figure, or 100 live
+agents. The separate scan and batch numbers above are the queue-path wins; this
+table is the read-path baseline they sit beside.

@@ -1,0 +1,160 @@
+{
+  "uid": "nexus-overview",
+  "title": "NEXUS — control plane overview",
+  "tags": ["nexus", "openhands", "control-plane"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "DSOURCE",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Queue depth (due, unclaimed)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A", "expr": "nexus_queue_depth", "legendFormat": "claimable"}],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 2,
+      "title": "Oldest claimable (seconds)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A", "expr": "nexus_queue_oldest_seconds", "legendFormat": "oldest"}],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}
+    },
+    {
+      "id": 3,
+      "title": "Stuck tasks",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 4, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A", "expr": "nexus_stuck_tasks", "legendFormat": "stuck"}],
+      "options": {"colorMode": "background", "graphMode": "area",
+                  "thresholds": {"mode": "absolute", "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "orange", "value": 1},
+                    {"color": "red", "value": 5}]}},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 4,
+      "title": "Live workers",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 4, "x": 20, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A", "expr": "nexus_live_workers", "legendFormat": "workers"}],
+      "options": {"colorMode": "background", "graphMode": "area",
+                  "thresholds": {"mode": "absolute", "steps": [
+                    {"color": "red", "value": null},
+                    {"color": "green", "value": 1}]}},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 5,
+      "title": "Active runs",
+      "type": "stat",
+      "gridPos": {"h": 6, "w": 4, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A", "expr": "nexus_active_runs", "legendFormat": "runs"}],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 6,
+      "title": "Claim rate by worker",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 10, "x": 4, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A",
+                   "expr": "sum(rate(nexus_tasks_claimed_total[5m])) by (worker)",
+                   "legendFormat": "{{worker}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}
+    },
+    {
+      "id": 7,
+      "title": "Evidence verifications by verdict",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 10, "x": 14, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A",
+                   "expr": "sum(rate(nexus_evidence_verifications_total[5m])) by (verdict)",
+                   "legendFormat": "{{verdict}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}
+    },
+    {
+      "id": 8,
+      "title": "HTTP latency p50 / p95 / p99",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum(rate(nexus_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum(rate(nexus_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum(rate(nexus_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}
+    },
+    {
+      "id": 9,
+      "title": "OpenHands API latency p95 by account",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A",
+                   "expr": "histogram_quantile(0.95, sum(rate(nexus_openhands_api_latency_seconds_bucket[5m])) by (le, account, transport))",
+                   "legendFormat": "{{account}} / {{transport}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}
+    },
+    {
+      "id": 10,
+      "title": "Database pool",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [
+        {"refId": "A", "expr": "nexus_db_pool_active_connections", "legendFormat": "active"},
+        {"refId": "B", "expr": "nexus_db_pool_idle_connections", "legendFormat": "idle"},
+        {"refId": "C", "expr": "nexus_db_pool_waiting_requests", "legendFormat": "waiting"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 11,
+      "title": "Wake-ups (NOTIFY)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(nexus_notifications_sent_total[5m]))", "legendFormat": "sent"},
+        {"refId": "B", "expr": "sum(rate(nexus_notifications_received_total[5m]))", "legendFormat": "received"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}
+    },
+    {
+      "id": 12,
+      "title": "HTTP responses by status",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 30},
+      "datasource": {"type": "prometheus", "uid": "${DSOURCE}"},
+      "targets": [{"refId": "A",
+                   "expr": "sum(rate(nexus_http_requests_total[5m])) by (status)",
+                   "legendFormat": "{{status}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}
+    }
+  ]
+}
