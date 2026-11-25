@@ -67,8 +67,9 @@
   follow-up changes passed **2272 tests, 122 skipped** in 436.02 s.
   GitHub Actions `selfqa-container` on commit `950c7ff` reported success, but
   job logs could not be retrieved in this network environment, so its exact
-  test/skip count is not independently confirmed. This is not production
-  verification.
+  test/skip count is not independently confirmed. The next revision makes the
+  job fail when the real Docker test's non-root/image prerequisites would skip
+  it. This is not production verification.
 - **Implemented, tested with stand-ins:** optional Docker check execution with
   a preloaded digest-pinned image, local Unix daemon socket, read-only checkout,
   restricted container settings and no automatic host fallback. The existing

@@ -265,4 +265,6 @@ jobs:
           docker pull python:3.12-slim
           echo "NEXUS_TEST_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' python:3.12-slim)" >> "$GITHUB_ENV"
       - name: Exercise the real container runner
-        run: python -m pytest tests/test_selfqa_sandbox.py -q -p no:cacheprovider
+        run: |
+          python -c 'import os; assert os.name == "posix" and os.getuid() != 0; assert os.environ.get("NEXUS_TEST_DOCKER_IMAGE")'
+          python -m pytest tests/test_selfqa_sandbox.py -q -p no:cacheprovider
