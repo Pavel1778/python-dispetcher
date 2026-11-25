@@ -19,6 +19,13 @@
 
 ## 2026-11-25 — queue wakeups and performance (PR #61, work in progress)
 
+- **Full suite:** commit `b357d3f`, Python 3.11.2 and an isolated local
+  PostgreSQL 16.2: `pytest -q -p no:cacheprovider --disable-warnings` yielded
+  **2240 passed, 162 skipped, 0 failed** in 397.22 s. This does not cover the
+  skipped tests, real OpenHands, PostgreSQL 17 or production. `ruff check .`
+  passed. The initial database run had three environment-related failures;
+  supplying the explicit local socket port and putting the venv on PATH fixed
+  those backup/restore tests, then the full suite was rerun.
 - **Implemented, locally tested:** optional `NEXUS_LISTEN_DSN` listener for
   `App` and the separate `LabWorker`; migration `0045` publishes transaction-
   committed, type-only hints. Polling remains the recovery path and a 0.5 s
