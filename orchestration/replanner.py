@@ -17,14 +17,16 @@ This module is that missing step, and only that step:
 
 Rules that keep it honest:
 
-* **Bounded.** At most ``max_attempts`` corrections per task (default 3). The
-  caller passes the attempt number it is about to make, read from what it
-  already stored, so the ceiling survives a restart.
+* **Bounded corrections.** At most three accepted corrections per task. The
+  caller derives the next number from durable task history, so the ceiling
+  survives a restart or requeue. Failed provider calls and stale concurrent
+  calls are not counted against this ceiling.
 * **Never fatal.** A provider outage, an empty answer or a malformed one is
   logged and answered with ``None``; the deterministic rework note is used
   instead. A replanner failure must not stop a run.
-* **No secret in the prompt or the record.** Every free-text field is passed
-  through ``nexus_policy.redact_text`` and truncated.
+* **Best-effort redaction.** Prompt fields and returned notes are passed through
+  ``nexus_policy.redact_text`` and truncated. Pattern-based redaction cannot
+  guarantee that arbitrary secrets are detected.
 * **The model proposes; the scheduler disposes.** The correction is delivered
   as text to the next attempt. It cannot create a task, change a budget or
   mark anything verified.
@@ -83,7 +85,7 @@ def _clip(text: Any, limit: int) -> str:
 
 def _clean(answer: str) -> str:
     """The model's answer as one instruction: no fence, no surrounding space."""
-    text = (answer or "").strip()
+    text = redact_text((answer or "").strip())
     text = _FENCE.sub("", text).strip()
     if len(text) > MAX_NOTE_CHARS:
         text = text[: MAX_NOTE_CHARS - 1] + "…"
@@ -99,7 +101,7 @@ class Replanner:
         if not callable(text):
             raise TypeError("Replanner needs a callable text(prompt, system) -> str")
         self.text = text
-        self.max_attempts = max(1, int(max_attempts))
+        self.max_attempts = min(3, max(1, int(max_attempts)))
         self.max_context_chars = max(500, int(max_context_chars))
 
     # ------------------------------------------------------------- builders
@@ -196,19 +198,33 @@ class Replanner:
 
 
 def _stored_attempts(task: dict) -> int:
-    verification = task.get("verification") or {}
-    if isinstance(verification, str):
+    """Read successful corrections from both current detail and durable history.
+
+    Verification is replaced on every retry and may be cleared by a manual
+    requeue; the task's evidence array retains the earlier retry records.
+    """
+    import json
+
+    def decode(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (ValueError, TypeError):
+                return None
+        return value
+
+    verification = decode(task.get("verification"))
+    history = decode(task.get("evidence"))
+    records = ([verification] if isinstance(verification, dict) else [])
+    if isinstance(history, list):
+        records.extend(item for item in history if isinstance(item, dict))
+    counts = [0]
+    for item in records:
         try:
-            import json
-            verification = json.loads(verification)
-        except Exception:  # noqa: BLE001 - a malformed column is "no attempt yet"
-            return 0
-    if not isinstance(verification, dict):
-        return 0
-    try:
-        return max(0, int(verification.get("auto_corrections") or 0))
-    except (TypeError, ValueError):
-        return 0
+            counts.append(max(0, int(item.get("auto_corrections") or 0)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return max(counts)
 
 
 def enabled() -> bool:

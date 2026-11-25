@@ -46,6 +46,11 @@
 
 ### Changed — observability and self-healing
 
+- Replanner correction counts are recovered from durable retry evidence even
+  after verification detail is replaced or cleared. Signed correction records
+  are attempted only after the fenced retry succeeds. Provider output is
+  best-effort redacted; the limit is three accepted corrections, not a hard
+  cap on failed or concurrent provider calls.
 - `LabScheduler._retry` records `auto_corrections` in the task's `verification`
   detail, so the replanner's ceiling is durable rather than in memory.
 - `CloudClient._request` and `OpenHandsClient._request_to` record their real

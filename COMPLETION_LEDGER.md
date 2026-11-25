@@ -63,7 +63,12 @@
   suite using the same disposable database, so it is not a clean full-suite
   result. After final small test/flag changes, the focused Self-QA, quality-gate
   and evidence suites passed **76 tests**, with one real-Docker test skipped.
-  `ruff check .` passed. This is not a live Docker or production verification.
+  `ruff check .` passed. A later clean run on the merged tree before replanner
+  follow-up changes passed **2272 tests, 122 skipped** in 436.02 s.
+  GitHub Actions `selfqa-container` on commit `950c7ff` reported success, but
+  job logs could not be retrieved in this network environment, so its exact
+  test/skip count is not independently confirmed. This is not production
+  verification.
 - **Implemented, tested with stand-ins:** optional Docker check execution with
   a preloaded digest-pinned image, local Unix daemon socket, read-only checkout,
   restricted container settings and no automatic host fallback. The existing
@@ -74,8 +79,8 @@
 - **Implemented and locally tested:** Self-QA output is drained with bounded
   memory and ordinary child process groups are killed on completion/timeout;
   `tests/test_selfqa.py` tests large stdout/stderr and timeout cleanup.
-- **NOT LIVE VERIFIED:** no Docker daemon/image was available in this sandbox;
-  the real-container integration test is skipped. Docker is defense in depth,
+- **LOCAL LIMITATION:** no Docker daemon/image was available in this sandbox;
+  the real-container integration test is skipped locally. Docker is defense in depth,
   not a VM boundary, and the existing default host runner is not isolated.
   No `run_tests_in_sandbox` agent tool or Jest image has been implemented.
   See `docs/SELF_QA_SANDBOX.md` for deployment and residual risks.
@@ -88,12 +93,19 @@
   `nexus_openhands_api_latency_seconds`) plus database-pool, queue, worker and
   HTTP series. Tests: `tests/test_metrics.py` and the `/metrics` entry in
   `tests/test_route_auth.py`. Dashboard: `docs/dashboards/nexus-overview.json`.
-- **LLM-driven replanner — implemented, locally tested.** `orchestration/replanner.py`
-  and `LabScheduler._retry`; at most three corrections per task (the count is
-  stored in the task's `verification` detail), delivered to the next attempt and
-  signed into the Evidence Trust Engine as `AUTO_CORRECTED`. Off by default
-  (`NEXUS_REPLANNER=1`). Tests: `tests/test_replanner.py`, which drives a real
-  durable run through the real scheduler and store.
+- **LLM-driven replanner — implemented, locally tested, not live verified.**
+  `orchestration/replanner.py` and `LabScheduler._retry`; at most three accepted
+  corrections per task, derived from durable retry evidence and current detail,
+  delivered to the next attempt. Signing `AUTO_CORRECTED` is best effort after
+  the fenced transition; a crash or evidence-service failure may omit it. This
+  limits successful corrections, not failed or concurrent provider calls, so the
+  requested maximum of three total attempts is not established. Redaction is
+  best effort and is not a guarantee against every secret. Off by default
+  (`NEXUS_REPLANNER=1`). `tests/test_replanner.py` covers overwritten/cleared
+  verification, redaction and lost fencing as well as scripted PostgreSQL runs.
+  After the follow-up fix, the targeted replanner suite passed **14 tests**;
+  combined durable-run and Self-QA suites passed **124 tests, 1 skipped** before
+  the final fencing test was added. `ruff check .` and `git diff --check` passed.
 - **This closes two items of the "Not implemented" list above:** metrics and the
   LLM replanner. The rest of that list is unchanged. The replanner's provider
   call is exercised with a deterministic text function in the tests; a live

@@ -99,6 +99,30 @@ def test_the_stored_attempt_count_is_read_from_the_task():
     assert planner.correct(task, _verdict(), _report()) is None
 
 
+def test_limit_survives_overwritten_verification_and_requeue():
+    from orchestration.nexus_lab import LabScheduler
+
+    task = {"task_key": "t1", "verification": {"reason": "provider outage"},
+            "evidence": [{"auto_corrections": 3}, {"requeued": "manual"}]}
+    calls = []
+    planner = Replanner(lambda *_: calls.append(1) or "again", max_attempts=99)
+    assert planner.max_attempts == 3
+    assert planner.correct(task, _verdict(), _report()) is None
+    assert LabScheduler._stored_auto_corrections(task) == 3
+    task["verification"] = None
+    assert planner.correct(task, _verdict(), _report()) is None
+    assert not calls
+
+
+def test_provider_output_is_redacted():
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    correction = Replanner(lambda *_: f"try using {secret}").correct(
+        {"task_key": "t1"}, _verdict(), _report())
+    assert correction is not None
+    assert secret not in correction.note
+    assert "«redacted»" in correction.note
+
+
 # --------------------------------------------------------------- real scheduler
 pytestmark_db = pytest.mark.skipif(
     not DSN, reason="set TEST_SUPABASE_DB_URL to run the scheduler integration")
@@ -161,6 +185,21 @@ def test_a_failed_task_gets_a_correction_delivered_and_signed(env):
     assert len(rows) == 1
     assert rows[0]["detail"]["status"] == "AUTO_CORRECTED"
     assert rows[0]["detail"]["auto_corrected"] is True
+
+
+@pytestmark_db
+def test_lost_retry_fence_does_not_record_correction(env, monkeypatch):
+    executor = RecordingConversations()
+    sched = scheduler(env, executor, Verdicts({"t1": [_verdict()]}),
+                      replanner=Replanner(lambda *_: "try again"),
+                      evidence=_evidence(env["store"]))
+    run_id = start(env, [{"task_key": "t1", "title": "do it"}],
+                   max_attempts_per_task=10)
+    sched.tick(run_id)
+    executor.finish(executor.of("t1")[-1], "still wrong")
+    monkeypatch.setattr(sched.store, "retry_task", lambda *args, **kwargs: None)
+    sched.tick(run_id)
+    assert _auto_corrected_rows(env["store"]) == []
 
 
 @pytestmark_db

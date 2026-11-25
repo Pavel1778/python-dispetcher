@@ -2047,7 +2047,7 @@ class LabScheduler:
         # instruction from the provider cascade, bounded per task. It is added
         # to the note the next attempt reads and signed as AUTO_CORRECTED; it
         # never changes the verdict or the task's state.
-        verdict, correction_note = self._auto_correct(task, verdict, report)
+        verdict, correction_note, correction = self._auto_correct(task, verdict, report)
         evidence = {"reason": verdict.reason, **verdict.evidence}
         note = self._rework_note(task, verdict)
         if correction_note:
@@ -2074,6 +2074,8 @@ class LabScheduler:
             lease_token=task["lease_token"], attestation=self._attestation(task, verdict, report),
             applied_only=True, stop_reason=stop_reason)
         if won:
+            if correction is not None:
+                self._record_auto_correction(task, correction, verdict)
             self._after_result(task, report)
             result.retried = task["task_key"]
             result.note = "not verified: " + ("trying again" if wait is None else f"next cycle in {_span(wait)}")
@@ -2096,51 +2098,40 @@ class LabScheduler:
     @staticmethod
     def _stored_auto_corrections(task: dict) -> int:
         """How many corrections this task has already been given (durable)."""
-        verification = task.get("verification") or {}
-        if isinstance(verification, str):
-            try:
-                import json
-                verification = json.loads(verification)
-            except Exception:  # noqa: BLE001 - a malformed column is "none yet"
-                return 0
-        if not isinstance(verification, dict):
-            return 0
-        try:
-            return max(0, int(verification.get("auto_corrections") or 0))
-        except (TypeError, ValueError):
-            return 0
+        from .replanner import _stored_attempts
+
+        return _stored_attempts(task)
 
     def _auto_correct(self, task: dict, verdict: Verification,
-                      report: TaskReport) -> tuple[Verification, str | None]:
+                      report: TaskReport) -> tuple[Verification, str | None, Any | None]:
         """One corrective instruction for a failed task, bounded and best effort.
 
         Returns the verdict to record (its evidence carries the correction, so
         the ceiling survives a restart) and the note to append, or the verdict
-        unchanged and ``None`` when there is no replanner, the ceiling is
-        reached, or the provider did not answer. It never raises: a replanner
-        outage must not stop a run.
+        unchanged and ``None`` values when there is no replanner, the ceiling
+        is reached, or the provider did not answer. A successful correction is
+        signed only after the fenced retry transition succeeds.
         """
         replanner = getattr(self, "replanner", None)
         if replanner is None:
-            return verdict, None
+            return verdict, None, None
         try:
-            limit = max(1, int(getattr(replanner, "max_attempts", 3)))
+            limit = min(3, max(1, int(getattr(replanner, "max_attempts", 3))))
             previous = self._stored_auto_corrections(task)
             if previous >= limit:
-                return verdict, None
+                return verdict, None, None
             correction = replanner.correct(task, verdict, report, attempt=previous + 1)
         except Exception:  # noqa: BLE001 - never fatal to the run
             log.warning("replanner failed for task %s", task.get("id"), exc_info=True)
-            return verdict, None
+            return verdict, None, None
         if correction is None:
-            return verdict, None
+            return verdict, None, None
         evidence = {**verdict.evidence,
                     "auto_corrections": previous + 1,
                     "auto_correction": correction.as_dict()}
         updated = Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
-        self._record_auto_correction(task, correction, verdict)
         note = f"Автокоррекция {previous + 1}/{limit}: {correction.note}"
-        return updated, note
+        return updated, note, correction
 
     def _record_auto_correction(self, task: dict, correction: Any,
                                 verdict: Verification) -> None:
@@ -2164,12 +2155,12 @@ class LabScheduler:
                 repository_full_name=task.get("repository") or None,
                 commit_sha=None, branch=task.get("branch") or None,
                 summary=(f"AUTO_CORRECTED (attempt {correction.attempt}): "
-                         f"{verdict.reason}")[:500],
+                         f"{correction.reason}")[:500],
                 detail={"status": "AUTO_CORRECTED", "auto_corrected": True,
                         "attempt": correction.attempt,
                         "note": correction.note[:2000],
                         "verdict": verdict.verdict,
-                        "reason": verdict.reason[:1000],
+                        "reason": correction.reason[:1000],
                         "task_key": task.get("task_key"),
                         "provider": correction.provider,
                         "model": correction.model},
