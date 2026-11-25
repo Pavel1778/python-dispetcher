@@ -37,6 +37,7 @@ Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
     POST /logout                 revoke the session
     GET  /api/session            current user + CSRF token
     GET  /api/studio             what is configured (names only, never a value)
+    GET  /metrics                Prometheus metrics (protected; bearer token)
     GET  /api/dashboard          real counts + store/Cloud health
     GET  /api/config             whether a Cloud key is configured
     GET  /api/repositories       the repository allowlist
@@ -61,6 +62,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import signal
@@ -137,6 +139,9 @@ from .nexus_projects import (
 )
 from .nexus_planning import PlanService
 from .nexus_policy import install_log_redaction, policy_report
+from . import nexus_metrics
+from . import nexus_events
+from . import nexus_redis
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
 from .nexus_specs import (
     SpecCorrupted,
@@ -467,6 +472,10 @@ class App:
         )
         self._stop = threading.Event()
         self._lab_wake = threading.Event()
+        self._dispatch_wake = threading.Event()
+        self._queue_listener = None
+        #: The optional Redis event bridge (``REDIS_URL``); ``None`` when off.
+        self._redis_bridge = None
         self._loop: threading.Thread | None = None
         self._lab_loop: threading.Thread | None = None
         self._plan_loop: threading.Thread | None = None
@@ -486,6 +495,15 @@ class App:
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
+        from .queue_wakeup import from_environment
+
+        # Cross-process events: a separate lab worker publishes to Redis and
+        # this process listens, so its WebSocket clients see those events too.
+        self._redis_bridge = nexus_redis.install(nexus_events.BUS, subscribe=True)
+        self._queue_listener = from_environment({"task": self._dispatch_wake.set,
+                                                 "lab": self.wake_lab})
+        if self._queue_listener is not None:
+            self._queue_listener.start()
         self._loop = threading.Thread(target=self._run, daemon=True)
         self._loop.start()
         self._plan_loop = threading.Thread(target=self._run_planning, daemon=True)
@@ -498,6 +516,9 @@ class App:
         self._stop.set()
         self.spec_planner.wake()
         self.wake_lab()
+        self._dispatch_wake.set()
+        if self._queue_listener is not None:
+            self._queue_listener.stop()
         # The pass that advances runs is given the time to finish what it has
         # in hand: closing the store under it would lose what it was about to
         # write (a start it has just been given, a verdict). It does not wait
@@ -510,6 +531,8 @@ class App:
             if loop:
                 left = max(0.2, deadline - time.monotonic())
                 loop.join(timeout=left if loop is self._lab_loop else min(5.0, left))
+        nexus_redis.uninstall(self._redis_bridge)
+        self._redis_bridge = None
         self.store.close()
 
     def _run_planning(self) -> None:
@@ -607,7 +630,6 @@ class App:
                                       "errors": [f"{type(e).__name__}: {e}"]}
             if not self._stop.is_set():
                 self._lab_wake.wait(self.poll_interval)
-                self._lab_wake.clear()
         if worker is not None:
             try:
                 worker.lab.stop_worker(self._lab_worker_id)
@@ -617,6 +639,7 @@ class App:
     def _run(self) -> None:
         synced = False
         while not self._stop.is_set():
+            self._dispatch_wake.clear()
             try:
                 if not synced:
                     startup_sync(self.store, self.client, self.openhands_accounts.execution_client_internal)
@@ -633,7 +656,8 @@ class App:
             # After the pass whatever became of it: housekeeping of this
             # server's own tables does not depend on the agent service.
             self._maybe_sweep()
-            self._stop.wait(self.poll_interval)
+            if not self._stop.is_set():
+                self._dispatch_wake.wait(self.poll_interval)
 
     def _maybe_sweep(self) -> None:
         """Occasionally drop expired sessions and stale rate-limit rows.
@@ -1758,11 +1782,88 @@ class Handler(BaseHTTPRequestHandler):
         cookie, self._renewed_cookie = self._renewed_cookie, None
         return cookie
 
+    def _note_http(self, code: int) -> None:
+        """Record one response's status and duration. Never raises."""
+        started = getattr(self, "_request_started", None)
+        if started is None:
+            return
+        self._request_started = None
+        nexus_metrics.observe_http(self.command or "", urlparse(self.path).path,
+                                   code, time.perf_counter() - started)
+
+    def _text(self, code: int, text: str, content_type: str) -> None:
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _websocket(self) -> None:
+        """Upgrade to WebSocket and stream small update events.
+
+        Authentication has already run (``_require_read``): a browser sends its
+        session cookie on the handshake, a machine client may send the bearer
+        token. Events are hints; the studio still reads the run over HTTP. A
+        slow or vanished client loses events; the bus never blocks a worker.
+        """
+        upgrade = (self.headers.get("Upgrade") or "").strip().lower()
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if upgrade != "websocket" or not key:
+            return self._json(400, {"error": "websocket upgrade required"})
+        subscriber = nexus_events.BUS.subscribe()
+        if subscriber is None:
+            return self._json(503, {"error": "too many update listeners"})
+        try:
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", nexus_events.accept_key(key))
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            self.connection.settimeout(1.0)
+            while True:
+                try:
+                    opcode, payload = nexus_events.read_frame(self.connection)
+                except TimeoutError:
+                    opcode, payload = None, b""
+                except (nexus_events.FrameError, OSError):
+                    break
+                if opcode == 0x8:                 # close
+                    try:
+                        self.wfile.write(nexus_events.encode_close())
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    break
+                if opcode == 0x9:                 # ping
+                    try:
+                        self.wfile.write(nexus_events.encode_control(0xA, payload))
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                while True:
+                    try:
+                        message = subscriber.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        self.wfile.write(nexus_events.encode_text(message))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+        finally:
+            nexus_events.BUS.unsubscribe(subscriber)
+
     def _json(self, code: int, payload: Any, *, cookie: str | None = None) -> None:
         # What the handler says about the cookie itself (login, logout) stands.
         renewed = self._take_renewed_cookie()
         cookie = cookie or renewed
         body = json.dumps(payload, default=str).encode()
+        self._note_http(code)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1777,6 +1878,7 @@ class Handler(BaseHTTPRequestHandler):
         renewed = self._take_renewed_cookie()
         cookie = cookie or renewed
         body = text.encode()
+        self._note_http(code)
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -4319,6 +4421,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
+        self._request_started = time.perf_counter()
         path = urlparse(self.path).path
         try:
             # --- public ---
@@ -4366,6 +4469,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(200, web_ui.APP_HTML)
             if not self._require_read():
                 return
+            if path == "/ws/updates":
+                return self._websocket()
+            if path == "/metrics":
+                # Prometheus scrape. Protected like every other read: the
+                # operator's scraper sends the bearer token. Counts only - the
+                # registry never holds a key, a token or a DSN.
+                try:
+                    nexus_metrics.set_db_pool(self.app.store.pool_stats())
+                except Exception:  # noqa: BLE001 - a scrape must not fail
+                    pass
+                try:
+                    obs = self.app.observability()
+                    stuck = obs.get("stuck_tasks")
+                    workers = (obs.get("workers") or {}).get("count")
+                    nexus_metrics.set_queue(
+                        obs.get("queue") or {},
+                        len(stuck) if isinstance(stuck, list) else 0,
+                        int(workers or 0))
+                except Exception:  # noqa: BLE001 - a scrape must not fail
+                    pass
+                self._note_http(200)
+                return self._text(200, nexus_metrics.render(),
+                                  "text/plain; version=0.0.4; charset=utf-8")
             if self._execution_profile(path):
                 return
 
@@ -4692,6 +4818,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- POST
     def do_POST(self) -> None:
+        self._request_started = time.perf_counter()
         path = urlparse(self.path).path
         try:
             # --- public: login (rate limited) ---

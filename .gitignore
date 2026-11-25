@@ -17,6 +17,8 @@ python-dispetcher.env
 dist/
 # Rust build output (the crate's own Cargo.lock IS committed; the build tree is not).
 rust/target/
+# Local Python virtualenv created for development / test runs.
+.venv/
 *.deb
 *.keystore
 nexus-*.apk

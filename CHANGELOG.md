@@ -1,5 +1,99 @@
 # Changelog
 
+## Unreleased — 2026-11-25
+
+### Added
+
+- Optional Docker Self-QA runner with a preloaded digest-pinned image,
+  restricted container settings, fail-closed setup and signed runtime/image
+  receipt. Real Docker isolation remains to be validated on the target host;
+  the default host runner is not a sandbox. See `docs/SELF_QA_SANDBOX.md`.
+- Optional PostgreSQL LISTEN/NOTIFY wakeups for the web dispatcher, inline lab
+  loop and separate lab worker. Set `NEXUS_LISTEN_DSN` to a direct or session
+  connection; polling and durable claims remain the fallback. Migration 0045
+  emits type-only hints on queue changes. See
+  [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) and `tests/test_queue_wakeup.py`.
+- PostgreSQL and SQLite dispatcher scan benchmarks, targeted SQL injection
+  regression vectors, and a 100-worker claim uniqueness test.
+
+### Changed
+
+- Self-QA command output is bounded while being read, and ordinary child
+  process groups are terminated when a check exits or times out.
+- Both dispatchers filter active task states in the store rather than fetching
+  historical tasks; SQLite's dispatch gate reuses its queued snapshot. The
+  Cloud dispatcher fetches bound conversation IDs in one batch instead of one
+  query per active task.
+- The missing-env self-hosting test now uses a fake `psql` so that it exercises
+  the configuration guard even when PostgreSQL client tools are absent.
+
+### Added — observability and self-healing
+
+- **Prometheus metrics** (`orchestration/nexus_metrics.py`, protected
+  `GET /metrics`). A dependency-free registry in the exposition format 0.0.4:
+  `nexus_tasks_claimed_total{worker}`, `nexus_evidence_verifications_total{verdict}`,
+  `nexus_openhands_api_latency_seconds{account,transport}`, the database-pool
+  gauges, queue/stuck/worker gauges and HTTP count/latency by normalised path.
+  Instrumentation never raises and never labels a secret. A 12-panel Grafana
+  dashboard is in `docs/dashboards/nexus-overview.json`.
+- **LLM-driven replanner (self-healing)** (`orchestration/replanner.py`). When a
+  durable task does not verify, the provider cascade is asked for one short,
+  concrete corrective instruction; it is appended to the note the next attempt
+  reads and signed into the Evidence Trust Engine as `AUTO_CORRECTED`. Bounded
+  at three per task (the count is stored on the task, so it survives a restart),
+  best effort (a provider outage keeps the deterministic note) and redacted.
+  Off unless `NEXUS_REPLANNER=1` and a provider key is configured.
+
+### Changed — observability and self-healing
+
+- Replanner correction counts are recovered from durable retry evidence even
+  after verification detail is replaced or cleared. Signed correction records
+  are attempted only after the fenced retry succeeds. Provider output is
+  best-effort redacted; the limit is three accepted corrections, not a hard
+  cap on failed or concurrent provider calls.
+- `LabScheduler._retry` records `auto_corrections` in the task's `verification`
+  detail, so the replanner's ceiling is durable rather than in memory.
+- `CloudClient._request` and `OpenHandsClient._request_to` record their real
+  latency; the request path is otherwise unchanged.
+
+### Tests — observability and self-healing
+
+- `tests/test_metrics.py` (registry + real `/metrics` + a real evidence record),
+  `tests/test_replanner.py` (pure rules + a real durable run through the real
+  scheduler/store), and the `/metrics` entry in `tests/test_route_auth.py`.
+
+### Added — WebSocket updates
+
+- **`GET /ws/updates`** (`orchestration/nexus_events.py`) upgrades to a
+  WebSocket (RFC 6455 handshake and frames implemented in the stdlib) behind the
+  same session/bearer auth as every other read. A small in-process event bus
+  publishes `task.started`, `task.completed`, `task.retried`, `run.failed`,
+  `run.completed` and `evidence.verified`; the studio opens the socket and
+  refreshes the open work view on an event, with reconnect backoff and the
+  existing poll as the fallback. Payloads carry a task key, a run id and a
+  verdict - never a report, a prompt or a credential.
+- **Default is in-process; `REDIS_URL` bridges across processes** (see the
+  next block). A slow client loses events; the HTTP reads remain authoritative.
+- Tests: `tests/test_ws_updates.py` (RFC handshake vector, bounded bus,
+  handshake + event over a raw socket, unauthenticated refusal, ping/pong,
+  close, a real evidence record publishing, and the route-auth entry).
+
+### Added — Redis event fan-out
+
+- **`orchestration/nexus_redis.py`** bridges the in-process event bus to Redis
+  with a narrow stdlib RESP2 client (no new dependency). Set `REDIS_URL` and a
+  separate lab worker's events reach the web server's WebSocket clients; the web
+  server subscribes and the worker publishes. Each bridge tags its messages with
+  an origin id and ignores its own echo, so an event is delivered once and never
+  loops. With no URL the bus stays local and nothing changes. Redis down is
+  fail-open: local events continue and the bridge reconnects with backoff.
+- **Pub/Sub, not Streams:** these are ephemeral hints; the database and HTTP
+  reads remain authoritative. A Stream can be added if replay is ever needed.
+- Tests: `tests/test_redis_events.py` (real `redis-server`: RESP round trip,
+  two-bus fan-out without an echo, publisher-only → subscriber, refcounted
+  install/uninstall, Redis-down local-only, secret-free parse/repr, and the
+  `App.start`/`App.stop` wiring).
+
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
 ### Added

@@ -314,3 +314,52 @@ def test_auth_failure_dead_letters_with_evidence(store, dispatcher):
     assert store.get_task(t.id).state is TaskState.DEAD_LETTER
     assert t.id in report.dead_letter
     assert any("auth" in str(e) for e in store.get_task(t.id).evidence)
+
+
+def test_list_tasks_multiple_states_and_other_filters(store):
+    queued = store.submit_task("queued", priority=5)
+    running = store.submit_task("running", priority=10)
+    done = store.submit_task("done", priority=15)
+    store.claim_task("worker", task_id=running.id)
+    store.transition(running.id, TaskState.RUNNING, owner="worker")
+    store.claim_task("worker", task_id=done.id)
+    store.transition(done.id, TaskState.RUNNING, owner="worker")
+    store.transition(done.id, TaskState.VERIFYING, owner="worker")
+    store.transition(done.id, TaskState.COMPLETED, owner="worker")
+
+    states = [TaskState.RUNNING, TaskState.QUEUED]
+    assert [t.id for t in store.list_tasks(states=states)] == [running.id, queued.id]
+    assert [t.id for t in store.list_tasks(states=states, state=TaskState.RUNNING)] == [running.id]
+    assert [t.id for t in store.list_tasks(states=states, owner="worker")] == [running.id]
+    assert store.list_tasks(states=[]) == []
+    assert store.list_tasks(states=[], state=TaskState.QUEUED) == []
+
+
+def test_conversation_ids_are_loaded_in_one_batch(store):
+    first = store.submit_task("first")
+    second = store.submit_task("second")
+    unbound = store.submit_task("unbound")
+    store.bind_conversation(first.id, "external-1")
+    store.bind_conversation(second.id, "external-2")
+    store.bind_conversation(unbound.id, None, start_task_id="starting")
+    assert store.conversation_ids_for_tasks([]) == {}
+    assert store.conversation_ids_for_tasks([first.id, second.id, unbound.id]) == {
+        first.id: "external-1", second.id: "external-2"}
+    assert store.conversation_ids_for_tasks([second.id]) == {second.id: "external-2"}
+
+
+def test_active_pass_batches_conversation_lookups(store, cloud, dispatcher, monkeypatch):
+    tasks = [store.submit_task(f"work {i}") for i in range(3)]
+    dispatcher.tick()
+    seen = []
+    batch = store.conversation_ids_for_tasks
+
+    def tracked(ids):
+        seen.append(ids)
+        return batch(ids)
+
+    monkeypatch.setattr(store, "conversation_ids_for_tasks", tracked)
+    dispatcher.tick(max_dispatch=0)
+    assert len(seen) == 1
+    assert set(seen[0]) == {task.id for task in tasks}
+    assert len(cloud.cloud.conversations) == 3

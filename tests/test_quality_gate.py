@@ -335,3 +335,33 @@ def test_corrupt_declaration_never_runs_a_subset_or_falls_back(tmp_path):
     _git(repo, 'commit','-qam','malformed declaration')
     report = SelfQa().run(repository=repo, commit=_git(repo,'rev-parse','HEAD'))
     assert report.verdict == 'blocked' and report.checks == []
+
+
+@pytest.mark.skipif(os.name != 'posix' or os.getuid() == 0,
+                    reason='container mode requires a non-root POSIX worker')
+def test_container_receipt_is_bound_and_signed_with_stubbed_runner(lab, tmp_path, monkeypatch):
+    """The receipt path is real; the Docker process is a stand-in, not a sandbox test."""
+    from orchestration import nexus_selfqa as qa
+    from orchestration.lab_worker import build_evidence_service
+    from tests.test_lab_evidence import _signer_env
+
+    _signer_env(monkeypatch)
+    service = build_evidence_service(lab['store'])
+    repo = _repo_with_tests(tmp_path, tests_pass=True)
+    head = _git(repo, 'rev-parse', 'HEAD')
+    run = _one_task_run(lab, repository=repo)
+    image = 'nexus/test@sha256:' + 'a' * 64
+    original_which = qa.shutil.which
+    monkeypatch.setattr(qa.shutil, 'which',
+                        lambda name: '/usr/bin/docker' if name == 'docker' else original_which(name))
+    monkeypatch.setattr(qa, '_run_bounded', lambda *args, **kwargs: (0, b'passed', b'', False))
+    sched = LabScheduler(lab['lab'], _Executor(), _Verifier(commit=head),
+                         quality_gate=SelfQa(runtime='docker', image=image), evidence=service)
+    sched.run_until_done(str(run['id']))
+    task = lab['lab'].list_tasks('user:alice', lab['project'], run['id'])[0]
+    receipt = [entry['self_qa'] for entry in task['evidence'] if 'self_qa' in entry][-1]
+    assert receipt['runtime'] == 'docker' and receipt['image'] == image
+    signed, = [item for item in service.list(project_id=lab['project'])
+               if item['subject_id'] == str(task['id'])]
+    assert signed['body']['detail']['self_qa'] == receipt
+    assert service.reverify(signed['id'], project_id=lab['project'], expected_commit=head)['verdict'] == 'VERIFIED'

@@ -169,3 +169,40 @@ def test_run_check_returns_a_result_and_never_raises(tmp_path):
     res = run_check(QaCheck("boom", ("definitely-not-real-xyz",)), tmp_path, timeout=5.0)
     assert res.status == "skipped"
     assert res.ok is False
+
+
+def test_check_caps_both_output_streams_without_blocking(tmp_path):
+    from orchestration.nexus_selfqa import MAX_OUTPUT_BYTES
+
+    code = "import sys; sys.stdout.write('a'*5000000); sys.stderr.write('b'*5000000)"
+    result = run_check(QaCheck("chatty", (sys.executable, "-c", code)), tmp_path, timeout=10)
+    assert result.status == "passed"
+    assert result.stdout == "a" * MAX_OUTPUT_BYTES + "\n… (truncated)"
+    assert result.stderr == "b" * MAX_OUTPUT_BYTES + "\n… (truncated)"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-specific")
+def test_timed_out_check_terminates_ordinary_child_process(tmp_path):
+    import time
+
+    marker = tmp_path / "child-survived"
+    child = f"import time; time.sleep(1); open({str(marker)!r},'w').write('bad')"
+    code = ("import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)")
+    result = run_check(QaCheck("slow", (sys.executable, "-c", code)), tmp_path, timeout=0.25)
+    assert result.status == "timeout"
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-specific")
+def test_completed_check_cleans_up_background_children(tmp_path):
+    import time
+
+    marker = tmp_path / "background-survived"
+    child = f"import time; time.sleep(1); open({str(marker)!r},'w').write('bad')"
+    code = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}])"
+    result = run_check(QaCheck("background", (sys.executable, "-c", code)), tmp_path, timeout=5)
+    assert result.status == "passed"
+    time.sleep(1.2)
+    assert not marker.exists()

@@ -159,14 +159,17 @@ class Dispatcher:
 
     def _advance_active(self, report: TickReport) -> None:
         """Read each active task's conversation and move it on real evidence."""
-        for task in self.cp.list_tasks():
-            if task.state not in (
-                TaskState.ASSIGNED,
-                TaskState.RUNNING,
-                TaskState.VERIFYING,
-                TaskState.RECOVERING,
-            ):
-                continue
+        # Only the live states ever advance; everything else (queued, completed,
+        # dead-lettered, cancelled) is irrelevant to this tick. Filtering at the
+        # store level uses idx_tasks_state so a long-lived control plane with
+        # thousands of finished tasks does not re-scan them every tick.
+        active_states = (
+            TaskState.ASSIGNED,
+            TaskState.RUNNING,
+            TaskState.VERIFYING,
+            TaskState.RECOVERING,
+        )
+        for task in self.cp.list_tasks(states=list(active_states)):
             if not task.conversation_id:
                 # Assigned but never bound: the crash happened between claim and
                 # create. Requeue so the next tick redoes it idempotently.
@@ -351,7 +354,10 @@ class Dispatcher:
 
         dispatched = 0
         touched = self._touched(report)
-        for task in self.cp.list_tasks(state=TaskState.QUEUED):
+        # Reuse the queue snapshot taken before the readiness gate. Claiming
+        # rechecks task state and leases atomically; newly queued tasks can be
+        # picked up on the next pass instead of another query on this pass.
+        for task in queued:
             if dispatched >= max_dispatch:
                 break
             if task.id in touched:

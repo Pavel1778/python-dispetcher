@@ -35,6 +35,18 @@ agent-server.
   `force_transition`. Holds the sandbox/conversation route table.
 - `orchestration/cloud_dispatcher.py` — Cloud dispatcher. Two-phase create
   (start task → poll → bind), allowlist, bounded retry, recovery.
+- `orchestration/nexus_selfqa.py` — checks run on the host by default; a scratch
+  checkout is **not** a sandbox. `NEXUS_SELFQA_RUNTIME=docker` opts into a
+  restricted container with a pinned, preloaded `NEXUS_SELFQA_IMAGE`. Errors
+  block verification; never fall back to host. See `docs/SELF_QA_SANDBOX.md`.
+- `orchestration/queue_wakeup.py` and `migrations/0045_queue_wakeups.sql` —
+  optional commit-time hints for task and lab loops. Set `NEXUS_LISTEN_DSN` to
+  a direct/session PostgreSQL DSN for each web/worker process; transaction
+  pooling cannot retain LISTEN. Hints contain no IDs or secrets, are not
+  durable, and never replace the timeout, leases or fencing. Listener
+  reconnect causes a full rescan; repeated hints are coalesced per queue with
+  a 0.5-second minimum interval to prevent retry storms. Changing triggers requires tests for commit,
+  rollback, reconnect, notification storms and both queues.
 - `orchestration/sr_tools.py` — Sr operations (create/list/status/report/
   revise/accept/cancel) with real, durable effects.
 - `orchestration/restore_point.py` — safe restore points. A restore point is a
@@ -3105,3 +3117,138 @@ the CLI. The routes existed and were tested; the screen did not.
 - Still backend-only after this (the rest of P1 #3): File Lab uploads,
   workspaces and voice notes, plan approval, GitHub create/visibility
   confirmations, the allowlist editor, the diagnostics page.
+
+## Queue wakeups, metrics and the replanner (2026-11-25, PR #61 + this increment)
+
+Three additive areas. The event-driven one is PR #61's; the other two were
+ported onto it. A deployment that sets nothing keeps the previous behaviour.
+
+### `orchestration/queue_wakeup.py` — LISTEN/NOTIFY (PR #61)
+
+- **The database is the durable queue; a notification is a hint.** Migration
+  `0045_queue_wakeups.sql` installs triggers on `tasks`, `nexus_run_tasks` and
+  `nexus_runs` that `pg_notify('nexus_queue_wakeup', 'task'|'lab')` **on
+  commit**. A listener still polls; a lost notification can never lose work.
+- **`NEXUS_LISTEN_DSN` is opt-in and must be a direct or session-mode
+  connection.** `LISTEN` lives on a session, so a transaction-mode pooler
+  cannot preserve it. One dedicated connection per web or lab-worker process.
+- **The listener reconnects with backoff and coalesces per queue**
+  (`MIN_WAKE_INTERVAL = 0.5 s`), so a burst - including the worker's own
+  transient-failure requeues - cannot become a hot loop. A reconnect forces a
+  rescan (`_wake_all`) because events may have been missed.
+- **Wiring:** `App.start` listens for `task` (the dispatcher loop) and `lab`
+  (the inline lab loop); `LabWorker.run_forever` listens for `lab`. The wake
+  events are cleared at the top of each pass, not inside `wait()`, so a
+  notification that arrives during a pass is not lost.
+- **Do not add a second listener.** An earlier `orchestration/nexus_notify.py`
+  with an `App.wake_lab()` producer was superseded by this trigger-based design
+  and is **not** in this branch; keep one mechanism.
+- Tests: `tests/test_queue_wakeup.py` (commit/rollback, reconnect, fan-out,
+  coalescing, both loops) against real PostgreSQL.
+
+### `orchestration/nexus_metrics.py` — Prometheus metrics
+
+- **Instrumentation never raises.** Every helper swallows its own errors: a
+  metrics bug must not fail the request or the dispatch it observes.
+- **Cardinality is bounded.** `normalize_path` turns UUIDs and numbers into
+  `{id}`/`{n}`; never label a raw user-supplied path.
+- **No secret is a label.** Labels are worker ids, verdicts, transports and
+  normalised paths only.
+- **`GET /metrics` is protected** like every other read (session or bearer); it
+  is in `tests/test_route_auth.py`. It publishes pool and queue/worker gauges at
+  scrape time from `PostgresStore.pool_stats()` and `App.observability()`
+  (counts only).
+- Instrumented: claims (`LabScheduler.tick`), evidence verifications
+  (`EvidenceService.record`/`reverify`), OpenHands latency
+  (`CloudClient._request`, `OpenHandsClient._request_to`), HTTP responses
+  (`Handler._json`/`_html`).
+- Tests: `tests/test_metrics.py` (pure registry + real `/metrics` + a real
+  evidence record counted through `EvidenceService`).
+
+### `orchestration/replanner.py` — LLM-driven self-healing
+
+- **Bounded, and the ceiling is durable.** At most `max_attempts` (3)
+  corrections per task. The count lives in the task's `verification` detail
+  (`auto_corrections`), written by `LabScheduler._verdict_detail`; do not move
+  it to memory, or a restart resets the ceiling.
+- **Best effort.** A provider outage, an empty answer or a malformed one is
+  logged and answered with `None`; the deterministic rework note is used and the
+  run continues. `_auto_correct` never raises.
+- **The model proposes; the scheduler disposes.** The correction is appended to
+  the note the next attempt reads (`resume_note`) and signed into the Evidence
+  Trust Engine as `detail.status = AUTO_CORRECTED`. It never changes a verdict,
+  a budget or a task's state.
+- **No secret in the prompt or the record.** Free text goes through
+  `nexus_policy.redact_text` and is truncated.
+- **Off unless `NEXUS_REPLANNER=1` and a provider key exists.** `LabWorker`
+  builds it from the environment in that case; tests construct one explicitly.
+- Tests: `tests/test_replanner.py` (pure prompt/safety rules; then a real
+  durable run through the real scheduler/store, including the three-correction
+  ceiling and a provider outage). The same tick that retries may re-claim the
+  task, so assert on the second dispatch / the stored verification, not on
+  `state == "pending"`.
+
+### Environment note
+
+- The Rust parity suites need a toolchain that satisfies the workspace's
+  dependency `rust-version`s (Debian's 1.85 is too old: `uuid` wants 1.89).
+  Install `rustup` and `rustup toolchain install stable`, then `cargo build` in
+  `rust/`, or set `NEXUS_RUST_BIN` to an already-built `nexus-rs`.
+- The test environment is reset between sessions; rebuild it with
+  `apt-get install postgresql`, `pip install -r requirements.txt -r
+  requirements-dev.txt`, and a `nexus` superuser role.
+
+### `orchestration/nexus_events.py` — WebSocket updates (`GET /ws/updates`)
+
+- **A hint, not a record.** An event says "look again"; the studio still reads
+  the run over HTTP. A slow or vanished client loses events; the bus never
+  blocks a worker, and a full subscriber queue drops its oldest event.
+- **In-process by default; Redis is opt-in.** A client sees events published in
+  this process. Set `REDIS_URL` to bridge events across processes: the web
+  server subscribes, a separate worker publishes (`nexus_redis`). Without it, a
+  separate worker's events do not reach a web process. Do not describe the bus
+  as cross-process unless `REDIS_URL` is set.
+- **Bounded.** At most `MAX_SUBSCRIBERS` clients, `QUEUE_SIZE` events per client
+  and `MAX_EVENT_BYTES` per event (an oversized event is replaced by a
+  `truncated` marker). Payloads carry a task key, a run id and a verdict - never
+  a report, a prompt or a credential.
+- **Auth is the existing gate.** `_require_read` runs before the upgrade, so a
+  browser uses its session cookie and a machine client its bearer token. A
+  browser cannot set `Authorization` on a WebSocket; do not require one there.
+- **Frames are stdlib.** `accept_key`/`read_frame`/`encode_text` implement RFC
+  6455; a client frame larger than the cap is refused before buffering. Ping is
+  answered with pong; close is answered and the handler returns with
+  `close_connection = True`.
+- **Studio consumer.** `connectUpdates()` in `studio/app.js` opens the socket,
+  calls `refreshWork()` on an event (or schedules the poll when the tab is
+  hidden), reconnects with exponential backoff, and closes on `beforeunload`.
+  The existing poll remains the fallback.
+- **Producers.** `LabScheduler` publishes `task.started`, `task.completed`,
+  `task.retried`, `run.failed`, `run.completed`; `EvidenceService` publishes
+  `evidence.verified` on record and re-verify.
+- Tests: `tests/test_ws_updates.py` (RFC vector, bounded bus, raw-socket
+  handshake + event, unauthenticated refusal, ping/pong, close, a real evidence
+  record, route auth).
+
+### `orchestration/nexus_redis.py` — optional cross-process event fan-out
+
+- **A narrow RESP2 client, no dependency.** `RedisConnection` implements exactly
+  what this feature needs (AUTH/SELECT/PUBLISH/SUBSCRIBE). It is not a general
+  Redis client; do not grow it into one. `rediss://` is refused (no TLS).
+- **No loop, no duplicate.** Each bridge tags its messages with an origin id and
+  ignores its own echo; a message from another process is fanned out with
+  `EventBus.publish_remote`, which **never** re-forwards. A local `publish` goes
+  to local subscribers and to Redis. Do not call `publish` from `_receive`.
+- **Off unless `REDIS_URL`** (or `NEXUS_REDIS_URL`). `install(bus, subscribe=...)`
+  is refcounted per bus, so several components in one process share one bridge.
+  The web server installs `subscribe=True` in `App.start`; `LabWorker` installs
+  `subscribe=False` (publisher only) in `run_forever`/`run_once`.
+- **Fail-open.** Redis down is not an error: local events still work, the
+  forwarder records `last_error` and the subscriber reconnects with backoff. A
+  bridge must never fail a producer or stop boot.
+- **No secret is logged.** The URL may contain a password; `repr` carries only
+  the channel, and no exception includes the URL.
+- **Pub/Sub, not Streams.** These are ephemeral hints; the database and HTTP
+  reads are authoritative. Add a Stream only if durable replay is needed.
+- Tests: `tests/test_redis_events.py` (real `redis-server` on a free port; the
+  module skips without it, and the Redis-down path is tested without one).

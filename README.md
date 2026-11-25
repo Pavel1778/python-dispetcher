@@ -11,7 +11,9 @@ A **project** owns repositories (many-to-many), tasks and workflows. A
 delegates each unit of work to **Jr** tasks through client tools. A dispatcher
 runs each Jr to completion, records the result, and feeds it back to the Sr.
 Every result can be captured as **signed evidence** whose verdict is earned,
-not granted.
+not granted. Durable lab runs already retry unverified work within their
+existing policy and backoff; this is not an LLM-driven replanner and does not
+claim an `AUTO_CORRECTED` evidence verdict.
 
 ```
 project ──▶ repositories (explicit links)
@@ -27,6 +29,24 @@ State lives in PostgreSQL; conversations run on OpenHands Cloud. The default
 Cloud transport provisions a sandbox and drives its agent-server directly
 (the `direct` transport); the legacy app-conversation endpoint is kept behind
 `OPENHANDS_TRANSPORT=app`.
+
+Self-QA's default host mode runs repository commands with the worker's OS
+permissions; a scratch checkout is **not a security sandbox**. An optional,
+fail-closed Docker runner is available for operator-provisioned pinned images;
+read [the setup and limitations](docs/SELF_QA_SANDBOX.md) before enabling it.
+
+For faster cross-process queue wakeups, optionally set `NEXUS_LISTEN_DSN` on
+web and lab-worker processes to a **direct or session-pooled** connection to
+that same PostgreSQL database. Migration `0045` sends type-only task/run
+hints after commit; PostgreSQL remains the durable queue and periodic polling
+still handles missed notifications, leases and OpenHands status. Repeated hints
+are coalesced with a 0.5-second minimum interval per queue to limit retry storms
+(the initial rescan on connection is separate).
+Leave the variable unset to keep timer-only behaviour. A transaction-pooling endpoint is
+not suitable for `LISTEN`; each enabled process uses one extra connection.
+Monitor PostgreSQL notification queue usage: an exhausted queue can cause a
+notifying transaction to fail at commit. See [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) and
+[performance measurements](docs/PERFORMANCE.md).
 
 Start here:
 
@@ -286,6 +306,30 @@ path over real PostgreSQL. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and
 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md). The "run running, task pending,
 attempt 0" symptom is answered by `queue.claimable_now` and `stuck_tasks` - a
 due task nobody claims is a missing or dead worker, and it is now visible.
+
+**Prometheus.** `GET /metrics` serves the exposition format (`text/plain;
+version=0.0.4`) behind the same session/bearer auth as every other read:
+`nexus_tasks_claimed_total{worker}`, `nexus_evidence_verifications_total{verdict}`,
+`nexus_openhands_api_latency_seconds{account,transport}`, the database-pool
+gauges, queue/stuck/worker gauges and HTTP count/latency by normalised path.
+The registry is `orchestration/nexus_metrics.py`; instrumentation never raises
+and never labels a secret. A 12-panel Grafana dashboard is in
+[docs/dashboards/nexus-overview.json](docs/dashboards/nexus-overview.json).
+
+**Self-healing.** With `NEXUS_REPLANNER=1` and a provider key, a task that does
+not verify gets one short corrective instruction from the provider cascade (at
+most three per task, stored on the task so the ceiling survives a restart). The
+correction is delivered to the next attempt and signed into the Evidence Trust
+Engine as `AUTO_CORRECTED`; a provider outage falls back to the deterministic
+rework note and never stops a run (`orchestration/replanner.py`).
+
+**Live updates.** `GET /ws/updates` upgrades to a WebSocket behind the same
+auth. The server publishes small events (`task.started`, `task.completed`,
+`task.retried`, `run.failed`, `run.completed`, `evidence.verified`) from an
+in-process bus, and the studio refreshes the open work view when one arrives;
+the poll remains the fallback. Set `REDIS_URL` to bridge events across
+processes (a separate lab worker publishes, the web server subscribes); without
+it the bus is per process.
 
 ## Evidence Trust Engine
 

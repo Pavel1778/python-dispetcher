@@ -103,3 +103,110 @@ Run with `NEXUS_LAB_MAX_ACTIVE_TASKS=0` on PostgreSQL 16.2:
    in one `SELECT filename, checksum FROM schema_migrations`, and replaced
    `information_schema.columns` in `verify_schema` with `pg_class` / `pg_namespace` /
    `pg_attribute`.
+8. **Indexed dispatcher control-plane scan (`CloudDispatcher`, `Dispatcher`,
+   `PostgresStore.list_tasks`, `ControlPlane.list_tasks`):** both dispatchers'
+   `_advance_active` used to call `list_tasks()` with no filter every tick and
+   discard the non-active rows in Python. They now pass the four live states
+   (`ASSIGNED` / `RUNNING` / `VERIFYING` / `RECOVERING`) to a new `states=`
+   parameter, so the store returns only active rows. Both databases have a
+   `state` index, although the planner chooses the actual plan. This reduces
+   rows decoded and transferred; it does not establish an O(active) bound for
+   the complete tick. Measured in `benchmarks/dispatcher_local.py` (see §7).
+
+---
+
+## 7. Dispatcher control-plane scan (`benchmarks/dispatcher_local.py`)
+
+Both dispatchers tick a control-plane store every loop. Before this change each
+tick pulled the **entire** `tasks` table and filtered in Python; with a long
+history of finished tasks that transfers and decodes many unnecessary rows.
+The fix queries only the live states; index selection and cost depend on the
+DB planner, data distribution and ordering.
+
+Measured on the SQLite `ControlPlane` (no PostgreSQL needed — the same query
+shape and `idx_tasks_state` index apply to the Postgres `CloudDispatcher`):
+
+| Backlog (finished) | Active | `list_tasks()` full scan (p50) | `list_tasks(states=[…])` indexed (p50) | Speedup |
+|---|---:|---:|---:|---:|
+| 20,000 | 50 | `154.8 ms` | `0.46 ms` | **~337x** |
+| 5,000 | 50 | `30.0 ms` | `0.37 ms` | **~81x** |
+
+After fixing the benchmark to bind conversations and maintain live leases, a
+separate 5,000 / 50 / 10 run (50 scan iterations, 30 ticks, in-process fake
+client) measured full tick p50 12.18 ms and p95 15.99 ms. This is **not** an
+OpenHands or PostgreSQL end-to-end measurement. Reproduce:
+
+```bash
+python benchmarks/dispatcher_local.py --backlog 5000 --active 50 --queued 10 --iters 50 --ticks 30
+```
+
+### PostgreSQL scan (2026-11-25)
+
+On a **disposable local PostgreSQL 16.2** database using the real
+`PostgresStore` with 20,000 completed and 50 running rows, 40 samples each:
+
+| Read | Rows | p50 | p95 |
+|---|---:|---:|---:|
+| Unfiltered `list_tasks()` | 20,050 | 289.277 ms | 341.959 ms |
+| `list_tasks(states=...)` | 50 | 0.992 ms | 1.258 ms |
+
+The p50 ratio is approximately 292× for this specific scan, **not** for the
+whole API or a production workload. A separate run with 50 bound conversations
+measured 50 individual `conversation_for` reads at p50 13.735 ms versus one
+batched `conversation_ids_for_tasks` read at 0.503 ms (p95 17.215 vs 0.594 ms).
+Both variants used the real PostgreSQL store; they do not include OpenHands API
+latency. Other tests were running on this host.
+Reproduce with `benchmarks/dispatcher_postgres.py`; it requires an explicit
+`NEXUS_BENCHMARK_DATABASE_URL`, `--allow-disposable-writes`, a database name
+starting with `nexus_bench_` and an empty tasks table. It applies migrations,
+creates/deletes benchmark rows and runs ANALYZE. Never use a shared database.
+
+## 8. Local API baseline (2026-11-25)
+
+On local PostgreSQL 16.2, Python 3.11.2, fake OpenHands/GitHub/LLM servers,
+`tools/benchmark.py --repeat 100 --projects 2 --conversations 5 --messages 20`
+measured the following **sequential** HTTP reads (100 samples each):
+
+| Operation | p50 | p99 |
+|---|---:|---:|
+| Studio status | 0.69 ms | 1.44 ms |
+| List projects | 1.20 ms | 3.39 ms |
+| Open conversation | 1.52 ms | 9.76 ms |
+| Fetch history | 1.85 ms | 2.96 ms |
+| Search by content | 1.88 ms | 3.36 ms |
+
+These are local, single-client baseline results on a small seeded dataset, not
+an improvement vs. the claimed 430 ms production p99 and not a 100-agent load
+test. Production network, larger datasets, concurrency and real OpenHands must
+be measured separately. The benchmark **resets its target schema**: use only a
+disposable database.
+
+### Read-path re-measurement after metrics instrumentation (2026-11-25, PostgreSQL 17.12)
+
+`tools/benchmark.py` was re-run on the merged tree (PostgreSQL 17.12, Python
+3.13.15, psycopg 3.3.9, local loopback, schema reset per run) after adding the
+`/metrics` instrumentation. Every value is a real HTTP round trip.
+
+| Path | p50 (ms) | p99 (ms) | n |
+|---|---:|---:|---:|
+| `studio_status_ms` (`GET /api/studio`) | 0.73 | 1.08 | 15 |
+| `list_projects_ms` | 1.32 | 1.69 | 15 |
+| `open_project_ms` | 1.64 | 1.96 | 15 |
+| `list_conversations_ms` | 1.64 | 1.93 | 15 |
+| `open_conversation_ms` | 1.49 | 1.65 | 15 |
+| `fetch_history_ms` | 2.40 | 3.01 | 15 |
+| `search_by_content_ms` | 1.97 | 2.50 | 15 |
+| `export_conversation_ms` | 2.61 | 3.04 | 15 |
+| `chat_turn_ms` (fake provider) | 12.13 | 17.16 | 5 |
+| `start_run_ms` (plan + store) | 26.86 | 32.01 | 5 |
+| `queue_claim_ms` | 3.16 | 5.05 | 15 |
+
+Read-path p99 is **1.1–3.0 ms** on this local stack. The instrumentation adds one
+`perf_counter()` pair and one histogram observation per OpenHands call, one
+counter per claim/verification and one status/duration observation per
+JSON/HTML response — in-memory operations behind a lock, below the noise of these
+numbers. No SQL, index, pool or event-loop change was made for this.
+
+**Not claimed:** a production SLO, the 430 ms before/after figure, or 100 live
+agents. The separate scan and batch numbers above are the queue-path wins; this
+table is the read-path baseline they sit beside.

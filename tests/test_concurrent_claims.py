@@ -155,3 +155,15 @@ def test_a_wide_stress_run_grants_each_task_exactly_once(store):
     by_task = Counter(c["task"] for c in claims)
     assert len(by_task) == 256
     assert all(n == 1 for n in by_task.values())
+
+
+def test_100_workers_claim_100_tasks_without_duplicates(store):
+    """A queue contention correctness test, not a 100-agent throughput test."""
+    run_id, _ = _run(store, n_tasks=100)
+    claims = _claim_all(store, run_id, workers=100)
+    assert len(claims) == 100
+    assert len({claim["task"] for claim in claims}) == 100
+    with store._tx() as cur:
+        cur.execute("SELECT id::text, lease_owner FROM nexus_run_tasks WHERE run_id=%s", (run_id,))
+        owners = {row["id"]: row["lease_owner"] for row in cur.fetchall()}
+    assert all(owners[claim["task"]] == claim["worker"] for claim in claims)

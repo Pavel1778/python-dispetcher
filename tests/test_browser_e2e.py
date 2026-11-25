@@ -962,7 +962,7 @@ def test_the_report_arrives_in_the_open_chat_by_itself_and_can_be_copied(lab_sta
         stored = stack.app.reports.get(principal, project, str(run["id"]))
         assert stored["state"] == "delivered"
         report.locator("[data-action='copy-message']").click()
-        expect(page.locator(".toast")).to_contain_text("Отчёт скопирован")
+        expect(page.locator(".toast", has_text="Отчёт скопирован")).to_be_visible()
         assert page.evaluate("() => navigator.clipboard.readText()") == stored["body"]
 
         # The same report in the run's card, with its own copy button. A
@@ -981,7 +981,7 @@ def test_the_report_arrives_in_the_open_chat_by_itself_and_can_be_copied(lab_sta
             "Разговоры OpenHands этого прогона будут удалены")
         assert "исполнитель: ключ сервера" in page.inner_text(".work .steps")
         page.click(".work [data-action='copy-report']")
-        expect(page.locator(".toast").last).to_contain_text("Отчёт скопирован")
+        expect(page.locator(".toast", has_text="Отчёт скопирован")).to_be_visible()
         assert page.evaluate("() => navigator.clipboard.readText()") == stored["body"]
 
         # One run, one report: further passes of the loop and of the page add nothing.

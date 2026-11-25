@@ -61,6 +61,8 @@ from .dispatch_journal import DispatchHeld, DispatchJournal
 from .cloud_store import NotFound, PostgresStore
 from .github_client import GitHubAuthError, GitHubClient, GitHubError, GitHubUnavailable
 from . import nexus_retry, tracing
+from . import nexus_metrics
+from . import nexus_events
 from .nexus_binding import AuthorizationError, ProjectRepositoryService, authorize_run_task
 from .nexus_github_accounts import GitHubAccountService, SecretsError
 from .nexus_evidence import LabEvidence
@@ -1576,6 +1578,7 @@ class LabScheduler:
                  cycle_wait: Callable[..., float] | None = None,
                  evidence: Any | None = None, acceptance: Any | None = None,
                  quality_gate: Any | None = None,
+                 replanner: Any | None = None,
                  stopping: Callable[[], bool] | None = None):
         self.store = store
         self.executor = executor
@@ -1626,6 +1629,13 @@ class LabScheduler:
         #: reworked. An unavailable required check cannot attest a pass.
         #: ``None`` (the default) leaves the loop exactly as it was.
         self.quality_gate = quality_gate
+        #: The REPLANNER: when given an ``orchestration.replanner.Replanner``, a
+        #: task that did not verify gets one short, concrete corrective
+        #: instruction from the provider cascade, bounded per task, and the
+        #: correction is signed into the Evidence Trust Engine as
+        #: ``AUTO_CORRECTED``. ``None`` (the default) keeps the deterministic
+        #: rework note and the loop exactly as it was.
+        self.replanner = replanner
 
     @staticmethod
     def _failed_account(error: Exception, task: dict) -> str | None:
@@ -1719,6 +1729,9 @@ class LabScheduler:
             attestation=self._attestation(task, verdict, report), stop_reason=stop_reason, applied_only=True)
         if won is None:
             return False
+        nexus_events.BUS.publish("task.completed", task=task.get("task_key"),
+                                 verdict=verdict.verdict,
+                                 run=str(task.get("run_id") or ""))
         self._after_result(task, report)
         return True
 
@@ -1855,6 +1868,9 @@ class LabScheduler:
                                      dispatch_intent=self.journal is not None)
         if task is not None:
             result.claimed = task["task_key"]
+            nexus_metrics.task_claimed(self.worker_id)
+            nexus_events.BUS.publish("task.started", worker=self.worker_id,
+                                     task=task["task_key"], run=str(run_id))
             if self._start(run, durable, task, result):
                 return result
             if result.dispatched:
@@ -1880,6 +1896,9 @@ class LabScheduler:
                     # tasks' own verdicts - ACCEPTED only when every task verified,
                     # otherwise REJECTED/NOT_READY - never asserted by the scheduler.
                     self._record_run_acceptance(run_id, state, last_error)
+                    if state == "failed":
+                        nexus_events.BUS.publish("run.failed", run=str(run_id),
+                                                 reason=last_error)
         elif durable and in_flight == 0 and task is None:
             # Nothing at work and nothing that may be started this instant: the
             # run is between two tries, or pausing. It goes on by itself.
@@ -2033,8 +2052,15 @@ class LabScheduler:
                 reason=f"the result is waiting to be checked: {verdict.reason}")
             result.note = "result held: the check could not be made"
             return True
+        # SELF-HEALING: a real failure may get one concrete corrective
+        # instruction from the provider cascade, bounded per task. It is added
+        # to the note the next attempt reads and signed as AUTO_CORRECTED; it
+        # never changes the verdict or the task's state.
+        verdict, correction_note, correction = self._auto_correct(task, verdict, report)
         evidence = {"reason": verdict.reason, **verdict.evidence}
         note = self._rework_note(task, verdict)
+        if correction_note:
+            note = f"{note}\n\n{correction_note}"
         continued = (task.get("execution_kind") or "") == "continue"
         same_place = (hint == "followup" and not continued
                       and bool(getattr(self.executor, "can_continue", False)))
@@ -2051,15 +2077,109 @@ class LabScheduler:
             wait = self.cycle_wait(cycle, seed=str(task["id"]))
             note += f" Попытки цикла исчерпаны ({task['max_attempts']}); следующий цикл через {_span(wait)}."
         won = self.store.retry_task(
-            task["id"], verdict=verdict.verdict, evidence=evidence, detail=verdict.as_detail(),
+            task["id"], verdict=verdict.verdict, evidence=evidence,
+            detail=self._verdict_detail(verdict),
             note=note, continue_conversation=same_place, outcome=outcome, wait_seconds=wait,
             lease_token=task["lease_token"], attestation=self._attestation(task, verdict, report),
             applied_only=True, stop_reason=stop_reason)
         if won:
+            if correction is not None:
+                self._record_auto_correction(task, correction, verdict)
+            nexus_events.BUS.publish("task.retried", task=task.get("task_key"),
+                                     verdict=verdict.verdict,
+                                     run=str(task.get("run_id") or ""))
             self._after_result(task, report)
             result.retried = task["task_key"]
             result.note = "not verified: " + ("trying again" if wait is None else f"next cycle in {_span(wait)}")
         return True
+
+    @staticmethod
+    def _verdict_detail(verdict: Verification) -> dict:
+        """The task's ``verification``: the verdict, and the durable counters.
+
+        ``auto_corrections`` must survive the attempt, or the replanner's
+        ceiling would reset on every retry; it is part of the detail the store
+        writes back, not only of the append-only evidence.
+        """
+        detail = verdict.as_detail()
+        for key in ("auto_corrections", "auto_correction"):
+            if key in verdict.evidence:
+                detail[key] = verdict.evidence[key]
+        return detail
+
+    @staticmethod
+    def _stored_auto_corrections(task: dict) -> int:
+        """How many corrections this task has already been given (durable)."""
+        from .replanner import _stored_attempts
+
+        return _stored_attempts(task)
+
+    def _auto_correct(self, task: dict, verdict: Verification,
+                      report: TaskReport) -> tuple[Verification, str | None, Any | None]:
+        """One corrective instruction for a failed task, bounded and best effort.
+
+        Returns the verdict to record (its evidence carries the correction, so
+        the ceiling survives a restart) and the note to append, or the verdict
+        unchanged and ``None`` values when there is no replanner, the ceiling
+        is reached, or the provider did not answer. A successful correction is
+        signed only after the fenced retry transition succeeds.
+        """
+        replanner = getattr(self, "replanner", None)
+        if replanner is None:
+            return verdict, None, None
+        try:
+            limit = min(3, max(1, int(getattr(replanner, "max_attempts", 3))))
+            previous = self._stored_auto_corrections(task)
+            if previous >= limit:
+                return verdict, None, None
+            correction = replanner.correct(task, verdict, report, attempt=previous + 1)
+        except Exception:  # noqa: BLE001 - never fatal to the run
+            log.warning("replanner failed for task %s", task.get("id"), exc_info=True)
+            return verdict, None, None
+        if correction is None:
+            return verdict, None, None
+        evidence = {**verdict.evidence,
+                    "auto_corrections": previous + 1,
+                    "auto_correction": correction.as_dict()}
+        updated = Verification(verdict.verdict, verdict.reason, evidence, verdict.retry)
+        note = f"Автокоррекция {previous + 1}/{limit}: {correction.note}"
+        return updated, note, correction
+
+    def _record_auto_correction(self, task: dict, correction: Any,
+                                verdict: Verification) -> None:
+        """Sign the fact of an automatic correction into the Trust Engine.
+
+        The engine's own verdict (``VERIFIED``/``UNVERIFIED``/...) is about the
+        record's integrity; ``detail.status`` is ``AUTO_CORRECTED`` and says
+        what the record is *for*. Exactly-once by a deterministic id, so a
+        re-run of the step collides with its own row. Best effort.
+        """
+        if self.evidence is None:
+            return
+        try:
+            from .nexus_evidence import lab_evidence_id
+
+            evidence_id = lab_evidence_id(str(task.get("run_id") or ""), str(task["id"]),
+                                          f"auto-correct-{correction.attempt}")
+            self.evidence.record_once(
+                evidence_id=evidence_id, subject_kind="task", subject_id=str(task["id"]),
+                project_id=str(task["project_id"]) if task.get("project_id") else None,
+                repository_full_name=task.get("repository") or None,
+                commit_sha=None, branch=task.get("branch") or None,
+                summary=(f"AUTO_CORRECTED (attempt {correction.attempt}): "
+                         f"{correction.reason}")[:500],
+                detail={"status": "AUTO_CORRECTED", "auto_corrected": True,
+                        "attempt": correction.attempt,
+                        "note": correction.note[:2000],
+                        "verdict": verdict.verdict,
+                        "reason": correction.reason[:1000],
+                        "task_key": task.get("task_key"),
+                        "provider": correction.provider,
+                        "model": correction.model},
+                created_by="lab:replanner")
+        except Exception:  # noqa: BLE001 - a side record must not fail the dispatch
+            log.warning("could not record an auto-correction for task %s",
+                        task.get("id"), exc_info=True)
 
     @staticmethod
     def _rework_note(task: dict, verdict: Verification) -> str:
@@ -2545,6 +2665,7 @@ class LabScheduler:
         # ACCEPTANCE: attested over the tasks' own verdicts, like every other
         # terminal decision of a run.
         self._record_run_acceptance(run_id, "completed", None)
+        nexus_events.BUS.publish("run.completed", run=str(run_id))
         if self.reports is not None:
             # Straight away, for the person who is waiting; a failure here is
             # made good by the next pass of the loop (``deliver_due``).

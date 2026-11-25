@@ -71,6 +71,8 @@ PROTECTED_GET = [
     "/api/openhands/inventory", "/api/providers",
     "/api/security/policy", "/api/observability", "/api/commands",
     "/api/openhands/tools",
+    "/metrics",
+    "/ws/updates",
     f"/api/github/accounts/{UUID}/repositories",
     "/api/github/accounts", f"/api/github/accounts/{UUID}",
     f"/api/github/accounts/{UUID}/repositories/owner/name/branches",
