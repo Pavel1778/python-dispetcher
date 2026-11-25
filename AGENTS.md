@@ -3252,3 +3252,21 @@ ported onto it. A deployment that sets nothing keeps the previous behaviour.
   reads are authoritative. Add a Stream only if durable replay is needed.
 - Tests: `tests/test_redis_events.py` (real `redis-server` on a free port; the
   module skips without it, and the Redis-down path is tested without one).
+
+## Consolidation into main (2026-11-25)
+
+- **PR #61 is merged** (`be8ce87`): queue wakeups (`queue_wakeup.py`,
+  `0045_queue_wakeups.sql`), scan/batch optimizations, Prometheus metrics,
+  the self-healing replanner, WebSocket `/ws/updates` and Redis fan-out.
+  PR #62 (the parallel metrics/replanner branch) is closed as superseded.
+- **`nexus/mission-2` is merged**: LLM provider Base URL persistence and the
+  configuration reconciler (`openhands_config_sync.py`). Its migration was
+  renumbered **`0045_llm_provider_config.sql` -> `0046_llm_provider_config.sql`**
+  because `0045` is the queue-wakeup migration. The DDL is idempotent, so a
+  database that applied the old filename re-runs it harmlessly.
+- **One migration per number.** The runner applies sorted `*.sql` and records
+  filenames; two numbers are not a functional collision, but reusing one hides
+  ordering from a reader. Check `ls migrations` before adding one.
+- **Verification on the consolidated merge:** `ruff check .` clean; full suite
+  **2394 passed, 33 skipped, 0 failed** (PostgreSQL 17.12, Rust parity binary);
+  browser E2E **42 passed**. CI on the consolidation PR is the gate.

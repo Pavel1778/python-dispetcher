@@ -140,6 +140,30 @@
   against a `redis:7` service. Skips are environmental (Android SDK, mingw-w64,
   pooler DSN, live section). No live OpenHands or live provider run was made.
 
+## 2026-11-25 — consolidation into `main`
+
+- **PR #61 merged into `main`** (merge commit `be8ce87`): queue wakeups,
+  scan/batch optimizations, Prometheus metrics, the self-healing replanner,
+  WebSocket `/ws/updates` with the studio refresh, and Redis event fan-out.
+  CI on the PR head was green (`test` 2426 passed / 30 skipped; `rust`;
+  `selfqa-container`).
+- **PR #62 closed as superseded.** Its unique work (metrics, replanner,
+  dashboard) had already been ported into #61; the duplicate LISTEN/NOTIFY
+  module was not kept.
+- **`nexus/mission-2` merged as well**: LLM provider Base URL persistence and
+  the configuration reconciler (`openhands_config_sync.py`, migration
+  `0046_llm_provider_config.sql`). Its migration was **renumbered from `0045`
+  to `0046`** because `0045` is the queue-wakeup migration already in main;
+  the DDL is idempotent, so a database that applied the old filename simply
+  re-runs it harmlessly.
+- **Verification on the consolidated merge:** `ruff check .` clean; full suite
+  **2394 passed, 33 skipped, 0 failed** on local PostgreSQL 17.12 with the Rust
+  parity binary; browser E2E **42 passed**. CI on the consolidation PR is the
+  gate before it reaches `main`.
+- **Still not implemented:** MinIO, PgBouncer deployment, the Push API,
+  Rust/PyO3, Redis session/config caching, Redis Streams, key rotation/DR.
+  No production SLO or live-provider run is claimed.
+
 Status of every requirement in the "Final Completion Program" against the actual
 repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,
 PR #50 reconstruction-merge; before that, PR #49 `6e5c2b4`, PR #46 `6629161`)

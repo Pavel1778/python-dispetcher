@@ -112,6 +112,8 @@ class CloudDirectClient:
         wait_attempts: int = 60,
         wait_interval: float = 5.0,
         llm_model: str | None = None,
+        llm_base_url: str | None = None,
+        llm_provider: str | None = None,
         timeout: float = 60.0,
         scope: str = "",
     ):
@@ -132,6 +134,12 @@ class CloudDirectClient:
         self.wait_attempts = wait_attempts
         self.wait_interval = wait_interval
         self.llm_model = llm_model
+        #: The LLM *provider* endpoint (not the OpenHands API URL) and an
+        #: optional provider label. ``None`` means the provider's own default.
+        #: These reach a sandbox's ``agent_settings.llm`` so a session runs on
+        #: the configured provider, not whatever the bare sandbox defaulted to.
+        self.llm_base_url = llm_base_url
+        self.llm_provider = llm_provider
         # A sandbox's address comes from the service. For a connection a person
         # added, that service is held to the same rule as the connection's own
         # URL: it may not name an address inside this server's network.
@@ -593,9 +601,14 @@ class CloudDirectClient:
         settings = payload.get("agent_settings")
         if not isinstance(settings, dict):
             raise CloudUnavailable("sandbox returned no agent_settings")
+        llm = dict(settings.get("llm") or {})
         if self.llm_model:
-            llm = dict(settings.get("llm") or {})
             llm["model"] = self.llm_model
+        if self.llm_base_url:
+            # The provider endpoint the model is reached at. Distinct from the
+            # OpenHands API URL: this is where the sandbox's LLM calls go.
+            llm["base_url"] = self.llm_base_url
+        if llm != (settings.get("llm") or {}):
             settings = {**settings, "llm": llm}
         return settings
 
@@ -1046,12 +1059,17 @@ def build_direct_client(
     cloud: CloudClient | None = None,
     reuse_sandboxes: bool = True,
     llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_provider: str | None = None,
     **kwargs: Any,
 ) -> CloudDirectClient:
     """Construct a :class:`CloudDirectClient` from the environment.
 
-    ``llm_model`` (or ``OPENHANDS_DEFAULT_MODEL``) is applied to every sandbox
-    conversation so a sandbox whose default model has no key still runs.
+    ``llm_model`` (or ``OPENHANDS_DEFAULT_MODEL``) and ``llm_base_url`` (or
+    ``OPENHANDS_LLM_BASE_URL``) are applied to every sandbox conversation, so a
+    sandbox whose default model/endpoint has no key still runs on the configured
+    provider. ``llm_base_url`` is the LLM provider endpoint, never the OpenHands
+    API URL.
     """
     import os
 
@@ -1060,6 +1078,8 @@ def build_direct_client(
         store,
         reuse_sandboxes=reuse_sandboxes,
         llm_model=llm_model or os.environ.get("OPENHANDS_DEFAULT_MODEL"),
+        llm_base_url=llm_base_url or os.environ.get("OPENHANDS_LLM_BASE_URL") or None,
+        llm_provider=llm_provider,
         **kwargs,
     )
 
