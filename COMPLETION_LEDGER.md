@@ -111,13 +111,21 @@
   LLM replanner and the WebSocket endpoint. The rest of that list is unchanged.
   The replanner's provider call is exercised with a deterministic text function
   in the tests; a live provider run is not claimed.
-- **WebSocket updates — implemented, locally tested, in-process.** `GET /ws/updates`
-  and `orchestration/nexus_events.py`: a bounded in-process bus publishes
+- **WebSocket updates — implemented, locally tested.** `GET /ws/updates`
+  and `orchestration/nexus_events.py`: a bounded bus publishes
   `task.started`/`task.completed`/`task.retried`/`run.failed`/`run.completed`/
   `evidence.verified`, and the studio refreshes the open work view on an event
   with reconnect backoff. Tests: `tests/test_ws_updates.py` and the route-auth
-  entry. **Limits:** fan-out is per process (a separate worker's events need
-  Redis, not implemented), and the PWA Push API is not implemented.
+  entry. **Limits:** the bus is per process unless `REDIS_URL` is set (next
+  bullet); the PWA Push API is not implemented.
+- **Redis event fan-out — implemented, locally tested against a real
+  `redis-server`.** `orchestration/nexus_redis.py` bridges the bus with a narrow
+  stdlib RESP2 client; the web server subscribes, a separate lab worker
+  publishes. Origin-tagged messages are delivered once and never loop; Redis
+  down is fail-open (local events continue, the bridge reconnects). Off unless
+  `REDIS_URL`. Tests: `tests/test_redis_events.py`. **Not done:** caching
+  sessions/configs in Redis (session revocation must stay immediate; the config
+  read is cheap) and Redis Streams (Pub/Sub is the right fit for hints).
 - **Read-path measurement, not a production SLO.** On local PostgreSQL 17,
   `tools/benchmark.py` measured read-path p99 at 1.1–2.8 ms. The user's parallel
   PR #61 separately measured the PostgreSQL scan at 289 → 0.99 ms (20 050 rows,
@@ -125,11 +133,12 @@
   production or 100-live-agent result.
 - **Verification (merged tree, this session):** `ruff check .` clean; full
   suite on local PostgreSQL 17.12 with the Rust parity binary
-  (`pytest tests/ -q --ignore=tests/test_browser_e2e.py`) **2347 passed,
-  32 skipped, 0 failed**; browser E2E **42 passed**; `cargo test --workspace`
+  (`pytest tests/ -q --ignore=tests/test_browser_e2e.py`) **2381 passed,
+  33 skipped, 0 failed**; browser E2E **42 passed**; `cargo test --workspace`
   **63 passed**, `cargo fmt --all --check` and `cargo clippy -D warnings`
-  clean. Skips are environmental (Android SDK, mingw-w64, pooler DSN, live
-  section). No live OpenHands or live provider run was made.
+  clean. The Redis tests ran against a real local `redis-server`; CI runs them
+  against a `redis:7` service. Skips are environmental (Android SDK, mingw-w64,
+  pooler DSN, live section). No live OpenHands or live provider run was made.
 
 Status of every requirement in the "Final Completion Program" against the actual
 repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,

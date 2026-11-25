@@ -136,6 +136,8 @@ jobs:
     # cleanly when it is absent, so the service is only here to keep them
     # running. No repository secret is needed: the DSN below is a throwaway
     # local credential. The tests apply migrations/ themselves.
+    # Redis is for the event fan-out tests (tests/test_redis_events.py); the
+    # fixture uses TEST_REDIS_URL and never needs a binary on PATH.
     services:
       postgres:
         image: postgres:17
@@ -150,9 +152,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     env:
       TEST_SUPABASE_DB_URL: postgresql://oh_test:oh_test_pw@127.0.0.1:5432/orchestrator
+      TEST_REDIS_URL: redis://127.0.0.1:6379/0
 
     steps:
       - uses: actions/checkout@v4

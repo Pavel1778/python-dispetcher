@@ -3203,10 +3203,11 @@ ported onto it. A deployment that sets nothing keeps the previous behaviour.
 - **A hint, not a record.** An event says "look again"; the studio still reads
   the run over HTTP. A slow or vanished client loses events; the bus never
   blocks a worker, and a full subscriber queue drops its oldest event.
-- **In-process only.** A client sees events published in this process. The
-  default deployment advances runs in the web server's own loop, so that is the
-  whole path; a separate worker's events need Redis fan-out, which is **not**
-  implemented. Do not describe the bus as cross-process.
+- **In-process by default; Redis is opt-in.** A client sees events published in
+  this process. Set `REDIS_URL` to bridge events across processes: the web
+  server subscribes, a separate worker publishes (`nexus_redis`). Without it, a
+  separate worker's events do not reach a web process. Do not describe the bus
+  as cross-process unless `REDIS_URL` is set.
 - **Bounded.** At most `MAX_SUBSCRIBERS` clients, `QUEUE_SIZE` events per client
   and `MAX_EVENT_BYTES` per event (an oversized event is replaced by a
   `truncated` marker). Payloads carry a task key, a run id and a verdict - never
@@ -3228,3 +3229,26 @@ ported onto it. A deployment that sets nothing keeps the previous behaviour.
 - Tests: `tests/test_ws_updates.py` (RFC vector, bounded bus, raw-socket
   handshake + event, unauthenticated refusal, ping/pong, close, a real evidence
   record, route auth).
+
+### `orchestration/nexus_redis.py` — optional cross-process event fan-out
+
+- **A narrow RESP2 client, no dependency.** `RedisConnection` implements exactly
+  what this feature needs (AUTH/SELECT/PUBLISH/SUBSCRIBE). It is not a general
+  Redis client; do not grow it into one. `rediss://` is refused (no TLS).
+- **No loop, no duplicate.** Each bridge tags its messages with an origin id and
+  ignores its own echo; a message from another process is fanned out with
+  `EventBus.publish_remote`, which **never** re-forwards. A local `publish` goes
+  to local subscribers and to Redis. Do not call `publish` from `_receive`.
+- **Off unless `REDIS_URL`** (or `NEXUS_REDIS_URL`). `install(bus, subscribe=...)`
+  is refcounted per bus, so several components in one process share one bridge.
+  The web server installs `subscribe=True` in `App.start`; `LabWorker` installs
+  `subscribe=False` (publisher only) in `run_forever`/`run_once`.
+- **Fail-open.** Redis down is not an error: local events still work, the
+  forwarder records `last_error` and the subscriber reconnects with backoff. A
+  bridge must never fail a producer or stop boot.
+- **No secret is logged.** The URL may contain a password; `repr` carries only
+  the channel, and no exception includes the URL.
+- **Pub/Sub, not Streams.** These are ephemeral hints; the database and HTTP
+  reads are authoritative. Add a Stream only if durable replay is needed.
+- Tests: `tests/test_redis_events.py` (real `redis-server` on a free port; the
+  module skips without it, and the Redis-down path is tested without one).

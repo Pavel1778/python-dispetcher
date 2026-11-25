@@ -327,8 +327,9 @@ rework note and never stops a run (`orchestration/replanner.py`).
 auth. The server publishes small events (`task.started`, `task.completed`,
 `task.retried`, `run.failed`, `run.completed`, `evidence.verified`) from an
 in-process bus, and the studio refreshes the open work view when one arrives;
-the poll remains the fallback. The bus is per process: a separate lab worker's
-events need Redis fan-out, which is not implemented.
+the poll remains the fallback. Set `REDIS_URL` to bridge events across
+processes (a separate lab worker publishes, the web server subscribes); without
+it the bus is per process.
 
 ## Evidence Trust Engine
 

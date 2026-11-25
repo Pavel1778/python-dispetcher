@@ -64,6 +64,20 @@ class EventBus:
         self._subscribers: set[queue.Queue[str]] = set()
         self._max = max(1, int(max_subscribers))
         self._size = max(1, int(queue_size))
+        #: Set by a Redis bridge (``nexus_redis``): every published event is
+        #: handed to it for other processes. ``None`` keeps the bus local.
+        self._forwarder = None
+
+    def set_forwarder(self, forwarder) -> None:
+        """Install (or clear) the cross-process forwarder. Best effort."""
+        with self._lock:
+            self._forwarder = forwarder
+
+    def clear_forwarder(self, forwarder) -> None:
+        """Clear the forwarder only if it is still *forwarder* (not a newer one)."""
+        with self._lock:
+            if self._forwarder is forwarder:
+                self._forwarder = None
 
     def subscribe(self) -> queue.Queue[str] | None:
         """A queue of JSON strings, or ``None`` when the client cap is reached."""
@@ -79,12 +93,31 @@ class EventBus:
             self._subscribers.discard(q)
 
     def publish(self, kind: str, **data: Any) -> int:
-        """Publish one event; returns how many subscribers it reached."""
+        """Publish one event; returns how many local subscribers it reached."""
+        payload = self._payload(kind, data)
+        reached = self._fanout(payload)
+        forwarder = self._forwarder
+        if forwarder is not None:
+            try:
+                forwarder(payload)
+            except Exception:  # noqa: BLE001 - a bridge must not fail its producer
+                pass
+        return reached
+
+    def publish_remote(self, payload: str) -> int:
+        """Fan out an event received from another process; never re-forward it."""
+        return self._fanout(payload)
+
+    @staticmethod
+    def _payload(kind: str, data: dict[str, Any]) -> str:
         event = Event(kind=kind, data={k: v for k, v in data.items() if v is not None})
         payload = event.as_json()
         if len(payload.encode("utf-8")) > MAX_EVENT_BYTES:
             payload = json.dumps({"kind": kind, "at": round(event.at, 3),
                                   "truncated": True})
+        return payload
+
+    def _fanout(self, payload: str) -> int:
         with self._lock:
             subscribers = tuple(self._subscribers)
         for q in subscribers:
@@ -106,6 +139,11 @@ class EventBus:
     def subscribers(self) -> int:
         with self._lock:
             return len(self._subscribers)
+
+    @property
+    def forwarding(self) -> bool:
+        """Is a cross-process forwarder installed?"""
+        return self._forwarder is not None
 
 
 #: The process-wide bus. Producers import this and call ``publish``.

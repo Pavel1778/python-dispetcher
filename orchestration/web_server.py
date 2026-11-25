@@ -141,6 +141,7 @@ from .nexus_planning import PlanService
 from .nexus_policy import install_log_redaction, policy_report
 from . import nexus_metrics
 from . import nexus_events
+from . import nexus_redis
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
 from .nexus_specs import (
     SpecCorrupted,
@@ -473,6 +474,8 @@ class App:
         self._lab_wake = threading.Event()
         self._dispatch_wake = threading.Event()
         self._queue_listener = None
+        #: The optional Redis event bridge (``REDIS_URL``); ``None`` when off.
+        self._redis_bridge = None
         self._loop: threading.Thread | None = None
         self._lab_loop: threading.Thread | None = None
         self._plan_loop: threading.Thread | None = None
@@ -494,6 +497,9 @@ class App:
     def start(self) -> None:
         from .queue_wakeup import from_environment
 
+        # Cross-process events: a separate lab worker publishes to Redis and
+        # this process listens, so its WebSocket clients see those events too.
+        self._redis_bridge = nexus_redis.install(nexus_events.BUS, subscribe=True)
         self._queue_listener = from_environment({"task": self._dispatch_wake.set,
                                                  "lab": self.wake_lab})
         if self._queue_listener is not None:
@@ -525,6 +531,8 @@ class App:
             if loop:
                 left = max(0.2, deadline - time.monotonic())
                 loop.join(timeout=left if loop is self._lab_loop else min(5.0, left))
+        nexus_redis.uninstall(self._redis_bridge)
+        self._redis_bridge = None
         self.store.close()
 
     def _run_planning(self) -> None:

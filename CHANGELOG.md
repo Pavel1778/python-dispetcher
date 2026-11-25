@@ -72,13 +72,27 @@
   refreshes the open work view on an event, with reconnect backoff and the
   existing poll as the fallback. Payloads carry a task key, a run id and a
   verdict - never a report, a prompt or a credential.
-- **Honest limit:** the bus is in-process. The default deployment advances runs
-  in the web server's own loop, so it sees them; a separate worker's events
-  would need Redis fan-out (not implemented). A slow client loses events; the
-  HTTP reads remain authoritative.
+- **Default is in-process; `REDIS_URL` bridges across processes** (see the
+  next block). A slow client loses events; the HTTP reads remain authoritative.
 - Tests: `tests/test_ws_updates.py` (RFC handshake vector, bounded bus,
   handshake + event over a raw socket, unauthenticated refusal, ping/pong,
   close, a real evidence record publishing, and the route-auth entry).
+
+### Added — Redis event fan-out
+
+- **`orchestration/nexus_redis.py`** bridges the in-process event bus to Redis
+  with a narrow stdlib RESP2 client (no new dependency). Set `REDIS_URL` and a
+  separate lab worker's events reach the web server's WebSocket clients; the web
+  server subscribes and the worker publishes. Each bridge tags its messages with
+  an origin id and ignores its own echo, so an event is delivered once and never
+  loops. With no URL the bus stays local and nothing changes. Redis down is
+  fail-open: local events continue and the bridge reconnects with backoff.
+- **Pub/Sub, not Streams:** these are ephemeral hints; the database and HTTP
+  reads remain authoritative. A Stream can be added if replay is ever needed.
+- Tests: `tests/test_redis_events.py` (real `redis-server`: RESP round trip,
+  two-bus fan-out without an echo, publisher-only → subscriber, refcounted
+  install/uninstall, Redis-down local-only, secret-free parse/repr, and the
+  `App.start`/`App.stop` wiring).
 
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 

@@ -35,6 +35,7 @@ from .cloud_direct import build_cloud_client
 from .cloud_store import PostgresStore
 from .github_client import GitHubClient
 from .replanner import from_env_if_enabled
+from . import nexus_events, nexus_redis
 from .nexus_binding import ProjectRepositoryService
 from .nexus_github_accounts import GitHubAccountService
 from .nexus_lab import (
@@ -325,6 +326,9 @@ class LabWorker:
         if listener is not None:
             listener.start()
         registered = False
+        # Events this worker publishes are sent to Redis (publisher only) so a
+        # web process's WebSocket clients see them; local events are unaffected.
+        bridge = nexus_redis.install(nexus_events.BUS, subscribe=False)
         try:
             while not self._stop.is_set():
                 # Clear before the pass: a notification during the pass must
@@ -353,6 +357,7 @@ class LabWorker:
         finally:
             if listener is not None:
                 listener.stop()
+            nexus_redis.uninstall(bridge)
             self._stop_worker_best_effort()
 
     def wake(self) -> None:
@@ -383,7 +388,11 @@ class LabWorker:
         try:
             from .execution_profiles import startup_sync
             startup_sync(self.store, self.client, self._client_for_account)
-            return self.tick_once()
+            bridge = nexus_redis.install(nexus_events.BUS, subscribe=False)
+            try:
+                return self.tick_once()
+            finally:
+                nexus_redis.uninstall(bridge)
         finally:
             self._stop_worker_best_effort()
 
