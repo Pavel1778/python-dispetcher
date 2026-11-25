@@ -4,6 +4,11 @@
 
 ### Added
 
+- Optional PostgreSQL LISTEN/NOTIFY wakeups for the web dispatcher, inline lab
+  loop and separate lab worker. Set `NEXUS_LISTEN_DSN` to a direct or session
+  connection; polling and durable claims remain the fallback. Migration 0045
+  emits type-only hints on queue changes. See
+  [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) and `tests/test_queue_wakeup.py`.
 - PostgreSQL and SQLite dispatcher scan benchmarks, targeted SQL injection
   regression vectors, and a 100-worker claim uniqueness test.
 

@@ -311,9 +311,17 @@ class LabWorker:
         # worker was the only one advancing. Registration is retried until it
         # sticks, and the final deregistration is best effort: a worker that
         # cannot reach the database on the way out must still exit.
+        from .queue_wakeup import from_environment
+
+        listener = from_environment({"lab": self.wake})
+        if listener is not None:
+            listener.start()
         registered = False
         try:
             while not self._stop.is_set():
+                # Clear before the pass: a notification during the pass must
+                # remain set until the following wait, not be lost.
+                self._wake.clear()
                 if not registered:
                     try:
                         self.lab.register_worker(self.worker_id, kind="worker")
@@ -335,6 +343,8 @@ class LabWorker:
                     log.info("tick: %s", summary)
                 self.wait(self.poll_interval)
         finally:
+            if listener is not None:
+                listener.stop()
             self._stop_worker_best_effort()
 
     def wake(self) -> None:
@@ -346,8 +356,6 @@ class LabWorker:
         if self._stop.is_set():
             return
         self._wake.wait(timeout)
-        if not self._stop.is_set():
-            self._wake.clear()
 
     def run_once(self) -> dict[str, Any]:
         """One pass, registered so the pass is visible to the diagnostics.

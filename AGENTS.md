@@ -35,6 +35,14 @@ agent-server.
   `force_transition`. Holds the sandbox/conversation route table.
 - `orchestration/cloud_dispatcher.py` — Cloud dispatcher. Two-phase create
   (start task → poll → bind), allowlist, bounded retry, recovery.
+- `orchestration/queue_wakeup.py` and `migrations/0045_queue_wakeups.sql` —
+  optional commit-time hints for task and lab loops. Set `NEXUS_LISTEN_DSN` to
+  a direct/session PostgreSQL DSN for each web/worker process; transaction
+  pooling cannot retain LISTEN. Hints contain no IDs or secrets, are not
+  durable, and never replace the timeout, leases or fencing. Listener
+  reconnect causes a full rescan; repeated hints are coalesced per queue with
+  a 0.5-second minimum interval to prevent retry storms. Changing triggers requires tests for commit,
+  rollback, reconnect, notification storms and both queues.
 - `orchestration/sr_tools.py` — Sr operations (create/list/status/report/
   revise/accept/cancel) with real, durable effects.
 - `orchestration/restore_point.py` — safe restore points. A restore point is a

@@ -11,7 +11,9 @@ A **project** owns repositories (many-to-many), tasks and workflows. A
 delegates each unit of work to **Jr** tasks through client tools. A dispatcher
 runs each Jr to completion, records the result, and feeds it back to the Sr.
 Every result can be captured as **signed evidence** whose verdict is earned,
-not granted.
+not granted. Durable lab runs already retry unverified work within their
+existing policy and backoff; this is not an LLM-driven replanner and does not
+claim an `AUTO_CORRECTED` evidence verdict.
 
 ```
 project ──▶ repositories (explicit links)
@@ -27,6 +29,19 @@ State lives in PostgreSQL; conversations run on OpenHands Cloud. The default
 Cloud transport provisions a sandbox and drives its agent-server directly
 (the `direct` transport); the legacy app-conversation endpoint is kept behind
 `OPENHANDS_TRANSPORT=app`.
+
+For faster cross-process queue wakeups, optionally set `NEXUS_LISTEN_DSN` on
+web and lab-worker processes to a **direct or session-pooled** connection to
+that same PostgreSQL database. Migration `0045` sends type-only task/run
+hints after commit; PostgreSQL remains the durable queue and periodic polling
+still handles missed notifications, leases and OpenHands status. Repeated hints
+are coalesced with a 0.5-second minimum interval per queue to limit retry storms
+(the initial rescan on connection is separate).
+Leave the variable unset to keep timer-only behaviour. A transaction-pooling endpoint is
+not suitable for `LISTEN`; each enabled process uses one extra connection.
+Monitor PostgreSQL notification queue usage: an exhausted queue can cause a
+notifying transaction to fail at commit. See [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) and
+[performance measurements](docs/PERFORMANCE.md).
 
 Start here:
 

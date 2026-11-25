@@ -467,6 +467,8 @@ class App:
         )
         self._stop = threading.Event()
         self._lab_wake = threading.Event()
+        self._dispatch_wake = threading.Event()
+        self._queue_listener = None
         self._loop: threading.Thread | None = None
         self._lab_loop: threading.Thread | None = None
         self._plan_loop: threading.Thread | None = None
@@ -486,6 +488,12 @@ class App:
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
+        from .queue_wakeup import from_environment
+
+        self._queue_listener = from_environment({"task": self._dispatch_wake.set,
+                                                 "lab": self.wake_lab})
+        if self._queue_listener is not None:
+            self._queue_listener.start()
         self._loop = threading.Thread(target=self._run, daemon=True)
         self._loop.start()
         self._plan_loop = threading.Thread(target=self._run_planning, daemon=True)
@@ -498,6 +506,9 @@ class App:
         self._stop.set()
         self.spec_planner.wake()
         self.wake_lab()
+        self._dispatch_wake.set()
+        if self._queue_listener is not None:
+            self._queue_listener.stop()
         # The pass that advances runs is given the time to finish what it has
         # in hand: closing the store under it would lose what it was about to
         # write (a start it has just been given, a verdict). It does not wait
@@ -607,7 +618,6 @@ class App:
                                       "errors": [f"{type(e).__name__}: {e}"]}
             if not self._stop.is_set():
                 self._lab_wake.wait(self.poll_interval)
-                self._lab_wake.clear()
         if worker is not None:
             try:
                 worker.lab.stop_worker(self._lab_worker_id)
@@ -617,6 +627,7 @@ class App:
     def _run(self) -> None:
         synced = False
         while not self._stop.is_set():
+            self._dispatch_wake.clear()
             try:
                 if not synced:
                     startup_sync(self.store, self.client, self.openhands_accounts.execution_client_internal)
@@ -633,7 +644,8 @@ class App:
             # After the pass whatever became of it: housekeeping of this
             # server's own tables does not depend on the agent service.
             self._maybe_sweep()
-            self._stop.wait(self.poll_interval)
+            if not self._stop.is_set():
+                self._dispatch_wake.wait(self.poll_interval)
 
     def _maybe_sweep(self) -> None:
         """Occasionally drop expired sessions and stale rate-limit rows.

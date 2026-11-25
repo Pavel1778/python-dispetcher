@@ -7,7 +7,7 @@
   for per-step approval. Phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) inventories
   dispatcher, lab, planning and external-service polling and describes a
   bounded, recoverable LISTEN/NOTIFY design. The implementation below was
-  not yet implemented at this commit.
+  added after this RFC entry.
 - **Verification:** on the working tree, `.venv/bin/python -m pytest -q
   -p no:cacheprovider` completed with 597 passed, 1783 skipped, 0 failed;
   `.venv/bin/ruff check .` passed. These runs include existing uncommitted
@@ -17,8 +17,15 @@
   production LISTEN/NOTIFY, and all other requested phases require separate
   implementation and measurements. There is no live self-healing example.
 
-## 2026-11-25 — dispatcher performance (PR #61, work in progress)
+## 2026-11-25 — queue wakeups and performance (PR #61, work in progress)
 
+- **Implemented, locally tested:** optional `NEXUS_LISTEN_DSN` listener for
+  `App` and the separate `LabWorker`; migration `0045` publishes transaction-
+  committed, type-only hints. Polling remains the recovery path and a 0.5 s
+  per-queue coalescing interval bounds notification-driven retry storms. Tests
+  in `tests/test_queue_wakeup.py` cover commit/rollback, reconnect, fan-out,
+  coalescing and both dispatcher and standalone worker loops on PostgreSQL 16.
+  Production deployment is not verified.
 - **Implemented, locally tested:** indexed multi-state scans in both stores and
   dispatchers. SQLite and PostgreSQL filter/ordering tests are in
   `tests/test_control_plane.py` and `tests/test_cloud_dispatcher.py`. The local
@@ -36,7 +43,7 @@
   100 sequential requests per read with `tools/benchmark.py` produced p99
   1.44–9.76 ms for the five documented examples; see `docs/PERFORMANCE.md`.
   No production or 430 ms before/after claim is made.
-- **Not implemented:** LISTEN/NOTIFY, Redis, MinIO, PgBouncer deployment, WebSocket/Push,
+- **Not implemented:** Redis, MinIO, PgBouncer deployment, WebSocket/Push,
   LLM replanner, Docker sandbox, Rust/PyO3 integration, metrics and key
   rotation/DR automation. Live self-healing and p99 under 100+ real agents
   remain unverified.
