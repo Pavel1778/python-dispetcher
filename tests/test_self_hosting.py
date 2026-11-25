@@ -62,11 +62,17 @@ def test_the_script_only_ever_drops_the_scratch_database():
 
 
 def test_a_missing_env_file_is_refused(tmp_path):
+    # Setup checks psql before loading the env. Supply a harmless fake so the
+    # configuration guard is tested even on hosts without PostgreSQL tools.
+    fake_psql = tmp_path / "psql"
+    fake_psql.write_text('#!/bin/sh\necho "psql (PostgreSQL) 17"\n')
+    fake_psql.chmod(0o755)
     env = dict(os.environ)
+    env["PATH"] = f"{tmp_path}:{env.get('PATH', '')}"
     env["NEXUS_ENV_FILE"] = str(tmp_path / "does-not-exist.env")
     out = subprocess.run([_SCRIPT, "setup"], capture_output=True, text=True, env=env)
     assert out.returncode != 0
-    assert "no " in (out.stderr + out.stdout).lower()
+    assert "does-not-exist.env" in (out.stderr + out.stdout)
 
 
 @requires_db

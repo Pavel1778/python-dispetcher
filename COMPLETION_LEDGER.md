@@ -2,19 +2,44 @@
 
 ## 2026-11-25 — event-driven RFC (proposed, not implemented)
 
-- **Status:** awaiting customer approval in [PR #61](https://github.com/Pavel1778/python-dispetcher/pull/61) before implementation;
-  phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) inventories
+- **Status:** [PR #61](https://github.com/Pavel1778/python-dispetcher/pull/61);
+  customer subsequently requested continued implementation without stopping
+  for per-step approval. Phase 1 is not complete. [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) inventories
   dispatcher, lab, planning and external-service polling and describes a
-  bounded, recoverable LISTEN/NOTIFY design. No event-driven runtime change or
-  migration is claimed by this entry.
+  bounded, recoverable LISTEN/NOTIFY design. The implementation below was
+  not yet implemented at this commit.
 - **Verification:** on the working tree, `.venv/bin/python -m pytest -q
   -p no:cacheprovider` completed with 597 passed, 1783 skipped, 0 failed;
   `.venv/bin/ruff check .` passed. These runs include existing uncommitted
   dispatcher changes and are not a PostgreSQL integration or E2E result.
-  PostgreSQL-dependent tests could not be verified locally.
+  PostgreSQL-dependent tests were not verified in that earlier run.
 - **Acceptance still open:** p99 API read latency <50 ms, 100+ parallel agents,
   production LISTEN/NOTIFY, and all other requested phases require separate
   implementation and measurements. There is no live self-healing example.
+
+## 2026-11-25 — dispatcher performance (PR #61, work in progress)
+
+- **Implemented, locally tested:** indexed multi-state scans in both stores and
+  dispatchers. SQLite and PostgreSQL filter/ordering tests are in
+  `tests/test_control_plane.py` and `tests/test_cloud_dispatcher.py`. The local
+  PostgreSQL 16 benchmark (20,000 completed/50 running, 40 samples, concurrent
+  test activity) measured p50 289.277 ms unfiltered vs 0.992 ms filtered;
+  this is not an end-to-end latency improvement. A separate PostgreSQL run
+  measured 50 individual conversation lookups at p50 13.735 ms versus one
+  batch at 0.503 ms. See `tests/test_cloud_dispatcher.py`,
+  `docs/PERFORMANCE.md` and `benchmarks/dispatcher_postgres.py`.
+- **Locally tested:** `tests/test_concurrent_claims.py::test_100_workers_claim_100_tasks_without_duplicates`
+  verifies uniqueness/owners in a PostgreSQL queue with 100 threads; it does not
+  prove 100 live OpenHands agents or throughput without degradation.
+  `tests/test_sql_fuzzing.py` covers selected hostile SQL values, not exhaustive fuzzing.
+- **API baseline, not production:** on local PostgreSQL 16 and fake services,
+  100 sequential requests per read with `tools/benchmark.py` produced p99
+  1.44–9.76 ms for the five documented examples; see `docs/PERFORMANCE.md`.
+  No production or 430 ms before/after claim is made.
+- **Not implemented:** LISTEN/NOTIFY, Redis, MinIO, PgBouncer deployment, WebSocket/Push,
+  LLM replanner, Docker sandbox, Rust/PyO3 integration, metrics and key
+  rotation/DR automation. Live self-healing and p99 under 100+ real agents
+  remain unverified.
 
 Status of every requirement in the "Final Completion Program" against the actual
 repository at `main` (current `c0f49fcfb91e5ced07d372c2a8743503d3bfde1e`,

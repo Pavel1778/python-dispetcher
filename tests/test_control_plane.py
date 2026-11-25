@@ -307,3 +307,22 @@ def test_priority_ordering(cp):
     cp.submit_task("mid", "mid", priority=5)
     order = [t.id for t in cp.list_tasks()]
     assert order == ["high", "mid", "low"]
+
+
+def test_list_tasks_multiple_states_and_other_filters(cp):
+    cp.submit_task("queued", "queued", priority=5)
+    cp.submit_task("running", "running", priority=10)
+    cp.submit_task("done", "done", priority=15)
+    cp.claim_task("running", "worker")
+    cp.transition("running", TaskState.RUNNING, owner="worker")
+    cp.claim_task("done", "worker")
+    cp.transition("done", TaskState.RUNNING, owner="worker")
+    cp.transition("done", TaskState.VERIFYING, owner="worker")
+    cp.transition("done", TaskState.COMPLETED, owner="worker")
+
+    states = [TaskState.RUNNING, TaskState.QUEUED]
+    assert [t.id for t in cp.list_tasks(states=states)] == ["running", "queued"]
+    assert [t.id for t in cp.list_tasks(states=states, state=TaskState.RUNNING)] == ["running"]
+    assert [t.id for t in cp.list_tasks(states=states, owner="worker")] == ["running"]
+    assert cp.list_tasks(states=[]) == []
+    assert cp.list_tasks(states=[], state=TaskState.QUEUED) == []

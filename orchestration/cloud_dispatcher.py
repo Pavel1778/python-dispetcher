@@ -306,16 +306,24 @@ class CloudDispatcher:
 
     # -------------------------------------------------------------- advance
     def _advance_active(self, report: TickReport) -> None:
-        for task in self.store.list_tasks():
-            if task.state not in (TaskState.ASSIGNED, TaskState.RUNNING,
-                                  TaskState.VERIFYING, TaskState.RECOVERING):
-                continue
-            conv = self.store.conversation_for(task.id)
-            if not conv or not conv.get("external_conversation_id"):
+        # Fetch only live states so finished tasks are not shipped on every
+        # pass. Fetch their bound conversation IDs in one query, rather than
+        # opening a transaction for each active task. The DB planner decides
+        # whether to use idx_tasks_state for the state filter.
+        active_states = [
+            TaskState.ASSIGNED,
+            TaskState.RUNNING,
+            TaskState.VERIFYING,
+            TaskState.RECOVERING,
+        ]
+        tasks = self.store.list_tasks(states=active_states)
+        conversations = self.store.conversation_ids_for_tasks([task.id for task in tasks])
+        for task in tasks:
+            cid = conversations.get(task.id)
+            if not cid:
                 # Start never completed; recovery will requeue it.
                 continue
             self._touched.add(task.id)
-            cid = conv["external_conversation_id"]
             try:
                 view = self.client.get_conversation(cid)
             except CloudNotFound:
@@ -329,7 +337,7 @@ class CloudDispatcher:
             report.advanced.append({"task": task.id, "status": view.execution_status})
 
             if outcome == "finished":
-                self._verify_finished(task, report)
+                self._verify_finished(task, report, cid)
             elif outcome == "failed":
                 self._fail(task, report, reason=f"runtime {view.execution_status}")
             elif outcome == "blocked":
@@ -340,11 +348,10 @@ class CloudDispatcher:
                 report.blocked.append(task.id)
             # running/idle: nothing to do, the next tick re-checks.
 
-    def _verify_finished(self, task: Task, report: TickReport) -> None:
+    def _verify_finished(self, task: Task, report: TickReport, conversation_id: str) -> None:
         """A finished conversation is only complete with a non-empty answer."""
-        conv = self.store.conversation_for(task.id)
         try:
-            answer = self.client.final_response(conv["external_conversation_id"])
+            answer = self.client.final_response(conversation_id)
         except CloudError:
             report.unavailable.append(task.id)
             return

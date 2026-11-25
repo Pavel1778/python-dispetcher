@@ -509,7 +509,11 @@ class ControlPlane:
         return _row_to_task(rows[0]) if rows else None
 
     def list_tasks(
-        self, *, state: TaskState | None = None, owner: str | None = None
+        self,
+        *,
+        state: TaskState | None = None,
+        owner: str | None = None,
+        states: list[TaskState] | None = None,
     ) -> list[Task]:
         sql = "SELECT * FROM tasks"
         clauses: list[str] = []
@@ -517,6 +521,13 @@ class ControlPlane:
         if state is not None:
             clauses.append("state=?")
             params.append(state.value)
+        if states is not None:
+            # Match the PostgreSQL implementation, including the empty set.
+            if not states:
+                return []
+            placeholders = ",".join("?" for _ in states)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(s.value for s in states)
         if owner is not None:
             clauses.append("owner=?")
             params.append(owner)

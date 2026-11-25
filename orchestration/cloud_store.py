@@ -1144,6 +1144,7 @@ class PostgresStore:
     def list_tasks(self, *, workflow_id: str | None = None,
                    parent_task_id: str | None = None,
                    state: TaskState | None = None,
+                   states: list[TaskState] | None = None,
                    owner: str | None = None,
                    project_id: str | None = None) -> list[Task]:
         sql = "SELECT * FROM tasks"
@@ -1158,6 +1159,13 @@ class PostgresStore:
         if state is not None:
             where.append("state=%s")
             params.append(state.value)
+        if states is not None:
+            # An empty selection must match nothing (PostgreSQL rejects IN ()).
+            if not states:
+                return []
+            placeholders = ",".join("%s" for _ in states)
+            where.append(f"state IN ({placeholders})")
+            params.extend(s.value for s in states)
         if owner is not None:
             where.append("owner=%s")
             params.append(owner)
@@ -1409,6 +1417,21 @@ class PostgresStore:
             cur.execute("SELECT * FROM conversations WHERE task_id=%s", (task_id,))
             row = cur.fetchone()
         return row
+
+    def conversation_ids_for_tasks(self, task_ids: list[str]) -> dict[str, str]:
+        """Fetch bound external IDs in one query for a dispatcher pass.
+
+        Rows without a bound external ID are omitted. The keys are string task
+        IDs, matching the public Task model. No conversation secrets are read.
+        """
+        if not task_ids:
+            return {}
+        with self._tx() as cur:
+            cur.execute("SELECT task_id, external_conversation_id FROM conversations "
+                        "WHERE task_id = ANY(%s::uuid[]) AND external_conversation_id IS NOT NULL",
+                        (task_ids,))
+            return {str(row["task_id"]): row["external_conversation_id"]
+                    for row in cur.fetchall()}
 
     # ------------------------------------------------------- direct transport
     def save_conversation_route(

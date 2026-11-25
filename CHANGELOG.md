@@ -4,10 +4,17 @@
 
 ### Added
 
-- Proposed [RFC-001](docs/RFC-001_EVENT_DRIVEN.md) for PostgreSQL
-  LISTEN/NOTIFY wakeups, with polling inventory, failure handling, PgBouncer
-  constraints and a verification plan. Awaiting customer approval; runtime
-  behaviour is unchanged by the RFC.
+- PostgreSQL and SQLite dispatcher scan benchmarks, targeted SQL injection
+  regression vectors, and a 100-worker claim uniqueness test.
+
+### Changed
+
+- Both dispatchers filter active task states in the store rather than fetching
+  historical tasks; SQLite's dispatch gate reuses its queued snapshot. The
+  Cloud dispatcher fetches bound conversation IDs in one batch instead of one
+  query per active task.
+- The missing-env self-hosting test now uses a fake `psql` so that it exercises
+  the configuration guard even when PostgreSQL client tools are absent.
 
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
