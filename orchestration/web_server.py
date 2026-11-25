@@ -37,6 +37,7 @@ Protected endpoints (session cookie, or Bearer WEB_AUTH_TOKEN for API writes):
     POST /logout                 revoke the session
     GET  /api/session            current user + CSRF token
     GET  /api/studio             what is configured (names only, never a value)
+    GET  /metrics                Prometheus metrics (protected; bearer token)
     GET  /api/dashboard          real counts + store/Cloud health
     GET  /api/config             whether a Cloud key is configured
     GET  /api/repositories       the repository allowlist
@@ -137,6 +138,8 @@ from .nexus_projects import (
 )
 from .nexus_planning import PlanService
 from .nexus_policy import install_log_redaction, policy_report
+from . import nexus_metrics
+from . import nexus_notify
 from .nexus_spec_planner import PlanningFailed, SpecPlanner
 from .nexus_specs import (
     SpecCorrupted,
@@ -467,6 +470,9 @@ class App:
         )
         self._stop = threading.Event()
         self._lab_wake = threading.Event()
+        #: The PostgreSQL LISTEN thread that feeds ``_lab_wake`` from other
+        #: processes. ``None`` unless ``NEXUS_NOTIFY`` is on.
+        self._notify_listener: Any = None
         self._loop: threading.Thread | None = None
         self._lab_loop: threading.Thread | None = None
         self._plan_loop: threading.Thread | None = None
@@ -483,6 +489,10 @@ class App:
     def wake_lab(self) -> None:
         """Wake the inline lab loop so a newly started/resumed/cancelled run is handled immediately."""
         self._lab_wake.set()
+        # Another process may be the one advancing this run; a NOTIFY is the
+        # only way to wake it. Best effort and gated on NEXUS_NOTIFY, so an
+        # untouched deployment makes no extra database call.
+        nexus_notify.notify_new_work(self.store, reason="wake")
 
     # ---------------------------------------------------------------- loop
     def start(self) -> None:
@@ -491,6 +501,12 @@ class App:
         self._plan_loop = threading.Thread(target=self._run_planning, daemon=True)
         self._plan_loop.start()
         if self.lab_inline:
+            # A NOTIFY from another process (a separate worker, a second
+            # instance) wakes this loop as well; without it, only this process's
+            # own requests would. Off unless NEXUS_NOTIFY asks for it.
+            if nexus_notify.enabled() and getattr(self.store, "dsn", None):
+                self._notify_listener = nexus_notify.NotificationListener(
+                    self.store.dsn, lambda payload: self._lab_wake.set()).start()
             self._lab_loop = threading.Thread(target=self._run_lab, daemon=True)
             self._lab_loop.start()
 
@@ -510,6 +526,9 @@ class App:
             if loop:
                 left = max(0.2, deadline - time.monotonic())
                 loop.join(timeout=left if loop is self._lab_loop else min(5.0, left))
+        if self._notify_listener is not None:
+            self._notify_listener.stop()
+            self._notify_listener = None
         self.store.close()
 
     def _run_planning(self) -> None:
@@ -1758,11 +1777,31 @@ class Handler(BaseHTTPRequestHandler):
         cookie, self._renewed_cookie = self._renewed_cookie, None
         return cookie
 
+    def _note_http(self, code: int) -> None:
+        """Record one response's status and duration. Never raises."""
+        started = getattr(self, "_request_started", None)
+        if started is None:
+            return
+        self._request_started = None
+        nexus_metrics.observe_http(self.command or "", urlparse(self.path).path,
+                                   code, time.perf_counter() - started)
+
+    def _text(self, code: int, text: str, content_type: str) -> None:
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _json(self, code: int, payload: Any, *, cookie: str | None = None) -> None:
         # What the handler says about the cookie itself (login, logout) stands.
         renewed = self._take_renewed_cookie()
         cookie = cookie or renewed
         body = json.dumps(payload, default=str).encode()
+        self._note_http(code)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1777,6 +1816,7 @@ class Handler(BaseHTTPRequestHandler):
         renewed = self._take_renewed_cookie()
         cookie = cookie or renewed
         body = text.encode()
+        self._note_http(code)
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -4319,6 +4359,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ GET
     def do_GET(self) -> None:
+        self._request_started = time.perf_counter()
         path = urlparse(self.path).path
         try:
             # --- public ---
@@ -4366,6 +4407,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(200, web_ui.APP_HTML)
             if not self._require_read():
                 return
+            if path == "/metrics":
+                # Prometheus scrape. Protected like every other read: the
+                # operator's scraper sends the bearer token. Counts only - the
+                # registry never holds a key, a token or a DSN.
+                try:
+                    nexus_metrics.set_db_pool(self.app.store.pool_stats())
+                except Exception:  # noqa: BLE001 - a scrape must not fail
+                    pass
+                try:
+                    obs = self.app.observability()
+                    stuck = obs.get("stuck_tasks")
+                    workers = (obs.get("workers") or {}).get("count")
+                    nexus_metrics.set_queue(
+                        obs.get("queue") or {},
+                        len(stuck) if isinstance(stuck, list) else 0,
+                        int(workers or 0))
+                except Exception:  # noqa: BLE001 - a scrape must not fail
+                    pass
+                self._note_http(200)
+                return self._text(200, nexus_metrics.render(),
+                                  "text/plain; version=0.0.4; charset=utf-8")
             if self._execution_profile(path):
                 return
 
@@ -4692,6 +4754,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- POST
     def do_POST(self) -> None:
+        self._request_started = time.perf_counter()
         path = urlparse(self.path).path
         try:
             # --- public: login (rate limited) ---

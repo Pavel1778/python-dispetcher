@@ -287,6 +287,29 @@ path over real PostgreSQL. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and
 attempt 0" symptom is answered by `queue.claimable_now` and `stuck_tasks` - a
 due task nobody claims is a missing or dead worker, and it is now visible.
 
+**Prometheus.** `GET /metrics` serves the exposition format (`text/plain;
+version=0.0.4`) behind the same session/bearer auth as every other read:
+`nexus_tasks_claimed_total{worker}`, `nexus_evidence_verifications_total{verdict}`,
+`nexus_openhands_api_latency_seconds{account,transport}`, the database-pool
+gauges and HTTP request count/latency by normalised path. The registry is
+`orchestration/nexus_metrics.py`; instrumentation never raises and never labels
+a secret.
+
+**Event-driven wake-ups.** With `NEXUS_NOTIFY=1` the loop that advances runs
+`LISTEN`s on the PostgreSQL channel `nexus_work`, and `App.wake_lab()` publishes
+`pg_notify` in the transaction that starts/resumes/retries a run. A run is then
+picked up in milliseconds rather than up to one poll interval later; the poll
+stays the backstop, so a missed notification can never lose work. See
+[docs/RFC-001_EVENT_DRIVEN.md](docs/RFC-001_EVENT_DRIVEN.md).
+
+**Self-healing.** With `NEXUS_REPLANNER=1` and a provider key, a task that does
+not verify gets one short corrective instruction from the provider cascade
+(at most three per task, stored on the task so the ceiling survives a restart).
+The correction is delivered to the next attempt and signed into the Evidence
+Trust Engine as `AUTO_CORRECTED`; a provider outage falls back to the
+deterministic rework note and never stops a run
+(`orchestration/replanner.py`).
+
 ## Evidence Trust Engine
 
 Evidence is signed with Ed25519 over a canonical byte encoding. A verdict is

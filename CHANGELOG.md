@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — event-driven wake-ups, Prometheus metrics, self-healing replanner
+
+### Added
+
+- **PostgreSQL LISTEN/NOTIFY wake-ups** (`orchestration/nexus_notify.py`,
+  `docs/RFC-001_EVENT_DRIVEN.md`). `App.wake_lab()` — the one line every
+  start/resume/retry already calls — publishes `pg_notify('nexus_work', …)`
+  inside the caller's transaction, and the worker loop and the server's inline
+  loop `LISTEN` for it, so a run started in one process is picked up by another
+  within milliseconds instead of up to one poll interval later. The poll stays
+  the backstop: a missed notification can never lose work, and a listener that
+  cannot connect leaves the loop polling. Off unless `NEXUS_NOTIFY=1`.
+- **Prometheus metrics** (`orchestration/nexus_metrics.py`, protected
+  `GET /metrics`). A dependency-free registry in the exposition format 0.0.4
+  with the metrics the requirement names: `nexus_tasks_claimed_total{worker}`,
+  `nexus_evidence_verifications_total{verdict}`,
+  `nexus_openhands_api_latency_seconds{account,transport}`, the database pool
+  gauges, and HTTP request count/latency by normalised path. Instrumentation
+  never raises and never labels a secret. The endpoint needs the same session or
+  bearer token as every other read.
+- **LLM-driven replanner (self-healing)** (`orchestration/replanner.py`). When a
+  durable task does not verify, the provider cascade is asked for one short,
+  concrete corrective instruction; it is appended to the note the next attempt
+  reads and signed into the Evidence Trust Engine as `AUTO_CORRECTED`. Bounded
+  at three per task (the count is stored on the task, so it survives a restart),
+  best effort (a provider outage keeps the deterministic note), and redacted.
+  Off unless `NEXUS_REPLANNER=1` and a provider key is configured.
+
+### Changed
+
+- `LabScheduler._retry` records `auto_corrections` in the task's `verification`
+  detail, so the replanner's ceiling is durable rather than in memory.
+- `CloudClient._request` and `OpenHandsClient._request_to` record their real
+  latency; the request path is otherwise unchanged.
+
+### Tests
+
+- `tests/test_notify.py` (8), `tests/test_metrics.py` (8),
+  `tests/test_replanner.py` (11), plus the `/metrics` entry in
+  `tests/test_route_auth.py`. The replanner integration drives a real durable
+  run through the real scheduler and store on PostgreSQL.
+
 ## Unreleased — the evidence viewer: the Trust Engine in the Studio
 
 ### Added

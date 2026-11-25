@@ -17,6 +17,26 @@ Last updated: 2026-11-18 (PR #50 merged as `c0f49fc`; this branch adds `0041` cl
 
 ---
 
+## Session 2026-11-25 — Phase 1 (event-driven) and selected Phase 4/5 work
+
+| Item | Status | Evidence |
+|---|---|---|
+| Environment: PostgreSQL 17, Rust 1.100 (rustup), Python deps | VERIFIED | full suite run below |
+| Baseline failures were environmental (no Rust toolchain, no browser), not defects | VERIFIED | Rust parity 86/86 with `NEXUS_RUST_BIN`; `test_sr_lifecycle` 22/22 alone |
+| RFC-001 event-driven design (LISTEN/NOTIFY, Redis, PgBouncer, MinIO) | WRITTEN | `docs/RFC-001_EVENT_DRIVEN.md` |
+| PostgreSQL LISTEN/NOTIFY wake-ups | IMPLEMENTED — TESTS PASS | `orchestration/nexus_notify.py`, `tests/test_notify.py` (8) |
+| Prometheus `/metrics` + instrumentation | IMPLEMENTED — TESTS PASS | `orchestration/nexus_metrics.py`, `tests/test_metrics.py` (8), `test_route_auth` |
+| LLM-driven replanner + `AUTO_CORRECTED` evidence | IMPLEMENTED — TESTS PASS | `orchestration/replanner.py`, `tests/test_replanner.py` (11) |
+| Read-path p99 under 50 ms | VERIFIED (measured) | `tools/benchmark.py` — see `docs/PERFORMANCE.md` |
+| Redis cache/Streams | NOT IMPLEMENTED | next increment in RFC-001 §3.2 |
+| MinIO for binary data | NOT IMPLEMENTED | next increment in RFC-001 §3.4 |
+| PgBouncer | NOT IMPLEMENTED (deployment) | RFC-001 §3.3; existing pooler caveats unchanged |
+| WebSocket `/ws/updates` + PWA push | NOT IMPLEMENTED | roadmap; requires a real WS layer |
+| Rust modules via PyO3 | NOT IMPLEMENTED | existing Rust crates are separate binaries with parity tests; PyO3 bindings are the next increment |
+| QA sandbox tool (`run_tests_in_sandbox`) | NOT IMPLEMENTED | existing Self-QA runs checks in a scratch clone; a per-task sandbox tool is next |
+
+---
+
 ## Phase 1 — Repository health
 
 | Requirement | Status | Evidence |

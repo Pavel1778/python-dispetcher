@@ -3105,3 +3105,80 @@ the CLI. The routes existed and were tested; the screen did not.
 - Still backend-only after this (the rest of P1 #3): File Lab uploads,
   workspaces and voice notes, plan approval, GitHub create/visibility
   confirmations, the allowlist editor, the diagnostics page.
+
+## Event-driven wake-ups, metrics and the replanner (2026-11-25)
+
+Three additive modules. Each is off (or inert) by default, so a deployment that
+sets nothing keeps the exact previous behaviour.
+
+### `orchestration/nexus_notify.py` — LISTEN/NOTIFY wake-ups
+
+- **The database is authoritative; a notification is a hint.** The payload names
+  a run, but the worker still reads it from PostgreSQL. The poll interval stays
+  the backstop, so a missed notification can never lose work.
+- **`notify_new_work` runs `pg_notify` inside the caller's transaction**, so a
+  rolled-back start notifies nobody. `App.wake_lab()` is the single producer
+  call site — it is what every start/resume/retry already invokes.
+- **The listener owns a dedicated connection.** `LISTEN` lives on a session and
+  cannot share a pooled connection; a transaction-mode pooler cannot guarantee
+  the same backend. A listener that cannot connect is logged once and left off;
+  the loop polls as before.
+- **`NEXUS_NOTIFY=1` turns it on.** The worker (`LabWorker.run_forever`) and the
+  server's inline loop (`App.start`) start it; both call their existing wake
+  event. Do not remove the poll backstop.
+- Tests: `tests/test_notify.py` (real PostgreSQL; committed vs rolled back, a
+  listener that cannot connect, `wake_lab` publishing). `docs/RFC-001_EVENT_DRIVEN.md`
+  is the design and the rollout order for Redis/PgBouncer/MinIO.
+
+### `orchestration/nexus_metrics.py` — Prometheus metrics
+
+- **Instrumentation never raises.** Every helper swallows its own errors: a
+  metrics bug must not fail the request or the dispatch it observes.
+- **Cardinality is bounded.** `normalize_path` turns UUIDs and numbers into
+  `{id}`/`{n}`; never label a raw user-supplied path.
+- **No secret is a label.** Labels are worker ids, verdicts, transports and
+  normalised paths only.
+- **`GET /metrics` is protected** like every other read (session or bearer); it
+  is in `tests/test_route_auth.py`. It publishes the pool gauges at scrape time
+  from `PostgresStore.pool_stats()` (counts only).
+- Instrumented: claims (`LabScheduler.tick`), evidence verifications
+  (`EvidenceService.record`/`reverify`), OpenHands latency
+  (`CloudClient._request`, `OpenHandsClient._request_to`), HTTP responses
+  (`Handler._json`/`_html`).
+- Tests: `tests/test_metrics.py` (pure registry + real `/metrics` + a real
+  evidence record counted through `EvidenceService`).
+
+### `orchestration/replanner.py` — LLM-driven self-healing
+
+- **Bounded, and the ceiling is durable.** At most `max_attempts` (3)
+  corrections per task. The count lives in the task's `verification` detail
+  (`auto_corrections`), written by `LabScheduler._verdict_detail`; do not move
+  it to memory, or a restart resets the ceiling.
+- **Best effort.** A provider outage, an empty answer or a malformed one is
+  logged and answered with `None`; the deterministic rework note is used and the
+  run continues. `_auto_correct` never raises.
+- **The model proposes; the scheduler disposes.** The correction is appended to
+  the note the next attempt reads (`resume_note`, the existing delivery channel)
+  and signed into the Evidence Trust Engine as `detail.status =
+  AUTO_CORRECTED`. It never changes a verdict, a budget or a task's state.
+- **No secret in the prompt or the record.** Free text goes through
+  `nexus_policy.redact_text` and is truncated.
+- **Off unless `NEXUS_REPLANNER=1` and a provider key exists.** `LabWorker`
+  builds it from the environment in that case; tests construct one explicitly.
+- Tests: `tests/test_replanner.py` (pure prompt/safety rules; then a real
+  durable run through the real scheduler/store, including the three-correction
+  ceiling and a provider outage). The same tick that retries may re-claim the
+  task, so assert on the second dispatch / the stored verification, not on
+  `state == "pending"`.
+
+### Environment note for this session
+
+- The Rust parity suites need a toolchain that satisfies the workspace's
+  dependency `rust-version`s (Debian's 1.85 is too old: `uuid` wants 1.89).
+  Install `rustup` and `rustup toolchain install stable`, then `cargo build` in
+  `rust/`, or set `NEXUS_RUST_BIN` to an already-built `nexus-rs`. Without it
+  those suites fail, not skip (the module skips only when `cargo` is absent).
+- `tests/test_sr_lifecycle.py` and `tests/test_sr_runtime.py` pass alone but can
+  fail after a module that leaves shared state in the same process; that is the
+  known ordering contamination described elsewhere, not a defect in these
+  modules.

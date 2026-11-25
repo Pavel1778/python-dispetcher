@@ -103,3 +103,56 @@ Run with `NEXUS_LAB_MAX_ACTIVE_TASKS=0` on PostgreSQL 16.2:
    in one `SELECT filename, checksum FROM schema_migrations`, and replaced
    `information_schema.columns` in `verify_schema` with `pg_class` / `pg_namespace` /
    `pg_attribute`.
+
+---
+
+## 8. Re-measured 2026-11-25 (PostgreSQL 17.12, Python 3.13, loopback)
+
+Environment: Debian trixie, PostgreSQL 17.12 on the same host, Python 3.13.15,
+`psycopg` 3.3.9, the real `WebServer`/`App`/`PostgresStore` and the same
+stand-in OpenHands/GitHub/LLM servers the test suite uses. Command:
+
+```bash
+TEST_SUPABASE_DB_URL="postgresql://…/nexus_bench" \
+  python tools/benchmark.py --out bench_after.json
+```
+
+`tools/benchmark.py` resets the schema first, so the numbers are not polluted
+by earlier data. Every value is a real HTTP round trip.
+
+| Path | p50 (ms) | p99 (ms) | n |
+|---|---:|---:|---:|
+| `studio_status_ms` (`GET /api/studio`) | 0.76 | 1.14 | 15 |
+| `list_projects_ms` | 1.22 | 1.58 | 15 |
+| `open_project_ms` | 1.69 | 1.91 | 15 |
+| `list_conversations_ms` | 1.64 | 2.00 | 15 |
+| `open_conversation_ms` | 1.46 | 2.08 | 15 |
+| `fetch_history_ms` | 2.41 | 2.76 | 15 |
+| `search_by_content_ms` | 1.86 | 2.27 | 15 |
+| `export_conversation_ms` | 2.50 | 2.83 | 15 |
+| `chat_turn_ms` (fake provider) | 11.58 | 15.45 | 5 |
+| `start_run_ms` (plan + store) | 25.16 | 31.66 | 5 |
+| `queue_claim_ms` | 3.41 | 6.24 | 15 |
+
+**Read-path p99 is 1.1–2.8 ms**, well inside the 50 ms target. The two slower
+paths are not reads: a chat turn includes the provider round trip, and starting
+a run includes planning and storing a plan. Neither is a database problem, and
+neither is improved by rewriting the read path.
+
+What this increment changed on the hot paths, and what it did not:
+
+* **Added:** one `perf_counter()` pair and one histogram observation per
+  OpenHands HTTP call; one counter increment per claim and per evidence
+  verification; one status/duration observation per JSON/HTML response. These
+  are in-memory operations behind a lock and are not visible above the noise.
+* **Not changed:** the SQL, the indexes, the connection pool, the JSON encoder
+  or the event loop. The p99 target was already met; the work that moves
+  *dispatch* latency is the LISTEN/NOTIFY wake-up (`docs/RFC-001_EVENT_DRIVEN.md`),
+  which removes up to one poll interval (default 5 s) between "a run is
+  started" and "a worker looks at it". That is a correctness-preserving latency
+  win, not a read-path one.
+
+**Honest limits.** These are loopback numbers on one host. A deployed service
+adds network RTT to PostgreSQL and to OpenHands; the read paths remain a small
+number of indexed queries, but the absolute values there will be higher. No
+claim is made here about a remote database.
